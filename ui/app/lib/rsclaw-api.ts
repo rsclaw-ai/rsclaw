@@ -5,6 +5,11 @@ let AUTH_TOKEN = process.env.NEXT_PUBLIC_RSCLAW_AUTH_TOKEN || "";
 // Allow runtime update of gateway URL (e.g. from Tauri config read)
 export function setGatewayUrl(url: string) {
   GATEWAY_URL = url;
+  // Persist so getGatewayUrl()'s localStorage fallback returns this fresh value
+  // rather than a stale cache (e.g. an old debug port the user has since changed
+  // back). Desktop startup calls this with the Tauri-resolved gateway port, so
+  // the cache re-syncs to the real port on every launch.
+  try { localStorage.setItem("rsclaw-gateway-url", url); } catch {}
 }
 export function getGatewayUrl() {
   if (GATEWAY_URL && GATEWAY_URL !== "http://localhost:18888") return GATEWAY_URL;

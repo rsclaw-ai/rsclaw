@@ -4642,13 +4642,7 @@ impl AgentRuntime {
 
         // Timeout wrapper. Daemon agents (long-lived monitor loops) run with NO
         // turn timeout — they loop forever by design; see `daemon_agent_ids`.
-        let daemon_mode: bool = self
-            .config
-            .agents
-            .defaults
-            .daemon_agent_ids
-            .as_ref()
-            .is_some_and(|ids| ids.iter().any(|id| id == &self.handle.id));
+        let daemon_mode: bool = self.config.agents.is_daemon_agent(&self.handle.id);
         let timeout_secs = self
             .config
             .agents
@@ -5590,10 +5584,7 @@ impl AgentRuntime {
             .agents
             .read()
             .await
-            .defaults
-            .daemon_agent_ids
-            .as_ref()
-            .is_some_and(|ids| ids.iter().any(|id| id == &ctx.agent_id));
+            .is_daemon_agent(&ctx.agent_id);
         if daemon_mode {
             warn!(
                 session = %ctx.session_key,

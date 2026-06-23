@@ -91,9 +91,24 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
                     .dimensions
                     .unwrap_or_else(|| rsclaw_embed::openai_model_dim(&model))
                     as usize;
-                // base_url empty + rsclaw-* model → fleet API; else OpenAI.
-                let base_url =
-                    rsclaw_embed::resolve_embed_base_url(cfg.base_url.as_deref(), &model);
+                // base_url empty + rsclaw-* model → the configured rsclaw
+                // provider base (self-hosted fleet honoured), falling back to
+                // RSCLAW_API_BASE_URL; non-rsclaw empty → OpenAI default.
+                let base_empty = cfg
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty();
+                let base_url = if base_empty && rsclaw_embed::is_rsclaw_model(&model) {
+                    rsclaw_config::load()
+                        .ok()
+                        .as_ref()
+                        .and_then(crate::ocr::rsclaw_provider_base_url)
+                        .unwrap_or_else(|| rsclaw_embed::RSCLAW_API_BASE_URL.to_owned())
+                } else {
+                    rsclaw_embed::resolve_embed_base_url(cfg.base_url.as_deref(), &model)
+                };
                 tracing::info!(model = %model, dim, base_url = %base_url, "kb: using remote OpenAI-compatible embedder");
                 return Arc::new(LocalKbEmbedder::remote_openai(
                     base_url, model, api_key, dim,

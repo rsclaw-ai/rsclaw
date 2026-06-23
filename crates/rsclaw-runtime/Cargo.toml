@@ -81,6 +81,7 @@ toml         = "1"
 anyhow    = "1"
 thiserror = "2"
 async-trait = "0.1"
+async-stream = "0.3"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -174,9 +175,6 @@ default = ["openclaw-migrate"]
 channel-matrix = ["dep:matrix-sdk"]
 openclaw-migrate = ["rsclaw-migrate/openclaw-migrate"]
 tray = ["dep:tray-icon", "dep:muda"]
-
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-xcap = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }

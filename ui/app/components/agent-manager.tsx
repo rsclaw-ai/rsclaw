@@ -10,10 +10,10 @@ import ConfirmIcon from "../icons/confirm.svg";
 import ReloadIcon from "../icons/reload.svg";
 import { useNavigate } from "react-router-dom";
 import { useEffect, useState, useCallback } from "react";
-import { Path } from "../constant";
+import { Path, RSCLAW_GATEWAY_API_BASE } from "../constant";
 import { showConfirm, showToast } from "./ui-lib";
 
-const GATEWAY_BASE = "http://localhost:18888/api/v1";
+const GATEWAY_BASE = RSCLAW_GATEWAY_API_BASE;
 
 interface Agent {
   id: string;

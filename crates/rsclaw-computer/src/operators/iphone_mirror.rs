@@ -26,7 +26,7 @@ use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Mouse, Settings,
 };
-use image::{ImageFormat, RgbaImage};
+use rsclaw_platform::capture;
 use tracing::{debug, warn};
 
 use crate::{
@@ -159,26 +159,26 @@ impl Operator for IphoneMirrorOperator {
 // macOS implementation
 // ---------------------------------------------------------------------------
 
+/// Find the iPhone Mirroring window via the script-based window list.
 #[cfg(target_os = "macos")]
-fn capture_iphone_window() -> Result<Screenshot> {
-    let windows = xcap::Window::all().map_err(|e| anyhow!("xcap::Window::all failed: {e}"))?;
-    let window = windows
+fn find_iphone_window() -> Result<capture::WindowInfo> {
+    capture::list_windows()
+        .map_err(|e| anyhow!("{e}"))?
         .into_iter()
-        .find(|w| {
-            w.title()
-                .map(|t| t.starts_with(WINDOW_TITLE_PREFIX))
-                .unwrap_or(false)
-        })
+        .find(|w| w.title.starts_with(WINDOW_TITLE_PREFIX))
         .ok_or_else(|| {
             anyhow!(
                 "iPhone Mirroring window not found — is the app running and \
                  visible? Open Apple Menu → System Settings → iPhone Mirroring."
             )
-        })?;
+        })
+}
 
-    let img: RgbaImage = window
-        .capture_image()
-        .map_err(|e| anyhow!("xcap window capture failed: {e}"))?;
+#[cfg(target_os = "macos")]
+fn capture_iphone_window() -> Result<Screenshot> {
+    let window = find_iphone_window()?;
+    let png_bytes = capture::capture_window_png(window.id).map_err(|e| anyhow!("{e}"))?;
+    let img = capture::png_to_rgba(&png_bytes).map_err(|e| anyhow!("{e}"))?;
     let physical_w = img.width();
     let physical_h = img.height();
 
@@ -186,13 +186,6 @@ fn capture_iphone_window() -> Result<Screenshot> {
     // (Retina), not the iPhone's. We treat the window's pixel content
     // as 1× from the model's POV so coordinate scaling stays simple.
     let scale_factor: f32 = 1.0;
-
-    let mut png_bytes: Vec<u8> = Vec::with_capacity(physical_w as usize * physical_h as usize / 4);
-    {
-        let mut cursor = std::io::Cursor::new(&mut png_bytes);
-        img.write_to(&mut cursor, ImageFormat::Png)
-            .context("PNG encode failed")?;
-    }
 
     Ok(Screenshot {
         png_bytes,
@@ -206,21 +199,8 @@ fn capture_iphone_window() -> Result<Screenshot> {
 /// in-iPhone coordinates → absolute Mac coordinates for enigo input.
 #[cfg(target_os = "macos")]
 fn iphone_window_origin() -> Result<(i32, i32, u32, u32)> {
-    let windows = xcap::Window::all().map_err(|e| anyhow!("xcap::Window::all failed: {e}"))?;
-    let window = windows
-        .into_iter()
-        .find(|w| {
-            w.title()
-                .map(|t| t.starts_with(WINDOW_TITLE_PREFIX))
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| anyhow!("iPhone Mirroring window not found"))?;
-
-    let x = window.x().unwrap_or(0);
-    let y = window.y().unwrap_or(0);
-    let w = window.width().unwrap_or(0);
-    let h = window.height().unwrap_or(0);
-    Ok((x, y, w, h))
+    let w = find_iphone_window()?;
+    Ok((w.x, w.y, w.w, w.h))
 }
 
 #[cfg(target_os = "macos")]

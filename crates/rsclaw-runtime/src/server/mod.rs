@@ -17,20 +17,20 @@
 //!   GET    /api/v1/status                   gateway status
 //!   POST   /api/v1/config/reload            trigger hot reload
 //!   GET    /api/v1/config                   current config (redacted)
-//!   GET    /api/v1/defaults                 provider/channel/search catalog (defaults.toml)
-//!   GET    /api/v1/stream                   SSE — subscribe to agent output
-//!   POST   /hooks/:path                     webhook ingress (see hooks module)
-//!   POST   /v1/chat/completions             OpenAI-compatible chat endpoint
-//!   GET    /v1/models                       OpenAI-compatible models list
-//!   POST   /v1/files                        upload a file (multipart)
-//!   GET    /v1/files                        list uploaded files
+//!   GET    /api/v1/defaults                 provider/channel/search catalog
+//! (defaults.toml)   GET    /api/v1/stream                   SSE — subscribe to
+//! agent output   POST   /hooks/:path                     webhook ingress (see
+//! hooks module)   POST   /v1/chat/completions             OpenAI-compatible
+//! chat endpoint   GET    /v1/models                       OpenAI-compatible
+//! models list   POST   /v1/files                        upload a file
+//! (multipart)   GET    /v1/files                        list uploaded files
 //!   GET    /v1/files/:id                    retrieve file metadata
 //!   GET    /v1/files/:id/content            download file content
 //!   DELETE /v1/files/:id                    delete a file
 //!   GET    /ws                              WebSocket gateway protocol
 //! (OpenClaw WS)
 
-use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
+use std::{convert::Infallible, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -45,19 +45,15 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use futures::{Stream, StreamExt as _};
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_config::runtime::RuntimeConfig;
+use rsclaw_store::Store;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
-use crate::{
-    cmd::config_json::load_config_json,
-    gateway::LiveConfig,
-    ws::types::EventFrame,
-};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_config::runtime::RuntimeConfig;
-use rsclaw_store::Store;
+use crate::{cmd::config_json::load_config_json, gateway::LiveConfig, ws::types::EventFrame};
 
 mod knowledge;
 
@@ -372,6 +368,18 @@ pub fn build_router(state: AppState) -> Router {
             "/computer-use/runs/{run_id}/abort",
             post(computer_use_run_abort),
         )
+        .route("/computer-use/stream", get(computer_use_stream_sse))
+        .route(
+            "/computer-use/permission_response",
+            post(computer_use_permission_response),
+        )
+        .route("/git/status", get(git_status))
+        .route("/git/diff", get(git_diff))
+        .route("/git/log", get(git_log))
+        .route("/git/commit", post(git_commit))
+        .route("/git/prs", get(git_prs))
+        .route("/git/prs/{number}", get(git_pr_get))
+        .route("/git/prs/{number}/review", post(git_pr_review))
         // Memory management — read-only browse + stats. Each request
         // opens `MemoryStore::open_readonly` to avoid touching the
         // agent runtime's live store. Mutating endpoints (delete,
@@ -740,19 +748,29 @@ mod tests {
         let var = root.path().join("var");
         let downloads = root.path().join("Downloads").join("rsclaw");
         let outside = root.path().join("outside");
-        tokio::fs::create_dir_all(&workspace).await.expect("workspace");
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace");
         tokio::fs::create_dir_all(&var).await.expect("var");
-        tokio::fs::create_dir_all(&downloads).await.expect("downloads");
+        tokio::fs::create_dir_all(&downloads)
+            .await
+            .expect("downloads");
         tokio::fs::create_dir_all(&outside).await.expect("outside");
 
         let workspace_file = workspace.join("chart.png");
         let var_file = var.join("chart.png");
         let downloads_file = downloads.join("chart.png");
         let outside_file = outside.join("chart.png");
-        tokio::fs::write(&workspace_file, b"png").await.expect("workspace file");
+        tokio::fs::write(&workspace_file, b"png")
+            .await
+            .expect("workspace file");
         tokio::fs::write(&var_file, b"png").await.expect("var file");
-        tokio::fs::write(&downloads_file, b"png").await.expect("downloads file");
-        tokio::fs::write(&outside_file, b"png").await.expect("outside file");
+        tokio::fs::write(&downloads_file, b"png")
+            .await
+            .expect("downloads file");
+        tokio::fs::write(&outside_file, b"png")
+            .await
+            .expect("outside file");
 
         let roots = vec![workspace.clone(), var, downloads];
         assert!(
@@ -793,7 +811,9 @@ mod tests {
     async fn media_path_rejects_large_or_non_file_inputs() {
         let root = tempfile::tempdir().expect("tempdir");
         let workspace = root.path().join("workspace");
-        tokio::fs::create_dir_all(&workspace).await.expect("workspace");
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace");
         let large = workspace.join("large.png");
         let file = std::fs::File::create(&large).expect("large file");
         file.set_len(MAX_LOCAL_MEDIA_BYTES + 1).expect("set len");
@@ -817,7 +837,9 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let workspace = root.path().join("workspace");
         let outside = root.path().join("outside");
-        tokio::fs::create_dir_all(&workspace).await.expect("workspace");
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace");
         tokio::fs::create_dir_all(&outside).await.expect("outside");
         let outside_file = outside.join("secret.png");
         let link = workspace.join("linked.png");
@@ -895,7 +917,11 @@ async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
         .into_iter()
         .map(|h| AgentStatusResponse {
             id: h.id.clone(),
-            model: h.config.model.as_ref().and_then(|m| m.primary_head().map(String::from)),
+            model: h
+                .config
+                .model
+                .as_ref()
+                .and_then(|m| m.primary_head().map(String::from)),
             default: h.config.default == Some(true),
         })
         .collect();
@@ -1038,9 +1064,7 @@ async fn canonicalize_media_path_in_roots(
         .await
         .map_err(|e| anyhow::anyhow!("canonicalize {}: {e}", lexical.display()))?;
     for root in roots {
-        let root_canonical = tokio::fs::canonicalize(&root)
-            .await
-            .unwrap_or(root);
+        let root_canonical = tokio::fs::canonicalize(&root).await.unwrap_or(root);
         if canonical.starts_with(&root_canonical) {
             return Ok(canonical);
         }
@@ -1184,7 +1208,11 @@ async fn agent_status(State(state): State<AppState>, Path(id): Path<String>) -> 
     match state.agents.get(&id) {
         Ok(h) => Json(AgentStatusResponse {
             id: h.id.clone(),
-            model: h.config.model.as_ref().and_then(|m| m.primary_head().map(String::from)),
+            model: h
+                .config
+                .model
+                .as_ref()
+                .and_then(|m| m.primary_head().map(String::from)),
             default: h.config.default == Some(true),
         })
         .into_response(),
@@ -2158,9 +2186,14 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             account: None,
         };
         if handle.tx.send(msg).await.is_ok() {
-            // Deliver agent reply through the job's delivery config.
-            let delivery_channel = job["delivery"]["channel"].as_str().map(|s| s.to_owned());
-            let delivery_to = job["delivery"]["to"].as_str().map(|s| s.to_owned());
+            // Deliver agent reply through the job's delivery config. Resolve
+            // recipients with the SAME logic as the scheduled path (send_delivery)
+            // so manual triggers honor `to` lists, the `agent.channels` sentinel,
+            // and the no-`to` "reply to recent conversation" fallback.
+            let delivery: Option<rsclaw_config::schema::CronDelivery> =
+                serde_json::from_value(job["delivery"].clone()).ok();
+            let agents = state.agents.clone();
+            let agent_id_owned = agent_id.to_owned();
             let ntx = state.notification_tx.clone();
             let job_id = id.clone();
             let ws_conns = state.ws_conns.clone();
@@ -2182,18 +2215,33 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
                     ws_conns.broadcast_all(frame).await;
 
                     if !reply.text.is_empty() {
-                        if let (Some(ch), Some(to)) = (delivery_channel, delivery_to) {
-                            let _ = ntx.send(rsclaw_channel::OutboundMessage {
-                                target_id: to,
-                                is_group: false,
-                                text: reply.text,
-                                reply_to: None,
-                                images: reply.images.clone(),
-                                files: reply.files.clone(),
-                                channel: Some(ch),
-                                account: None,
-                            });
-                            tracing::info!(job_id = %job_id, "cron trigger: delivered reply to channel");
+                        if let Some(delivery) = delivery {
+                            if delivery.mode.as_deref() != Some("none") {
+                                let thread = delivery.thread_id.clone();
+                                let targets = crate::cron::resolve_delivery_targets(
+                                    &agents,
+                                    &agent_id_owned,
+                                    &delivery,
+                                );
+                                for (channel_name, account, to, is_group) in targets {
+                                    let resolved_channel = if channel_name == "ws" {
+                                        "desktop".to_string()
+                                    } else {
+                                        channel_name
+                                    };
+                                    let _ = ntx.send(rsclaw_channel::OutboundMessage {
+                                        target_id: to,
+                                        is_group,
+                                        text: reply.text.clone(),
+                                        reply_to: thread.clone(),
+                                        images: reply.images.clone(),
+                                        files: reply.files.clone(),
+                                        channel: Some(resolved_channel),
+                                        account,
+                                    });
+                                }
+                                tracing::info!(job_id = %job_id, "cron trigger: delivered reply to resolved recipients");
+                            }
                         }
                     }
                 }
@@ -2307,6 +2355,331 @@ async fn computer_use_run_abort(
         tracing::warn!(run_id = %run_id, "computer_use: abort target not found (already finished?)");
     }
     Json(serde_json::json!({"aborted": aborted, "runId": run_id}))
+}
+
+/// GET /api/v1/computer-use/stream?session_id=...
+///
+/// HTTP/SSE shim for the existing WS-only computer_use relays. It forwards
+/// `permission_request` and `computer_use_status` events from the same
+/// broadcast channels used by the desktop WebSocket gateway.
+async fn computer_use_stream_sse(
+    State(state): State<AppState>,
+    Query(_q): Query<std::collections::HashMap<String, String>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let mut permission_rx = state.computer_permission_tx.subscribe();
+    let mut status_rx = state.computer_status_tx.subscribe();
+    let stream = async_stream::stream! {
+        loop {
+            tokio::select! {
+                result = permission_rx.recv() => {
+                    match result {
+                        Ok(req) => {
+                            let data = serde_json::to_string(&serde_json::json!({
+                                "type": "permission_request",
+                                "request_id": req.request_id,
+                                "agent_id": req.agent_id,
+                                "app": req.app,
+                                "reason": req.reason,
+                                "estimated_steps": req.estimated_steps,
+                            })).unwrap_or_else(|_| "{}".to_owned());
+                            yield Ok(Event::default().data(data));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                result = status_rx.recv() => {
+                    match result {
+                        Ok(status) => {
+                            let payload = serde_json::to_value(&status).unwrap_or(serde_json::json!({}));
+                            let data = serde_json::to_string(&serde_json::json!({
+                                "type": "computer_use_status",
+                                "status": payload,
+                            })).unwrap_or_else(|_| "{}".to_owned());
+                            yield Ok(Event::default().data(data));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Debug, Deserialize)]
+struct ComputerUsePermissionResponse {
+    request_id: String,
+    decision: String,
+    agent_id: Option<String>,
+    app: Option<String>,
+}
+
+async fn computer_use_permission_response(
+    State(state): State<AppState>,
+    Json(body): Json<ComputerUsePermissionResponse>,
+) -> Response {
+    use rsclaw_computer::permission::{PermissionDecision, PermissionStore as _};
+    let decision = match body.decision.as_str() {
+        "allow" | "allow_once" => PermissionDecision::AllowOnce,
+        "allow_session" => PermissionDecision::AllowSession,
+        "allow_always" => PermissionDecision::AllowAlways,
+        "deny" => PermissionDecision::Deny,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "invalid decision `{other}` (expected: allow_once, allow_session, allow_always, deny)"
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let (Some(agent_id), Some(app)) = (body.agent_id.as_deref(), body.app.as_deref()) {
+        if let Err(e) = state.computer_permission.record(agent_id, app, decision).await {
+            warn!(error = %e, "computer_permission.record failed");
+        }
+    }
+
+    let resolved = state
+        .computer_permission
+        .resolve_pending_request(&body.request_id, decision)
+        .await;
+    Json(serde_json::json!({
+        "resolved": resolved,
+        "request_id": body.request_id,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct GitQuery {
+    path: Option<String>,
+    staged: Option<bool>,
+    limit: Option<usize>,
+    repo: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitCommitRequest {
+    path: Option<String>,
+    message: String,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitReviewRequest {
+    body: String,
+    event: Option<String>,
+}
+
+fn git_workdir(path: Option<&str>) -> PathBuf {
+    match path.filter(|p| !p.is_empty()) {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
+fn run_cmd(dir: &std::path::Path, program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("{program}: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+async fn git_status(Query(q): Query<GitQuery>) -> Response {
+    let dir = git_workdir(q.path.as_deref());
+    let branch = run_cmd(&dir, "git", &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_else(|_| "unknown".to_owned())
+        .trim()
+        .to_owned();
+    let porcelain = match run_cmd(&dir, "git", &["status", "--porcelain=v1", "--branch"]) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+        }
+    };
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+    let mut ahead = 0;
+    let mut behind = 0;
+    for line in porcelain.lines() {
+        if let Some(meta) = line.strip_prefix("## ") {
+            if let Some(idx) = meta.find("ahead ") {
+                ahead = meta[idx + 6..]
+                    .split([',', ']'])
+                    .next()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+            if let Some(idx) = meta.find("behind ") {
+                behind = meta[idx + 7..]
+                    .split([',', ']'])
+                    .next()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+            continue;
+        }
+        if line.len() < 4 {
+            continue;
+        }
+        let xy = &line[..2];
+        let file = line[3..].to_owned();
+        if !xy.starts_with(' ') && !xy.starts_with('?') {
+            staged.push(file.clone());
+        }
+        if !xy.ends_with(' ') || xy.starts_with('?') {
+            unstaged.push(file);
+        }
+    }
+    Json(serde_json::json!({
+        "branch": branch,
+        "dirty": !staged.is_empty() || !unstaged.is_empty(),
+        "staged": staged,
+        "unstaged": unstaged,
+        "ahead": ahead,
+        "behind": behind,
+    }))
+    .into_response()
+}
+
+async fn git_diff(Query(q): Query<GitQuery>) -> Response {
+    let dir = git_workdir(q.path.as_deref());
+    let args = if q.staged.unwrap_or(false) {
+        vec!["diff", "--staged"]
+    } else {
+        vec!["diff"]
+    };
+    match run_cmd(&dir, "git", &args) {
+        Ok(diff) => (StatusCode::OK, diff).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn git_log(Query(q): Query<GitQuery>) -> Response {
+    let dir = git_workdir(q.path.as_deref());
+    let limit = q.limit.unwrap_or(20).min(100).to_string();
+    match run_cmd(&dir, "git", &["log", "--oneline", "-n", &limit]) {
+        Ok(log) => {
+            let commits: Vec<_> = log
+                .lines()
+                .map(|line| {
+                    let mut parts = line.splitn(2, ' ');
+                    serde_json::json!({
+                        "sha": parts.next().unwrap_or(""),
+                        "title": parts.next().unwrap_or(""),
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({"commits": commits})).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn git_commit(Json(body): Json<GitCommitRequest>) -> Response {
+    let dir = git_workdir(body.path.as_deref());
+    for file in &body.files {
+        if let Err(error) = run_cmd(&dir, "git", &["add", "--", file]) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+        }
+    }
+    match run_cmd(&dir, "git", &["commit", "-m", &body.message]) {
+        Ok(output) => Json(serde_json::json!({"ok": true, "output": output})).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn git_prs(Query(q): Query<GitQuery>) -> Response {
+    let dir = git_workdir(q.repo.as_deref().or(q.path.as_deref()));
+    match run_cmd(&dir, "gh", &["pr", "list", "--json", "number,title,state,author,url"]) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => Json(value).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        Err(_) => Json(serde_json::json!([])).into_response(),
+    }
+}
+
+async fn git_pr_get(Path(number): Path<u64>, Query(q): Query<GitQuery>) -> Response {
+    let dir = git_workdir(q.repo.as_deref().or(q.path.as_deref()));
+    let number_s = number.to_string();
+    match run_cmd(
+        &dir,
+        "gh",
+        &["pr", "view", &number_s, "--json", "number,title,state,author,url,body"],
+    ) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => Json(value).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn git_pr_review(Path(number): Path<u64>, Json(body): Json<GitReviewRequest>) -> Response {
+    let number_s = number.to_string();
+    let event = body.event.unwrap_or_else(|| "COMMENT".to_owned());
+    let review_flag = match event.as_str() {
+        "APPROVE" | "approve" => "--approve",
+        "REQUEST_CHANGES" | "request_changes" => "--request-changes",
+        _ => "--comment",
+    };
+    match run_cmd(
+        &git_workdir(None),
+        "gh",
+        &["pr", "review", &number_s, review_flag, "--body", &body.body],
+    ) {
+        Ok(output) => Json(serde_json::json!({"ok": true, "output": output})).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3389,9 +3762,7 @@ async fn probe_inference_for_request(
         prov_defaults::resolve_base_url(&req.provider)
     };
 
-    let base = base_url_in
-        .filter(|u| !u.is_empty())
-        .unwrap_or(default_url);
+    let base = base_url_in.filter(|u| !u.is_empty()).unwrap_or(default_url);
     if base.is_empty() {
         // Nothing to probe against — caller already failed.
         return Ok(false);
@@ -3549,7 +3920,8 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
             if status == 404
                 && let Ok(true) = probe_inference_for_request(&client, &req).await
             {
-                return Json(serde_json::json!({"models": [], "fallback": "probe"})).into_response();
+                return Json(serde_json::json!({"models": [], "fallback": "probe"}))
+                    .into_response();
             }
             (
                 StatusCode::OK,

@@ -71,7 +71,10 @@ impl KbReranker {
         let base_raw = rr.base_url.trim();
         let base = if base_raw.is_empty() {
             if model_is_rsclaw {
-                rsclaw_embed::RSCLAW_API_BASE_URL.to_owned()
+                // Empty base + rsclaw-* model → the configured rsclaw provider
+                // base (self-hosted fleet honoured); fall back to the constant.
+                crate::ocr::rsclaw_provider_base_url(&cfg)
+                    .unwrap_or_else(|| rsclaw_embed::RSCLAW_API_BASE_URL.to_owned())
             } else {
                 return None;
             }
@@ -171,7 +174,16 @@ impl KbReranker {
         let results = resp
             .get("results")
             .and_then(|v| v.as_array())
-            .context("rerank response missing results array")?;
+            .with_context(|| {
+                // Surface the backend's own error (e.g. "input too large /
+                // increase batch size") instead of an opaque "missing
+                // results" so rerank failures are diagnosable from the log.
+                let detail = resp
+                    .pointer("/error/message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("no results array in response");
+                format!("rerank backend returned no results: {detail}")
+            })?;
         let mut scores = vec![f32::NEG_INFINITY; docs.len()];
         for r in results {
             let idx = r.get("index").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;

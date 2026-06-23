@@ -326,8 +326,16 @@ impl AgentHandle {
             }
         }
 
+        // Which agent answered this conversation — the channel/account routed
+        // here via route_account, so surfacing the handle's id (+ display name)
+        // tells the user exactly which agent they're talking to.
+        let agent_line = match self.config.name.as_deref().filter(|n| !n.is_empty()) {
+            Some(name) if name != self.id => format!("Agent: {} ({name})\n", self.id),
+            _ => format!("Agent: {}\n", self.id),
+        };
+
         format!(
-            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
+            "{agent_line}Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
              {ctx_lines}\
              {sticky_lines}\
              {in_flight_lines}\
@@ -726,6 +734,7 @@ impl AgentRegistry {
             let codex = cfg.agents.defaults.codex.clone();
             vec![rsclaw_config::schema::AgentEntry {
                 id: "main".to_owned(),
+                daemon: false,
                 description: None,
                 default: Some(true),
                 name: Some("Main Agent".to_owned()),
