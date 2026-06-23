@@ -106,6 +106,24 @@ fn capture_primary_monitor() -> Result<String, String> {
 /// window list. The list is front-to-back where the OS provides ordering, so the
 /// first match is frontmost — letting one call serve both the main window and a
 /// transient child (e.g. WeChat's merged-record viewer).
+/// Virtual-screen rect (origin + size) via GetSystemMetrics — matches the area
+/// `capture_full_png` grabs (System.Windows.Forms.SystemInformation.VirtualScreen).
+/// Fast (no process spawn); used so the plugin's full-screen 0-1000 coords convert
+/// to correct screen pixels. SM_*VIRTUALSCREEN = 76..79.
+#[cfg(target_os = "windows")]
+fn virtual_screen_rect() -> (i32, i32, u32, u32) {
+    unsafe extern "system" {
+        fn GetSystemMetrics(n: i32) -> i32;
+    }
+    unsafe {
+        let x = GetSystemMetrics(76);
+        let y = GetSystemMetrics(77);
+        let w = GetSystemMetrics(78).max(0) as u32;
+        let h = GetSystemMetrics(79).max(0) as u32;
+        (x, y, w, h)
+    }
+}
+
 fn find_app_window(app_name: &str) -> Result<capture::WindowInfo, String> {
     let wins = capture::list_windows().map_err(|e| e.to_string())?;
     // App identity differs by platform: macOS list reports the app's display name
@@ -123,8 +141,33 @@ fn find_app_window(app_name: &str) -> Result<capture::WindowInfo, String> {
         let a = w.app.to_lowercase();
         a == target || aliases.iter().any(|al| a.contains(al) || w.app.contains(al))
     };
-    let qualifies = |w: &capture::WindowInfo| matches(w) && !w.minimized && w.w >= 200 && w.h >= 200;
-    if let Some(w) = wins.iter().find(|w| qualifies(w)).cloned() {
+    // WeChat's process owns several non-UI helper top-level windows (a tray-message
+    // sink, IME hosts, a splash). They can be larger than the real chat window but
+    // render BLANK, so "pick the biggest weixin window" grabs the wrong one. Skip
+    // them by their (ASCII, encoding-safe) titles; the real chat window is titled
+    // "微信" and is the largest of what remains.
+    const HELPER_TITLES: &[&str] = &[
+        "WxTrayIconMessageWindow",
+        "Default IME",
+        "MSCTFIME UI",
+        "Weixin", // English splash/loader window, not the chat UI
+        "",       // untitled helper surfaces
+    ];
+    let qualifies = |w: &capture::WindowInfo| {
+        matches(w)
+            && !w.minimized
+            && w.w >= 200
+            && w.h >= 200
+            && !HELPER_TITLES.contains(&w.title.as_str())
+    };
+    // Pick the LARGEST qualifying window (the chat UI), not just the first.
+    let largest = |wins: &[capture::WindowInfo]| {
+        wins.iter()
+            .filter(|&w| qualifies(w))
+            .max_by_key(|w| (w.w as u64) * (w.h as u64))
+            .cloned()
+    };
+    if let Some(w) = largest(&wins) {
         return Ok(w);
     }
     // Nothing on-screen: the app may have closed to the tray (WeChat 4.x destroys
@@ -132,11 +175,8 @@ fn find_app_window(app_name: &str) -> Result<capture::WindowInfo, String> {
     // re-enumerate once before giving up — keeps the monitor loop self-healing.
     if capture::restore_app_window(app_name).unwrap_or(false) {
         std::thread::sleep(std::time::Duration::from_millis(800));
-        if let Some(w) = capture::list_windows()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|w| qualifies(w))
-        {
+        let wins2 = capture::list_windows().map_err(|e| e.to_string())?;
+        if let Some(w) = largest(&wins2) {
             return Ok(w);
         }
     }
@@ -166,17 +206,40 @@ fn ocr_window(_app_name: &str) -> Result<String, String> {
     Err("ocr_window only implemented on macOS and Windows".to_string())
 }
 
-/// Bring a window (by HWND) to the foreground and un-minimise it, so WeChat's
-/// built-in screenshot overlay lands on the right window. CREATE_NO_WINDOW keeps
+/// Maximise a window (by HWND) and force it to the foreground, even over another
+/// app (e.g. a stray File Explorer) — a background gateway process can't normally
+/// win SetForegroundWindow, so we AttachThreadInput to the current foreground
+/// thread first to bypass Windows' foreground lock. Maximising also guarantees the
+/// window is unoccluded for the CopyFromScreen region grab. CREATE_NO_WINDOW keeps
 /// the helper PowerShell from flashing a console.
 #[cfg(target_os = "windows")]
 fn focus_window(hwnd: u64) {
     use std::os::windows::process::CommandExt;
     let script = format!(
-        r#"$s='[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);'
-Add-Type -MemberDefinition $s -Name FW -Namespace W
-[W.FW]::ShowWindow([IntPtr]{hwnd}, 9) | Out-Null
-[W.FW]::SetForegroundWindow([IntPtr]{hwnd}) | Out-Null"#,
+        r#"$sig=@'
+using System;
+using System.Runtime.InteropServices;
+public class FW {{
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  public static void Go(IntPtr h) {{
+    ShowWindow(h, 3); // SW_MAXIMIZE (also un-minimises)
+    IntPtr fg = GetForegroundWindow();
+    uint pid; uint fgT = GetWindowThreadProcessId(fg, out pid);
+    uint cur = GetCurrentThreadId();
+    AttachThreadInput(cur, fgT, true);
+    BringWindowToTop(h); SetForegroundWindow(h);
+    AttachThreadInput(cur, fgT, false);
+  }}
+}}
+'@
+Add-Type $sig
+[FW]::Go([IntPtr]{hwnd})"#,
         hwnd = hwnd
     );
     let mut cmd = Command::new("powershell");
@@ -194,12 +257,14 @@ Add-Type -MemberDefinition $s -Name FW -Namespace W
 /// hits to correct screen-absolute click points. macOS keeps its backing-store path.
 #[cfg(target_os = "windows")]
 fn wechat_region_capture(app_name: &str) -> Result<(Vec<u8>, capture::WindowInfo), String> {
-    let win = find_app_window(app_name)?;
-    // Bring the window forward + restore from tray/minimise so its on-screen rect
-    // shows the real UI for the region grab.
-    focus_window(win.id);
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    // Re-resolve the rect — restoring from minimised moves the window.
+    // IMPORTANT: do NOT programmatically focus / maximise / restore the window.
+    // WeChat's CEF renderer paints blank gray when its window is shown or resized
+    // from a background process — so any SetForegroundWindow/ShowWindow turns the
+    // capture into a featureless gray rectangle. Instead capture the window's
+    // current on-screen rect exactly as it sits (CopyFromScreen, which WeChat's
+    // risk-control does NOT blank, unlike PrintWindow). This relies on WeChat being
+    // left visible and unoccluded; if it isn't, the grab will look blank and the
+    // caller falls back to WeChat's own built-in screenshot.
     let win = find_app_window(app_name)?;
     let png = capture::capture_region_png(win.x, win.y, win.w, win.h).map_err(|e| e.to_string())?;
     Ok((png, win))
@@ -317,28 +382,24 @@ fn wechat_screenshot_png(win: &capture::WindowInfo) -> Result<Vec<u8>, String> {
 #[cfg(target_os = "windows")]
 fn ocr_window(app_name: &str) -> Result<String, String> {
     let lname = app_name.to_lowercase();
-    let (png, win) = if lname.contains("wechat") || lname.contains("weixin") {
-        // Primary: non-intrusive region grab (CopyFromScreen, risk-control-proof).
-        let (png, win) = wechat_region_capture(app_name)?;
-        if looks_blank(&png) {
-            // Region grab came back blank (occluded, or anti-capture on GDI too) →
-            // fall back to WeChat's own built-in screenshot (Alt+A → clipboard).
-            warn!("wechat region capture blank; falling back to built-in screenshot (Alt+A)");
-            let fwin = find_app_window(app_name)?;
-            (wechat_screenshot_png(&fwin)?, fwin)
-        } else {
-            (png, win)
-        }
+    let (png, wx, wy, ww, wh) = if lname.contains("wechat") || lname.contains("weixin") {
+        // WeChat: do NOT enumerate or touch the window. Its risk-control blanks
+        // per-window captures (PrintWindow) and its helper windows confuse
+        // enumeration; any focus/resize blanks its renderer. A FULL-SCREEN grab
+        // (CopyFromScreen — the same path as the host `/ss` screenshot, which is NOT
+        // blocked by risk-control) reliably captures whatever is on screen. WeChat
+        // must be left maximised/visible so its UI fills the screen. ww=wh=0 tells the
+        // OCR driver the image pixels ARE screen coordinates (no window offset).
+        let png = capture::capture_full_png().map_err(|e| e.to_string())?;
+        (png, 0i32, 0i32, 0u32, 0u32)
     } else {
         let win = find_app_window(app_name)?;
         let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
-        (png, win)
+        (png, win.x, win.y, win.w, win.h)
     };
-    let (wx, wy, ww, wh) = (win.x, win.y, win.w, win.h);
     let tmp = std::env::temp_dir().join(format!(
-        "rsclaw_ocr_{}_{}.png",
-        std::process::id(),
-        win.id
+        "rsclaw_ocr_{}.png",
+        std::process::id()
     ));
     std::fs::write(&tmp, &png).map_err(|e| format!("write OCR temp PNG: {e}"))?;
     // Write the OCR script to a temp .ps1 (avoids -Command quoting hell) and run
@@ -409,7 +470,8 @@ foreach($l in $res.Lines){
   if($maxx -le 0){continue}
   $cx=($minx+$maxx)/2.0; $cy=($miny+$maxy)/2.0
   $rx=[int][math]::Round($cx/$iw*1000.0); $ry=[int][math]::Round($cy/$ih*1000.0)
-  $sx=[int]($wx + $cx/$iw*$ww); $sy=[int]($wy + $cy/$ih*$wh)
+  # ww<=0 => full-screen capture: the image pixels ARE screen coordinates.
+  if($ww -le 0){ $sx=[int]$cx; $sy=[int]$cy } else { $sx=[int]($wx + $cx/$iw*$ww); $sy=[int]($wy + $cy/$ih*$wh) }
   $out += [pscustomobject]@{ text=$l.Text; conf=100; x=$rx; y=$ry; sx=$sx; sy=$sy }
 }
 $out | ConvertTo-Json -Compress -Depth 3
@@ -910,7 +972,21 @@ end tell"#,
                     Err(_) => cgwindow_fallback("WeChat"),
                 }
             } else {
-                Err("get_main_window: not yet implemented on this platform".to_string())
+                #[cfg(target_os = "windows")]
+                {
+                    // Full-screen-capture model: WeChat's OCR is a full-screen grab and
+                    // the plugin's 0-1000 coords are relative to the whole screen, so the
+                    // "main window" bounds the plugin should use ARE the full virtual
+                    // screen. Return its rect (origin + size) so relative→screen maps 1:1.
+                    let (vx, vy, vw, vh) = virtual_screen_rect();
+                    return Ok(format!(
+                        "{{\"x\":{vx},\"y\":{vy},\"w\":{vw},\"h\":{vh}}}"
+                    ));
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    return Err("get_main_window: not yet implemented on this platform".to_string());
+                }
             }
         })
         .await
@@ -1159,7 +1235,16 @@ print('ok')
                 let target = parse_key(&key).ok_or_else(|| format!("unknown key: {key}"))?;
                 let mut mod_keys = Vec::new();
                 for m in &modifiers {
-                    let mk = parse_key(m).ok_or_else(|| format!("unknown modifier: {m}"))?;
+                    // The (mac-authored) callers pass "command" for shortcuts that on
+                    // Windows/Linux are Ctrl (Cmd+V→Ctrl+V, Cmd+A→Ctrl+A). enigo's
+                    // Meta = the Win key here, which would fire Win+V (clipboard
+                    // history) etc. Remap command/meta/super → Control off macOS.
+                    let ml = m.trim().to_lowercase();
+                    let m_eff = match ml.as_str() {
+                        "command" | "cmd" | "meta" | "super" | "win" => "control",
+                        other => other,
+                    };
+                    let mk = parse_key(m_eff).ok_or_else(|| format!("unknown modifier: {m}"))?;
                     mod_keys.push(mk);
                 }
                 for mk in &mod_keys {
@@ -1229,17 +1314,29 @@ print('ok')
                     Err(e) => Err(format!("no clipboard tool available: {e}")),
                 }
             } else if cfg!(target_os = "windows") {
-                let ps = format!("Set-Clipboard -Value '{}'", text.replace('\'', "''"));
+                // Write the text as UTF-8 to a temp file and have PowerShell read it
+                // back — passing Chinese through a -Command arg mangles it to '?'
+                // (and then Set-Clipboard fails). Run STA (clipboard needs it).
+                let tmp = std::env::temp_dir()
+                    .join(format!("rsclaw_clipset_{}.txt", std::process::id()));
+                std::fs::write(&tmp, text.as_bytes())
+                    .map_err(|e| format!("clipboard_set temp write: {e}"))?;
+                let ps = format!(
+                    "$t=[System.IO.File]::ReadAllText('{}',[System.Text.Encoding]::UTF8); \
+                     Set-Clipboard -Value $t",
+                    tmp.display()
+                );
                 #[allow(unused_mut)]
                 let mut ps_cmd = Command::new("powershell");
-                ps_cmd.args(["-NoProfile", "-Command", &ps]);
+                ps_cmd.args(["-NoProfile", "-STA", "-Command", &ps]);
                 #[cfg(windows)]
                 {
                     use std::os::windows::process::CommandExt;
                     ps_cmd.creation_flags(0x08000000);
                 }
-                match ps_cmd.output()
-                {
+                let r = ps_cmd.output();
+                let _ = std::fs::remove_file(&tmp);
+                match r {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
                     Ok(out) => Err(format!(
                         "Set-Clipboard failed: {}",
