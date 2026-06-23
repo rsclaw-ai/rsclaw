@@ -2000,18 +2000,26 @@ fn spawn_agent_tasks(
                 // long legitimate cap_live + multi-tool turns can take a
                 // while, but tight enough to keep the single-threaded
                 // agent queue from going dark for an hour.
-                const TURN_WALL_CLOCK_LIMIT: std::time::Duration =
-                    std::time::Duration::from_secs(20 * 60);
+                // Daemon agents (e.g. agent_wechat monitor) are *designed* to
+                // loop indefinitely, so the normal 20-min cap would cancel them
+                // every 20 min and dark the queue between restarts (dropping
+                // messages that land in the gap). Give them a 6-hour backstop —
+                // still catches a genuine wedge, but doesn't fight the loop.
+                let turn_wall_clock_limit = if runtime.is_daemon_agent(&handle.id) {
+                    std::time::Duration::from_secs(6 * 60 * 60)
+                } else {
+                    std::time::Duration::from_secs(20 * 60)
+                };
                 let watchdog_token = turn_token.clone();
                 let watchdog_agent = handle.id.clone();
                 let watchdog_session = session_key.clone();
                 let watchdog = tokio::spawn(async move {
-                    tokio::time::sleep(TURN_WALL_CLOCK_LIMIT).await;
+                    tokio::time::sleep(turn_wall_clock_limit).await;
                     if !watchdog_token.is_cancelled() {
                         tracing::error!(
                             agent = %watchdog_agent,
                             session = %watchdog_session,
-                            limit_s = TURN_WALL_CLOCK_LIMIT.as_secs(),
+                            limit_s = turn_wall_clock_limit.as_secs(),
                             "stuck-turn watchdog: firing cancel_token — turn exceeded \
                              wall-clock limit; the agent queue must not stay dark"
                         );

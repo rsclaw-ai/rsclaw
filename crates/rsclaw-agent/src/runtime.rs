@@ -2282,6 +2282,14 @@ impl AgentRuntime {
     ///
     /// Takes individual fields (not the full `AgentMessage`) so callers can
     /// extract `reply_tx` separately before dispatching.
+    /// True if `agent_id` runs as a long-lived daemon (forever monitor loop).
+    /// The gateway uses this to give daemon turns a far longer stuck-turn
+    /// watchdog limit — they're *meant* to run indefinitely, so the normal
+    /// 20-min cap would needlessly cancel them and dark the queue.
+    pub fn is_daemon_agent(&self, agent_id: &str) -> bool {
+        self.config.agents.is_daemon_agent(agent_id)
+    }
+
     pub async fn run_turn(
         &mut self,
         session_key: &str,
