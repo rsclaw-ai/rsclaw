@@ -8,6 +8,9 @@
 //!   - Text chunking (4000-char limit).
 //!   - Auto-reconnect on disconnect.
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use std::{
     sync::Arc,
     time::{Duration, Instant},

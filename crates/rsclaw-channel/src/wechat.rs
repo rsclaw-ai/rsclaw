@@ -11,6 +11,9 @@
 //! Config in openclaw.json:
 //!   channels.wechat.enabled: true
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use std::{sync::Arc, time::Duration};
 
 use aes::cipher::{BlockEncrypt, KeyInit};

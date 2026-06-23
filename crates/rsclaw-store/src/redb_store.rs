@@ -12,6 +12,9 @@
 //!   KV            — generic string key → string value (for agent scratch
 //! storage)
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use std::path::Path;
 
 use anyhow::{Context, Result};

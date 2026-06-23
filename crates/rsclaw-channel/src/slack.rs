@@ -7,6 +7,9 @@
 //! Send path: Slack Web API `chat.postMessage` / `chat.update`.
 //! Receive path: Socket Mode WebSocket → `message` events.
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};

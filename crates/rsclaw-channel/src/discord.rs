@@ -12,6 +12,9 @@
 //!     the full reply via PATCH /channels/{id}/messages/{msg_id} (agents.md
 //!     §21).
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};

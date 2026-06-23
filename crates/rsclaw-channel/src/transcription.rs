@@ -13,6 +13,9 @@
 //!
 //! Configuration via `memorySearch.provider` or env `TRANSCRIPTION_PROVIDER`.
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use anyhow::{Context, Result};
 use reqwest::Client;
 use tracing::{debug, info, warn};

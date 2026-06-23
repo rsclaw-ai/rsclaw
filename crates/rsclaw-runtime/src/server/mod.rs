@@ -30,6 +30,9 @@
 //!   GET    /ws                              WebSocket gateway protocol
 //! (OpenClaw WS)
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use std::{convert::Infallible, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
 use anyhow::Result;
