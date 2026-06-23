@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw-ui"
-version = "2026.6.15"
+version = "2026.6.16"
 description = "AI Agent Engine Compatible with OpenClaw"
 authors = ["RsClaw Contributors"]
 license = "MIT OR Apache-2.0"

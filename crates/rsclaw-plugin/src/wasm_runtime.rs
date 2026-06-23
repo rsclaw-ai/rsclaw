@@ -3256,6 +3256,76 @@ impl rsclaw::plugin::host_android::Host for HostState {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
+
+    async fn android_tap_yellow_button(
+        &mut self,
+        y_min: u32,
+        y_max: u32,
+    ) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        // Raw screencap (RGBA, no PNG decode): 12- or 16-byte header (w,h,format
+        // [,colorspace]) then width*height*4 bytes.
+        let raw = match adb_run_bytes(serial.as_deref(), &["exec-out", "screencap"]).await {
+            Ok(b) => b,
+            Err(e) => return Ok(Err(format!("screencap: {e}"))),
+        };
+        if raw.len() < 16 {
+            return Ok(Err("screencap: data too small".to_string()));
+        }
+        let rd = |i: usize| {
+            u32::from_le_bytes([raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]) as usize
+        };
+        let (w, h) = (rd(0), rd(4));
+        if w == 0 || h == 0 || w > 20000 || h > 20000 {
+            return Ok(Err(format!("screencap: bad header {w}x{h}")));
+        }
+        let body = w * h * 4;
+        let hdr = if raw.len() >= 16 + body {
+            16
+        } else if raw.len() >= 12 + body {
+            12
+        } else {
+            return Ok(Err("screencap: truncated body".to_string()));
+        };
+        let data = &raw[hdr..hdr + body];
+        let ymin = y_min as usize;
+        let ymax = if y_max == 0 || (y_max as usize) > h {
+            h
+        } else {
+            y_max as usize
+        };
+        // Centroid of brand-yellow pixels (R~255,G~215,B~0). Sample every 2px.
+        let (mut sx, mut sy, mut n): (u64, u64, u64) = (0, 0, 0);
+        let mut y = ymin;
+        while y < ymax {
+            let row = y * w * 4;
+            let mut x = 0;
+            while x < w {
+                let p = row + x * 4;
+                let (r, g, b) = (data[p] as i32, data[p + 1] as i32, data[p + 2] as i32);
+                if r > 230 && (185..235).contains(&g) && b < 95 {
+                    sx += x as u64;
+                    sy += y as u64;
+                    n += 1;
+                }
+                x += 2;
+            }
+            y += 2;
+        }
+        if n < 80 {
+            return Ok(Err("android_tap_yellow_button: no yellow button found".to_string()));
+        }
+        let (cx, cy) = ((sx / n) as u32, (sy / n) as u32);
+        match adb_run_str(
+            serial.as_deref(),
+            &["shell", "input", "tap", &cx.to_string(), &cy.to_string()],
+        )
+        .await
+        {
+            Ok(_) => Ok(Ok(format!("tapped:{cx},{cy}"))),
+            Err(e) => Ok(Err(format!("tap failed: {e}"))),
+        }
+    }
 }
 
 /// Parse `mCurrentFocus=Window{xxxx [u0 ]<package>/<Activity>}` out of

@@ -118,6 +118,12 @@ pub struct AgentHandle {
     /// Used by /status; 0 when nothing matched and the caller should
     /// fall back to its own default.
     pub context_window: usize,
+    /// Effective primary model name, resolved at construction via the same
+    /// chain as [`crate::runtime::resolve_primary_model_for`] (per-agent
+    /// `model.primary` → `agents.defaults.model.primary` → rsclaw fallback).
+    /// `/model` and `/status` display this so they show the real model
+    /// instead of the literal "default" when only `agents.defaults` is set.
+    pub effective_model: String,
 }
 
 /// Per-session context token statistics.
@@ -185,12 +191,7 @@ impl AgentHandle {
     pub fn format_status(&self) -> String {
         use crate::prompt_builder::format_duration;
 
-        let model = self
-            .config
-            .model
-            .as_ref()
-            .and_then(|m| m.primary_head())
-            .unwrap_or("default");
+        let model = self.effective_model.as_str();
         let sessions = self
             .session_count
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -325,14 +326,37 @@ impl AgentHandle {
             }
         }
 
+        // Which agent answered this conversation — the channel/account routed
+        // here via route_account, so surfacing the handle's id (+ display name)
+        // tells the user exactly which agent they're talking to.
+        let agent_line = match self.config.name.as_deref().filter(|n| !n.is_empty()) {
+            Some(name) if name != self.id => format!("Agent: {} ({name})\n", self.id),
+            _ => format!("Agent: {}\n", self.id),
+        };
+
         format!(
-            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
+            "{agent_line}Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
              {ctx_lines}\
              {sticky_lines}\
              {in_flight_lines}\
              Uptime: {uptime}\nVersion: rsclaw {}",
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         )
+    }
+
+    /// Render the `/model` (`/models`) reply: the effective model plus the
+    /// registered provider list. Single source of truth shared by the
+    /// gateway fast-preparse path and the agent-queue `__MODELS__` template,
+    /// so the two can never drift (they previously rendered "default" vs the
+    /// resolved name independently).
+    pub fn format_models(&self) -> String {
+        let mut lines = vec![format!("Current model: {}", self.effective_model)];
+        lines.push(String::new());
+        lines.push("Registered providers:".to_owned());
+        for name in self.providers.names() {
+            lines.push(format!("  {name}"));
+        }
+        lines.join("\n")
     }
 }
 
@@ -766,6 +790,9 @@ impl AgentRegistry {
                     .and_then(|m| m.context_tokens)
                     .or(cfg.agents.defaults.context_tokens)
                     .unwrap_or(0) as usize;
+                let effective_model =
+                    crate::runtime::resolve_primary_model_for(entry, &cfg.agents.defaults)
+                        .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
                 let handle = Arc::new(AgentHandle {
                     id: entry.id.clone(),
                     kind,
@@ -792,6 +819,7 @@ impl AgentRegistry {
                     clear_signal: Arc::new(AtomicBool::new(false)),
                     new_session_signal: Arc::new(AtomicBool::new(false)),
                     context_window,
+                    effective_model,
                 });
                 inner.agents.insert(entry.id.clone(), handle);
                 receivers.insert(entry.id.clone(), rx);

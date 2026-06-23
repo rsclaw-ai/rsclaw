@@ -195,6 +195,42 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     setStarting(true);
     setStatus("starting");
     setErrorMsg("");
+
+    // Poll health up to ~60s before declaring failure. A cold gateway can
+    // take a while to bind: DB open, provider registry, channel handlers,
+    // and a first-run KB / tantivy index that runs 30-60s. The old 15s
+    // ceiling false-flagged every cold launch as "failed", which then
+    // flipped to "running" seconds later — exactly the flicker users saw.
+    // Stay on "starting" until it's genuinely up.
+    const maxAttempts = 60;
+    const intervalMs = 1000;
+    let attempt = 0;
+    const poll = () => {
+      attempt += 1;
+      getHealth()
+        .then(() => {
+          setStatus("online");
+          setStarting(false);
+          failCount.current = 0;
+          setErrorMsg("");
+        })
+        .catch(() => {
+          if (attempt < maxAttempts) {
+            // Still starting — keep the UI on "starting".
+            setTimeout(poll, intervalMs);
+          } else {
+            failCount.current++;
+            setStarting(false);
+            setStatus("failed");
+            setErrorMsg(
+              zh
+                ? "网关启动失败，请检查端口是否被占用或配置是否正确"
+                : "Gateway failed to start. Check port conflicts or config errors.",
+            );
+          }
+        });
+    };
+
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
@@ -202,45 +238,24 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
         tauriInvoke("set_gateway_user_stopped", { stopped: false }).catch(() => {});
       }
       setUserStopped(false);
-      // Poll health up to ~15 seconds before declaring failure. The gateway
-      // can take several seconds to initialize (DB open, provider registry,
-      // channel handlers, etc.) — a single 1-second wait false-flags every
-      // launch.
-      const maxAttempts = 15;
-      const intervalMs = 1000;
-      let attempt = 0;
-      const poll = () => {
-        attempt += 1;
-        getHealth()
-          .then(() => {
-            setStatus("online");
-            setStarting(false);
-            failCount.current = 0;
-            setErrorMsg("");
-          })
-          .catch(() => {
-            if (attempt < maxAttempts) {
-              // Still starting — keep the UI on "starting".
-              setTimeout(poll, intervalMs);
-            } else {
-              failCount.current++;
-              setStarting(false);
-              setStatus("failed");
-              setErrorMsg(
-                zh
-                  ? "网关启动失败，请检查端口是否被占用或配置是否正确"
-                  : "Gateway failed to start. Check port conflicts or config errors.",
-              );
-            }
-          });
-      };
-      setTimeout(poll, intervalMs);
     } catch (e: any) {
-      failCount.current++;
-      setStarting(false);
-      setStatus("failed");
-      setErrorMsg(String(e?.message || e || ""));
+      // `start_gateway` throwing usually means the sidecar is ALREADY
+      // running/starting — the desktop watchdog auto-spawns it on launch, so
+      // a manual start races it and gets "address in use" / "already
+      // running". That's not a failure: fall through to health polling, which
+      // flips to "online" once the existing process is up. Only a genuine,
+      // non-already-running error declares failure immediately.
+      const msg = String(e?.message || e || "").toLowerCase();
+      const alreadyUp = /already|in use|address|running|bind|占用|运行/.test(msg);
+      if (!alreadyUp) {
+        failCount.current++;
+        setStarting(false);
+        setStatus("failed");
+        setErrorMsg(String(e?.message || e || ""));
+        return;
+      }
     }
+    setTimeout(poll, intervalMs);
   };
 
   const doStop = async () => {
@@ -279,7 +294,15 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
         await new Promise((r) => setTimeout(r, 500));
         await tauriInvoke("start_gateway");
       }
-      setTimeout(() => {
+      // Patient poll (~60s) instead of a single 1s check — a restarted
+      // gateway cold-boots just like a fresh launch (DB, registry, first-run
+      // KB index 30-60s). The old single check at 1s always failed, flashing
+      // "failed"/offline before the outer poller recovered it to "running".
+      const maxAttempts = 60;
+      const intervalMs = 1000;
+      let attempt = 0;
+      const poll = () => {
+        attempt += 1;
         getHealth()
           .then(() => {
             setStatus("online");
@@ -289,12 +312,17 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
             setGatewayRestarting(false);
           })
           .catch(() => {
-            failCount.current++;
-            setStarting(false);
-            setStatus("failed");
-            setGatewayRestarting(false);
+            if (attempt < maxAttempts) {
+              setTimeout(poll, intervalMs);
+            } else {
+              failCount.current++;
+              setStarting(false);
+              setStatus("failed");
+              setGatewayRestarting(false);
+            }
           });
-      }, 1000);
+      };
+      setTimeout(poll, intervalMs);
     } catch {
       setStarting(false);
       setStatus("failed");

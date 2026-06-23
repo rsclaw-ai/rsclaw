@@ -222,8 +222,66 @@ function extractCmdPreview(output: string): string {
 }
 
 /** Expand/collapse single tool output block. */
+/** Render the `todo` tool's working-plan output as a styled checklist instead
+ *  of raw JSON. Output shape: `{"plan":"[x] a\n[>] b\n[ ] c","items":N}`.
+ *  Returns null on a parse miss (e.g. partial JSON mid-stream) so the caller
+ *  falls back to the generic tool block. Pure (no hooks). */
+function renderTodoChecklist(output: string): React.ReactElement | null {
+  let plan: string;
+  try {
+    const parsed = JSON.parse(output.trim());
+    if (typeof parsed?.plan !== "string") return null;
+    plan = parsed.plan;
+  } catch {
+    return null;
+  }
+  const isCn = getLang() === "cn";
+  if (plan === "(cleared)" || plan.trim() === "") {
+    return (
+      <div style={{ margin: "6px 0", padding: "8px 12px", fontSize: 12, opacity: 0.55, fontStyle: "italic" }}>
+        {isCn ? "📋 计划已清空" : "📋 Plan cleared"}
+      </div>
+    );
+  }
+  const rows = plan
+    .split("\n")
+    .map((l) => l.match(/^\s*\[([ x>])\]\s?(.*)$/))
+    .filter((m): m is RegExpMatchArray => !!m);
+  if (rows.length === 0) return null;
+  const done = rows.filter((m) => m[1] === "x").length;
+  return (
+    <div style={{ margin: "6px 0", padding: "10px 13px", borderRadius: 10, border: "1px solid var(--border-in-light)", background: "var(--white)" }}>
+      <div style={{ fontSize: 10.5, opacity: 0.55, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.6, display: "flex", gap: 6, alignItems: "center" }}>
+        <span>{isCn ? "任务清单" : "Plan"}</span>
+        <span style={{ fontFamily: "monospace" }}>{done}/{rows.length}</span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+        {rows.map((m, i) => {
+          const st = m[1]; // ' ' | 'x' | '>'
+          const text = m[2];
+          const marker = st === "x" ? "✓" : st === ">" ? "▸" : "○";
+          return (
+            <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 9, fontSize: 13, lineHeight: 1.55 }}>
+              <span style={{ flexShrink: 0, width: 14, textAlign: "center", color: st === "x" ? "#2dd4a0" : st === ">" ? "#f97316" : "var(--black)", opacity: st === " " ? 0.4 : 1, fontWeight: st === ">" ? 700 : 400 }}>{marker}</span>
+              <span style={{ color: st === ">" ? "#f97316" : "var(--black)", fontWeight: st === ">" ? 600 : 400, opacity: st === "x" ? 0.5 : 1, textDecoration: st === "x" ? "line-through" : "none" }}>{text}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ToolOutputBlock({ name, args, output }: { name: string; args: string; output: string }) {
   const [open, setOpen] = React.useState(false);
+
+  // The `todo` tool returns a working-plan checklist as JSON — render it as a
+  // styled list instead of raw JSON. Falls back to the generic block on a
+  // parse miss (e.g. partial JSON mid-stream).
+  if (name === "todo") {
+    const todo = renderTodoChecklist(output);
+    if (todo) return todo;
+  }
 
   const lines = output.split("\n");
   const cmdPreview = extractCmdPreview(output);
@@ -2326,6 +2384,14 @@ function _Chat() {
               style={{ overflowX: "hidden", width: "100%" }}
               scrollerRef={captureScroller}
               followOutput="auto"
+              // Keep auto-scroll glued to the bottom while a message streams.
+              // `followOutput="auto"` only sticks when Virtuoso thinks we're
+              // "at bottom", and the default threshold is 4px — fast token
+              // streaming grows the content past that every frame, so the
+              // at-bottom state flips false and scrolling stops following. A
+              // generous threshold (~2-3 lines) keeps it stuck during streaming
+              // while still letting a deliberate scroll-up detach.
+              atBottomThreshold={120}
               initialTopMostItemIndex={initialBottomIndex}
               atBottomStateChange={handleAtBottomStateChange}
               computeItemKey={computeChatItemKey}

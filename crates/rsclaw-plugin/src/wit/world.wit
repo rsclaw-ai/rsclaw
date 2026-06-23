@@ -237,6 +237,14 @@ interface host-android {
 
     /// Wait up to timeout-ms for an element matching selector to appear. Returns "found" or error.
     android-wait-for-element: func(selector-type: string, selector-value: string, timeout-ms: u32) -> result<string, string>;
+
+    /// Tap the brand-yellow primary button by its RENDERED COLOR. Flutter confirm
+    /// dialogs (下架/删除/取消订单/发货) expose no UI tree, so element selectors
+    /// can't find their 确定/确认 button — but it's always the bright-yellow action.
+    /// Screenshots, finds the largest yellow region within the vertical band
+    /// [y-min, y-max) (pass 0,0 for the whole screen), and taps its center.
+    /// Returns "tapped:x,y" or an error if no yellow button is found.
+    android-tap-yellow-button: func(y-min: u32, y-max: u32) -> result<string, string>;
 }
 
 interface host-desktop {

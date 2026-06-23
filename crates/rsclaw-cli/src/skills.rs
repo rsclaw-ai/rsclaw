@@ -10,6 +10,13 @@ pub enum SkillsCommand {
     /// Example: rsclaw skills info web-search
     Info { skill: String },
 
+    /// Load a skill's full playbook (SKILL.md) so you can follow it.
+    /// Mirrors the in-agent `skill_use` tool: prints the SOP plus the
+    /// skill directory (scripts / references live there).
+    ///
+    /// Example: rsclaw skills use web-search
+    Use { skill: String },
+
     /// Check installed skill health (missing commands, broken manifests)
     ///
     /// Use --eligible to show only runnable skills.

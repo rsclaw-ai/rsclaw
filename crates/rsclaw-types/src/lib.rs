@@ -132,7 +132,6 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "cap_unbind_sticky",
     "channel",
     "anycli",
-    "clarify",
     "pairing",
     "create_docx",
     "create_pdf",

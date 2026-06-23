@@ -19,4 +19,4 @@ rsclaw-events = { path = "../rsclaw-events" }
 rsclaw-config = { path = "../rsclaw-config" }
 rsclaw-memory = { path = "../rsclaw-memory" }
 rsclaw-i18n = { path = "../rsclaw-i18n" }
-cap-rs = { version = "0.1.0", default-features = false, features = ["stream-json", "codex", "acp"] }
+cap-rs = { version = "0.1.1", default-features = false, features = ["stream-json", "codex", "acp"] }

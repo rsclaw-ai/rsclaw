@@ -53,6 +53,7 @@ import {
   testProviderKey,
   listProviderModels,
 } from "../lib/rsclaw-api";
+import { useAccessStore } from "../store/access";
 import {
   useCatalog,
   getProviderMap,
@@ -6359,6 +6360,16 @@ export function RsClawPanel() {
           if (gw?.url) {
             setGatewayUrl(gw.url);
             if (gw.token) { setApiAuthToken(gw.token); }
+            // Desktop: the local gateway port (from config) is authoritative.
+            // Force the persisted access-store URL to it too, so a stale cache
+            // (e.g. an old debug port the user changed back) can't keep the
+            // OpenAI-compat chat client + the settings display pointed at the
+            // wrong port. Web builds skip this (isTauri-gated) and keep any
+            // user-set custom endpoint.
+            const access = useAccessStore.getState();
+            if (access.openaiUrl !== gw.url) {
+              access.update((a) => { a.openaiUrl = gw.url; });
+            }
           }
         }
       } catch {}

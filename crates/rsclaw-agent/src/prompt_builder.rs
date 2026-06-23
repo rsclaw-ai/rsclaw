@@ -193,7 +193,7 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
         h.push_str(if zh {
             "  agent    创建/任务/列表/终止子智能体\n"
         } else {
-            "  agent    spawn/task/list/kill sub-agents\n"
+            "  agent    create/temp/list/kill sub-agents\n"
         });
         h.push_str(if zh {
             "  channel  发送/回复/置顶/删除跨渠道消息\n"
@@ -436,7 +436,10 @@ fn build_shared_system_prefix_uncached() -> String {
          3. Execute: call the tool\n\
          4. Observe: check the result\n\
          5. Iterate: repeat until the task is complete, then reply to the user\n\
-         If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
+         If a tool call fails, do NOT retry with the same arguments — recover by error type: \
+         permission denied → check the Allowed list / pick another path; timeout → set wait=false or raise the timeout; \
+         rate limit → wait one turn; not found → re-read the source and retry with corrected params. \
+         If the last 2 tool calls returned no NEW information relevant to the question, STOP and reply with what you have.\n\
          \n\
          [ANTI-HALLUCINATION — HARD RULES]\n\
          1. DO NOT fabricate numbers, dates, temperatures, prices, names, URLs, or any concrete facts.\n\
@@ -583,7 +586,7 @@ fn build_shared_system_prefix_uncached() -> String {
          ### Agent & Task Delegation\n\
          Delegate work to sub-agents for parallelism, never block.\n\
          - rsclaw HAS first-class multi-agent orchestration + task dispatch BUILT IN. ANY request to \
-create / spawn / delegate an agent, sub-agent, task-agent, task-proxy, worker, or sub-task \
+create / delegate an agent, sub-agent, task-agent, task-proxy, worker, or sub-task \
 (创建智能体 / 子智能体 / 任务智能体 / 任务代理 / 子代理 / 分发任务 / 并发执行) MUST go through the \
 built-in `agent` tool. NEVER simulate orchestration in your own head, and NEVER claim you \
 \"can't create agents\" or \"have no concurrency\" — you do, via this tool.\n\
@@ -593,11 +596,11 @@ it only wastes wall-clock. REAL parallelism exists ONLY through the built-in `ag
 the runtime spawns concurrent sub-agents that truly run at the same time. So never hand-run \
 independent subtasks yourself when they could run at once.\n\
          - When work splits into N INDEPENDENT subtasks, dispatch them ALL at once via \
-`agent` action=task (set `toolset` per task), then collect — do NOT loop them one-by-one.\n\
-         - Trivial / single-step / inherently-sequential work -> do yourself (spawning buys no parallelism).\n\
+`agent` action=temp (set `toolset` per task), then collect — do NOT loop them one-by-one.\n\
+         - Trivial / single-step / inherently-sequential work -> do yourself (creating buys no parallelism).\n\
          - Pipeline: dispatch parallel -> collect results -> dispatch dependent tasks -> synthesize.\n\
          ### When to call the `task` tool (escalate to background)\n\
-         (`task` = move a whole long job to the BACKGROUND — distinct from `agent` action=task above, which spawns parallel sub-agents WITHIN this turn. The caution below is about background escalation only; it does NOT discourage parallel `agent` dispatch.)\n\
+         (The `task` tool moves a whole long job to the BACKGROUND — distinct from `agent` action=temp above, which spawns temporary sub-agents for parallel work WITHIN this turn. The caution below is about background escalation only.)\n\
          Default to answering the user directly in this turn. Only call `task` when ALL of:\n\
          1. The work obviously needs many tool calls or many minutes (e.g. multi-file \
          implementation, deep multi-source research, end-to-end deploys, long debugging).\n\
@@ -647,10 +650,6 @@ independent subtasks yourself when they could run at once.\n\
 
     parts.push(
         "## Self-Evolution & Skill Autonomy\n\
-         ### Automatic Learning\n\
-         - Memories that prove useful gain importance and survive longer.\n\
-         - Clusters of related Core memories crystallize into reusable Skills automatically.\n\
-         - Periodic meditation deduplicates and cleans up stale memories.\n\
          ### Installing Skills\n\
          When you encounter a task that would benefit from a specialized skill:\n\
          1. Search: use shell to run `rsclaw skills search <query>`\n\
@@ -1037,7 +1036,7 @@ fn build_coding_mode_block() -> String {
         "",
         "**Discipline:**",
         "- Do not invent file paths, function names, or APIs. If unsure, \
-           `search_content` first or `clarify` with the user.",
+           `search_content` first or `ask_user` with the user.",
         "- When `edit_file` fails with \"not found\", re-read the file with \
            `read_file` — DO NOT retry the same `old_string`.",
         "- After a successful edit you do NOT need to re-read the file in the \

@@ -92,7 +92,11 @@ fn default_workspace_path() -> PathBuf {
 /// mismatch) logs at warn and returns Ok without aborting the cap
 /// bind — identity files are an ergonomic boost, not a hard
 /// dependency.
-pub async fn write_identity_files(cwd: &Path) -> Result<()> {
+pub async fn write_identity_files(
+    cwd: &Path,
+    plugins: &[String],
+    skills: &[String],
+) -> Result<()> {
     if !is_default_workspace(cwd) {
         tracing::debug!(
             target: "cap",
@@ -147,7 +151,8 @@ pub async fn write_identity_files(cwd: &Path) -> Result<()> {
         _ => user_body,
     };
     let agents_existing = std::fs::read_to_string(&agents_path).ok();
-    let agents_new = compose_agents_md(agents_existing.as_deref(), &user_body_for_agents);
+    let agents_new =
+        compose_agents_md(agents_existing.as_deref(), &user_body_for_agents, plugins, skills);
     let touch_agents = match agents_existing.as_deref() {
         None => true,
         Some(s) => has_markers(s) || is_rsclaw_authored(s),
@@ -206,12 +211,48 @@ fn strip_header_lines(s: &str) -> String {
 ///     adding markers later.)
 ///   - Missing entirely → emit the full default template with the
 ///     USER body embedded.
-fn compose_agents_md(existing: Option<&str>, user_body: &str) -> String {
+fn compose_agents_md(
+    existing: Option<&str>,
+    user_body: &str,
+    plugins: &[String],
+    skills: &[String],
+) -> String {
+    // The managed region (spliced on every /cap bind) carries BOTH the
+    // live capability snapshot (loaded plugins / installed skills — they
+    // change on install) and the memory-derived user profile, so the
+    // coding agent always sees the current name list without running a
+    // discovery command.
+    let managed = managed_region(plugins, skills, user_body);
     match existing {
-        Some(s) if has_markers(s) => splice_between_markers(s, user_body),
+        Some(s) if has_markers(s) => splice_between_markers(s, &managed),
         Some(s) if !is_rsclaw_authored(s) => s.to_owned(),
-        Some(_) | None => default_template(user_body),
+        Some(_) | None => default_template(&managed),
     }
+}
+
+/// Compose the auto-managed region: a compact "loaded plugins / installed
+/// skills" snapshot (with the exact CLI call/load syntax) followed by the
+/// user profile body.
+fn managed_region(plugins: &[String], skills: &[String], user_body: &str) -> String {
+    let mut s = String::new();
+    if !plugins.is_empty() || !skills.is_empty() {
+        s.push_str("Loaded capabilities — prefer these over scraping the web:\n\n");
+        if !plugins.is_empty() {
+            s.push_str(&format!(
+                "**Loaded plugins** (call: `rsclaw plugins call <plugin>.<tool> --args '<json>'`, \
+                 e.g. `rsclaw plugins call astock.quote --args '{{\"code\":\"300033\"}}'`): {}\n\n",
+                plugins.join(", ")
+            ));
+        }
+        if !skills.is_empty() {
+            s.push_str(&format!(
+                "**Installed skills** (load + follow: `rsclaw skills use <name>`): {}\n\n",
+                skills.join(", ")
+            ));
+        }
+    }
+    s.push_str(user_body.trim());
+    s
 }
 
 fn has_markers(s: &str) -> bool {
@@ -254,11 +295,12 @@ You are a coding subagent that **rsclaw** (the main chat-side agent) has bridged
 into this user's IM session. The user can still read every word you write. Be \
 concise. Verify with tools before asserting facts.
 
-The `## User profile` section below is auto-generated from rsclaw's long-term \
-memory and refreshed on every `/cap` bind. Treat it as hints, not gospel — when \
-in doubt, ask or check.
+The `## Session context` section below is auto-generated and refreshed on every \
+`/cap` bind: it lists the plugins/skills loaded right now plus user-profile hints \
+from rsclaw's long-term memory. Treat the profile as hints, not gospel — when in \
+doubt, ask or check.
 
-## User profile
+## Session context
 
 {USER_BEGIN_MARKER}
 
@@ -266,12 +308,29 @@ in doubt, ask or check.
 
 {USER_END_MARKER}
 
-## rsclaw helpers
+## rsclaw helpers — USE THESE FIRST
 
-You can shell out to the `rsclaw` CLI for cross-process state. All commands \
-print JSON with `--json`; auth + URL are handled inside the binary.
+You run in a shell with the `rsclaw` CLI on PATH. It exposes rsclaw's plugins, \
+skills, memory and knowledge base as cross-process commands. **When a task is in \
+a plugin's or skill's domain (A-share quotes, travel, image/video gen, etc.), \
+call it through these commands instead of scraping the web or guessing** — they \
+are faster, structured, and authenticated. All commands take `--json`; auth + \
+URL are handled inside the binary.
 
 ```
+# Plugins — domain capabilities (stocks, social media, media gen, …)
+rsclaw plugins list                                  # what's installed right now
+rsclaw plugins describe <plugin>                     # its tools + arg schemas
+rsclaw plugins call <plugin>.<tool> --args '<json>'  # invoke a tool
+#   e.g.  rsclaw plugins call astock.quote --args '{{\"code\":\"300033\"}}'
+
+# Skills — packaged playbooks (booking, market queries, …). A skill is a
+# markdown SOP (+ scripts), not a one-shot call: load it, then follow it.
+rsclaw skills list                                   # installed skills
+rsclaw skills use <name>                              # print the full SOP + its dir, then follow it
+rsclaw skills search \"<query>\"                       # find one to install
+rsclaw skills install <name>
+
 # Memory
 rsclaw memory search \"<query>\" [--max-results N] [--json]
 rsclaw memory save \"<fact>\" [--scope SCOPE] [--kind fact|note] [--pinned] [--json]
@@ -279,11 +338,6 @@ rsclaw memory save \"<fact>\" [--scope SCOPE] [--kind fact|note] [--pinned] [--j
 # Knowledge base
 rsclaw kb search \"<query>\" [-k N] [--json]
 rsclaw kb add <path-or-url> [--tag T ...] [--recursive]
-
-# Plugins
-rsclaw plugins list
-rsclaw plugins describe <plugin>
-rsclaw plugins call <plugin>.<tool> --args '{{\"k\":\"v\"}}'
 
 # Messaging (send to IM channels rsclaw is wired to)
 rsclaw message send --channel <wechat|feishu|...> --target <id> -m \"...\"
@@ -371,7 +425,7 @@ mod tests {
             end = USER_END_MARKER,
         );
         let new_body = "- new fact 1\n- new fact 2";
-        let out = compose_agents_md(Some(&existing), new_body);
+        let out = compose_agents_md(Some(&existing), new_body, &[], &[]);
         assert!(out.contains("# Custom header"));
         assert!(out.contains("User-written notes."));
         assert!(out.contains("## Custom trailer"));
@@ -384,7 +438,7 @@ mod tests {
         // Plain user-authored AGENTS.md with no rsclaw sentinel and no
         // markers → return as-is, never auto-mutated.
         let existing = "# My project AGENTS.md\n\nManual instructions here.";
-        let out = compose_agents_md(Some(existing), "- new fact");
+        let out = compose_agents_md(Some(existing), "- new fact", &[], &[]);
         assert_eq!(out, existing, "user-authored AGENTS.md should be untouched");
     }
 
@@ -393,7 +447,7 @@ mod tests {
         // Previously-generated file (carries sentinel) but markers are gone
         // (user deleted them somehow) → regenerate from template.
         let existing = "<!-- auto-generated by rsclaw cap_live -->\n# Stuff";
-        let out = compose_agents_md(Some(existing), "- fact");
+        let out = compose_agents_md(Some(existing), "- fact", &[], &[]);
         assert!(out.contains(USER_BEGIN_MARKER));
         assert!(out.contains("- fact"));
     }
@@ -417,7 +471,7 @@ mod tests {
             begin = USER_BEGIN_MARKER,
             end = USER_END_MARKER,
         );
-        let out = compose_agents_md(Some(&existing), "- fact");
+        let out = compose_agents_md(Some(&existing), "- fact", &[], &[]);
         assert!(out.contains(USER_BEGIN_MARKER));
         // Order in the regenerated template MUST be BEGIN before END.
         let begin_at = out.find(USER_BEGIN_MARKER).unwrap();

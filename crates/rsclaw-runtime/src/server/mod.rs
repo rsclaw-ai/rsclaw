@@ -30,7 +30,7 @@
 //!   GET    /ws                              WebSocket gateway protocol
 //! (OpenClaw WS)
 
-use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
+use std::{convert::Infallible, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -368,6 +368,18 @@ pub fn build_router(state: AppState) -> Router {
             "/computer-use/runs/{run_id}/abort",
             post(computer_use_run_abort),
         )
+        .route("/computer-use/stream", get(computer_use_stream_sse))
+        .route(
+            "/computer-use/permission_response",
+            post(computer_use_permission_response),
+        )
+        .route("/git/status", get(git_status))
+        .route("/git/diff", get(git_diff))
+        .route("/git/log", get(git_log))
+        .route("/git/commit", post(git_commit))
+        .route("/git/prs", get(git_prs))
+        .route("/git/prs/{number}", get(git_pr_get))
+        .route("/git/prs/{number}/review", post(git_pr_review))
         // Memory management — read-only browse + stats. Each request
         // opens `MemoryStore::open_readonly` to avoid touching the
         // agent runtime's live store. Mutating endpoints (delete,
@@ -2343,6 +2355,331 @@ async fn computer_use_run_abort(
         tracing::warn!(run_id = %run_id, "computer_use: abort target not found (already finished?)");
     }
     Json(serde_json::json!({"aborted": aborted, "runId": run_id}))
+}
+
+/// GET /api/v1/computer-use/stream?session_id=...
+///
+/// HTTP/SSE shim for the existing WS-only computer_use relays. It forwards
+/// `permission_request` and `computer_use_status` events from the same
+/// broadcast channels used by the desktop WebSocket gateway.
+async fn computer_use_stream_sse(
+    State(state): State<AppState>,
+    Query(_q): Query<std::collections::HashMap<String, String>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let mut permission_rx = state.computer_permission_tx.subscribe();
+    let mut status_rx = state.computer_status_tx.subscribe();
+    let stream = async_stream::stream! {
+        loop {
+            tokio::select! {
+                result = permission_rx.recv() => {
+                    match result {
+                        Ok(req) => {
+                            let data = serde_json::to_string(&serde_json::json!({
+                                "type": "permission_request",
+                                "request_id": req.request_id,
+                                "agent_id": req.agent_id,
+                                "app": req.app,
+                                "reason": req.reason,
+                                "estimated_steps": req.estimated_steps,
+                            })).unwrap_or_else(|_| "{}".to_owned());
+                            yield Ok(Event::default().data(data));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                result = status_rx.recv() => {
+                    match result {
+                        Ok(status) => {
+                            let payload = serde_json::to_value(&status).unwrap_or(serde_json::json!({}));
+                            let data = serde_json::to_string(&serde_json::json!({
+                                "type": "computer_use_status",
+                                "status": payload,
+                            })).unwrap_or_else(|_| "{}".to_owned());
+                            yield Ok(Event::default().data(data));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Debug, Deserialize)]
+struct ComputerUsePermissionResponse {
+    request_id: String,
+    decision: String,
+    agent_id: Option<String>,
+    app: Option<String>,
+}
+
+async fn computer_use_permission_response(
+    State(state): State<AppState>,
+    Json(body): Json<ComputerUsePermissionResponse>,
+) -> Response {
+    use rsclaw_computer::permission::{PermissionDecision, PermissionStore as _};
+    let decision = match body.decision.as_str() {
+        "allow" | "allow_once" => PermissionDecision::AllowOnce,
+        "allow_session" => PermissionDecision::AllowSession,
+        "allow_always" => PermissionDecision::AllowAlways,
+        "deny" => PermissionDecision::Deny,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "invalid decision `{other}` (expected: allow_once, allow_session, allow_always, deny)"
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let (Some(agent_id), Some(app)) = (body.agent_id.as_deref(), body.app.as_deref()) {
+        if let Err(e) = state.computer_permission.record(agent_id, app, decision).await {
+            warn!(error = %e, "computer_permission.record failed");
+        }
+    }
+
+    let resolved = state
+        .computer_permission
+        .resolve_pending_request(&body.request_id, decision)
+        .await;
+    Json(serde_json::json!({
+        "resolved": resolved,
+        "request_id": body.request_id,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct GitQuery {
+    path: Option<String>,
+    staged: Option<bool>,
+    limit: Option<usize>,
+    repo: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitCommitRequest {
+    path: Option<String>,
+    message: String,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitReviewRequest {
+    body: String,
+    event: Option<String>,
+}
+
+fn git_workdir(path: Option<&str>) -> PathBuf {
+    match path.filter(|p| !p.is_empty()) {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
+fn run_cmd(dir: &std::path::Path, program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("{program}: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+async fn git_status(Query(q): Query<GitQuery>) -> Response {
+    let dir = git_workdir(q.path.as_deref());
+    let branch = run_cmd(&dir, "git", &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_else(|_| "unknown".to_owned())
+        .trim()
+        .to_owned();
+    let porcelain = match run_cmd(&dir, "git", &["status", "--porcelain=v1", "--branch"]) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+        }
+    };
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+    let mut ahead = 0;
+    let mut behind = 0;
+    for line in porcelain.lines() {
+        if let Some(meta) = line.strip_prefix("## ") {
+            if let Some(idx) = meta.find("ahead ") {
+                ahead = meta[idx + 6..]
+                    .split([',', ']'])
+                    .next()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+            if let Some(idx) = meta.find("behind ") {
+                behind = meta[idx + 7..]
+                    .split([',', ']'])
+                    .next()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+            continue;
+        }
+        if line.len() < 4 {
+            continue;
+        }
+        let xy = &line[..2];
+        let file = line[3..].to_owned();
+        if !xy.starts_with(' ') && !xy.starts_with('?') {
+            staged.push(file.clone());
+        }
+        if !xy.ends_with(' ') || xy.starts_with('?') {
+            unstaged.push(file);
+        }
+    }
+    Json(serde_json::json!({
+        "branch": branch,
+        "dirty": !staged.is_empty() || !unstaged.is_empty(),
+        "staged": staged,
+        "unstaged": unstaged,
+        "ahead": ahead,
+        "behind": behind,
+    }))
+    .into_response()
+}
+
+async fn git_diff(Query(q): Query<GitQuery>) -> Response {
+    let dir = git_workdir(q.path.as_deref());
+    let args = if q.staged.unwrap_or(false) {
+        vec!["diff", "--staged"]
+    } else {
+        vec!["diff"]
+    };
+    match run_cmd(&dir, "git", &args) {
+        Ok(diff) => (StatusCode::OK, diff).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn git_log(Query(q): Query<GitQuery>) -> Response {
+    let dir = git_workdir(q.path.as_deref());
+    let limit = q.limit.unwrap_or(20).min(100).to_string();
+    match run_cmd(&dir, "git", &["log", "--oneline", "-n", &limit]) {
+        Ok(log) => {
+            let commits: Vec<_> = log
+                .lines()
+                .map(|line| {
+                    let mut parts = line.splitn(2, ' ');
+                    serde_json::json!({
+                        "sha": parts.next().unwrap_or(""),
+                        "title": parts.next().unwrap_or(""),
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({"commits": commits})).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn git_commit(Json(body): Json<GitCommitRequest>) -> Response {
+    let dir = git_workdir(body.path.as_deref());
+    for file in &body.files {
+        if let Err(error) = run_cmd(&dir, "git", &["add", "--", file]) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+        }
+    }
+    match run_cmd(&dir, "git", &["commit", "-m", &body.message]) {
+        Ok(output) => Json(serde_json::json!({"ok": true, "output": output})).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn git_prs(Query(q): Query<GitQuery>) -> Response {
+    let dir = git_workdir(q.repo.as_deref().or(q.path.as_deref()));
+    match run_cmd(&dir, "gh", &["pr", "list", "--json", "number,title,state,author,url"]) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => Json(value).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        Err(_) => Json(serde_json::json!([])).into_response(),
+    }
+}
+
+async fn git_pr_get(Path(number): Path<u64>, Query(q): Query<GitQuery>) -> Response {
+    let dir = git_workdir(q.repo.as_deref().or(q.path.as_deref()));
+    let number_s = number.to_string();
+    match run_cmd(
+        &dir,
+        "gh",
+        &["pr", "view", &number_s, "--json", "number,title,state,author,url,body"],
+    ) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => Json(value).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn git_pr_review(Path(number): Path<u64>, Json(body): Json<GitReviewRequest>) -> Response {
+    let number_s = number.to_string();
+    let event = body.event.unwrap_or_else(|| "COMMENT".to_owned());
+    let review_flag = match event.as_str() {
+        "APPROVE" | "approve" => "--approve",
+        "REQUEST_CHANGES" | "request_changes" => "--request-changes",
+        _ => "--comment",
+    };
+    match run_cmd(
+        &git_workdir(None),
+        "gh",
+        &["pr", "review", &number_s, review_flag, "--body", &body.body],
+    ) {
+        Ok(output) => Json(serde_json::json!({"ok": true, "output": output})).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------

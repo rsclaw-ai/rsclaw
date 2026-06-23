@@ -32,7 +32,24 @@ pub struct KbReranker {
     client: rsclaw_embed::FleetHttp,
     url: String,
     model: Option<String>,
+    /// Bearer token sent with each rerank request. For first-party
+    /// `rsclaw-*` models this is the shared rsclaw provider key (the same
+    /// key OCR/embed use); without it a fleet rerank call 401s.
+    api_key: Option<String>,
     pub top_n: usize,
+}
+
+/// Resolve the bearer for a fleet rerank: only `rsclaw-*` models hit the
+/// authenticated fleet, and they all share the one rsclaw provider key.
+fn rerank_api_key(model: Option<&str>) -> Option<String> {
+    if model.map(rsclaw_embed::is_rsclaw_model).unwrap_or(false) {
+        rsclaw_config::load()
+            .ok()
+            .as_ref()
+            .and_then(crate::ocr::rsclaw_provider_key)
+    } else {
+        None
+    }
 }
 
 impl KbReranker {
@@ -54,7 +71,10 @@ impl KbReranker {
         let base_raw = rr.base_url.trim();
         let base = if base_raw.is_empty() {
             if model_is_rsclaw {
-                rsclaw_embed::RSCLAW_API_BASE_URL.to_owned()
+                // Empty base + rsclaw-* model → the configured rsclaw provider
+                // base (self-hosted fleet honoured); fall back to the constant.
+                crate::ocr::rsclaw_provider_base_url(&cfg)
+                    .unwrap_or_else(|| rsclaw_embed::RSCLAW_API_BASE_URL.to_owned())
             } else {
                 return None;
             }
@@ -67,10 +87,16 @@ impl KbReranker {
         // Shared redirect-cached fleet client (308 baseUrl caching), same as
         // the OCR / embed / provider lanes — amortises the LB redirect.
         let client = rsclaw_embed::FleetHttp::new(None);
+        let api_key = if model_is_rsclaw {
+            crate::ocr::rsclaw_provider_key(&cfg)
+        } else {
+            None
+        };
         Some(std::sync::Arc::new(Self {
             client,
             url: format!("{base}/rerank"),
             model: rr.model,
+            api_key,
             top_n: rr.top_n.unwrap_or(DEFAULT_RERANK_TOP_N).clamp(2, 100),
         }))
     }
@@ -80,10 +106,13 @@ impl KbReranker {
     /// than reading `kb.rerank` (e.g. the `web_search` deep pipeline).
     pub fn remote(base_url: &str, model: impl Into<String>, top_n: usize) -> std::sync::Arc<Self> {
         let base = base_url.trim().trim_end_matches('/');
+        let model = model.into();
+        let api_key = rerank_api_key(Some(&model));
         std::sync::Arc::new(Self {
             client: rsclaw_embed::FleetHttp::new(None),
             url: format!("{base}/rerank"),
-            model: Some(model.into()),
+            model: Some(model),
+            api_key,
             top_n: top_n.clamp(2, 100),
         })
     }
@@ -123,7 +152,7 @@ impl KbReranker {
                 .post_following_redirects(
                     self.url.as_str(),
                     &body,
-                    None,
+                    self.api_key.as_deref(),
                     false,
                     None,
                     Some(std::time::Duration::from_secs(RERANK_TIMEOUT_SECS)),
@@ -145,7 +174,16 @@ impl KbReranker {
         let results = resp
             .get("results")
             .and_then(|v| v.as_array())
-            .context("rerank response missing results array")?;
+            .with_context(|| {
+                // Surface the backend's own error (e.g. "input too large /
+                // increase batch size") instead of an opaque "missing
+                // results" so rerank failures are diagnosable from the log.
+                let detail = resp
+                    .pointer("/error/message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("no results array in response");
+                format!("rerank backend returned no results: {detail}")
+            })?;
         let mut scores = vec![f32::NEG_INFINITY; docs.len()];
         for r in results {
             let idx = r.get("index").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;

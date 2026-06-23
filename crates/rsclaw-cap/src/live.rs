@@ -851,24 +851,21 @@ async fn actor_loop(
     let mut prebuf_request: Option<LiveRequest> = None;
     {
         use cap_rs::core::AgentEvent;
+        // Capture the native session id from the driver's Ready event so the
+        // resume hint can be sent. A queued first prompt must NOT pre-empt
+        // this: the old `biased; rx.recv()` arm broke capture whenever the
+        // user typed during the agent's cold start (claudecode/codex/opencode
+        // take 10-30s to emit Ready), leaving the resume id permanently None.
+        // But blocking purely on Ready stalled the prompt for 30s. Compromise:
+        // Ready-capture takes priority; a first prompt is BUFFERED (not a
+        // break) and only SHORTENS the remaining Ready wait to 8s so the
+        // prompt isn't delayed much while we still usually catch Ready.
         let capture_deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
         tokio::pin!(capture_deadline);
         loop {
             tokio::select! {
                 biased;
-                first_req = rx.recv() => {
-                    prebuf_request = first_req;
-                    break;
-                }
-                _ = &mut capture_deadline => {
-                    tracing::warn!(
-                        target: "cap",
-                        session_id = %sid,
-                        agent = kind.as_str(),
-                        "no Ready captured in 30s; resume id unavailable until next bind"
-                    );
-                    break;
-                }
+                // Ready capture first — a same-tick prompt won't pre-empt it.
                 ev = driver.next_event() => match ev {
                     Some(AgentEvent::Ready { session_id, .. }) => {
                         if let Ok(mut g) = agent_sid_slot.lock() {
@@ -891,6 +888,27 @@ async fn actor_loop(
                         );
                         break;
                     }
+                },
+                // Buffer the first prompt but keep waiting (briefly) for Ready.
+                // Disabled once a prompt is already buffered so we never eat a
+                // second one here.
+                first_req = rx.recv(), if prebuf_request.is_none() => match first_req {
+                    Some(req) => {
+                        prebuf_request = Some(req);
+                        capture_deadline.as_mut().reset(
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(8),
+                        );
+                    }
+                    None => break, // request channel closed
+                },
+                _ = &mut capture_deadline => {
+                    tracing::warn!(
+                        target: "cap",
+                        session_id = %sid,
+                        agent = kind.as_str(),
+                        "no Ready captured before deadline; resume id unavailable until next bind"
+                    );
+                    break;
                 }
             }
         }

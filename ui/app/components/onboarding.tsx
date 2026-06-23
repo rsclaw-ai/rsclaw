@@ -3,7 +3,7 @@
 import JSON5 from "json5";
 import { useState, useEffect, useRef, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
-import { Path } from "../constant";
+import { Path, RSCLAW_GATEWAY_API_BASE } from "../constant";
 import Locale, { getLang } from "../locales";
 import {
   getHealth,
@@ -1663,7 +1663,7 @@ export function OnboardingPage() {
       } else {
         // Browser mode: try reading config from gateway API
         try {
-          const res = await fetch("http://localhost:18888/api/v1/config");
+          const res = await fetch(`${RSCLAW_GATEWAY_API_BASE}/config`);
           if (res.ok) {
             const cfg = await res.json();
             const cfgLang: string | undefined = cfg?.gateway?.language;

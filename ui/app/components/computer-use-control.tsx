@@ -24,7 +24,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { ErrorBoundary } from "./error";
 import { IconButton } from "./button";
-import { Path } from "../constant";
+import { Path, RSCLAW_GATEWAY_API_BASE } from "../constant";
 import { getLang } from "../locales";
 import { rsclawWs, type ComputerUseStatusPayload } from "../lib/rsclaw-ws";
 import { showConfirm, showToast } from "./ui-lib";
@@ -35,7 +35,7 @@ import DeleteIcon from "../icons/delete.svg";
 
 import styles from "./computer-use-control.module.scss";
 
-const GATEWAY_BASE = "http://localhost:18888/api/v1";
+const GATEWAY_BASE = RSCLAW_GATEWAY_API_BASE;
 
 type SavedGrant = {
   agent_id: string;

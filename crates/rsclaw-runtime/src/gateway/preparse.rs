@@ -484,7 +484,35 @@ pub(crate) async fn try_preparse_locally_with_account(
         // already loaded an empty/stale view and won't reread on its
         // own. Best-effort: any write failure is logged inside the
         // helper and does not abort the bind.
-        let _ = rsclaw_cap::identity::write_identity_files(&cwd).await;
+        // Snapshot the currently-loaded plugins + installed skills so the
+        // freshly-written AGENTS.md lists the exact capabilities (names +
+        // call syntax) available to the coding agent right now.
+        let cap_plugins: Vec<String> = handle
+            .wasm_plugins_snapshot()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let cap_skills: Vec<String> = {
+            let mut names = Vec::new();
+            let base = rsclaw_config::loader::base_dir();
+            for dir in [base.join("skills"), workspace().join("skills")] {
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.is_dir() && p.join("SKILL.md").exists() {
+                            if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                                names.push(n.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            names.sort();
+            names.dedup();
+            names
+        };
+        let _ =
+            rsclaw_cap::identity::write_identity_files(&cwd, &cap_plugins, &cap_skills).await;
         match manager.open_session(kind, cwd).await {
             Ok(sid) => {
                 manager
@@ -1043,10 +1071,14 @@ $g.Dispose();$b.Dispose()"#
         let id = format!("loop-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
         // ws transport is registered as "desktop" on the delivery side.
         let delivery_channel: &str = if channel == "ws" { "desktop" } else { channel };
+        // Inherit the originating session so each firing continues the same
+        // conversation history instead of starting a blank session.
+        let inherited_session_key = preparse_session_key(handle, channel, peer_id, account);
         let job = serde_json::json!({
             "id": id,
             "agentId": handle.id,
             "enabled": true,
+            "sessionKey": inherited_session_key,
             "schedule": {"kind": "every", "everyMs": every_ms, "anchorMs": now_ms},
             "payload": {"kind": "agentTurn", "text": prompt},
             "delivery": {"channel": delivery_channel, "to": peer_id, "mode": "always"},
@@ -1117,19 +1149,8 @@ $g.Dispose();$b.Dispose()"#
     }
     // /model — show current model; /models — list providers; /model <name> — switch
     if lower == "/model" || lower == "/models" {
-        let model = handle
-            .config
-            .model
-            .as_ref()
-            .and_then(|m| m.primary_head())
-            .unwrap_or("default");
-        let mut lines = vec![format!("Current model: {model}")];
-        lines.push(String::new());
-        lines.push("Registered providers:".to_owned());
-        for name in handle.providers.names() {
-            lines.push(format!("  {name}"));
-        }
-        return Some(txt(lines.join("\n")));
+        // Single source of truth shared with the agent-queue __MODELS__ path.
+        return Some(txt(handle.format_models()));
     }
     if lower.starts_with("/model ") {
         let model = t.get(7..).unwrap_or("").trim();

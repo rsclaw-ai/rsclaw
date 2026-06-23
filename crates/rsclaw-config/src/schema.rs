@@ -763,7 +763,7 @@ pub struct ModelConfig {
     /// tool names (the `toolset` preset becomes the fallback baseline,
     /// not an additive base). Use for hub-router agents and any setup
     /// where you want explicit control over what the model can call.
-    /// Examples: `["agent_spoke_aihub", "memory", "clarify"]`.
+    /// Examples: `["agent_spoke_aihub", "memory", "ask_user"]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     /// Per-agent always-on PIN list for plugin tools. Each entry is
@@ -2494,7 +2494,10 @@ pub struct KbConfig {
 pub struct KbRerankConfig {
     /// API root of an OpenAI/Jina-compatible rerank server, e.g.
     /// `http://117.50.139.244:5556/v1` (llama.cpp with `--reranking`).
-    /// `/rerank` is appended at request time.
+    /// `/rerank` is appended at request time. Optional: when empty and the
+    /// `model` is a `rsclaw-*` name, it resolves to the fleet API
+    /// (`https://api.rsclaw.ai/v1`) — see `KbReranker::from_config`.
+    #[serde(default)]
     pub base_url: String,
     /// Model name sent in the request body. Optional — single-model
     /// llama.cpp servers ignore it.
