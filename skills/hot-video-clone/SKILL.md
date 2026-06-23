@@ -118,3 +118,41 @@ author: "@rsclaw"
 保存返回音频为 `bgm.wav`。
 
 生成后：各镜片段按脚本顺序命名 `seg_01.mp4 .. seg_NN.mp4`，口播总音轨拼成 `voice.wav`（见 Step 4），`bgm.wav` 备用。
+
+## Step 4: 合成成片（仅路线 B；jimeng 出整片则跳过）
+
+> 目标规格：竖屏 9:16、1080x1920、30fps、AAC 音频。
+
+### 4a. 统一每段规格
+对每个 `seg_NN.mp4`：
+```json
+{"tool": "shell", "command": "ffmpeg -i seg_NN.mp4 -vf scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30 -c:v libx264 -c:a aac -ar 48000 norm_NN.mp4 -y"}
+```
+
+### 4b. 近似卡点（可选，BPM 已知时）
+拍长 = 60 / BPM 秒。把每段裁到最接近整数拍的时长（≥1 拍），使切换大致落在节拍上：
+```json
+{"tool": "shell", "command": "ffmpeg -i norm_NN.mp4 -t 1.6 -c copy cut_NN.mp4 -y"}
+```
+（`-t` 取 `round(dur/beat)*beat`；BPM 未知则跳过本步，直接用 `norm_NN.mp4`。）
+
+### 4c. 带转场拼接（相邻段 0.3s 交叉溶解）
+按顺序对相邻段用 xfade（多段时链式重复，offset = 上一段累计时长 - 0.3）：
+```json
+{"tool": "shell", "command": "ffmpeg -i cut_01.mp4 -i cut_02.mp4 -filter_complex \"[0][1]xfade=transition=fade:duration=0.3:offset=1.3\" -c:v libx264 video_only.mp4 -y"}
+```
+（多段时逐步把上一步输出与下一段再 xfade；保持 video-only，音频在 4d 统一处理。）
+
+### 4d. 口播音轨拼接
+把所有 talk 镜的 `talk_NN.wav` 按顺序 concat 成 `voice.wav`：
+```json
+{"tool": "shell", "command": "printf \"file 'talk_01.wav'\\nfile 'talk_02.wav'\\n\" > vlist.txt && ffmpeg -f concat -safe 0 -i vlist.txt -c copy voice.wav -y"}
+```
+
+### 4e. BGM 混音 + ducking（口播时压低 BGM）
+用 sidechaincompress 让口播盖过 BGM：
+```json
+{"tool": "shell", "command": "ffmpeg -i video_only.mp4 -i voice.wav -i bgm.wav -filter_complex \"[2:a]volume=0.35[bg];[bg][1:a]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300[duck];[1:a][duck]amix=inputs=2:duration=longest[mix]\" -map 0:v -map \"[mix]\" -c:v copy -c:a aac -shortest final.mp4 -y"}
+```
+
+成片为 `final.mp4`。
