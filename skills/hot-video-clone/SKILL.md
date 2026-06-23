@@ -1,12 +1,12 @@
 ---
-name: viral-video-clone
-description: 爆款视频复刻 — 推一个爆款视频，自动推理爆款逻辑并生成同款、本人真人出镜的视频。viral video clone, same-style, real-person, 数字人, 口播, BGM
+name: hot-video-clone
+description: 爆款视频复刻 — 推一个爆款视频，自动推理爆款逻辑并生成同款、本人真人出镜的视频。hot video clone, same-style, real-person, 数字人, 口播, BGM
 version: 1.0.0
 icon: "🎬"
 author: "@rsclaw"
 ---
 
-# 爆款视频复刻 (viral-video-clone)
+# 爆款视频复刻 (hot-video-clone)
 
 给我一个爆款视频（URL 或本地文件）+ 一个本人档案名，我会：
 1. 下载并拆解它的爆款逻辑（钩子/节奏/分镜/文案/BGM 情绪）

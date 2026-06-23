@@ -1,7 +1,7 @@
-# viral-video-clone
+# hot-video-clone
 
 ## 安装
-`rsclaw skills install viral-video-clone`
+`rsclaw skills install hot-video-clone`
 
 ## 一次性配置本人档案
 mkdir -p ~/.rsclaw/profiles/me
