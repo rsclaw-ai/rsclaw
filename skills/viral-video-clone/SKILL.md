@@ -77,3 +77,44 @@ author: "@rsclaw"
 - **BGM 提示词**：基于 BGM 情绪/风格，给 music_gen 的一句话描述
 
 把该方案写进上下文，后续生成逐镜引用。建议总时长贴近原片。
+
+## Step 3: 生成素材
+
+### 路线 A（优先）：jimeng 插件可用
+按 jimeng skill 的 web_browser 流程：
+- 图生视频 / 数字人 / 声音克隆均走 jimeng。
+- 用本人档案 `face.jpg` 作数字人参考、`voice.wav` 作声音克隆参考。
+- 逐镜生成 talk（数字人口播）与 broll（i2v）片段，下载到本地 `seg_NN.mp4`。
+若 jimeng 出整片（已含口播+画面），可直接进 Step 5 交付，跳过 ffmpeg 合成。
+
+### 路线 B（回落）：内置工具链
+
+**B1. 本人口播音轨（声音克隆）** — 对每个 talk 镜的 `line`：
+```json
+{"tool": "voice_gen", "text": "<line>", "reference_audio": "~/.rsclaw/profiles/<name>/voice.wav", "reference_text": "<voice.txt 内容，可选>"}
+```
+保存返回音频为 `talk_NN.wav`。
+
+**B2. 本人出镜口播段（对口型）** — 对每个 talk 镜：
+```json
+{"tool": "avatar_gen", "image": "~/.rsclaw/profiles/<name>/face.jpg", "audio": "talk_NN.wav"}
+```
+等 job 完成，下载为 `seg_NN.mp4`（竖屏，9:16 或 profile.default_aspect）。
+
+**B3. b-roll 画面** — 对每个 broll 镜：
+```json
+{"tool": "image_gen", "prompt": "<desc>", "aspect_ratio": "9:16"}
+```
+拿到首帧 `shot_NN.jpg` 后做图生视频：
+```json
+{"tool": "video_gen", "image": "shot_NN.jpg", "prompt": "<desc>", "duration": 5, "aspect_ratio": "9:16"}
+```
+等 job 完成，下载为 `seg_NN.mp4`。
+
+**B4. BGM** —
+```json
+{"tool": "music_gen", "prompt": "<BGM 提示词>"}
+```
+保存返回音频为 `bgm.wav`。
+
+生成后：各镜片段按脚本顺序命名 `seg_01.mp4 .. seg_NN.mp4`，口播总音轨拼成 `voice.wav`（见 Step 4），`bgm.wav` 备用。
