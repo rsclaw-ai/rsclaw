@@ -166,16 +166,175 @@ fn ocr_window(_app_name: &str) -> Result<String, String> {
     Err("ocr_window only implemented on macOS and Windows".to_string())
 }
 
-/// Windows on-device OCR via Windows.Media.Ocr (WinRT) through PowerShell,
-/// mirroring the macOS Vision shell-out. Captures the app window by id (occlusion
-/// -proof PrintWindow), runs the built-in zh-Hans OCR engine, and prints the same
-/// JSON shape as macOS: `[{"text","conf","x","y","sx","sy"}]` with x/y 0-1000
-/// window-relative and sx/sy screen-absolute click points.
+/// Bring a window (by HWND) to the foreground and un-minimise it, so WeChat's
+/// built-in screenshot overlay lands on the right window. CREATE_NO_WINDOW keeps
+/// the helper PowerShell from flashing a console.
+#[cfg(target_os = "windows")]
+fn focus_window(hwnd: u64) {
+    use std::os::windows::process::CommandExt;
+    let script = format!(
+        r#"$s='[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);'
+Add-Type -MemberDefinition $s -Name FW -Namespace W
+[W.FW]::ShowWindow([IntPtr]{hwnd}, 9) | Out-Null
+[W.FW]::SetForegroundWindow([IntPtr]{hwnd}) | Out-Null"#,
+        hwnd = hwnd
+    );
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script]);
+    cmd.creation_flags(0x08000000);
+    let _ = cmd.output();
+}
+
+/// Capture the WeChat window for OCR via a screen-region grab. WeChat 4.x's
+/// risk-control blanks PrintWindow (per-window) captures — they come back solid
+/// black — but a CopyFromScreen (GDI BitBlt) region grab of the window's on-screen
+/// rect is NOT blocked. We foreground + un-minimise the window first (CopyFromScreen
+/// captures whatever is displayed at those coords, so the window must be visible),
+/// then grab its rect. Returns the PNG plus the refreshed window bounds, so OCR maps
+/// hits to correct screen-absolute click points. macOS keeps its backing-store path.
+#[cfg(target_os = "windows")]
+fn wechat_region_capture(app_name: &str) -> Result<(Vec<u8>, capture::WindowInfo), String> {
+    let win = find_app_window(app_name)?;
+    // Bring the window forward + restore from tray/minimise so its on-screen rect
+    // shows the real UI for the region grab.
+    focus_window(win.id);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Re-resolve the rect — restoring from minimised moves the window.
+    let win = find_app_window(app_name)?;
+    let png = capture::capture_region_png(win.x, win.y, win.w, win.h).map_err(|e| e.to_string())?;
+    Ok((png, win))
+}
+
+/// Heuristic: is a capture essentially blank (solid black / uniform)? WeChat
+/// risk-control blanks PrintWindow to pure black; if a region grab ever comes back
+/// blank too (window occluded, or stricter anti-capture), we fall back to WeChat's
+/// own screenshot. Samples sparsely and reports blank when <1% of sampled pixels
+/// are non-black.
+#[cfg(target_os = "windows")]
+fn looks_blank(png: &[u8]) -> bool {
+    match capture::png_to_rgba(png) {
+        Ok(img) => {
+            let mut nonblack = 0u64;
+            let mut total = 0u64;
+            for p in img.pixels().step_by(37) {
+                total += 1;
+                let [r, g, b, _] = p.0;
+                if r > 16 || g > 16 || b > 16 {
+                    nonblack += 1;
+                }
+            }
+            total == 0 || (nonblack as f64 / total as f64) < 0.01
+        }
+        // Undecodable → don't assume blank; let OCR try.
+        Err(_) => false,
+    }
+}
+
+/// Read the current clipboard image as PNG bytes (WeChat's built-in screenshot
+/// copies the captured region here). Requires STA.
+#[cfg(target_os = "windows")]
+fn clipboard_image_png() -> Result<Vec<u8>, String> {
+    use std::os::windows::process::CommandExt;
+    let out_png = std::env::temp_dir().join(format!("rsclaw_clip_{}.png", std::process::id()));
+    let script = format!(
+        r#"Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+$img = [System.Windows.Forms.Clipboard]::GetImage()
+if ($img -eq $null) {{ Write-Output 'NOIMG'; exit 1 }}
+$img.Save('{path}', [System.Drawing.Imaging.ImageFormat]::Png)
+Write-Output 'OK'"#,
+        path = out_png.display()
+    );
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-STA",
+        "-Command",
+        &script,
+    ]);
+    cmd.creation_flags(0x08000000);
+    let res = cmd
+        .output()
+        .map_err(|e| format!("clipboard image spawn failed: {e}"))?;
+    if !res.status.success() {
+        return Err(format!(
+            "clipboard has no image ({})",
+            String::from_utf8_lossy(&res.stdout).trim()
+        ));
+    }
+    let bytes = std::fs::read(&out_png).map_err(|e| format!("read clipboard png: {e}"))?;
+    let _ = std::fs::remove_file(&out_png);
+    Ok(bytes)
+}
+
+/// FALLBACK capture via WeChat's OWN built-in screenshot (PC default hotkey Alt+A
+/// → drag-select the window → Enter copies to clipboard). Used only when the region
+/// grab comes back blank, since WeChat's internal screenshot is never blocked by its
+/// own risk-control. Intrusive (steals focus, flashes the selection overlay).
+#[cfg(target_os = "windows")]
+fn wechat_screenshot_png(win: &capture::WindowInfo) -> Result<Vec<u8>, String> {
+    use std::{thread::sleep, time::Duration};
+    focus_window(win.id);
+    sleep(Duration::from_millis(450));
+    let mut e = new_enigo()?;
+    // Trigger WeChat's screenshot (Alt held while pressing 'a').
+    e.key(Key::Alt, Press)
+        .map_err(|err| format!("alt down: {err}"))?;
+    e.key(Key::Unicode('a'), Click)
+        .map_err(|err| format!("press a: {err}"))?;
+    e.key(Key::Alt, Release)
+        .map_err(|err| format!("alt up: {err}"))?;
+    sleep(Duration::from_millis(700)); // selection overlay appears
+    // Drag-select the whole window (real down → move → move → up).
+    let pad = 2;
+    let (x1, y1) = (win.x + pad, win.y + pad);
+    let (x2, y2) = (win.x + win.w as i32 - pad, win.y + win.h as i32 - pad);
+    e.move_mouse(x1, y1, Coordinate::Abs)
+        .map_err(|err| format!("move start: {err}"))?;
+    e.button(Button::Left, Press)
+        .map_err(|err| format!("btn down: {err}"))?;
+    e.move_mouse((x1 + x2) / 2, (y1 + y2) / 2, Coordinate::Abs)
+        .map_err(|err| format!("move mid: {err}"))?;
+    e.move_mouse(x2, y2, Coordinate::Abs)
+        .map_err(|err| format!("move end: {err}"))?;
+    e.button(Button::Left, Release)
+        .map_err(|err| format!("btn up: {err}"))?;
+    sleep(Duration::from_millis(350));
+    // Enter = 完成/复制 → puts the capture on the clipboard, closes the overlay.
+    e.key(Key::Return, Click)
+        .map_err(|err| format!("enter: {err}"))?;
+    sleep(Duration::from_millis(450));
+    clipboard_image_png()
+}
+
+/// Windows on-device OCR via Windows.Media.Ocr (WinRT) through PowerShell. For
+/// WeChat the window is captured via a screen-region grab (PrintWindow is blanked
+/// by WeChat risk-control); other apps use the occlusion-proof PrintWindow path.
+/// Prints the same JSON shape as macOS: `[{"text","conf","x","y","sx","sy"}]` with
+/// x/y 0-1000 window-relative and sx/sy screen-absolute click points. Because the
+/// captured image IS the window rect at a known origin, sx/sy land correctly.
 #[cfg(target_os = "windows")]
 fn ocr_window(app_name: &str) -> Result<String, String> {
-    let win = find_app_window(app_name)?;
+    let lname = app_name.to_lowercase();
+    let (png, win) = if lname.contains("wechat") || lname.contains("weixin") {
+        // Primary: non-intrusive region grab (CopyFromScreen, risk-control-proof).
+        let (png, win) = wechat_region_capture(app_name)?;
+        if looks_blank(&png) {
+            // Region grab came back blank (occluded, or anti-capture on GDI too) →
+            // fall back to WeChat's own built-in screenshot (Alt+A → clipboard).
+            warn!("wechat region capture blank; falling back to built-in screenshot (Alt+A)");
+            let fwin = find_app_window(app_name)?;
+            (wechat_screenshot_png(&fwin)?, fwin)
+        } else {
+            (png, win)
+        }
+    } else {
+        let win = find_app_window(app_name)?;
+        let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
+        (png, win)
+    };
     let (wx, wy, ww, wh) = (win.x, win.y, win.w, win.h);
-    let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
     let tmp = std::env::temp_dir().join(format!(
         "rsclaw_ocr_{}_{}.png",
         std::process::id(),
