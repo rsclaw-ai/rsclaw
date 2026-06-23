@@ -581,6 +581,71 @@ impl FeishuChannel {
         Ok(())
     }
 
+    /// Bulk-send one message to many individual users in a single call via
+    /// `im/v1/batch_messages` (feishu caps each call at 200 ids). `ids` must be
+    /// individual user ids — open_id / union_id / user_id; group (oc_) ids are
+    /// not accepted by the batch API and are filtered out by the caller. Ids are
+    /// partitioned into the right request array by prefix. Returns the number of
+    /// recipients accepted by the batch call.
+    async fn send_batch_text(&self, ids: &[String], text: &str) -> Result<usize> {
+        let token = self.get_token().await?;
+        let card_payload = build_feishu_card(text, &self.brand);
+
+        let mut sent = 0usize;
+        // Chunk to feishu's 200-id-per-call ceiling.
+        for chunk in ids.chunks(200) {
+            let mut open_ids = Vec::new();
+            let mut union_ids = Vec::new();
+            let mut user_ids = Vec::new();
+            for id in chunk {
+                if id.starts_with("ou_") {
+                    open_ids.push(id.clone());
+                } else if id.starts_with("on_") {
+                    union_ids.push(id.clone());
+                } else {
+                    user_ids.push(id.clone());
+                }
+            }
+            // Bulk send uses the v4 batch_send endpoint (the im/v1/batch_messages
+            // path is for reading/recalling an existing batch, not sending).
+            let url = format!("{}/message/v4/batch_send/", self.api_base());
+            let body = json!({
+                "msg_type": "interactive",
+                "card": card_payload["card"],
+                "open_ids": open_ids,
+                "union_ids": union_ids,
+                "user_ids": user_ids,
+            });
+            info!(
+                count = chunk.len(),
+                text_preview = %text.chars().take(60).collect::<String>(),
+                "feishu: batch_messages sending"
+            );
+            let resp = send_with_retry("feishu", &SendRetry::default(), || {
+                self.client.post(&url).bearer_auth(&token).json(&body)
+            })
+            .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("feishu: batch_messages failed {status}: {body}");
+            }
+            let api_resp: FeishuApiResponse<serde_json::Value> = resp
+                .json()
+                .await
+                .context("feishu: parse batch_messages response")?;
+            if api_resp.code != 0 {
+                anyhow::bail!(
+                    "feishu: batch_messages error code={}: {}",
+                    api_resp.code,
+                    api_resp.msg
+                );
+            }
+            sent += chunk.len();
+        }
+        Ok(sent)
+    }
+
     /// Reply to a specific message by message_id.
     async fn reply_text_chunk(&self, message_id: &str, text: &str) -> Result<()> {
         let token = self.get_token().await?;
@@ -1384,6 +1449,23 @@ impl Channel for FeishuChannel {
 
     fn send(&self, msg: OutboundMessage) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
+            // Batch fan-out: target_id carries a sentinel-prefixed id list that
+            // we deliver in one `im/v1/batch_messages` call instead of per-id.
+            if let Some(list) = msg
+                .target_id
+                .strip_prefix(rsclaw_types::OUTBOUND_BATCH_PREFIX)
+            {
+                let ids: Vec<String> = list
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if !ids.is_empty() && !msg.text.is_empty() {
+                    let n = self.send_batch_text(&ids, &msg.text).await?;
+                    info!(count = n, "feishu: batch send complete");
+                }
+                return Ok(());
+            }
             let chunk_cfg = ChunkConfig {
                 max_chars: platform_chunk_limit("feishu"),
                 min_chars: 1,
@@ -2010,13 +2092,36 @@ async fn extract_and_upload_cover(
         .to_string_lossy()
         .into_owned();
     // Run ffmpeg to extract first frame at 1s.
-    let output = std::process::Command::new(&ffmpeg_bin)
-        .args([
+    let mut cmd = std::process::Command::new(&ffmpeg_bin);
+    cmd.args([
+        "-y",
+        "-i",
+        video_path,
+        "-ss",
+        "00:00:01",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        &cover_path,
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd.output();
+    let ok_first = matches!(&output, Ok(o) if o.status.success());
+    if !ok_first {
+        // Retry at 0s (video might be shorter than 1s).
+        let mut cmd = std::process::Command::new(&ffmpeg_bin);
+        cmd.args([
             "-y",
             "-i",
             video_path,
             "-ss",
-            "00:00:01",
+            "00:00:00",
             "-frames:v",
             "1",
             "-q:v",
@@ -2024,27 +2129,12 @@ async fn extract_and_upload_cover(
             &cover_path,
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let ok_first = matches!(&output, Ok(o) if o.status.success());
-    if !ok_first {
-        // Retry at 0s (video might be shorter than 1s).
-        let _ = std::process::Command::new(&ffmpeg_bin)
-            .args([
-                "-y",
-                "-i",
-                video_path,
-                "-ss",
-                "00:00:00",
-                "-frames:v",
-                "1",
-                "-q:v",
-                "2",
-                &cover_path,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output();
+        .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(0x08000000);
+        }
+        let _ = cmd.output();
     }
     let cover_bytes = match std::fs::read(&cover_path) {
         Ok(b) => b,
@@ -2165,18 +2255,21 @@ fn mp4_duration_ms(path: &str) -> Option<u64> {
 /// Falls back to estimate from file size if ffprobe is not available.
 fn audio_duration_ms(path: &str) -> Option<u64> {
     // Try ffprobe first.
-    let output = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            path,
-        ])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "quiet",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd.output().ok()?;
     if output.status.success() {
         let s = String::from_utf8_lossy(&output.stdout);
         if let Ok(secs) = s.trim().parse::<f64>() {

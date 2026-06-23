@@ -380,9 +380,24 @@ pub struct TurnContext {
     pub event_tx: Option<tokio::sync::mpsc::Sender<rsclaw_a2a_types::event::AgentEvent>>,
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
     pub input_request_tx: Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<String>>>,
+    /// Monotonic progress counter bumped once per agent-loop iteration. A
+    /// progress-based stuck-turn watchdog (used for daemon agents, which loop
+    /// forever so a flat wall-clock limit can't apply) samples it: if it stops
+    /// advancing for a while, a tool is genuinely wedged and the turn is
+    /// cancelled. `None` for non-A2A/legacy turns (no watchdog wiring).
+    pub progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl TurnContext {
+    /// Bump the progress counter (no-op when unset). Called once per agent-loop
+    /// iteration so a progress watchdog can tell "alive but looping" from
+    /// "wedged on a non-returning tool".
+    pub fn progress_tick(&self) {
+        if let Some(p) = &self.progress {
+            p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// True once the A2A caller fired `tasks/cancel` (or the task's cancel
     /// token was tripped for any other reason). Runtime polls this between
     /// iterations of the agent loop and at every tool-dispatch boundary.
@@ -734,6 +749,7 @@ impl AgentRegistry {
             let codex = cfg.agents.defaults.codex.clone();
             vec![rsclaw_config::schema::AgentEntry {
                 id: "main".to_owned(),
+                daemon: false,
                 description: None,
                 default: Some(true),
                 name: Some("Main Agent".to_owned()),

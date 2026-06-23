@@ -176,9 +176,6 @@ channel-matrix = ["dep:matrix-sdk"]
 openclaw-migrate = ["rsclaw-migrate/openclaw-migrate"]
 tray = ["dep:tray-icon", "dep:muda"]
 
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-xcap = "0.9"
-
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }
 

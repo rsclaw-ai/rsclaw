@@ -1971,6 +1971,19 @@ fn push_plugin_outbound(
     } else {
         peer_id.to_owned()
     };
+    // Batch fan-out: `batch_targets` (≤200 ids) is encoded into target_id via a
+    // sentinel prefix so the existing OutboundMessage pipe carries it unchanged;
+    // only feishu decodes it into a single `im/v1/batch_messages` call.
+    let batch_targets = json_array_strings(&message, "batch_targets");
+    let target_id = if batch_targets.is_empty() {
+        target_id
+    } else {
+        format!(
+            "{}{}",
+            rsclaw_types::OUTBOUND_BATCH_PREFIX,
+            batch_targets.join(",")
+        )
+    };
     let msg = OutboundMessage {
         target_id,
         is_group: message

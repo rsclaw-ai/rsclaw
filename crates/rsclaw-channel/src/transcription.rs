@@ -1081,20 +1081,24 @@ fn decode_audio_ffmpeg(audio_bytes: &[u8], ext: &str) -> Result<Vec<f32>> {
     std::fs::write(&input_path, audio_bytes)?;
     let ffmpeg_bin = which_ffmpeg();
     info!(input = %input_path.display(), ext = %ext, bytes = audio_bytes.len(), bin = %ffmpeg_bin, "ffmpeg fallback: converting");
-    let output = std::process::Command::new(&ffmpeg_bin)
-        .args([
-            "-i",
-            input_path.to_str().unwrap_or(""),
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-f",
-            "wav",
-            "-y",
-            wav_path.to_str().unwrap_or(""),
-        ])
-        .output();
+    let mut cmd = std::process::Command::new(&ffmpeg_bin);
+    cmd.args([
+        "-i",
+        input_path.to_str().unwrap_or(""),
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-f",
+        "wav",
+        "-y",
+        wav_path.to_str().unwrap_or(""),
+    ]);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd.output();
     let _ = std::fs::remove_file(&input_path);
     let status = output
         .as_ref()
@@ -1328,17 +1332,22 @@ pub fn encode_audio_to_ogg_opus(audio_bytes: &[u8], file_ext: Option<&str>) -> R
     let tmp_ogg = std::env::temp_dir().join(format!("rsclaw_opus_out_{ts}.ogg"));
 
     std::fs::write(&tmp_src, audio_bytes)?;
-    let output = std::process::Command::new(which_ffmpeg())
-        .args([
-            "-i",
-            &tmp_src.to_string_lossy(),
-            "-y",
-            "-c:a",
-            "libopus",
-            "-b:a",
-            "48k",
-            &tmp_ogg.to_string_lossy().to_string(),
-        ])
+    let mut cmd = std::process::Command::new(which_ffmpeg());
+    cmd.args([
+        "-i",
+        &tmp_src.to_string_lossy(),
+        "-y",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "48k",
+        &tmp_ogg.to_string_lossy().to_string(),
+    ]);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd
         .output()
         .context("ffmpeg not available for opus encoding")?;
     let _ = std::fs::remove_file(&tmp_src);
@@ -1494,21 +1503,24 @@ fn decode_audio_ffmpeg_at_rate(
         chrono::Utc::now().timestamp_millis()
     ));
     std::fs::write(&tmp_in, audio_bytes)?;
-    let output = std::process::Command::new(which_ffmpeg())
-        .args([
-            "-i",
-            &tmp_in.to_string_lossy(),
-            "-y",
-            "-f",
-            "s16le",
-            "-ar",
-            &target_rate.to_string(),
-            "-ac",
-            "1",
-            &tmp_out.to_string_lossy().to_string(),
-        ])
-        .output()
-        .context("ffmpeg not available")?;
+    let mut cmd = std::process::Command::new(which_ffmpeg());
+    cmd.args([
+        "-i",
+        &tmp_in.to_string_lossy(),
+        "-y",
+        "-f",
+        "s16le",
+        "-ar",
+        &target_rate.to_string(),
+        "-ac",
+        "1",
+        &tmp_out.to_string_lossy().to_string(),
+    ]);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd.output().context("ffmpeg not available")?;
     let _ = std::fs::remove_file(&tmp_in);
     if !output.status.success() {
         let _ = std::fs::remove_file(&tmp_out);

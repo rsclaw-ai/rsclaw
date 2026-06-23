@@ -386,6 +386,29 @@ pub struct AgentsConfig {
     pub a2a: Option<Vec<A2aPeerConfig>>,
 }
 
+impl AgentsConfig {
+    /// IDs of agents flagged `daemon: true` — long-lived monitor loops whose
+    /// turn-bounding guards and cron turn-timeout are disabled.
+    pub fn daemon_agent_ids(&self) -> Vec<String> {
+        self.list
+            .as_ref()
+            .map(|l| {
+                l.iter()
+                    .filter(|a| a.daemon)
+                    .map(|a| a.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Is the agent `id` flagged `daemon: true`?
+    pub fn is_daemon_agent(&self, id: &str) -> bool {
+        self.list
+            .as_ref()
+            .is_some_and(|l| l.iter().any(|a| a.daemon && a.id == id))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDefaults {
@@ -464,15 +487,6 @@ pub struct AgentDefaults {
     /// (browser/shell/cap): 100. Budget depletes on stagnation/errors, not on
     /// productive iterations. Set to 0 to use built-in defaults.
     pub max_iterations: Option<u32>,
-    /// Agent IDs that run as long-lived DAEMON loops (e.g. a realtime monitor
-    /// that polls forever). For these agents the turn-bounding guards are
-    /// disabled: the hard iteration ceiling, the stagnation budget, and the
-    /// same-call / same-name repeat breaks. They are meant to never self-
-    /// terminate, so a tight `wait`+poll loop (which looks like stagnation) is
-    /// expected. Use with care — such a turn only ends on error or external
-    /// stop. Empty/absent = no daemon agents (normal bounded behaviour).
-    #[serde(default)]
-    pub daemon_agent_ids: Option<Vec<String>>,
     /// Send intermediate text to user during multi-step tool calls. Default:
     /// true.
     pub intermediate_output: Option<bool>,
@@ -552,6 +566,14 @@ pub struct AgentEntry {
     /// `agents.defaults.temperature` (which itself may be None = "auto").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// rsclaw extension: run this agent as a long-lived DAEMON loop (a realtime
+    /// monitor that polls forever). Disables the turn-bounding guards (hard
+    /// iteration ceiling, stagnation budget, same-call/same-name repeat breaks)
+    /// and the cron turn-timeout — the loop only ends on error or external stop,
+    /// with the agent's own cron as a restart backstop. Default false. Replaces
+    /// the old top-level `agents.defaults.daemonAgentIds` list.
+    #[serde(default)]
+    pub daemon: bool,
 }
 
 /// OpenCode ACP configuration for an agent.
@@ -663,7 +685,11 @@ impl StringOrVec {
                 let t = s.trim();
                 if t.is_empty() { vec![] } else { vec![t] }
             }
-            Self::Multi(v) => v.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect(),
+            Self::Multi(v) => v
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 
@@ -836,7 +862,10 @@ impl ModelConfig {
 
     /// Full primary chain as borrowed slice. Length 0 = unset.
     pub fn primary_chain(&self) -> Vec<&str> {
-        self.primary.as_ref().map(StringOrVec::chain).unwrap_or_default()
+        self.primary
+            .as_ref()
+            .map(StringOrVec::chain)
+            .unwrap_or_default()
     }
 
     /// First model id in the `flash` chain.
@@ -846,7 +875,10 @@ impl ModelConfig {
 
     /// Full flash chain.
     pub fn flash_chain(&self) -> Vec<&str> {
-        self.flash.as_ref().map(StringOrVec::chain).unwrap_or_default()
+        self.flash
+            .as_ref()
+            .map(StringOrVec::chain)
+            .unwrap_or_default()
     }
 
     /// First model id in the `vision` chain.
@@ -856,7 +888,10 @@ impl ModelConfig {
 
     /// Full vision chain.
     pub fn vision_chain(&self) -> Vec<&str> {
-        self.vision.as_ref().map(StringOrVec::chain).unwrap_or_default()
+        self.vision
+            .as_ref()
+            .map(StringOrVec::chain)
+            .unwrap_or_default()
     }
 
     /// First model id in the `image` chain.
@@ -866,7 +901,10 @@ impl ModelConfig {
 
     /// Full image chain.
     pub fn image_chain(&self) -> Vec<&str> {
-        self.image.as_ref().map(StringOrVec::chain).unwrap_or_default()
+        self.image
+            .as_ref()
+            .map(StringOrVec::chain)
+            .unwrap_or_default()
     }
 
     /// First model id in the `video` chain.
@@ -876,7 +914,10 @@ impl ModelConfig {
 
     /// Full video chain.
     pub fn video_chain(&self) -> Vec<&str> {
-        self.video.as_ref().map(StringOrVec::chain).unwrap_or_default()
+        self.video
+            .as_ref()
+            .map(StringOrVec::chain)
+            .unwrap_or_default()
     }
 }
 
@@ -1793,9 +1834,11 @@ pub struct CronDelivery {
     pub mode: Option<String>,
     /// Channel to send to: "feishu", "wechat", "telegram", etc.
     pub channel: Option<String>,
-    /// Target user/chat ID.
+    /// Target user/chat ID(s). Accepts a single id or a list (fan-out to
+    /// multiple recipients). When omitted, the cron runner falls back to the
+    /// peer of the agent's most-recent conversation (incl. a2a-delegated).
     #[serde(rename = "to")]
-    pub to: Option<String>,
+    pub to: Option<StringOrVec>,
     /// Thread/topic ID for channels that support it.
     pub thread_id: Option<String>,
     /// Account ID for multi-account setups.

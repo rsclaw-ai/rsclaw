@@ -23,12 +23,8 @@ use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Mouse, Settings,
 };
-use image::{ImageFormat, RgbaImage};
+use rsclaw_platform::capture;
 use tracing::{debug, warn};
-// xcap is dep-gated to non-Linux (Cargo.toml). On Linux,
-// `capture_primary_screen` returns an error rather than panicking.
-#[cfg(not(target_os = "linux"))]
-use xcap::Monitor;
 
 use crate::{
     action::{Action, ActionSpec, ExecCtx, MouseButton, Screenshot, ScrollDir},
@@ -140,46 +136,16 @@ impl Operator for NativeOperator {
 // Screenshot
 // ---------------------------------------------------------------------------
 
-/// Capture the primary monitor and encode as PNG.
-#[cfg(target_os = "linux")]
+/// Capture the primary screen and encode as PNG (script-based capture; works on
+/// macOS / Windows / Linux). Logical size = physical / scale_factor.
 fn capture_primary_screen() -> Result<Screenshot> {
-    Err(anyhow!(
-        "screen capture not supported on Linux (xcap disabled — pipewire/libspa build chain)"
-    ))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn capture_primary_screen() -> Result<Screenshot> {
-    let monitors = Monitor::all().map_err(|e| anyhow!("xcap::Monitor::all failed: {e}"))?;
-    if monitors.is_empty() {
-        return Err(anyhow!("no monitors detected"));
-    }
-
-    // Prefer the primary; fall back to the first if `is_primary` errors
-    // (xcap occasionally returns errors on fresh sessions).
-    let monitor = monitors
-        .iter()
-        .find(|m| m.is_primary().unwrap_or(false))
-        .unwrap_or(&monitors[0])
-        .clone();
-
-    let scale_factor = monitor.scale_factor().unwrap_or(1.0);
-    let monitor_w = monitor.width().unwrap_or(0);
-    let monitor_h = monitor.height().unwrap_or(0);
-
-    let img: RgbaImage = monitor
-        .capture_image()
-        .map_err(|e| anyhow!("xcap capture_image failed: {e}"))?;
-
+    let png_bytes = capture::capture_full_png().map_err(|e| anyhow!("{e}"))?;
+    // Decode just to read the physical pixel dimensions of the capture.
+    let img = capture::png_to_rgba(&png_bytes).map_err(|e| anyhow!("{e}"))?;
     let physical_w = img.width();
     let physical_h = img.height();
 
-    // xcap's `width`/`height` reports the physical pixel size on macOS
-    // Retina, so logical = physical / scale_factor. If the monitor
-    // metadata disagrees with the captured image (rare), trust the
-    // image.
-    let _ = (monitor_w, monitor_h);
-
+    let scale_factor = capture::primary_scale_factor();
     let logical_w = if scale_factor > 0.0 {
         (physical_w as f32 / scale_factor).round() as u32
     } else {
@@ -190,14 +156,6 @@ fn capture_primary_screen() -> Result<Screenshot> {
     } else {
         physical_h
     };
-
-    // Encode RGBA -> PNG via the `image` crate.
-    let mut png_bytes: Vec<u8> = Vec::with_capacity(physical_w as usize * physical_h as usize / 4);
-    {
-        let mut cursor = std::io::Cursor::new(&mut png_bytes);
-        img.write_to(&mut cursor, ImageFormat::Png)
-            .context("PNG encode failed")?;
-    }
 
     Ok(Screenshot {
         png_bytes,

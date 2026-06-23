@@ -24,28 +24,26 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{ChannelManager, OutboundMessage};
+use rsclaw_config::schema::{CronConfig, CronDelivery};
+// Re-export the DATA / PERSISTENCE / PURE-COMPUTE layer so existing
+// `crate::cron::X` callers across agent / cmd / server / gateway keep
+// resolving unchanged.
+pub use rsclaw_cron::{
+    CRON_FILE_LOCK, CronIter, CronJob, CronJobState, CronPayload, CronSchedule, CronScheduleTagged,
+    CronStore, RunLogEntry, build_run_log_entry, compute_next_run_from_expr,
+    cron_jobs_config_equal, cron_store, current_timestamp_ms, error_backoff_ms,
+    export_cron_jobs_to_file, extract_saved_files_content, init_cron_store, install_reload_sender,
+    load_cron_jobs, load_cron_jobs_from_file, reconcile_file_to_redb_on_boot,
+    resolve_cron_store_path, save_cron_jobs, trigger_reload, validate_cron_expr,
+};
 use tokio::{
     io::AsyncWriteExt,
     sync::{Semaphore, broadcast},
     time::sleep,
 };
 use tracing::{debug, info, warn};
-
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{ChannelManager, OutboundMessage};
-use rsclaw_config::schema::{CronConfig, CronDelivery};
-
-// Re-export the DATA / PERSISTENCE / PURE-COMPUTE layer so existing
-// `crate::cron::X` callers across agent / cmd / server / gateway keep
-// resolving unchanged.
-pub use rsclaw_cron::{
-    CRON_FILE_LOCK, CronIter, CronJob, CronJobState, CronPayload, CronSchedule,
-    CronScheduleTagged, CronStore, RunLogEntry, build_run_log_entry, compute_next_run_from_expr,
-    cron_jobs_config_equal, cron_store, current_timestamp_ms, error_backoff_ms,
-    export_cron_jobs_to_file, extract_saved_files_content, init_cron_store, install_reload_sender,
-    load_cron_jobs, load_cron_jobs_from_file, reconcile_file_to_redb_on_boot,
-    resolve_cron_store_path, save_cron_jobs, trigger_reload, validate_cron_expr,
-};
 
 // ---------------------------------------------------------------------------
 // Constants (runner-only — pure-compute backoff table lives in rsclaw-cron)
@@ -207,6 +205,18 @@ impl CronRunner {
                             // enabled: memory can disable, never re-enable.
                             if !mem_job.enabled {
                                 redb_job.enabled = false;
+                            }
+                            // If the user edited the schedule in cron.json5,
+                            // adopt it and force a next-run recompute — otherwise
+                            // the stale `next_run_at_ms` carried in state keeps
+                            // firing on the OLD time (or never, if it's past).
+                            let sched_changed = serde_json::to_string(&redb_job.schedule).ok()
+                                != serde_json::to_string(&mem_job.schedule).ok();
+                            if sched_changed {
+                                redb_job.schedule = mem_job.schedule.clone();
+                                if let Some(st) = redb_job.state.as_mut() {
+                                    st.next_run_at_ms = None;
+                                }
                             }
                             redb_job
                         }
@@ -971,11 +981,13 @@ impl CronRunner {
                     // The result is logged but we don't wait for it.
                     if let Some(delivery_text) = delivery_text {
                         let delivery_channels = Arc::clone(&channels);
+                        let delivery_agents = Arc::clone(&agents);
                         let delivery_job = job.clone();
                         let delivery_default = default_delivery.clone();
                         tokio::spawn(async move {
                             if let Err(e) = send_delivery(
                                 &delivery_channels,
+                                &delivery_agents,
                                 &delivery_job,
                                 &delivery_default,
                                 &delivery_text,
@@ -1122,8 +1134,14 @@ impl CronRunner {
 
         // Delivery goes through send_delivery → DesktopChannel (which broadcasts
         // via ws_conns). A separate direct broadcast here would double-deliver.
-        if let Err(e) =
-            send_delivery(&self.channels, job, &self.default_delivery, &delivery_text).await
+        if let Err(e) = send_delivery(
+            &self.channels,
+            &self.agents,
+            job,
+            &self.default_delivery,
+            &delivery_text,
+        )
+        .await
         {
             warn!(job_id = %job.id, %e, "delivery failed");
         }
@@ -1296,7 +1314,7 @@ async fn run_cron_job(
         let (preparse_channel, preparse_peer) = match job.delivery.as_ref() {
             Some(d) => (
                 d.channel.as_deref().unwrap_or(""),
-                d.to.as_deref().unwrap_or(""),
+                d.to.as_ref().and_then(|t| t.head()).unwrap_or(""),
             ),
             None => ("", ""),
         };
@@ -1449,27 +1467,182 @@ async fn run_cron_job(
     }
 }
 
+/// Sentinel `delivery.to` value: fan out to every channel the agent is bound
+/// to (`agents.<id>.channels`), sending to each channel's most-recent
+/// conversation peer.
+const TO_AGENT_CHANNELS: &str = "agent.channels";
+/// Max concurrent deliveries per batch when fanning out to many recipients.
+const DELIVERY_BATCH: usize = 10;
+
+/// Resolve the peer of the agent's most-recent conversation, optionally
+/// restricted to one channel and one account. Considers both the agent's own
+/// DM/group sessions and a2a-delegated sessions (`…:a2a:<id>`, where another
+/// agent handed work to this one — the peer is the human who started that
+/// upstream conversation). Session-key shapes (see gateway/session.rs):
+///   `agent:<id>:<channel>:direct|group:<peer>`            (per-channel-peer)
+///   `agent:<id>:<channel>:<account>:direct|group:<peer>`  (per-account-…)
+/// Returns `(channel, account_from_key, peer_or_group_id, is_group)`.
+fn resolve_recent_session_target(
+    agent_id: &str,
+    channel: Option<&str>,
+    account: Option<&str>,
+) -> Option<(String, Option<String>, String, bool)> {
+    let store = cron_store()?;
+    let keys = store.list_sessions().ok()?;
+    let own_prefix = format!("agent:{agent_id}:");
+    let a2a_suffix = format!(":a2a:{agent_id}");
+    let mut best: Option<(i64, String)> = None;
+    for k in &keys {
+        if !(k.starts_with(&own_prefix) || k.contains(&a2a_suffix)) {
+            continue;
+        }
+        let toks: Vec<&str> = k.split(':').collect();
+        let Some(marker) = toks.iter().position(|t| *t == "direct" || *t == "group") else {
+            continue;
+        };
+        // channel is the 3rd segment; account (per-account scope) sits between
+        // channel and the direct/group marker, i.e. present iff marker == 4.
+        if let Some(want) = channel {
+            if toks.get(2) != Some(&want) {
+                continue;
+            }
+        }
+        let key_account = if marker == 4 {
+            toks.get(3).copied()
+        } else {
+            None
+        };
+        if let (Some(want), Some(have)) = (account, key_account) {
+            if want != have {
+                continue;
+            }
+        }
+        let la = store
+            .get_session_meta(k)
+            .ok()
+            .flatten()
+            .map(|m| m.last_active)
+            .unwrap_or(0);
+        if best.as_ref().map_or(true, |(b, _)| la > *b) {
+            best = Some((la, k.clone()));
+        }
+    }
+    let (_, key) = best?;
+    let toks: Vec<&str> = key.split(':').collect();
+    let marker = toks.iter().position(|t| *t == "direct" || *t == "group")?;
+    let ch = toks.get(2)?.to_string();
+    let key_account = if marker == 4 {
+        toks.get(3).map(|s| s.to_string())
+    } else {
+        None
+    };
+    let is_group = toks[marker] == "group";
+    let peer = toks.get(marker + 1)?.to_string();
+    Some((ch, key_account, peer, is_group))
+}
+
+/// Heuristic: does this target id look like a group/chat rather than a user?
+fn target_is_group(id: &str) -> bool {
+    id.starts_with("oc_") || id.ends_with("@chatroom")
+}
+
+/// Resolve a cron job's delivery config into concrete
+/// `(channel, account, target, is_group)` recipients. Shared by the scheduled
+/// path (`send_delivery`) and the manual-trigger path (`cron_trigger`) so both
+/// honor `to` lists, the `agent.channels` sentinel, and the no-`to` "reply to
+/// the agent's most-recent conversation" fallback identically. The account
+/// (which bot/app sends) keeps each channel-specific open_id valid.
+pub(crate) fn resolve_delivery_targets(
+    agents: &AgentRegistry,
+    agent_id: &str,
+    delivery: &CronDelivery,
+) -> Vec<(String, Option<String>, String, bool)> {
+    let default_account = delivery.account_id.clone();
+    let to_list: Vec<String> = delivery
+        .to
+        .as_ref()
+        .map(|t| t.to_chain())
+        .unwrap_or_default();
+    let mut targets: Vec<(String, Option<String>, String, bool)> = Vec::new();
+
+    if to_list.iter().any(|s| s == TO_AGENT_CHANNELS) {
+        // Fan out to every channel:account the agent is bound to. Each binding
+        // entry is `<channel>` or `<channel>:<account>` (see route_account).
+        let bound: Vec<String> = agents
+            .get(agent_id)
+            .ok()
+            .and_then(|h| h.config.channels.clone())
+            .filter(|v| !v.is_empty())
+            .or_else(|| delivery.channel.clone().map(|c| vec![c]))
+            .unwrap_or_default();
+        for entry in &bound {
+            let (ch, acct) = match entry.split_once(':') {
+                Some((c, a)) => (c, Some(a)),
+                None => (entry.as_str(), None),
+            };
+            match resolve_recent_session_target(agent_id, Some(ch), acct) {
+                Some((rch, key_acct, peer, is_group)) => {
+                    let send_acct = acct
+                        .map(|s| s.to_string())
+                        .or(key_acct)
+                        .or_else(|| default_account.clone());
+                    targets.push((rch, send_acct, peer, is_group));
+                }
+                None => {
+                    warn!(agent = %agent_id, binding = %entry, "cron: agent.channels — no recent conversation for binding, skipping")
+                }
+            }
+        }
+        // Explicit ids listed alongside the sentinel still go through.
+        if let Some(ch) = &delivery.channel {
+            for to in to_list.iter().filter(|s| *s != TO_AGENT_CHANNELS) {
+                targets.push((
+                    ch.clone(),
+                    default_account.clone(),
+                    to.clone(),
+                    target_is_group(to),
+                ));
+            }
+        }
+    } else if !to_list.is_empty() {
+        // Explicit recipient(s) on the configured channel + account.
+        let Some(ch) = delivery.channel.clone() else {
+            warn!(agent = %agent_id, "cron: delivery channel not specified");
+            return targets;
+        };
+        for to in to_list {
+            let is_group = target_is_group(&to);
+            targets.push((ch.clone(), default_account.clone(), to, is_group));
+        }
+    } else {
+        // No `to`: reply to the agent's most-recent conversation peer
+        // (including a2a-delegated conversations), via that session's account.
+        match resolve_recent_session_target(agent_id, None, None) {
+            Some((rch, key_acct, peer, is_group)) => {
+                let send_acct = key_acct.or_else(|| default_account.clone());
+                targets.push((rch, send_acct, peer, is_group));
+            }
+            None => {
+                info!(agent = %agent_id, "cron: no `to` set and no recent conversation found; discarding result")
+            }
+        }
+    }
+    targets
+}
+
 async fn send_delivery(
     channels: &ChannelManager,
+    agents: &AgentRegistry,
     job: &CronJob,
     default_delivery: &Option<CronDelivery>,
     output_text: &str,
 ) -> Result<()> {
-    let delivery = match &job.delivery {
-        Some(d) if d.channel.is_some() && d.to.is_some() => {
-            debug!(job_id = %job.id, "cron: using job-level delivery");
-            d
+    let delivery = match job.delivery.as_ref().or(default_delivery.as_ref()) {
+        Some(d) => d,
+        None => {
+            info!(job_id = %job.id, name = ?job.name, "cron: no delivery configured, result discarded. Set delivery on the job or configure default_delivery in cron config.");
+            return Ok(());
         }
-        Some(_) | None => match default_delivery {
-            Some(d) => {
-                debug!(job_id = %job.id, mode = ?d.mode, channel = ?d.channel, to = ?d.to, "cron: using default_delivery");
-                d
-            }
-            None => {
-                info!(job_id = %job.id, name = ?job.name, "cron: no delivery configured, result discarded. Set delivery on the job or configure default_delivery in cron config.");
-                return Ok(());
-            }
-        },
     };
 
     let mode = delivery.mode.as_deref().unwrap_or("none");
@@ -1478,75 +1651,76 @@ async fn send_delivery(
         return Ok(());
     }
 
-    let channel_name = match &delivery.channel {
-        Some(c) => c,
-        None => {
-            warn!(job_id = %job.id, "cron: delivery channel not specified");
-            return Ok(());
-        }
-    };
-
-    let to = match &delivery.to {
-        Some(t) => t,
-        None => {
-            warn!(job_id = %job.id, "cron: delivery target 'to' not specified");
-            return Ok(());
-        }
-    };
-
     let text = output_text.trim();
-    // Note: empty text is now handled by the caller which generates a summary
-    // We only skip if both text is empty AND this is the original behavior
-    // (no default_delivery configured)
     if text.is_empty() && default_delivery.is_none() && job.delivery.is_none() {
         debug!(job_id = %job.id, "cron: output text is empty and no delivery configured");
         return Ok(());
     }
 
-    // Back-compat: historical cron.json5 entries created from the WS chat
-    // transport carry channel="ws" (copied from ctx.channel). That is not a
-    // registered ChannelManager entry — the desktop broadcaster is registered
-    // under "desktop". Remap here so pre-existing jobs still deliver.
-    let resolved_channel: &str = if channel_name == "ws" {
-        "desktop"
-    } else {
-        channel_name.as_str()
-    };
-    let channel = match channels.get(resolved_channel) {
-        Some(ch) => ch,
-        None => {
-            warn!(job_id = %job.id, channel = %channel_name, resolved = %resolved_channel, "cron: channel not found in ChannelManager");
-            return Ok(());
-        }
-    };
+    let thread = delivery.thread_id.clone();
+    let best_effort = delivery.best_effort.unwrap_or(false);
 
-    info!(job_id = %job.id, channel = %channel_name, to = %to, text_len = text.len(), "cron: sending delivery");
+    // Resolve recipients (channel, account, target, is_group). Shared with the
+    // manual-trigger path so both honor `to` lists, the `agent.channels`
+    // sentinel, and the no-`to` "reply to recent conversation" fallback.
+    let targets = resolve_delivery_targets(agents, &job.agent_id, delivery);
+    if targets.is_empty() {
+        return Ok(());
+    }
 
-    let msg = OutboundMessage {
-        target_id: to.clone(),
-        is_group: false,
-        text: text.to_owned(),
-        reply_to: delivery.thread_id.clone(),
-        images: vec![],
-        files: vec![],
-        channel: Some(resolved_channel.to_owned()),
-        account: None,
-    };
+    info!(job_id = %job.id, recipients = targets.len(), text_len = text.len(), "cron: sending delivery");
 
-    match channel.send(msg).await {
-        Ok(()) => {
-            info!(job_id = %job.id, channel = %channel_name, to = %to, "cron delivery sent successfully");
-            Ok(())
-        }
-        Err(e) => {
-            if delivery.best_effort.unwrap_or(false) {
-                warn!(job_id = %job.id, error = %e, "cron delivery failed (best_effort)");
-                Ok(())
+    // Send in concurrent batches of DELIVERY_BATCH.
+    for chunk in targets.chunks(DELIVERY_BATCH) {
+        let futs = chunk.iter().map(|(channel_name, account, to, is_group)| {
+            // Back-compat: legacy jobs carry channel="ws"; the desktop
+            // broadcaster is registered under "desktop".
+            let resolved_channel = if channel_name == "ws" {
+                "desktop".to_string()
             } else {
-                Err(e)
+                channel_name.clone()
+            };
+            let ch = channels.get(&resolved_channel);
+            let msg = OutboundMessage {
+                target_id: to.clone(),
+                is_group: *is_group,
+                text: text.to_owned(),
+                reply_to: thread.clone(),
+                images: vec![],
+                files: vec![],
+                channel: Some(resolved_channel.clone()),
+                account: account.clone(),
+            };
+            let job_id = job.id.clone();
+            let to_log = to.clone();
+            async move {
+                match ch {
+                    Some(c) => match c.send(msg).await {
+                        Ok(()) => {
+                            info!(job_id = %job_id, channel = %resolved_channel, to = %to_log, "cron delivery sent successfully");
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    },
+                    None => {
+                        warn!(job_id = %job_id, channel = %resolved_channel, "cron: channel not found in ChannelManager");
+                        Ok(())
+                    }
+                }
+            }
+        });
+        let results = futures::future::join_all(futs).await;
+        for r in results {
+            if let Err(e) = r {
+                if best_effort {
+                    warn!(job_id = %job.id, error = %e, "cron delivery failed (best_effort)");
+                } else {
+                    return Err(e);
+                }
             }
         }
     }
+    Ok(())
 }
 
 /// Execute a command directly without agent, returning real output.

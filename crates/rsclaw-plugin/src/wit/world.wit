@@ -268,6 +268,14 @@ interface host-desktop {
     /// Screenshot a screen region. Returns data URI.
     desktop-screenshot-region: func(x: u32, y: u32, w: u32, h: u32) -> result<string, string>;
 
+    /// Scan an absolute screen region for pixels near a target RGB colour
+    /// (per-channel `tolerance`). Cross-platform pure-pixel test (no OCR/VLM),
+    /// used for red-badge *presence* detection (we can't read the digit, but we
+    /// can see the red cluster). Returns JSON
+    /// `{"hit":bool,"count":u32,"total":u32,"ratio":float}` where
+    /// `hit = count >= min-count`.
+    desktop-region-has-color: func(x: u32, y: u32, w: u32, h: u32, r: u32, g: u32, b: u32, tolerance: u32, min-count: u32) -> result<string, string>;
+
     /// OCR the app's main window (macOS Vision). Returns JSON
     /// `[{"text":"...","x":143,"y":699}, ...]` with 0-1000 relative centre
     /// coords -- precise enough to click a named row.
