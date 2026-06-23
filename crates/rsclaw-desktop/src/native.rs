@@ -108,8 +108,23 @@ fn capture_primary_monitor() -> Result<String, String> {
 /// transient child (e.g. WeChat's merged-record viewer).
 fn find_app_window(app_name: &str) -> Result<capture::WindowInfo, String> {
     let wins = capture::list_windows().map_err(|e| e.to_string())?;
+    // App identity differs by platform: macOS list reports the app's display name
+    // ("WeChat"/"Weixin"), Windows reports the process name ("Weixin"), and the
+    // caller may pass a macOS bundle id ("com.tencent.xinWeChat"). Match the exact
+    // name first, then known aliases (case-insensitive substring) so the same
+    // plugin works on both OSes — esp. WeChat 4.x renamed the process to "Weixin".
+    let target = app_name.to_lowercase();
+    let aliases: &[&str] = if target.contains("wechat") || target.contains("weixin") {
+        &["weixin", "wechat", "微信"]
+    } else {
+        &[]
+    };
+    let matches = |w: &capture::WindowInfo| {
+        let a = w.app.to_lowercase();
+        a == target || aliases.iter().any(|al| a.contains(al) || w.app.contains(al))
+    };
     wins.into_iter()
-        .find(|w| w.app == app_name && !w.minimized && w.w >= 200 && w.h >= 200)
+        .find(|w| matches(w) && !w.minimized && w.w >= 200 && w.h >= 200)
         .ok_or_else(|| format!("no on-screen window for app '{app_name}'"))
 }
 
@@ -131,10 +146,92 @@ fn capture_app_window(app_name: &str) -> Result<String, String> {
 /// recognition, and returns a JSON array of recognised lines with 0-1000
 /// relative centre coords: `[{"text":"东升","x":143,"y":699}, ...]`.
 /// Far more precise than VLM grounding for clicking a named row.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn ocr_window(_app_name: &str) -> Result<String, String> {
-    Err("ocr_window only implemented on macOS".to_string())
+    Err("ocr_window only implemented on macOS and Windows".to_string())
 }
+
+/// Windows on-device OCR via Windows.Media.Ocr (WinRT) through PowerShell,
+/// mirroring the macOS Vision shell-out. Captures the app window by id (occlusion
+/// -proof PrintWindow), runs the built-in zh-Hans OCR engine, and prints the same
+/// JSON shape as macOS: `[{"text","conf","x","y","sx","sy"}]` with x/y 0-1000
+/// window-relative and sx/sy screen-absolute click points.
+#[cfg(target_os = "windows")]
+fn ocr_window(app_name: &str) -> Result<String, String> {
+    let win = find_app_window(app_name)?;
+    let (wx, wy, ww, wh) = (win.x, win.y, win.w, win.h);
+    let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
+    let tmp = std::env::temp_dir().join(format!(
+        "rsclaw_ocr_{}_{}.png",
+        std::process::id(),
+        win.id
+    ));
+    std::fs::write(&tmp, &png).map_err(|e| format!("write OCR temp PNG: {e}"))?;
+    // Write the OCR script to a temp .ps1 (avoids -Command quoting hell) and run
+    // it STA (WinRT requires it). Args: <png> <wx> <wy> <ww> <wh>.
+    let ps = std::env::temp_dir().join("rsclaw_ocr_win.ps1");
+    let _ = std::fs::write(&ps, OCR_WIN_PS1);
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-STA",
+            "-File",
+        ])
+        .arg(&ps)
+        .arg(&tmp)
+        .arg(wx.to_string())
+        .arg(wy.to_string())
+        .arg(ww.to_string())
+        .arg(wh.to_string())
+        .output()
+        .map_err(|e| format!("powershell OCR spawn failed: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        return Err(format!(
+            "Windows OCR failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Windows.Media.Ocr driver (PowerShell, STA). argv: png, wx, wy, ww, wh (window
+/// screen bounds in logical px). Emits `[{"text","conf","x","y","sx","sy"}]`:
+/// x/y are 0-1000 window-relative line centres; sx/sy are screen-absolute click
+/// points (window origin + relative * window size). conf is 100 (Windows OCR has
+/// no per-line confidence). The captured PNG IS the window, so we normalise by
+/// the image's own pixel size.
+#[cfg(target_os = "windows")]
+const OCR_WIN_PS1: &str = r#"param([string]$img,[int]$wx,[int]$wy,[int]$ww,[int]$wh)
+$ErrorActionPreference='Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+[void][Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime]
+[void][Windows.Media.Ocr.OcrEngine,Windows.Foundation,ContentType=WindowsRuntime]
+[void][Windows.Graphics.Imaging.BitmapDecoder,Windows.Foundation,ContentType=WindowsRuntime]
+$asTask=([System.WindowsRuntimeSystemExtensions].GetMethods()|?{$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'})[0]
+function Await($op,$t){ $m=$asTask.MakeGenericMethod($t); $tk=$m.Invoke($null,@($op)); $tk.Wait(); $tk.Result }
+$file=Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($img)) ([Windows.Storage.StorageFile])
+$stream=Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$dec=Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$sb=Await ($dec.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+$iw=[double]$dec.PixelWidth; $ih=[double]$dec.PixelHeight
+$eng=[Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+if(-not $eng){ $eng=[Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage(([Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages)[0]) }
+$res=Await ($eng.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult])
+$out=@()
+foreach($l in $res.Lines){
+  $minx=1e9;$miny=1e9;$maxx=0;$maxy=0
+  foreach($w in $l.Words){ $r=$w.BoundingRect; if($r.X -lt $minx){$minx=$r.X}; if($r.Y -lt $miny){$miny=$r.Y}; if(($r.X+$r.Width) -gt $maxx){$maxx=$r.X+$r.Width}; if(($r.Y+$r.Height) -gt $maxy){$maxy=$r.Y+$r.Height} }
+  if($maxx -le 0){continue}
+  $cx=($minx+$maxx)/2.0; $cy=($miny+$maxy)/2.0
+  $rx=[int][math]::Round($cx/$iw*1000.0); $ry=[int][math]::Round($cy/$ih*1000.0)
+  $sx=[int]($wx + $cx/$iw*$ww); $sy=[int]($wy + $cy/$ih*$wh)
+  $out += [pscustomobject]@{ text=$l.Text; conf=100; x=$rx; y=$ry; sx=$sx; sy=$sy }
+}
+$out | ConvertTo-Json -Compress -Depth 3
+"#;
 
 #[cfg(target_os = "macos")]
 fn ocr_window(app_name: &str) -> Result<String, String> {
