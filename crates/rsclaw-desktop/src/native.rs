@@ -123,9 +123,24 @@ fn find_app_window(app_name: &str) -> Result<capture::WindowInfo, String> {
         let a = w.app.to_lowercase();
         a == target || aliases.iter().any(|al| a.contains(al) || w.app.contains(al))
     };
-    wins.into_iter()
-        .find(|w| matches(w) && !w.minimized && w.w >= 200 && w.h >= 200)
-        .ok_or_else(|| format!("no on-screen window for app '{app_name}'"))
+    let qualifies = |w: &capture::WindowInfo| matches(w) && !w.minimized && w.w >= 200 && w.h >= 200;
+    if let Some(w) = wins.iter().find(|w| qualifies(w)).cloned() {
+        return Ok(w);
+    }
+    // Nothing on-screen: the app may have closed to the tray (WeChat 4.x destroys
+    // its top-level window on close). Try to restore the hidden main window, then
+    // re-enumerate once before giving up — keeps the monitor loop self-healing.
+    if capture::restore_app_window(app_name).unwrap_or(false) {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        if let Some(w) = capture::list_windows()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|w| qualifies(w))
+        {
+            return Ok(w);
+        }
+    }
+    Err(format!("no on-screen window for app '{app_name}'"))
 }
 
 fn capture_app_window(app_name: &str) -> Result<String, String> {
@@ -171,7 +186,8 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
     // it STA (WinRT requires it). Args: <png> <wx> <wy> <ww> <wh>.
     let ps = std::env::temp_dir().join("rsclaw_ocr_win.ps1");
     let _ = std::fs::write(&ps, OCR_WIN_PS1);
-    let out = Command::new("powershell")
+    let mut ocr_cmd = Command::new("powershell");
+    ocr_cmd
         .args([
             "-NoProfile",
             "-ExecutionPolicy",
@@ -184,7 +200,14 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
         .arg(wx.to_string())
         .arg(wy.to_string())
         .arg(ww.to_string())
-        .arg(wh.to_string())
+        .arg(wh.to_string());
+    {
+        // CREATE_NO_WINDOW: don't allocate a console window (no screen flash on
+        // every monitor_tick).
+        use std::os::windows::process::CommandExt;
+        ocr_cmd.creation_flags(0x08000000);
+    }
+    let out = ocr_cmd
         .output()
         .map_err(|e| format!("powershell OCR spawn failed: {e}"))?;
     let _ = std::fs::remove_file(&tmp);
