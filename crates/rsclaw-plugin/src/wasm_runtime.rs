@@ -2567,6 +2567,25 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         Ok(self.desktop.screenshot_region(x, y, w, h).await)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn desktop_region_has_color(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        r: u32,
+        g: u32,
+        b: u32,
+        tolerance: u32,
+        min_count: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self
+            .desktop
+            .region_has_color(x, y, w, h, r, g, b, tolerance, min_count)
+            .await)
+    }
+
     async fn desktop_mouse_move(
         &mut self,
         x: u32,

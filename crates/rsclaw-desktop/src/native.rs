@@ -1,4 +1,5 @@
-//! Native desktop session backed by `enigo` + `xcap`.
+//! Native desktop session backed by `enigo` (input) + `rsclaw-platform::capture`
+//! (script-based screen capture + window enumeration; replaces xcap).
 //!
 //! Input synthesis runs inside `tokio::task::spawn_blocking` with a fresh
 //! `Enigo` per call because `Enigo` is not `Send` on Windows. Screenshots
@@ -12,13 +13,8 @@ use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Mouse, Settings,
 };
-use image::{ImageFormat, RgbaImage};
+use rsclaw_platform::capture;
 use tracing::warn;
-// xcap is gated to non-Linux at the dep level (Cargo.toml) — see the
-// long comment on the `xcap` line for the pipewire/libspa rationale.
-// Functions below fall back to a stub-error on Linux.
-#[cfg(not(target_os = "linux"))]
-use xcap::{Monitor, Window};
 
 use super::DesktopSession;
 
@@ -50,79 +46,48 @@ fn scale_for_input(x: u32, y: u32) -> (i32, i32) {
     (x as i32, y as i32)
 }
 
-/// Capture a region of the primary monitor.
-#[cfg(target_os = "linux")]
-fn capture_region(_x: u32, _y: u32, _w: u32, _h: u32) -> Result<String, String> {
-    Err(
-        "screen capture not supported on Linux (xcap disabled — pipewire/libspa build chain). \
-         Use an alternative capture path or run on macOS/Windows."
-            .to_string(),
-    )
+/// Capture a region of the screen (logical points). Script-based capture grabs
+/// exactly the requested rect, so no monitor enumeration / scale-crop needed.
+fn capture_region(x: u32, y: u32, w: u32, h: u32) -> Result<String, String> {
+    let png = capture::capture_region_png(x as i32, y as i32, w, h).map_err(|e| e.to_string())?;
+    Ok(capture::png_to_data_uri(&png))
 }
 
-#[cfg(not(target_os = "linux"))]
-fn capture_region(x: u32, y: u32, w: u32, h: u32) -> Result<String, String> {
-    let monitors = Monitor::all().map_err(|e| format!("xcap Monitor::all failed: {e}"))?;
-    if monitors.is_empty() {
-        return Err("no monitors detected".to_string());
+/// Count pixels in a screen region whose RGB is within `tol` (per channel) of
+/// the target colour. Returns `(matching, total)`. The script capture returns
+/// exactly the requested region (at native resolution), so we scan every pixel.
+#[allow(clippy::too_many_arguments)]
+fn region_color_count(
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    r: u32,
+    g: u32,
+    b: u32,
+    tol: u32,
+) -> Result<(u32, u32), String> {
+    let img = capture::capture_region_rgba(x as i32, y as i32, w, h).map_err(|e| e.to_string())?;
+    let (tr, tg, tb, tol) = (r as i32, g as i32, b as i32, tol as i32);
+    let mut count: u32 = 0;
+    let mut total: u32 = 0;
+    for px in img.pixels() {
+        let [pr, pg, pb, _pa] = px.0;
+        total += 1;
+        if (pr as i32 - tr).abs() <= tol
+            && (pg as i32 - tg).abs() <= tol
+            && (pb as i32 - tb).abs() <= tol
+        {
+            count += 1;
+        }
     }
-    let monitor = monitors
-        .iter()
-        .find(|m| m.is_primary().unwrap_or(false))
-        .unwrap_or(&monitors[0])
-        .clone();
-
-    let img: RgbaImage = monitor
-        .capture_image()
-        .map_err(|e| format!("xcap capture_image failed: {e}"))?;
-
-    let x = x.min(img.width());
-    let y = y.min(img.height());
-    let w = w.min(img.width() - x);
-    let h = h.min(img.height() - y);
-
-    let cropped = image::imageops::crop_imm(&img, x, y, w, h).to_image();
-    let mut png_bytes = Vec::new();
-    {
-        let mut cursor = std::io::Cursor::new(&mut png_bytes);
-        cropped
-            .write_to(&mut cursor, ImageFormat::Png)
-            .map_err(|e| format!("PNG encode failed: {e}"))?;
-    }
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-    Ok(format!("data:image/png;base64,{b64}"))
+    Ok((count, total))
 }
 
 /// Capture the full primary monitor (fallback when window bounds unavailable).
-#[cfg(target_os = "linux")]
 fn capture_primary_monitor() -> Result<String, String> {
-    Err("screen capture not supported on Linux (xcap disabled)".to_string())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn capture_primary_monitor() -> Result<String, String> {
-    let monitors = Monitor::all().map_err(|e| format!("xcap Monitor::all failed: {e}"))?;
-    if monitors.is_empty() {
-        return Err("no monitors detected".to_string());
-    }
-    let monitor = monitors
-        .iter()
-        .find(|m| m.is_primary().unwrap_or(false))
-        .unwrap_or(&monitors[0])
-        .clone();
-
-    let img: RgbaImage = monitor
-        .capture_image()
-        .map_err(|e| format!("xcap capture_image failed: {e}"))?;
-
-    let mut png_bytes = Vec::new();
-    {
-        let mut cursor = std::io::Cursor::new(&mut png_bytes);
-        img.write_to(&mut cursor, ImageFormat::Png)
-            .map_err(|e| format!("PNG encode failed: {e}"))?;
-    }
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-    Ok(format!("data:image/png;base64,{b64}"))
+    let png = capture::capture_full_png().map_err(|e| e.to_string())?;
+    Ok(capture::png_to_data_uri(&png))
 }
 
 /// Capture an app window's content directly by window backing store
@@ -137,87 +102,27 @@ fn capture_primary_monitor() -> Result<String, String> {
 /// viewer): when the child is open it is frontmost and gets captured;
 /// otherwise the main window does. A 200x200 minimum filters out tooltips and
 /// other tiny helper windows. Returns a PNG data URI.
-#[cfg(target_os = "linux")]
-fn capture_app_window(_app_name: &str) -> Result<String, String> {
-    Err("window capture not supported on Linux (xcap disabled)".to_string())
+/// Find the frontmost on-screen window of an app (≥200×200) via the script-based
+/// window list. The list is front-to-back where the OS provides ordering, so the
+/// first match is frontmost — letting one call serve both the main window and a
+/// transient child (e.g. WeChat's merged-record viewer).
+fn find_app_window(app_name: &str) -> Result<capture::WindowInfo, String> {
+    let wins = capture::list_windows().map_err(|e| e.to_string())?;
+    wins.into_iter()
+        .find(|w| w.app == app_name && !w.minimized && w.w >= 200 && w.h >= 200)
+        .ok_or_else(|| format!("no on-screen window for app '{app_name}'"))
 }
 
-#[cfg(not(target_os = "linux"))]
 fn capture_app_window(app_name: &str) -> Result<String, String> {
-    let windows = Window::all().map_err(|e| format!("xcap Window::all failed: {e}"))?;
-    let win = windows
-        .iter()
-        .find(|w| {
-            w.app_name().map(|n| n == app_name).unwrap_or(false)
-                && !w.is_minimized().unwrap_or(true)
-                && w.width().unwrap_or(0) >= 200
-                && w.height().unwrap_or(0) >= 200
-        })
-        .ok_or_else(|| format!("no on-screen window for app '{app_name}'"))?;
-    // macOS: prefer Apple's `screencapture -l<windowID>` for the pixel grab.
-    // xcap's in-process window capture (deprecated CGWindowListCreateImage /
-    // SCScreenshotManager) hangs ~30s then fails with "Failed to copy data" on
-    // hardware-accelerated / opaque windows — notably WeChat 4.x — silently
-    // degrading callers to a wrong-region fallback. screencapture uses Apple's
-    // current path, is occlusion-proof, and captures those windows correctly
-    // (verified on WeChat). xcap stays as the fallback for the rare case
-    // screencapture is unavailable / fails.
-    #[cfg(target_os = "macos")]
-    if let Ok(window_id) = win.id() {
-        match screencapture_window_by_id(window_id) {
-            Ok(uri) => return Ok(uri),
-            Err(se) => warn!(
-                "screencapture -l{window_id} failed ({se}); falling back to xcap capture_image"
-            ),
-        }
+    let win = find_app_window(app_name)?;
+    // Capture the exact window by id — occlusion-proof (Apple `screencapture -l`
+    // on macOS), handles hardware-accelerated / opaque windows like WeChat 4.x
+    // that the old in-process xcap path hung on.
+    let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
+    if png.is_empty() {
+        return Err("window capture produced an empty image (window off-screen?)".to_string());
     }
-
-    let img: RgbaImage = win
-        .capture_image()
-        .map_err(|e| format!("xcap window capture_image failed: {e}"))?;
-    let mut png_bytes = Vec::new();
-    {
-        let mut cursor = std::io::Cursor::new(&mut png_bytes);
-        img.write_to(&mut cursor, ImageFormat::Png)
-            .map_err(|e| format!("PNG encode failed: {e}"))?;
-    }
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-    Ok(format!("data:image/png;base64,{b64}"))
-}
-
-/// Capture a single window by its CGWindowID via Apple's `screencapture -l`
-/// CLI. Occlusion-proof and handles hardware-accelerated / opaque windows
-/// (e.g. WeChat 4.x) that xcap's in-process capture cannot. Returns a PNG
-/// data URI. The temp file is keyed by pid+window-id so concurrent captures
-/// of different windows don't collide.
-#[cfg(target_os = "macos")]
-fn screencapture_window_by_id(window_id: u32) -> Result<String, String> {
-    let tmp = std::env::temp_dir().join(format!(
-        "rsclaw_wincap_{}_{window_id}.png",
-        std::process::id()
-    ));
-    let out = Command::new("/usr/sbin/screencapture")
-        .arg("-x") // silent — no shutter sound
-        .arg("-o") // omit the window's drop shadow
-        .arg(format!("-l{window_id}")) // capture the window with this id
-        .arg(&tmp)
-        .output()
-        .map_err(|e| format!("screencapture spawn failed: {e}"))?;
-    if !out.status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "screencapture exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let bytes = std::fs::read(&tmp).map_err(|e| format!("read screencapture output: {e}"))?;
-    let _ = std::fs::remove_file(&tmp);
-    if bytes.is_empty() {
-        return Err("screencapture produced an empty file (window off-screen?)".to_string());
-    }
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:image/png;base64,{b64}"))
+    Ok(capture::png_to_data_uri(&png))
 }
 
 /// On-device OCR of an app window via macOS Vision (through `python3` +
@@ -233,45 +138,20 @@ fn ocr_window(_app_name: &str) -> Result<String, String> {
 
 #[cfg(target_os = "macos")]
 fn ocr_window(app_name: &str) -> Result<String, String> {
-    let windows = Window::all().map_err(|e| format!("xcap Window::all failed: {e}"))?;
-    let win = windows
-        .iter()
-        .find(|w| {
-            w.app_name().map(|n| n == app_name).unwrap_or(false)
-                && !w.is_minimized().unwrap_or(true)
-                && w.width().unwrap_or(0) >= 200
-                && w.height().unwrap_or(0) >= 200
-        })
-        .ok_or_else(|| format!("no on-screen window for app '{app_name}'"))?;
-    let window_id = win.id().map_err(|e| format!("xcap window id: {e}"))?;
+    let win = find_app_window(app_name)?;
     // Bounds of the EXACT window we OCR (frontmost match — may be a CEF popover
     // that AppleScript/get_main_window can't see). Passing them to the OCR driver
     // lets it emit screen-absolute click points, so callers never have to re-resolve
     // the window (and never mis-scale a popover's coords by the main window).
-    let (wx, wy, ww, wh) = (
-        win.x().unwrap_or(0),
-        win.y().unwrap_or(0),
-        win.width().unwrap_or(0),
-        win.height().unwrap_or(0),
-    );
+    let (wx, wy, ww, wh) = (win.x, win.y, win.w, win.h);
+    // Capture the exact window by id (occlusion-proof) to a temp PNG for python.
+    let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
     let tmp = std::env::temp_dir().join(format!(
-        "rsclaw_ocr_{}_{window_id}.png",
-        std::process::id()
+        "rsclaw_ocr_{}_{}.png",
+        std::process::id(),
+        win.id
     ));
-    let cap = Command::new("/usr/sbin/screencapture")
-        .arg("-x")
-        .arg("-o")
-        .arg(format!("-l{window_id}"))
-        .arg(&tmp)
-        .output()
-        .map_err(|e| format!("screencapture spawn failed: {e}"))?;
-    if !cap.status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "screencapture -l{window_id} exited {}",
-            cap.status
-        ));
-    }
+    std::fs::write(&tmp, &png).map_err(|e| format!("write OCR temp PNG: {e}"))?;
     let out = Command::new("python3")
         .arg("-c")
         .arg(OCR_VISION_PY)
@@ -547,15 +427,37 @@ impl DesktopSession for NativeDesktopSession {
         let bundle_id = bundle_id.to_owned();
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
+                // Frontmost check (System Events) — used both as a fast-path
+                // (skip the whole activation dance when already frontmost, the
+                // common case in a monitor loop) and as the verify poll.
+                let check_script = format!(
+                    r#"tell application "System Events"
+    return frontmost of (first process whose bundle identifier is "{}")
+end tell"#,
+                    bundle_id.replace('"', r#"\""#)
+                );
+                let is_frontmost = || {
+                    matches!(
+                        Command::new("osascript").args(["-e", &check_script]).output(),
+                        Ok(out) if out.status.success()
+                            && String::from_utf8_lossy(&out.stdout).trim().eq_ignore_ascii_case("true")
+                    )
+                };
+
+                // FAST PATH: already frontmost → return immediately (~30ms).
+                // Previously every call paid 500ms + 300ms + up to 5×300ms of
+                // fixed sleeps (~2-5s) even when the app was already active —
+                // the dominant cost in the monitor loop.
+                if is_frontmost() {
+                    return Ok("ok".to_string());
+                }
+
                 // Three-layer fallback (matches wechat_agent.py):
                 // 1. open -b (system-level launchctl, most reliable)
                 // 2. activate via AppleScript
                 // 3. set frontmost via System Events
-                // 4. Poll frontmost up to 5 times
-                let _ = Command::new("open")
-                    .args(["-b", &bundle_id])
-                    .output();
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = Command::new("open").args(["-b", &bundle_id]).output();
+                std::thread::sleep(std::time::Duration::from_millis(250));
 
                 let script_activate = format!(
                     r#"tell application id "{}" to activate"#,
@@ -564,7 +466,6 @@ impl DesktopSession for NativeDesktopSession {
                 let _ = Command::new("osascript")
                     .args(["-e", &script_activate])
                     .output();
-                std::thread::sleep(std::time::Duration::from_millis(300));
 
                 let script_frontmost = format!(
                     r#"tell application "System Events"
@@ -576,27 +477,14 @@ end tell"#,
                     .args(["-e", &script_frontmost])
                     .output();
 
-                // Verify frontmost up to 5 times
-                for _ in 0..5 {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    let check = format!(
-                        r#"tell application "System Events"
-    return frontmost of (first process whose bundle identifier is "{}")
-end tell"#,
-                        bundle_id.replace('"', r#"\""#)
-                    );
-                    match Command::new("osascript").args(["-e", &check]).output() {
-                        Ok(out) if out.status.success() => {
-                            let result = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
-                            if result == "true" {
-                                return Ok("ok".to_string());
-                            }
-                        }
-                        _ => {}
+                // Verify frontmost up to 4 times (100ms apart), exit as soon as
+                // confirmed.
+                for _ in 0..4 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if is_frontmost() {
+                        return Ok("ok".to_string());
                     }
-                    let _ = Command::new("open")
-                        .args(["-b", &bundle_id])
-                        .output();
+                    let _ = Command::new("open").args(["-b", &bundle_id]).output();
                 }
                 Ok("ok".to_string()) // Return ok even if frontmost check fails
             } else if cfg!(target_os = "windows") {
@@ -787,6 +675,33 @@ end tell"#,
         tokio::task::spawn_blocking(move || capture_region(x, y, w, h))
             .await
             .map_err(|e| format!("screenshot_region join failed: {e}"))?
+    }
+
+    async fn region_has_color(
+        &self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        r: u32,
+        g: u32,
+        b: u32,
+        tolerance: u32,
+        min_count: u32,
+    ) -> Result<String, String> {
+        let (count, total) =
+            tokio::task::spawn_blocking(move || region_color_count(x, y, w, h, r, g, b, tolerance))
+                .await
+                .map_err(|e| format!("region_has_color join failed: {e}"))??;
+        let ratio = if total > 0 {
+            count as f64 / total as f64
+        } else {
+            0.0
+        };
+        let hit = count >= min_count;
+        Ok(format!(
+            "{{\"hit\":{hit},\"count\":{count},\"total\":{total},\"ratio\":{ratio:.4}}}"
+        ))
     }
 
     async fn ocr_window(&self, bundle_id: &str) -> Result<String, String> {

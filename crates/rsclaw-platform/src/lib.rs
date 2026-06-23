@@ -301,4 +301,5 @@ pub fn detect_ffmpeg() -> Option<String> {
     }
     None
 }
+pub mod capture;
 pub mod install_hints;

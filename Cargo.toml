@@ -265,14 +265,9 @@ tempfile   = "3"
 wiremock = "0.6"
 ctor = "0.4"
 
-# xcap pulled in pipewire → libspa → GLIBC 2.38 symbol chain on Linux,
-# which broke every release attempt this round. Linux server / headless
-# rsclaw doesn't need screen capture; the iphone-mirror path is already
-# macOS-only; native.rs falls back to a stub-error on Linux. Re-enable
-# once xcap drops pipewire or libspa bindings stabilise against older
-# spa headers.
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-xcap = "0.9"
+# Screen capture is now in-tree (rsclaw-platform::capture, script-based) —
+# xcap removed entirely (it pulled pipewire → libspa → GLIBC 2.38 on Linux and
+# was slow on macOS via ScreenCaptureKit cold-start).
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }

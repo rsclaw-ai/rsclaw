@@ -34,6 +34,24 @@ pub trait DesktopSession: Send + Sync {
     /// Screenshot a screen region. Returns data URI.
     async fn screenshot_region(&self, x: u32, y: u32, w: u32, h: u32) -> Result<String, String>;
 
+    /// Scan an absolute screen region for pixels near a target RGB colour
+    /// (per-channel `tolerance`). Cross-platform (xcap capture + pure pixel
+    /// math, no OCR/VLM) — used for red-badge presence detection. Returns JSON
+    /// `{"hit":bool,"count":N,"total":T,"ratio":f}`, `hit = count >= min_count`.
+    #[allow(clippy::too_many_arguments)]
+    async fn region_has_color(
+        &self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        r: u32,
+        g: u32,
+        b: u32,
+        tolerance: u32,
+        min_count: u32,
+    ) -> Result<String, String>;
+
     /// OCR the app's main window with on-device text recognition (macOS
     /// Vision). Returns a JSON array of recognised lines with 0-1000
     /// relative centre coordinates: `[{"text":"...","x":143,"y":699}, ...]`.
