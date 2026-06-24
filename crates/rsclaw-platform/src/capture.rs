@@ -211,8 +211,15 @@ mod imp {
     pub fn capture_full_png() -> Result<Vec<u8>> {
         let out = tmp_png("full");
         let p = out.display();
+        // SetProcessDPIAware FIRST so on a scaled display (e.g. 2560x1440 @150%)
+        // we capture PHYSICAL pixels (2560x1440), matching the coordinate space that
+        // enigo SendInput uses for clicks. Without it CopyFromScreen captures the
+        // logical 1707x960 surface and every OCR→click mapping is off by the DPI
+        // scale (clicks land at ~1/1.5 of the intended position).
         let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; \
+            "Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();' -Name DpiA -Namespace Win32 -ErrorAction SilentlyContinue; \
+             try {{ [Win32.DpiA]::SetProcessDPIAware() | Out-Null }} catch {{}}; \
+             Add-Type -AssemblyName System.Windows.Forms; \
              Add-Type -AssemblyName System.Drawing; \
              $b = [System.Windows.Forms.SystemInformation]::VirtualScreen; \
              $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); \
