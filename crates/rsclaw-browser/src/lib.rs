@@ -1889,7 +1889,15 @@ impl BrowserSession {
     }
 
     async fn cmd_fill(&self, args: &Value) -> Result<Value> {
-        let eref = args.get("ref").and_then(|v| v.as_str());
+        // An empty ref means "type into the currently-focused element" via real
+        // CDP keystrokes (the no-ref path below). This is the reliable way to
+        // enter text into React-controlled contenteditable editors (e.g. Douyin
+        // comment reply boxes), where setting .value / execCommand does not
+        // update the framework state and leaves the submit button disabled.
+        let eref = args
+            .get("ref")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         let text = args
             .get("text")
             .and_then(|v| v.as_str())

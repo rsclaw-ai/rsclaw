@@ -184,6 +184,9 @@ struct HostState {
     /// <serial>` to every adb invocation; `None` uses the single attached
     /// device (adb default).
     android_serial: Option<String>,
+    /// WDA session URL (`RSCLAW_IOS_WDA_URL` env var, default
+    /// `http://localhost:8100`). Set when `ios-connect` succeeds.
+    wda_url: Option<String>,
 }
 
 fn new_host_state(
@@ -210,6 +213,7 @@ fn new_host_state(
         providers,
         vision_model,
         android_serial: std::env::var("RSCLAW_ANDROID_SERIAL").ok(),
+        wda_url: None,
     }
 }
 
@@ -3328,6 +3332,423 @@ impl rsclaw::plugin::host_android::Host for HostState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// host-ios trait implementation (WebDriverAgent)
+// ---------------------------------------------------------------------------
+
+impl rsclaw::plugin::host_ios::Host for HostState {
+    async fn ios_connect(
+        &mut self,
+        bundle_id: Option<String>,
+    ) -> HostTrapResult<Result<String, String>> {
+        let base = std::env::var("RSCLAW_IOS_WDA_URL")
+            .unwrap_or_else(|_| "http://localhost:8100".to_string());
+        
+        // Reuse existing session if available
+        if let Some(ref existing_url) = self.wda_url {
+            if existing_url.starts_with(&base) {
+                return Ok(Ok(base));
+            }
+        }
+        
+        let cli = match host_http_client() {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(e)),
+        };
+        let resp = match cli.get(format!("{base}/status")).send().await {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA status: {e}"))),
+        };
+        if !resp.status().is_success() {
+            return Ok(Err(format!("WDA status returned {}", resp.status())));
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("WDA status decode: {e}"))),
+        };
+        let session_id = body
+            .pointer("/value/currentSession")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !session_id.is_empty() {
+            self.wda_url = Some(format!("{base}/session/{session_id}"));
+        } else {
+            // Create a new session (W3C WebDriver format)
+            let payload = serde_json::json!({
+                "capabilities": {
+                    "alwaysMatch": {
+                        "bundleId": bundle_id.as_deref().unwrap_or("com.apple.springboard"),
+                    }
+                }
+            });
+            let r = match cli
+                .post(format!("{base}/session"))
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return Ok(Err(format!("WDA create session: {e}"))),
+            };
+            if !r.status().is_success() {
+                let text = r.text().await.unwrap_or_else(|_| "unknown".to_string());
+                return Ok(Err(format!("WDA create session {text}")));
+            }
+            let session_body: serde_json::Value = match r.json().await {
+                Ok(v) => v,
+                Err(e) => return Ok(Err(format!("WDA session decode: {e}"))),
+            };
+            let sid = session_body
+                .pointer("/value/sessionId")
+                .or_else(|| session_body.pointer("/sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if sid.is_empty() {
+                return Ok(Err(
+                    "WDA create session: no sessionId in response".to_string()
+                ));
+            }
+            self.wda_url = Some(format!("{base}/session/{sid}"));
+        }
+        Ok(Ok(base))
+    }
+
+    async fn ios_find_elements(
+        &mut self,
+        selector_type: String,
+        selector_value: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let payload = serde_json::json!({"using": selector_type, "value": selector_value});
+        let resp = match cli
+            .post(format!("{base}/element"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA find: {e}"))),
+        };
+        if !resp.status().is_success() {
+            return Ok(Err(format!("WDA find returned {}", resp.status())));
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("WDA find decode: {e}"))),
+        };
+        let elements = body.pointer("/value").cloned().unwrap_or(body);
+        Ok(Ok(elements.to_string()))
+    }
+
+    async fn ios_tap_element(
+        &mut self,
+        selector_type: String,
+        selector_value: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        // 1. Find the element
+        let payload = serde_json::json!({"using": selector_type, "value": selector_value});
+        let resp = match cli
+            .post(format!("{base}/element"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA find element: {e}"))),
+        };
+        if !resp.status().is_success() {
+            return Ok(Err(format!("WDA find returned {}", resp.status())));
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("WDA find decode: {e}"))),
+        };
+        let elem_id = match body.pointer("/value/ELEMENT").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return Ok(Err("element not found".to_string())),
+        };
+        // 2. Get element rect (this WDA version does not support /element/{id}/click)
+        let rect_resp = match cli
+            .get(format!("{base}/element/{elem_id}/rect"))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA rect: {e}"))),
+        };
+        if !rect_resp.status().is_success() {
+            return Ok(Err(format!("WDA rect returned {}", rect_resp.status())));
+        }
+        let rect_body: serde_json::Value = match rect_resp.json().await {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("WDA rect decode: {e}"))),
+        };
+        let x = rect_body["value"]["x"].as_f64().unwrap_or(0.0);
+        let y = rect_body["value"]["y"].as_f64().unwrap_or(0.0);
+        let w = rect_body["value"]["width"].as_f64().unwrap_or(0.0);
+        let h = rect_body["value"]["height"].as_f64().unwrap_or(0.0);
+        let cx = x + w / 2.0;
+        let cy = y + h / 2.0;
+        // 3. Tap via coordinate-based wda/tap (works on this WDA version)
+        let tap_resp = match cli
+            .post(format!("{base}/wda/tap"))
+            .json(&serde_json::json!({"x": cx, "y": cy}))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA tap: {e}"))),
+        };
+        if tap_resp.status().is_success() {
+            Ok(Ok("tapped".to_string()))
+        } else {
+            Ok(Err(format!("WDA tap returned {}", tap_resp.status())))
+        }
+    }
+
+    async fn ios_tap(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let payload = serde_json::json!({"x": x, "y": y});
+        let resp = match cli
+            .post(format!("{base}/wda/tap/{x}/{y}"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA tap: {e}"))),
+        };
+        if resp.status().is_success() {
+            Ok(Ok("tapped".to_string()))
+        } else {
+            Ok(Err(format!("WDA tap returned {}", resp.status())))
+        }
+    }
+
+    async fn ios_type(
+        &mut self,
+        text: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let payload = serde_json::json!({"value": [text]});
+        let resp = match cli
+            .post(format!("{base}/wda/keys"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA type: {e}"))),
+        };
+        if resp.status().is_success() {
+            Ok(Ok("typed".to_string()))
+        } else {
+            Ok(Err(format!("WDA type returned {}", resp.status())))
+        }
+    }
+
+    async fn ios_swipe(
+        &mut self,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        duration_ms: u32,
+    ) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let payload = serde_json::json!({
+            "fromX": x1, "fromY": y1,
+            "toX": x2, "toY": y2,
+            "duration": duration_ms as f64 / 1000.0,
+        });
+        let resp = match cli
+            .post(format!("{base}/wda/dragfromtoforduration"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA drag: {e}"))),
+        };
+        if resp.status().is_success() {
+            Ok(Ok("swiped".to_string()))
+        } else {
+            Ok(Err(format!("WDA drag returned {}", resp.status())))
+        }
+    }
+
+    async fn ios_get_labels(&mut self) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let resp = match cli
+            .get(format!("{base}/source"))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA source: {e}"))),
+        };
+        if !resp.status().is_success() {
+            return Ok(Err(format!("WDA source returned {}", resp.status())));
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("WDA source decode: {e}"))),
+        };
+        let xml = body
+            .pointer("/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        Ok(Ok(xml.to_string()))
+    }
+
+    async fn ios_screenshot(&mut self) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let resp = match cli.get(format!("{base}/screenshot")).send().await {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA screenshot: {e}"))),
+        };
+        if !resp.status().is_success() {
+            return Ok(Err(format!("WDA screenshot returned {}", resp.status())));
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("WDA screenshot decode: {e}"))),
+        };
+        let png_b64 = body
+            .pointer("/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        Ok(Ok(format!("data:image/png;base64,{png_b64}")))
+    }
+
+    async fn ios_screen_size(&mut self) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let resp = match cli.get(format!("{base}/window/size")).send().await {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA window size: {e}"))),
+        };
+        if !resp.status().is_success() {
+            return Ok(Err(format!("WDA window size returned {}", resp.status())));
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("WDA size decode: {e}"))),
+        };
+        Ok(Ok(body.pointer("/value").cloned().unwrap_or(body).to_string()))
+    }
+
+    async fn ios_press_button(
+        &mut self,
+        name: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let payload = serde_json::json!({"name": name});
+        let resp = match cli
+            .post(format!("{base}/wda/pressButton"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA pressButton: {e}"))),
+        };
+        if resp.status().is_success() {
+            Ok(Ok("pressed".to_string()))
+        } else {
+            Ok(Err(format!("WDA pressButton returned {}", resp.status())))
+        }
+    }
+
+    async fn ios_current_app(&mut self) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let resp = match cli
+            .get(format!("{base}/wda/activeAppInfo"))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA activeApp: {e}"))),
+        };
+        if !resp.status().is_success() {
+            return Ok(Err(format!("WDA activeApp returned {}", resp.status())));
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("WDA activeApp decode: {e}"))),
+        };
+        let bundle = body
+            .pointer("/value/bundleId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        Ok(Ok(bundle.to_string()))
+    }
+
+    async fn ios_launch_app(
+        &mut self,
+        bundle_id: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let payload = serde_json::json!({"bundleId": bundle_id});
+        let resp = match cli
+            .post(format!("{base}/wda/apps/launch"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA launch: {e}"))),
+        };
+        if resp.status().is_success() {
+            Ok(Ok("launched".to_string()))
+        } else {
+            Ok(Err(format!("WDA launch returned {}", resp.status())))
+        }
+    }
+
+    async fn ios_terminate_app(
+        &mut self,
+        bundle_id: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let payload = serde_json::json!({"bundleId": bundle_id});
+        let resp = match cli
+            .post(format!("{base}/wda/apps/terminate"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA terminate: {e}"))),
+        };
+        if resp.status().is_success() {
+            Ok(Ok("terminated".to_string()))
+        } else {
+            Ok(Err(format!("WDA terminate returned {}", resp.status())))
+        }
+    }
+}
+
+impl HostState {
+    fn wda_base_and_client(&self) -> (String, reqwest::Client) {
+        let base = self
+            .wda_url
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| "http://localhost:8100".to_string());
+        let cli = host_http_client().unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .build()
+                .expect("failed to build reqwest client")
+        });
+        (base, cli)
+    }
+}
+
 /// Parse `mCurrentFocus=Window{xxxx [u0 ]<package>/<Activity>}` out of
 /// `dumpsys window windows`. Returns the `<package>/<Activity>` slug
 /// without the surrounding `Window{...}` envelope. Handles both the
@@ -3453,6 +3874,11 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
         wasmtime::component::HasSelf<HostState>,
     >(&mut linker, |state: &mut HostState| state)
     .map_err(|e| anyhow::anyhow!("failed to add host-android linker interfaces: {e}"))?;
+    rsclaw::plugin::host_ios::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-ios linker interfaces: {e}"))?;
     Ok(linker)
 }
 

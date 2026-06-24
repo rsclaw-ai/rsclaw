@@ -113,14 +113,34 @@ fn capture_primary_monitor() -> Result<String, String> {
 #[cfg(target_os = "windows")]
 fn virtual_screen_rect() -> (i32, i32, u32, u32) {
     unsafe extern "system" {
-        fn GetSystemMetrics(n: i32) -> i32;
+        fn GetDC(h: isize) -> isize;
+        fn ReleaseDC(h: isize, dc: isize) -> i32;
+        fn GetDeviceCaps(dc: isize, index: i32) -> i32;
     }
+    // PHYSICAL screen size (DESKTOPHORZRES=118 / DESKTOPVERTRES=117) — independent
+    // of this process's DPI awareness. capture_full_png also captures physical
+    // pixels (SetProcessDPIAware), and enigo SendInput maps in physical space, so
+    // returning physical here keeps OCR→0-1000→screen→click all in one coord space
+    // on scaled displays (e.g. 2560x1440 @150%, where logical is 1707x960).
     unsafe {
-        let x = GetSystemMetrics(76);
-        let y = GetSystemMetrics(77);
-        let w = GetSystemMetrics(78).max(0) as u32;
-        let h = GetSystemMetrics(79).max(0) as u32;
-        (x, y, w, h)
+        let dc = GetDC(0);
+        let w = GetDeviceCaps(dc, 118).max(0) as u32;
+        let h = GetDeviceCaps(dc, 117).max(0) as u32;
+        ReleaseDC(0, dc);
+        if w > 0 && h > 0 {
+            (0, 0, w, h)
+        } else {
+            // Fallback to logical metrics if GetDeviceCaps fails.
+            unsafe extern "system" {
+                fn GetSystemMetrics(n: i32) -> i32;
+            }
+            (
+                0,
+                0,
+                GetSystemMetrics(0).max(0) as u32,
+                GetSystemMetrics(1).max(0) as u32,
+            )
+        }
     }
 }
 
@@ -228,7 +248,7 @@ public class FW {{
   [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   public static void Go(IntPtr h) {{
-    ShowWindow(h, 3); // SW_MAXIMIZE (also un-minimises)
+    ShowWindow(h, 5); // SW_SHOW — bring up WITHOUT resizing (SW_MAXIMIZE blanks WeChat CEF)
     IntPtr fg = GetForegroundWindow();
     uint pid; uint fgT = GetWindowThreadProcessId(fg, out pid);
     uint cur = GetCurrentThreadId();
@@ -383,13 +403,16 @@ fn wechat_screenshot_png(win: &capture::WindowInfo) -> Result<Vec<u8>, String> {
 fn ocr_window(app_name: &str) -> Result<String, String> {
     let lname = app_name.to_lowercase();
     let (png, wx, wy, ww, wh) = if lname.contains("wechat") || lname.contains("weixin") {
-        // WeChat: do NOT enumerate or touch the window. Its risk-control blanks
-        // per-window captures (PrintWindow) and its helper windows confuse
-        // enumeration; any focus/resize blanks its renderer. A FULL-SCREEN grab
-        // (CopyFromScreen — the same path as the host `/ss` screenshot, which is NOT
-        // blocked by risk-control) reliably captures whatever is on screen. WeChat
-        // must be left maximised/visible so its UI fills the screen. ww=wh=0 tells the
-        // OCR driver the image pixels ARE screen coordinates (no window offset).
+        // WeChat: bring its window to the FOREGROUND first (it shares the desktop with
+        // the douyin browser, which steals focus), then full-screen grab. Foregrounding
+        // (SetForegroundWindow, NO resize) is safe — only resize/maximise blanks the CEF
+        // surface. Capture is a full-screen CopyFromScreen (risk-control-proof, unlike
+        // PrintWindow). WeChat must be left maximised so its UI fills the screen.
+        // ww=wh=0 tells the OCR driver the image pixels ARE screen coordinates.
+        if let Ok(win) = find_app_window(app_name) {
+            focus_window(win.id);
+            std::thread::sleep(std::time::Duration::from_millis(350));
+        }
         let png = capture::capture_full_png().map_err(|e| e.to_string())?;
         (png, 0i32, 0i32, 0u32, 0u32)
     } else {
@@ -1321,9 +1344,15 @@ print('ok')
                     .join(format!("rsclaw_clipset_{}.txt", std::process::id()));
                 std::fs::write(&tmp, text.as_bytes())
                     .map_err(|e| format!("clipboard_set temp write: {e}"))?;
+                // Retry Set-Clipboard a few times: when a RustDesk/remote viewer is
+                // connected its clipboard sync intermittently holds the clipboard,
+                // making Set-Clipboard throw "failed to open clipboard".
                 let ps = format!(
                     "$t=[System.IO.File]::ReadAllText('{}',[System.Text.Encoding]::UTF8); \
-                     Set-Clipboard -Value $t",
+                     $ok=$false; \
+                     for($i=0;$i -lt 10;$i++){{ try{{ Set-Clipboard -Value $t -ErrorAction Stop; $ok=$true; break }} \
+                     catch{{ Start-Sleep -Milliseconds 250 }} }} \
+                     if(-not $ok){{ Write-Error 'clipboard busy after retries'; exit 1 }}",
                     tmp.display()
                 );
                 #[allow(unused_mut)]
