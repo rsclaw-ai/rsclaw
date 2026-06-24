@@ -2282,6 +2282,14 @@ impl AgentRuntime {
     ///
     /// Takes individual fields (not the full `AgentMessage`) so callers can
     /// extract `reply_tx` separately before dispatching.
+    /// True if `agent_id` runs as a long-lived daemon (forever monitor loop).
+    /// The gateway uses this to give daemon turns a far longer stuck-turn
+    /// watchdog limit — they're *meant* to run indefinitely, so the normal
+    /// 20-min cap would needlessly cancel them and dark the queue.
+    pub fn is_daemon_agent(&self, agent_id: &str) -> bool {
+        self.config.agents.is_daemon_agent(agent_id)
+    }
+
     pub async fn run_turn(
         &mut self,
         session_key: &str,
@@ -5639,6 +5647,13 @@ impl AgentRuntime {
         let mut last_result_hash: Option<String> = None;
         let mut last_tool_name = String::new();
         let mut wrapup_injected = false;
+        // DAEMON: consecutive "tried to end with no tool call" re-injects. Reset
+        // whenever the model actually makes a tool call. If it keeps refusing
+        // (some models won't honor the loop), we stop re-injecting after a cap
+        // and let the turn end — the cron backstop restarts a fresh turn rather
+        // than hot-looping the LLM endpoint forever.
+        let mut daemon_noprogress_streak = 0u32;
+        const DAEMON_NOPROGRESS_CAP: u32 = 5;
         let mut iteration = 0usize;
 
         loop {
@@ -5728,6 +5743,11 @@ impl AgentRuntime {
                 info!(session = %ctx.session_key, iteration, "agent_loop: canceled by A2A");
                 return Err(anyhow!("canceled by A2A CancelTask"));
             }
+            // Heartbeat for the progress-based stuck-turn watchdog: each loop
+            // iteration advances the counter, so a daemon that's actively
+            // looping is never killed, but one wedged on a non-returning tool
+            // (its counter frozen) gets cancelled.
+            ctx.turn_ctx.progress_tick();
             // Check abort flag at start of each iteration (allows /abort to
             // interrupt even when tool dispatch is blocking between LLM calls).
             if abort_flag.load(Ordering::SeqCst) {
@@ -6872,6 +6892,57 @@ impl AgentRuntime {
                 "agent_loop: stream finished"
             );
             if tool_calls.is_empty() {
+                // DAEMON agents must never end their turn by "concluding". A
+                // monitor like agent_wechat is a `while(true)` poll loop; some
+                // models (e.g. agent-v1) like to wrap up with a summary after a
+                // few iterations, which kills the turn and leaves a coverage gap
+                // until the cron backstop restarts it. Instead, nudge the model
+                // straight back into the loop and `continue` — true continuous
+                // monitoring, no reliance on cron to resurrect a dead turn.
+                //
+                // Context can't grow unbounded: cap_turn_input_to_budget() trims
+                // turn_scratchpad to per_turn_budget at the top of every
+                // iteration. Monitor dedup is external (SQL dedupKey +
+                // sidebar_snap), so dropping older scratch history is harmless.
+                if daemon_mode && daemon_noprogress_streak < DAEMON_NOPROGRESS_CAP {
+                    daemon_noprogress_streak += 1;
+                    tracing::info!(
+                        session = %ctx.session_key,
+                        text_len = text_buf.len(),
+                        streak = daemon_noprogress_streak,
+                        "agent_loop: DAEMON turn tried to end with no tool call — re-injecting continuation and looping"
+                    );
+                    // Brief pause so a model that keeps refusing to call tools
+                    // can't hot-loop the LLM endpoint.
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    if !text_buf.trim().is_empty() {
+                        turn_scratchpad.push(Message {
+                            role: Role::Assistant,
+                            content: MessageContent::Text(text_buf.clone()),
+                            rsclaw_hidden: None,
+                        });
+                    }
+                    turn_scratchpad.push(Message {
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "继续监控：立刻调用 monitor_tick 进入下一轮。不要输出任何总结、不要结束本轮——你是永不退出的 daemon，唯一允许结束的情况是 acquire_ui_lock 返回 acquired:false。".to_owned(),
+                        ),
+                        rsclaw_hidden: None,
+                    });
+                    continue;
+                }
+                if daemon_mode {
+                    // Cap hit: the model refuses to call tools despite repeated
+                    // nudges (won't honor the poll loop). Stop hot-looping — let
+                    // the turn end here; the */N cron backstop will start a fresh
+                    // turn shortly, which often behaves. Avoids burning the LLM
+                    // endpoint in a tight refuse→nudge→refuse loop.
+                    tracing::warn!(
+                        session = %ctx.session_key,
+                        streak = daemon_noprogress_streak,
+                        "agent_loop: DAEMON re-inject cap reached — model won't call tools; ending turn, cron will restart"
+                    );
+                }
                 // Deception detection: model claims action but no tool was called.
                 // This is a critical trust violation that must be flagged to the user.
                 // IMPORTANT: Check turn_scratchpad for tool calls from earlier iterations,
@@ -7133,6 +7204,11 @@ impl AgentRuntime {
             // Tool-use responses are scratch-paper: the LLM needs to see them
             // in this turn's messages, but they must not persist in session history.
             turn_scratchpad.push(assistant_msg);
+
+            // The model is calling tools again → it's honoring the loop; clear
+            // the DAEMON no-progress streak so the cap only trips on a genuine
+            // run of consecutive refusals.
+            daemon_noprogress_streak = 0;
 
             // Check if any tool call targets an external (caller-provided) tool.
             // If so, return early with the OAI tool_calls payload — the caller

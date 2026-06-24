@@ -7,6 +7,9 @@
 //! Send path: Slack Web API `chat.postMessage` / `chat.update`.
 //! Receive path: Socket Mode WebSocket → `message` events.
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
@@ -693,9 +696,13 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
         // Fallback to pdftotext CLI
         let tmp = std::env::temp_dir().join(format!("rsclaw_slack_{filename}"));
         if std::fs::write(&tmp, bytes).is_ok() {
-            let output = std::process::Command::new("pdftotext")
-                .args([tmp.to_str().unwrap_or(""), "-"])
-                .output();
+            let mut cmd = std::process::Command::new("pdftotext");
+            cmd.args([tmp.to_str().unwrap_or(""), "-"]);
+            #[cfg(windows)]
+            {
+                cmd.creation_flags(0x08000000);
+            }
+            let output = cmd.output();
             let _ = std::fs::remove_file(&tmp);
             if let Ok(o) = output {
                 if o.status.success() {

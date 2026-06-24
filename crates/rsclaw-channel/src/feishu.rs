@@ -8,6 +8,9 @@
 //!   - Text chunking (4000-char limit).
 //!   - Auto-reconnect on disconnect.
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -2092,13 +2095,36 @@ async fn extract_and_upload_cover(
         .to_string_lossy()
         .into_owned();
     // Run ffmpeg to extract first frame at 1s.
-    let output = std::process::Command::new(&ffmpeg_bin)
-        .args([
+    let mut cmd = std::process::Command::new(&ffmpeg_bin);
+    cmd.args([
+        "-y",
+        "-i",
+        video_path,
+        "-ss",
+        "00:00:01",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        &cover_path,
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd.output();
+    let ok_first = matches!(&output, Ok(o) if o.status.success());
+    if !ok_first {
+        // Retry at 0s (video might be shorter than 1s).
+        let mut cmd = std::process::Command::new(&ffmpeg_bin);
+        cmd.args([
             "-y",
             "-i",
             video_path,
             "-ss",
-            "00:00:01",
+            "00:00:00",
             "-frames:v",
             "1",
             "-q:v",
@@ -2106,27 +2132,12 @@ async fn extract_and_upload_cover(
             &cover_path,
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let ok_first = matches!(&output, Ok(o) if o.status.success());
-    if !ok_first {
-        // Retry at 0s (video might be shorter than 1s).
-        let _ = std::process::Command::new(&ffmpeg_bin)
-            .args([
-                "-y",
-                "-i",
-                video_path,
-                "-ss",
-                "00:00:00",
-                "-frames:v",
-                "1",
-                "-q:v",
-                "2",
-                &cover_path,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output();
+        .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(0x08000000);
+        }
+        let _ = cmd.output();
     }
     let cover_bytes = match std::fs::read(&cover_path) {
         Ok(b) => b,
@@ -2247,18 +2258,21 @@ fn mp4_duration_ms(path: &str) -> Option<u64> {
 /// Falls back to estimate from file size if ffprobe is not available.
 fn audio_duration_ms(path: &str) -> Option<u64> {
     // Try ffprobe first.
-    let output = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            path,
-        ])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "quiet",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd.output().ok()?;
     if output.status.success() {
         let s = String::from_utf8_lossy(&output.stdout);
         if let Ok(secs) = s.trim().parse::<f64>() {

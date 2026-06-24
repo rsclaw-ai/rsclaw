@@ -1985,37 +1985,76 @@ fn spawn_agent_tasks(
                 // `cancel_token` is now always set, so the runtime's
                 // cooperative `is_cancelled()` checks (between iterations and
                 // at tool-dispatch boundaries) also observe WS aborts.
+                let is_daemon = runtime.is_daemon_agent(&handle.id);
+                // Progress heartbeat for the daemon watchdog (bumped once per
+                // agent-loop iteration via TurnContext::progress_tick).
+                let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let turn_ctx = rsclaw_agent::registry::TurnContext {
                     task_id,
                     context_id,
                     event_tx,
                     cancel_token: Some(turn_token.clone()),
                     input_request_tx,
+                    progress: Some(progress.clone()),
                 };
-                // Per-turn stuck-turn watchdog (P2c). If a single user turn
-                // runs longer than this without completing, assume something
-                // is wedged (LLM provider hang, runaway tool-call loop, a
-                // tool that ignored its own internal deadline) and force-
-                // abort the turn via the cancel_token. Generous because
-                // long legitimate cap_live + multi-tool turns can take a
-                // while, but tight enough to keep the single-threaded
-                // agent queue from going dark for an hour.
-                const TURN_WALL_CLOCK_LIMIT: std::time::Duration =
-                    std::time::Duration::from_secs(20 * 60);
+                // Stuck-turn watchdog. Two modes:
+                //  - Normal turns: flat 20-min wall-clock cap (a single turn
+                //    should complete; if not, something's wedged).
+                //  - Daemon agents (agent_wechat monitor): they loop FOREVER, so
+                //    a wall-clock cap can't apply. Instead watch PROGRESS — the
+                //    loop bumps a counter every iteration; if it stops advancing
+                //    for STALL_LIMIT, a tool is genuinely wedged (e.g. enter_chat
+                //    spinning), so cancel and let the cron backstop restart. A
+                //    healthy forever-loop bumps every few seconds → never killed.
                 let watchdog_token = turn_token.clone();
                 let watchdog_agent = handle.id.clone();
                 let watchdog_session = session_key.clone();
                 let watchdog = tokio::spawn(async move {
-                    tokio::time::sleep(TURN_WALL_CLOCK_LIMIT).await;
-                    if !watchdog_token.is_cancelled() {
-                        tracing::error!(
-                            agent = %watchdog_agent,
-                            session = %watchdog_session,
-                            limit_s = TURN_WALL_CLOCK_LIMIT.as_secs(),
-                            "stuck-turn watchdog: firing cancel_token — turn exceeded \
-                             wall-clock limit; the agent queue must not stay dark"
-                        );
-                        watchdog_token.cancel();
+                    use std::sync::atomic::Ordering;
+                    if is_daemon {
+                        const POLL: std::time::Duration = std::time::Duration::from_secs(30);
+                        const STALL_LIMIT: std::time::Duration =
+                            std::time::Duration::from_secs(180);
+                        let mut last = progress.load(Ordering::Relaxed);
+                        let mut stalled = std::time::Duration::ZERO;
+                        loop {
+                            tokio::time::sleep(POLL).await;
+                            if watchdog_token.is_cancelled() {
+                                break;
+                            }
+                            let cur = progress.load(Ordering::Relaxed);
+                            if cur != last {
+                                last = cur;
+                                stalled = std::time::Duration::ZERO;
+                                continue;
+                            }
+                            stalled += POLL;
+                            if stalled >= STALL_LIMIT {
+                                tracing::error!(
+                                    agent = %watchdog_agent,
+                                    session = %watchdog_session,
+                                    stall_s = stalled.as_secs(),
+                                    "stuck-turn watchdog (daemon): no loop progress — a tool is \
+                                     wedged; firing cancel_token (cron will restart)"
+                                );
+                                watchdog_token.cancel();
+                                break;
+                            }
+                        }
+                    } else {
+                        const TURN_WALL_CLOCK_LIMIT: std::time::Duration =
+                            std::time::Duration::from_secs(20 * 60);
+                        tokio::time::sleep(TURN_WALL_CLOCK_LIMIT).await;
+                        if !watchdog_token.is_cancelled() {
+                            tracing::error!(
+                                agent = %watchdog_agent,
+                                session = %watchdog_session,
+                                limit_s = TURN_WALL_CLOCK_LIMIT.as_secs(),
+                                "stuck-turn watchdog: firing cancel_token — turn exceeded \
+                                 wall-clock limit; the agent queue must not stay dark"
+                            );
+                            watchdog_token.cancel();
+                        }
                     }
                 });
                 let result = tokio::select! {

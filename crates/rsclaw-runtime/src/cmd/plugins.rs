@@ -1,3 +1,6 @@
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -532,10 +535,13 @@ fn plugins_doctor() -> Result<()> {
         } {
             Ok(path) => {
                 // Try to get version
-                let version = std::process::Command::new(bin)
-                    .arg("--version")
-                    .output()
-                    .ok()
+                let mut cmd = std::process::Command::new(bin);
+                cmd.arg("--version");
+                #[cfg(windows)]
+                {
+                    cmd.creation_flags(0x08000000);
+                }
+                let version = cmd.output().ok()
                     .and_then(|o| String::from_utf8(o.stdout).ok())
                     .map(|s| s.trim().to_string())
                     .unwrap_or_else(|| "(unknown version)".to_string());

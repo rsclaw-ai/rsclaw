@@ -11,6 +11,9 @@
 //! Config in openclaw.json:
 //!   channels.wechat.enabled: true
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use std::{sync::Arc, time::Duration};
 
 use aes::cipher::{BlockEncrypt, KeyInit};
@@ -1425,19 +1428,24 @@ impl WeChatPersonalChannel {
         // ffmpeg: decode to raw PCM s16le mono 24kHz
         let ffmpeg_bin =
             rsclaw_platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
-        let output = std::process::Command::new(&ffmpeg_bin)
-            .args([
-                "-i",
-                &tmp_src.to_string_lossy(),
-                "-y",
-                "-f",
-                "s16le",
-                "-ar",
-                "24000",
-                "-ac",
-                "1",
-                &tmp_pcm.to_string_lossy(),
-            ])
+        let mut cmd = std::process::Command::new(&ffmpeg_bin);
+        cmd.args([
+            "-i",
+            &tmp_src.to_string_lossy(),
+            "-y",
+            "-f",
+            "s16le",
+            "-ar",
+            "24000",
+            "-ac",
+            "1",
+            &tmp_pcm.to_string_lossy(),
+        ]);
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(0x08000000);
+        }
+        let output = cmd
             .output()
             .context("ffmpeg not available for PCM conversion")?;
         let _ = std::fs::remove_file(&tmp_src);

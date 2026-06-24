@@ -1,10 +1,10 @@
-# viral-video-clone Implementation Plan
+# hot-video-clone Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship a `viral-video-clone` skill that ingests a viral reference video, infers its 爆款逻辑 via VLM, and produces a same-style real-person (本人出镜) video end to end — pure skill, no Rust/server changes.
+**Goal:** Ship a `hot-video-clone` skill that ingests a viral reference video, infers its 爆款逻辑 via VLM, and produces a same-style real-person (本人出镜) video end to end — pure skill, no Rust/server changes.
 
-**Architecture:** A single `skills/viral-video-clone/SKILL.md` orchestrating existing native tools. A reusable 本人档案 under `~/.rsclaw/profiles/<name>/` supplies face + cloned voice. jimeng plugin is preferred for generation (browser automation); built-in `image_gen`/`video_gen`/`avatar_gen`/`voice_gen`/`music_gen` are the fallback. Final assembly (concat, xfade, BGM ducking, BPM-approx cuts) runs via `shell` + ffmpeg.
+**Architecture:** A single `skills/hot-video-clone/SKILL.md` orchestrating existing native tools. A reusable 本人档案 under `~/.rsclaw/profiles/<name>/` supplies face + cloned voice. jimeng plugin is preferred for generation (browser automation); built-in `image_gen`/`video_gen`/`avatar_gen`/`voice_gen`/`music_gen` are the fallback. Final assembly (concat, xfade, BGM ducking, BPM-approx cuts) runs via `shell` + ffmpeg.
 
 **Tech Stack:** rsclaw SKILL.md (YAML frontmatter + Markdown + JSON tool calls), native tools (`web_download`, `image_gen`, `video_gen`, `avatar_gen`, `voice_gen`, `music_gen`, `shell`, `send_file`), ffmpeg (auto-installed via `ensure_ffmpeg()`).
 
@@ -14,9 +14,9 @@
 
 ## File Structure
 
-- Create: `skills/viral-video-clone/SKILL.md` — the skill itself (the whole deliverable).
-- Create: `skills/viral-video-clone/profile.example.json5` — sample 本人档案 metadata.
-- Create: `skills/viral-video-clone/README.md` — install + profile setup + usage.
+- Create: `skills/hot-video-clone/SKILL.md` — the skill itself (the whole deliverable).
+- Create: `skills/hot-video-clone/profile.example.json5` — sample 本人档案 metadata.
+- Create: `skills/hot-video-clone/README.md` — install + profile setup + usage.
 - Reference only (do NOT modify): `skills/jimeng/SKILL.md`, `skills/web-video-download/SKILL.md` for tool-call conventions.
 
 Authoring order: scaffold → profile → analysis → creative plan → generation (jimeng + fallback) → assembly → delivery → README → e2e smoke. Each task appends/edits one coherent section of `SKILL.md` and is committed independently.
@@ -26,22 +26,22 @@ Authoring order: scaffold → profile → analysis → creative plan → generat
 ### Task 1: Scaffold skill + frontmatter + profile-load gate
 
 **Files:**
-- Create: `skills/viral-video-clone/SKILL.md`
+- Create: `skills/hot-video-clone/SKILL.md`
 
 - [ ] **Step 1: Write frontmatter + intro + profile gate**
 
-Create `skills/viral-video-clone/SKILL.md` with:
+Create `skills/hot-video-clone/SKILL.md` with:
 
 ```markdown
 ---
-name: viral-video-clone
+name: hot-video-clone
 description: 爆款视频复刻 — 推一个爆款视频，自动推理爆款逻辑并生成同款、本人真人出镜的视频。viral video clone, same-style, real-person, 数字人, 口播, BGM
 version: 1.0.0
 icon: "🎬"
 author: "@rsclaw"
 ---
 
-# 爆款视频复刻 (viral-video-clone)
+# 爆款视频复刻 (hot-video-clone)
 
 给我一个爆款视频（URL 或本地文件）+ 一个本人档案名，我会：
 1. 下载并拆解它的爆款逻辑（钩子/节奏/分镜/文案/BGM 情绪）
@@ -76,14 +76,14 @@ author: "@rsclaw"
 
 - [ ] **Step 2: Lint the JSON blocks**
 
-Run: `python3 -c "import json,sys,re; [json.loads(b) for b in re.findall(r'\`\`\`json\n(.*?)\n\`\`\`', open('skills/viral-video-clone/SKILL.md').read(), re.S)]; print('json ok')"`
+Run: `python3 -c "import json,sys,re; [json.loads(b) for b in re.findall(r'\`\`\`json\n(.*?)\n\`\`\`', open('skills/hot-video-clone/SKILL.md').read(), re.S)]; print('json ok')"`
 Expected: `json ok` (every ```json block parses; `<name>` placeholders live in string values so JSON still parses).
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add skills/viral-video-clone/SKILL.md
-git commit -m "feat(skill): scaffold viral-video-clone + profile gate"
+git add skills/hot-video-clone/SKILL.md
+git commit -m "feat(skill): scaffold hot-video-clone + profile gate"
 ```
 
 ---
@@ -91,12 +91,12 @@ git commit -m "feat(skill): scaffold viral-video-clone + profile gate"
 ### Task 2: Sample profile + README
 
 **Files:**
-- Create: `skills/viral-video-clone/profile.example.json5`
-- Create: `skills/viral-video-clone/README.md`
+- Create: `skills/hot-video-clone/profile.example.json5`
+- Create: `skills/hot-video-clone/README.md`
 
 - [ ] **Step 1: Write the example profile**
 
-Create `skills/viral-video-clone/profile.example.json5`:
+Create `skills/hot-video-clone/profile.example.json5`:
 
 ```json5
 {
@@ -111,13 +111,13 @@ Create `skills/viral-video-clone/profile.example.json5`:
 
 - [ ] **Step 2: Write README**
 
-Create `skills/viral-video-clone/README.md`:
+Create `skills/hot-video-clone/README.md`:
 
 ```markdown
-# viral-video-clone
+# hot-video-clone
 
 ## 安装
-`rsclaw skills install viral-video-clone`
+`rsclaw skills install hot-video-clone`
 
 ## 一次性配置本人档案
 mkdir -p ~/.rsclaw/profiles/me
@@ -137,8 +137,8 @@ mkdir -p ~/.rsclaw/profiles/me
 - [ ] **Step 3: Commit**
 
 ```bash
-git add skills/viral-video-clone/profile.example.json5 skills/viral-video-clone/README.md
-git commit -m "docs(skill): viral-video-clone profile example + README"
+git add skills/hot-video-clone/profile.example.json5 skills/hot-video-clone/README.md
+git commit -m "docs(skill): hot-video-clone profile example + README"
 ```
 
 ---
@@ -146,7 +146,7 @@ git commit -m "docs(skill): viral-video-clone profile example + README"
 ### Task 3: Analysis phase — download + extract + infer 爆款逻辑
 
 **Files:**
-- Modify: `skills/viral-video-clone/SKILL.md` (append "Step 1: 分析" section)
+- Modify: `skills/hot-video-clone/SKILL.md` (append "Step 1: 分析" section)
 
 - [ ] **Step 1: Append the analysis section**
 
@@ -187,13 +187,13 @@ Append to `SKILL.md`:
 
 - [ ] **Step 2: Lint JSON blocks**
 
-Run: `python3 -c "import json,re; [json.loads(b) for b in re.findall(r'\`\`\`json\n(.*?)\n\`\`\`', open('skills/viral-video-clone/SKILL.md').read(), re.S)]; print('json ok')"`
+Run: `python3 -c "import json,re; [json.loads(b) for b in re.findall(r'\`\`\`json\n(.*?)\n\`\`\`', open('skills/hot-video-clone/SKILL.md').read(), re.S)]; print('json ok')"`
 Expected: `json ok`
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add skills/viral-video-clone/SKILL.md
+git add skills/hot-video-clone/SKILL.md
 git commit -m "feat(skill): analysis phase — download, extract, infer viral logic"
 ```
 
@@ -202,7 +202,7 @@ git commit -m "feat(skill): analysis phase — download, extract, infer viral lo
 ### Task 4: Creative plan phase — 同款脚本 + 分镜
 
 **Files:**
-- Modify: `skills/viral-video-clone/SKILL.md` (append "Step 2: 创作方案")
+- Modify: `skills/hot-video-clone/SKILL.md` (append "Step 2: 创作方案")
 
 - [ ] **Step 1: Append the creative-plan section**
 
@@ -226,7 +226,7 @@ Append to `SKILL.md`:
 - [ ] **Step 2: Commit**
 
 ```bash
-git add skills/viral-video-clone/SKILL.md
+git add skills/hot-video-clone/SKILL.md
 git commit -m "feat(skill): creative-plan phase — same-style script + storyboard"
 ```
 
@@ -235,7 +235,7 @@ git commit -m "feat(skill): creative-plan phase — same-style script + storyboa
 ### Task 5: Generation phase — jimeng-first + built-in fallback
 
 **Files:**
-- Modify: `skills/viral-video-clone/SKILL.md` (append "Step 3: 生成")
+- Modify: `skills/hot-video-clone/SKILL.md` (append "Step 3: 生成")
 
 - [ ] **Step 1: Append the generation section**
 
@@ -288,13 +288,13 @@ Append to `SKILL.md`:
 
 - [ ] **Step 2: Lint JSON blocks**
 
-Run: `python3 -c "import json,re; [json.loads(b) for b in re.findall(r'\`\`\`json\n(.*?)\n\`\`\`', open('skills/viral-video-clone/SKILL.md').read(), re.S)]; print('json ok')"`
+Run: `python3 -c "import json,re; [json.loads(b) for b in re.findall(r'\`\`\`json\n(.*?)\n\`\`\`', open('skills/hot-video-clone/SKILL.md').read(), re.S)]; print('json ok')"`
 Expected: `json ok`
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add skills/viral-video-clone/SKILL.md
+git add skills/hot-video-clone/SKILL.md
 git commit -m "feat(skill): generation phase — jimeng-first with built-in fallback"
 ```
 
@@ -303,7 +303,7 @@ git commit -m "feat(skill): generation phase — jimeng-first with built-in fall
 ### Task 6: Assembly phase — ffmpeg concat + xfade + BPM cuts + BGM ducking
 
 **Files:**
-- Modify: `skills/viral-video-clone/SKILL.md` (append "Step 4: 合成")
+- Modify: `skills/hot-video-clone/SKILL.md` (append "Step 4: 合成")
 
 - [ ] **Step 1: Append the assembly section with concrete ffmpeg commands**
 
@@ -353,7 +353,7 @@ BPM 未知则跳过本步，直接用 `norm_NN.mp4`。
 
 - [ ] **Step 2: Lint JSON blocks**
 
-Run: `python3 -c "import json,re; [json.loads(b) for b in re.findall(r'\`\`\`json\n(.*?)\n\`\`\`', open('skills/viral-video-clone/SKILL.md').read(), re.S)]; print('json ok')"`
+Run: `python3 -c "import json,re; [json.loads(b) for b in re.findall(r'\`\`\`json\n(.*?)\n\`\`\`', open('skills/hot-video-clone/SKILL.md').read(), re.S)]; print('json ok')"`
 Expected: `json ok`
 
 - [ ] **Step 3: Validate ffmpeg recipes actually run (with stand-in inputs)**
@@ -373,7 +373,7 @@ Expected: `OK-assembly` (confirms scale/crop, xfade, and codecs are valid on thi
 - [ ] **Step 4: Commit**
 
 ```bash
-git add skills/viral-video-clone/SKILL.md
+git add skills/hot-video-clone/SKILL.md
 git commit -m "feat(skill): assembly phase — concat, xfade, BPM cuts, BGM ducking"
 ```
 
@@ -382,7 +382,7 @@ git commit -m "feat(skill): assembly phase — concat, xfade, BPM cuts, BGM duck
 ### Task 7: Delivery phase + rules section
 
 **Files:**
-- Modify: `skills/viral-video-clone/SKILL.md` (append "Step 5: 交付" + "Rules")
+- Modify: `skills/hot-video-clone/SKILL.md` (append "Step 5: 交付" + "Rules")
 
 - [ ] **Step 1: Append delivery + rules**
 
@@ -409,13 +409,13 @@ Append to `SKILL.md`:
 
 - [ ] **Step 2: Lint JSON blocks**
 
-Run: `python3 -c "import json,re; [json.loads(b) for b in re.findall(r'\`\`\`json\n(.*?)\n\`\`\`', open('skills/viral-video-clone/SKILL.md').read(), re.S)]; print('json ok')"`
+Run: `python3 -c "import json,re; [json.loads(b) for b in re.findall(r'\`\`\`json\n(.*?)\n\`\`\`', open('skills/hot-video-clone/SKILL.md').read(), re.S)]; print('json ok')"`
 Expected: `json ok`
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add skills/viral-video-clone/SKILL.md
+git add skills/hot-video-clone/SKILL.md
 git commit -m "feat(skill): delivery phase + rules"
 ```
 
@@ -424,7 +424,7 @@ git commit -m "feat(skill): delivery phase + rules"
 ### Task 8: End-to-end manual smoke validation
 
 **Files:**
-- Reference: `skills/viral-video-clone/SKILL.md` (no edits unless smoke finds a gap)
+- Reference: `skills/hot-video-clone/SKILL.md` (no edits unless smoke finds a gap)
 
 - [ ] **Step 1: Set up a throwaway profile**
 
@@ -432,7 +432,7 @@ git commit -m "feat(skill): delivery phase + rules"
 mkdir -p ~/.rsclaw/profiles/smoketest && \
 ffmpeg -f lavfi -i color=c=gray:s=512x512:d=1 -frames:v 1 ~/.rsclaw/profiles/smoketest/face.jpg -y >/dev/null 2>&1 && \
 ffmpeg -f lavfi -i sine=f=220:d=8 -ar 16000 -ac 1 ~/.rsclaw/profiles/smoketest/voice.wav -y >/dev/null 2>&1 && \
-cp skills/viral-video-clone/profile.example.json5 ~/.rsclaw/profiles/smoketest/profile.json5 && \
+cp skills/hot-video-clone/profile.example.json5 ~/.rsclaw/profiles/smoketest/profile.json5 && \
 ls ~/.rsclaw/profiles/smoketest
 ```
 Expected: `face.jpg  profile.json5  voice.wav`
@@ -453,8 +453,8 @@ If any phase stalls (missing tool, wrong path assumption, ffmpeg arg error), not
 - [ ] **Step 4: Commit any fixes**
 
 ```bash
-git add skills/viral-video-clone/SKILL.md
-git commit -m "fix(skill): viral-video-clone e2e smoke fixes"
+git add skills/hot-video-clone/SKILL.md
+git commit -m "fix(skill): hot-video-clone e2e smoke fixes"
 ```
 
 - [ ] **Step 5: Clean up the throwaway profile**

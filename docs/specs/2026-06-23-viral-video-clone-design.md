@@ -1,4 +1,4 @@
-# viral-video-clone — Design Spec
+# hot-video-clone — Design Spec
 
 Date: 2026-06-23
 Status: Approved (brainstorming) → ready for implementation plan

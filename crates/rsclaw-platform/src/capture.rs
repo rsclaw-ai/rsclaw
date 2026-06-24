@@ -159,6 +159,12 @@ print(px / pts if pts else 1.0)
             .filter(|s| *s > 0.0)
             .unwrap_or(2.0)
     }
+
+    /// macOS apps don't destroy their window on close the way WeChat 4.x does on
+    /// Windows; the activate path (`open -b`) already handles bringing them up.
+    pub fn restore_app_window(_app_name: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 // ===========================================================================
@@ -169,8 +175,11 @@ mod imp {
     use super::*;
 
     fn run_powershell(script: &str, out: &PathBuf) -> Result<Vec<u8>> {
+        use std::os::windows::process::CommandExt;
         let status = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            // CREATE_NO_WINDOW: no flashing console window per capture.
+            .creation_flags(0x08000000)
             .output()
             .map_err(|e| anyhow!("powershell spawn failed: {e}"))?;
         if !status.status.success() {
@@ -280,8 +289,11 @@ public class WL {
 '@
 Add-Type $sig
 [WL]::Run() | ForEach-Object { $_ }"#;
+        use std::os::windows::process::CommandExt;
         let out = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            // CREATE_NO_WINDOW: no flashing console window when listing windows.
+            .creation_flags(0x08000000)
             .output()
             .map_err(|e| anyhow!("powershell window list spawn failed: {e}"))?;
         if !out.status.success() {
@@ -313,6 +325,79 @@ Add-Type $sig
 
     pub fn primary_scale_factor() -> f32 {
         1.0
+    }
+
+    /// Restore an app's hidden/tray main window. WeChat 4.x closes to the tray by
+    /// destroying its top-level window, so we enumerate ALL top-level windows of
+    /// the matching process (including invisible ones) whose title looks like the
+    /// main window and SW_RESTORE + foreground them. Returns true if ≥1 restored.
+    pub fn restore_app_window(app_name: &str) -> Result<bool> {
+        use std::os::windows::process::CommandExt;
+        let needle = app_name.to_lowercase();
+        // Process-name aliases (WeChat 4.x renamed the process to "Weixin").
+        let proc_match = if needle.contains("wechat") || needle.contains("weixin") {
+            "weixin wechat".to_string()
+        } else {
+            needle.clone()
+        };
+        // Embed the process-name match list; titles are fixed to the known main
+        // window captions so we don't surface IME/tray helper windows.
+        let script = format!(
+            r#"$procs = '{procs}'.Split(' ')
+$sig = @'
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public class WR {{
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  public delegate bool EnumProc(IntPtr h, IntPtr p);
+  public static int Restore(string[] procs, string[] titles) {{
+    int n = 0;
+    EnumWindows((h,p) => {{
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      string pname = "";
+      try {{ pname = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName.ToLower(); }} catch {{ return true; }}
+      bool pmatch = false; foreach (var pr in procs) {{ if (pr.Length > 0 && pname.Contains(pr)) pmatch = true; }}
+      if (!pmatch) return true;
+      var sb = new StringBuilder(512); GetWindowText(h, sb, 512);
+      string t = sb.ToString();
+      bool tmatch = false; foreach (var tt in titles) {{ if (t == tt) tmatch = true; }}
+      if (!tmatch) return true;
+      ShowWindow(h, 9); ShowWindow(h, 5); SetForegroundWindow(h); n++;
+      return true;
+    }}, IntPtr.Zero);
+    return n;
+  }}
+}}
+'@
+Add-Type $sig
+[WR]::Restore($procs, @('微信','Weixin','WeChat'))"#,
+            procs = proc_match
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            // CREATE_NO_WINDOW: no flashing console window.
+            .creation_flags(0x08000000)
+            .output()
+            .map_err(|e| anyhow!("powershell restore spawn failed: {e}"))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "restore window failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let n: i32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .lines()
+            .last()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(0);
+        Ok(n > 0)
     }
 }
 
@@ -470,6 +555,10 @@ mod imp {
     pub fn primary_scale_factor() -> f32 {
         1.0
     }
+
+    pub fn restore_app_window(_app_name: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 // ===========================================================================
@@ -499,6 +588,18 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
 /// Primary-display scale factor (2.0 on macOS Retina, 1.0 elsewhere by default).
 pub fn primary_scale_factor() -> f32 {
     imp::primary_scale_factor()
+}
+
+/// Restore an app's main window from the system tray / hidden state so it can be
+/// captured. `app_name` is matched case-insensitively against the process name
+/// (e.g. "WeChat"/"Weixin"). Returns `Ok(true)` if at least one window was
+/// restored. No-op (returns `Ok(false)`) on platforms where it isn't needed.
+///
+/// Motivation: WeChat 4.x closes to the tray by destroying its top-level window
+/// (MainWindowHandle becomes 0), so window enumeration finds nothing and OCR has
+/// no surface. This brings the hidden main window back before capture.
+pub fn restore_app_window(app_name: &str) -> Result<bool> {
+    imp::restore_app_window(app_name)
 }
 
 /// Convenience: capture a region directly as an RGBA image.
