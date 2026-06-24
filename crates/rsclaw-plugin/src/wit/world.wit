@@ -247,6 +247,49 @@ interface host-android {
     android-tap-yellow-button: func(y-min: u32, y-max: u32) -> result<string, string>;
 }
 
+interface host-ios {
+    /// Connect to WebDriverAgent and optionally launch app by bundle id.
+    /// Returns session id string on success.
+    ios-connect: func(bundle-id: option<string>) -> result<string, string>;
+
+    /// Find elements by WDA selector. Returns JSON array of
+    /// [{text, label, type, enabled, rect:{x,y,w,h}}].
+    ios-find-elements: func(selector-type: string, selector-value: string) -> result<string, string>;
+
+    /// Tap the first element matching selector.
+    ios-tap-element: func(selector-type: string, selector-value: string) -> result<string, string>;
+
+    /// Tap at absolute screen coordinates (points, not pixels).
+    ios-tap: func(x: f64, y: f64) -> result<string, string>;
+
+    /// Type text via the keyboard (UIKit path).
+    ios-type: func(text: string) -> result<string, string>;
+
+    /// Swipe from (x1,y1) to (x2,y2) over duration-ms.
+    ios-swipe: func(x1: f64, y1: f64, x2: f64, y2: f64, duration-ms: u32) -> result<string, string>;
+
+    /// Get compact screen element labels as JSON array of strings.
+    ios-get-labels: func() -> result<string, string>;
+
+    /// Capture screenshot as data:image/png;base64,... URI.
+    ios-screenshot: func() -> result<string, string>;
+
+    /// Get screen size in points as JSON {width, height}.
+    ios-screen-size: func() -> result<string, string>;
+
+    /// Press a system keyboard button by name: "Send", "Return", "back", "home".
+    ios-press-button: func(name: string) -> result<string, string>;
+
+    /// Get current foreground app bundle id.
+    ios-current-app: func() -> result<string, string>;
+
+    /// Launch/foreground app by bundle id.
+    ios-launch-app: func(bundle-id: string) -> result<string, string>;
+
+    /// Terminate app by bundle id.
+    ios-terminate-app: func(bundle-id: string) -> result<string, string>;
+}
+
 interface host-desktop {
     /// Activate an application by bundle-id (macOS), exe name (Windows), or WM_CLASS (Linux).
     desktop-activate-app: func(bundle-id: string) -> result<string, string>;
@@ -346,6 +389,7 @@ world jimeng-plugin {
     import host-storage;
     import host-media;
     import host-android;
+    import host-ios;
     import host-desktop;
     import host-vlm;
     export plugin-api;
