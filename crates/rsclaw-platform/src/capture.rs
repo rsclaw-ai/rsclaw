@@ -197,8 +197,11 @@ mod imp {
     pub fn capture_region_png(x: i32, y: i32, w: u32, h: u32) -> Result<Vec<u8>> {
         let out = tmp_png("region");
         let p = out.display();
+        // DPI-aware so coords/sizes are PHYSICAL pixels (match enigo + full capture).
         let script = format!(
-            "Add-Type -AssemblyName System.Drawing; \
+            "Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();' -Name DpiR -Namespace Win32 -ErrorAction SilentlyContinue; \
+             try {{ [Win32.DpiR]::SetProcessDPIAware() | Out-Null }} catch {{}}; \
+             Add-Type -AssemblyName System.Drawing; \
              $bmp = New-Object System.Drawing.Bitmap({w}, {h}); \
              $g = [System.Drawing.Graphics]::FromImage($bmp); \
              $g.CopyFromScreen({x}, {y}, 0, 0, $bmp.Size); \
