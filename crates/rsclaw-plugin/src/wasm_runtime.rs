@@ -2270,6 +2270,107 @@ async fn u2_type_focused(serial: Option<&str>, text: &str) -> Result<(), String>
     else { Err(format!("u2 setValue http {}", resp.status())) }
 }
 
+/// Resolve `(base, session_id)` for a serial, bringing the u2 server up if
+/// needed. Every gesture below needs a live session (W3C `/actions` and
+/// `/screenshot` are session-scoped on this server build).
+async fn u2_session(serial: Option<&str>) -> Result<(String, String), String> {
+    let base = u2_ensure(serial).await?;
+    let sid = {
+        let map = u2_conns().lock().await;
+        map.get(serial.unwrap_or("")).and_then(|c| c.session.clone())
+    };
+    match sid {
+        Some(s) => Ok((base, s)),
+        None => Err("u2 session unavailable".into()),
+    }
+}
+
+/// Tap at `(x, y)` via the u2 server's W3C `/actions` endpoint — no `adb shell
+/// input` process per call, so no screen flash and no adb spawn storm in tight
+/// monitor loops.
+async fn u2_tap(serial: Option<&str>, x: u32, y: u32) -> Result<(), String> {
+    let (base, sid) = u2_session(serial).await?;
+    let client = host_http_client()?;
+    let body = json!({"actions":[{
+        "type":"pointer","id":"finger1","parameters":{"pointerType":"touch"},
+        "actions":[
+            {"type":"pointerMove","duration":0,"x":x,"y":y},
+            {"type":"pointerDown","button":0},
+            {"type":"pause","duration":60},
+            {"type":"pointerUp","button":0}
+        ]}]});
+    let resp = client
+        .post(format!("{base}/session/{}/actions", u2_url_encode(&sid)))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("u2 tap: {e}"))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("u2 tap http {}", resp.status()))
+    }
+}
+
+/// Swipe from `(x1,y1)` to `(x2,y2)` over `duration_ms` via the u2 `/actions`
+/// endpoint (a single held pointer move, like a finger drag).
+async fn u2_swipe(
+    serial: Option<&str>,
+    x1: u32,
+    y1: u32,
+    x2: u32,
+    y2: u32,
+    duration_ms: u32,
+) -> Result<(), String> {
+    let (base, sid) = u2_session(serial).await?;
+    let client = host_http_client()?;
+    let dur = duration_ms.max(1);
+    let body = json!({"actions":[{
+        "type":"pointer","id":"finger1","parameters":{"pointerType":"touch"},
+        "actions":[
+            {"type":"pointerMove","duration":0,"x":x1,"y":y1},
+            {"type":"pointerDown","button":0},
+            {"type":"pointerMove","duration":dur,"x":x2,"y":y2},
+            {"type":"pointerUp","button":0}
+        ]}]});
+    let resp = client
+        .post(format!("{base}/session/{}/actions", u2_url_encode(&sid)))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs((dur / 1000 + 12) as u64))
+        .send()
+        .await
+        .map_err(|e| format!("u2 swipe: {e}"))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("u2 swipe http {}", resp.status()))
+    }
+}
+
+/// Capture a screenshot via the u2 `/screenshot` endpoint. Returns the raw
+/// (un-prefixed) base64 PNG string. Unlike `adb exec-out screencap`, this
+/// reuses the persistent instrumentation connection — no per-frame adb child.
+async fn u2_screenshot_b64(serial: Option<&str>) -> Result<String, String> {
+    let (base, sid) = u2_session(serial).await?;
+    let client = host_http_client()?;
+    let resp = client
+        .get(format!("{base}/session/{}/screenshot", u2_url_encode(&sid)))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("u2 screenshot: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("u2 screenshot http {}", resp.status()));
+    }
+    let v: Value = resp.json().await.map_err(|e| format!("u2 screenshot body: {e}"))?;
+    v.get("value")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "u2 screenshot: empty value".to_string())
+}
+
 async fn u2_status_ok(base: &str) -> bool {
     let Ok(client) = host_http_client() else { return false };
     match client
@@ -2797,6 +2898,12 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
 impl rsclaw::plugin::host_android::Host for HostState {
     async fn android_tap(&mut self, x: u32, y: u32) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
+        // Prefer u2 /actions — no `adb shell input` child per tap, so no screen
+        // flash and no adb spawn storm in tight monitor loops. Fall back to adb
+        // only if the u2 server can't be reached.
+        if u2_tap(serial.as_deref(), x, y).await.is_ok() {
+            return Ok(Ok("tapped".to_string()));
+        }
         let (xs, ys) = (x.to_string(), y.to_string());
         Ok(
             adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys])
@@ -2814,6 +2921,9 @@ impl rsclaw::plugin::host_android::Host for HostState {
         duration_ms: u32,
     ) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
+        if u2_swipe(serial.as_deref(), x1, y1, x2, y2, duration_ms).await.is_ok() {
+            return Ok(Ok("swiped".to_string()));
+        }
         let (s1, s2, s3, s4, s5) = (
             x1.to_string(),
             y1.to_string(),
@@ -3051,6 +3161,12 @@ impl rsclaw::plugin::host_android::Host for HostState {
 
     async fn android_screenshot(&mut self) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
+        // Prefer u2 /screenshot (reuses the persistent instrumentation
+        // connection — no per-frame `adb exec-out screencap` child, which on
+        // some mirror/scrcpy setups visibly flashes the display).
+        if let Ok(b64) = u2_screenshot_b64(serial.as_deref()).await {
+            return Ok(Ok(format!("data:image/png;base64,{b64}")));
+        }
         let png_bytes =
             match adb_run_bytes(serial.as_deref(), &["exec-out", "screencap", "-p"]).await {
                 Ok(b) => b,
@@ -3102,6 +3218,9 @@ impl rsclaw::plugin::host_android::Host for HostState {
         };
         let cx = el["bounds"]["centerX"].as_i64().unwrap_or(0) as u32;
         let cy = el["bounds"]["centerY"].as_i64().unwrap_or(0) as u32;
+        if u2_tap(serial.as_deref(), cx, cy).await.is_ok() {
+            return Ok(Ok("tapped".to_string()));
+        }
         let (xs, ys) = (cx.to_string(), cy.to_string());
         Ok(
             adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys])
