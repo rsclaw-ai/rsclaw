@@ -247,30 +247,15 @@ impl CronRunner {
                 }
             }
 
-            // Best-effort export: read the canonical job set back from
-            // redb (so we capture any user-config preservation done
-            // above) and write `cron.json5` for human readability.
-            if let Ok(entries) = store.cron_list() {
-                let exported: Vec<CronJob> = entries
-                    .into_iter()
-                    .filter_map(|(_, j)| serde_json::from_str(&j).ok())
-                    .collect();
-                tokio::task::spawn_blocking(move || {
-                    export_cron_jobs_to_file(&exported);
-                });
-            }
+            // NOTE: Do NOT export to cron.json5 here. The file is the user's
+            // editable source of truth — we only read from it on boot (reconcile).
+            // Exporting on every runtime save_store() overwrites manual edits.
+            // File updates only happen via explicit user operations (API/CLI).
             return Ok(());
         }
 
         // Legacy fallback: file-only (tests, standalone tools).
-        let store_data = CronStore {
-            version: 1,
-            jobs: jobs.to_vec(),
-        };
-        let json = serde_json::to_string_pretty(&store_data)?;
-        let tmp = format!("{}.tmp", self.store_path.display());
-        tokio::fs::write(&tmp, &json).await?;
-        tokio::fs::rename(&tmp, &self.store_path).await?;
+        // Do NOT write to file — same rationale as the redb path above.
         Ok(())
     }
 
