@@ -3513,9 +3513,11 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         y: f64,
     ) -> HostTrapResult<Result<String, String>> {
         let (base, cli) = self.wda_base_and_client();
+        // Use the sessionless `/wda/tap` with the coordinates in the JSON body —
+        // the `/wda/tap/{x}/{y}` path form returns 404 on this WDA build.
         let payload = serde_json::json!({"x": x, "y": y});
         let resp = match cli
-            .post(format!("{base}/wda/tap/{x}/{y}"))
+            .post(format!("{base}/wda/tap"))
             .json(&payload)
             .send()
             .await
