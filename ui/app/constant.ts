@@ -55,12 +55,7 @@ export enum Path {
   Settings = "/settings",
   Auth = "/auth",
   SearchChat = "/search-chat",
-  GatewayControl = "/gateway",
   SetupWizard = "/setup",
-  AgentManager = "/agents",
-  ChannelConfig = "/channels",
-  CronManager = "/cron",
-  ComputerUseControl = "/computer-use",
   RsClawPanel = "/rsclaw",
   Onboarding = "/onboarding",
 }
