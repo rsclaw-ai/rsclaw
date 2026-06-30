@@ -10,10 +10,9 @@ import ConfirmIcon from "../icons/confirm.svg";
 import ReloadIcon from "../icons/reload.svg";
 import { useNavigate } from "react-router-dom";
 import { useEffect, useState, useCallback } from "react";
-import { Path, RSCLAW_GATEWAY_API_BASE } from "../constant";
+import { Path } from "../constant";
 import { showConfirm, showToast } from "./ui-lib";
-
-const GATEWAY_BASE = RSCLAW_GATEWAY_API_BASE;
+import { gatewayFetch } from "../lib/rsclaw-api";
 
 interface Agent {
   id: string;
@@ -51,7 +50,7 @@ export function AgentManagerPage() {
 
   const fetchAgents = useCallback(async () => {
     try {
-      const res = await fetch(`${GATEWAY_BASE}/status`, {
+      const res = await gatewayFetch("/api/v1/status", {
         signal: AbortSignal.timeout(3000),
       });
       if (!res.ok) throw new Error("Failed to fetch agents");
@@ -93,7 +92,7 @@ export function AgentManagerPage() {
   const handleDelete = async (id: string) => {
     if (await showConfirm(`Delete agent "${id}"?`)) {
       try {
-        const res = await fetch(`${GATEWAY_BASE}/agents/${id}`, {
+        const res = await gatewayFetch(`/api/v1/agents/${id}`, {
           method: "DELETE",
         });
         if (!res.ok) throw new Error("Failed to delete agent");
@@ -128,13 +127,15 @@ export function AgentManagerPage() {
     };
 
     try {
-      const method = editingId ? "PUT" : "POST";
-      const url = editingId
-        ? `${GATEWAY_BASE}/agents/${editingId}`
-        : `${GATEWAY_BASE}/agents`;
-      const res = await fetch(url, {
+      // Gateway route is PATCH /agents/{id} for updates (there is no PUT
+      // handler — PUT 405'd). Create is POST /agents. gatewayFetch adds the
+      // auth token + Content-Type (raw fetch sent neither, so it 401'd).
+      const method = editingId ? "PATCH" : "POST";
+      const path = editingId
+        ? `/api/v1/agents/${editingId}`
+        : `/api/v1/agents`;
+      const res = await gatewayFetch(path, {
         method,
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error("Failed to save agent");
