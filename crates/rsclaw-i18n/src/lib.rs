@@ -1365,6 +1365,10 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "en" => "Account '{name}': edit / remove?",
         "zh" => "账号 '{name}'：编辑还是删除？",
     );
+    msg!("cli_account_added",
+        "en" => "Added account '{name}'.",
+        "zh" => "已添加账号 '{name}'。",
+    );
     msg!("cli_account_remove",
         "en" => "Remove account",
         "zh" => "删除账号",
@@ -1488,6 +1492,11 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "es" => "Config {label}:",
         "ko" => "{label} 설정:",
         "ru" => "Конфигурация {label}:",
+    );
+    msg!("cli_scan_add",
+        "en" => "Scan to add (QR / OAuth)",
+        "zh" => "扫码添加",
+        "fr" => "Scanner pour ajouter (QR / OAuth)",
     );
     msg!("cli_scan_rescan",
         "en" => "Scan / OAuth login (re-scan)",

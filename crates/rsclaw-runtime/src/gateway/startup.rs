@@ -1372,8 +1372,21 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 break;
             }
             if std::time::Instant::now() >= deadline {
+                // Identify WHICH turns are still holding the inflight guard so
+                // the log says "stuck on heartbeat" / "stuck on this HTTP turn"
+                // instead of just a bare count. Live turns register a hard-
+                // cancel token under their session key (`agent:<id>:<channel>:..`).
+                let stuck: Vec<String> = registry
+                    .all()
+                    .iter()
+                    .filter_map(|h| h.cancel_tokens.read().ok().map(|m| {
+                        m.keys().cloned().collect::<Vec<_>>()
+                    }))
+                    .flatten()
+                    .collect();
                 warn!(
                     inflight = n,
+                    stuck = ?stuck,
                     "graceful drain: 60s timeout reached, restarting anyway"
                 );
                 break;

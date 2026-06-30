@@ -1680,6 +1680,7 @@ async fn try_plugin_slash(
                 chat_id: peer_id.to_owned(),
                 session_key: session_key.to_owned(),
                 is_group: false,
+                account: account.map(str::to_owned),
             });
             return Some(match plugin.call_tool_with_ctx(&command.handler, args, notify_ctx).await {
                 Ok(value) => plugin_slash_outbound(value),

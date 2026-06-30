@@ -164,9 +164,23 @@ pub(crate) fn start_feishu_if_configured(
                 .write()
                 .expect("channel_senders lock poisoned");
             senders.insert(format!("feishu/{}", acct_name), out_tx.clone());
-            senders
-                .entry("feishu".to_string())
-                .or_insert_with(|| out_tx.clone());
+            // Bare "feishu" fallback (used when an outbound message carries no
+            // account). Must be DETERMINISTIC: bind it to the account named
+            // "default", regardless of HashMap iteration order. The old
+            // `.or_insert` bound it to whichever account iterated first out of
+            // an unordered HashMap, so on multi-account setups the bare key
+            // pointed at an arbitrary app's token → Feishu 99992361 "open_id
+            // cross app" when that token didn't own the target open_id.
+            if acct_name == "default" {
+                senders.insert("feishu".to_string(), out_tx.clone());
+            } else {
+                // Configs without a "default"-named account still need *some*
+                // bare fallback; first-wins is fine there since "default"
+                // (above) overrides it whenever it exists.
+                senders
+                    .entry("feishu".to_string())
+                    .or_insert_with(|| out_tx.clone());
+            }
         }
 
         // Find binding for this account to determine which agent handles it.

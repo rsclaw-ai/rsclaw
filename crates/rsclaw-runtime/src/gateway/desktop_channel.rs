@@ -71,10 +71,26 @@ impl Channel for DesktopChannel {
                     obj.insert("kind".to_string(), serde_json::Value::String(k.clone()));
                 }
             }
+            // Forward any attachments (e.g. the astock `chart` tool pushes its
+            // K-line PNG as a data-URI via host::notify_with_image). Without
+            // this the image was silently dropped here — text reached the UI
+            // but the chart never did, while channels like Feishu (which carry
+            // OutboundMessage.images) showed it fine.
+            if !msg.images.is_empty() {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("images".to_string(), serde_json::json!(msg.images));
+                }
+            }
+            if !msg.files.is_empty() {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("files".to_string(), serde_json::json!(msg.files));
+                }
+            }
             let frame = EventFrame::new("notification", payload, 0);
             debug!(
                 target_id = %msg.target_id,
                 text_len = msg.text.len(),
+                image_count = msg.images.len(),
                 kind = ?kind,
                 "desktop: broadcasting notification"
             );

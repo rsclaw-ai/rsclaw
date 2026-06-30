@@ -156,7 +156,9 @@ class RsClawWsClient {
   private reqCounter = 2; // 1 is reserved for the connect handshake
   private pendingReqs = new Map<string, PendingReq>();
   private chatHandlers = new Map<string, { cb: ChatCallbacks; fullText: string }>();
-  private notificationHandlers = new Set<(text: string, kind?: string) => void>();
+  private notificationHandlers = new Set<
+    (text: string, kind?: string, images?: string[]) => void
+  >();
   private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
   private permissionHandlers = new Set<(payload: PermissionRequestPayload) => void>();
   private statusHandlers = new Set<(payload: ComputerUseStatusPayload) => void>();
@@ -197,7 +199,9 @@ class RsClawWsClient {
   }
 
   /** Register a notification handler. Returns an unsubscribe function. */
-  onNotification(handler: (text: string, kind?: string) => void): () => void {
+  onNotification(
+    handler: (text: string, kind?: string, images?: string[]) => void,
+  ): () => void {
     this.notificationHandlers.add(handler);
     return () => this.notificationHandlers.delete(handler);
   }
@@ -428,8 +432,13 @@ class RsClawWsClient {
         data.payload?.text || data.data?.text || data.text || "";
       const kind: string | undefined =
         data.payload?.kind || data.data?.kind || data.kind || undefined;
-      if (text) {
-        this.notificationHandlers.forEach((h) => h(text, kind));
+      const images: string[] | undefined =
+        data.payload?.images || data.data?.images || data.images || undefined;
+      // Fire when there's text OR an attachment — an image-only push (e.g.
+      // the astock chart PNG via host::notify_with_image) carries no text
+      // and must not be dropped by a text-only gate.
+      if (text || (images && images.length > 0)) {
+        this.notificationHandlers.forEach((h) => h(text, kind, images));
       }
       return;
     }
