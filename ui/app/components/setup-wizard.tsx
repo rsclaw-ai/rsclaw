@@ -6,7 +6,8 @@ import ReturnIcon from "../icons/return.svg";
 import ConfirmIcon from "../icons/confirm.svg";
 import { useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef, useMemo } from "react";
-import { Path, RSCLAW_GATEWAY_API_BASE } from "../constant";
+import { Path } from "../constant";
+import { gatewayFetch } from "../lib/rsclaw-api";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 import { showToast } from "./ui-lib";
 import {
@@ -16,8 +17,6 @@ import {
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
 import { useCatalog, getProviderMap } from "../lib/catalog";
-
-const GATEWAY_BASE = RSCLAW_GATEWAY_API_BASE;
 
 const LANGUAGES = [
   { code: "zh-CN", name: "简体中文" },
@@ -118,7 +117,7 @@ export function SetupWizardPage() {
           const cfg = JSON5.parse(raw || "{}");
           cfgLang = cfg?.gateway?.language;
         } else {
-          const res = await fetch(`${GATEWAY_BASE}/config`);
+          const res = await gatewayFetch("/api/v1/config");
           if (res.ok) {
             const cfg = await res.json();
             cfgLang = cfg?.gateway?.language;
@@ -190,9 +189,8 @@ export function SetupWizardPage() {
         models: { providers: providerConfig },
       };
 
-      const res = await fetch(`${GATEWAY_BASE}/config`, {
+      const res = await gatewayFetch("/api/v1/config", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error("Failed to save config");

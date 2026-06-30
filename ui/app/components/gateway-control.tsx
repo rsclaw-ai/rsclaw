@@ -8,10 +8,9 @@ import StopIcon from "../icons/pause.svg";
 import PowerIcon from "../icons/power.svg";
 import { useNavigate } from "react-router-dom";
 import { useEffect, useState, useCallback } from "react";
-import { Path, RSCLAW_GATEWAY_API_BASE } from "../constant";
+import { Path } from "../constant";
+import { gatewayFetch } from "../lib/rsclaw-api";
 import Locale from "../locales";
-
-const GATEWAY_BASE = RSCLAW_GATEWAY_API_BASE;
 
 interface AgentInfo {
   id: string;
@@ -38,7 +37,7 @@ export function GatewayControlPage() {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const healthRes = await fetch(`${GATEWAY_BASE}/health`, {
+      const healthRes = await gatewayFetch("/api/v1/health", {
         signal: AbortSignal.timeout(3000),
       });
       if (!healthRes.ok) throw new Error("Health check failed");
@@ -46,7 +45,7 @@ export function GatewayControlPage() {
 
       let agents: AgentInfo[] = [];
       try {
-        const statusRes = await fetch(`${GATEWAY_BASE}/status`, {
+        const statusRes = await gatewayFetch("/api/v1/status", {
           signal: AbortSignal.timeout(3000),
         });
         if (statusRes.ok) {

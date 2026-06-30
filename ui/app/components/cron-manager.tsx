@@ -11,10 +11,9 @@ import ReloadIcon from "../icons/reload.svg";
 import PlayIcon from "../icons/play.svg";
 import { useNavigate } from "react-router-dom";
 import { useEffect, useState, useCallback } from "react";
-import { Path, RSCLAW_GATEWAY_API_BASE } from "../constant";
+import { Path } from "../constant";
+import { gatewayFetch } from "../lib/rsclaw-api";
 import { showConfirm, showToast } from "./ui-lib";
-
-const GATEWAY_BASE = RSCLAW_GATEWAY_API_BASE;
 
 interface CronDelivery {
   channel?: string;
@@ -74,7 +73,7 @@ export function CronManagerPage() {
 
   const fetchJobs = useCallback(async () => {
     try {
-      const res = await fetch(`${GATEWAY_BASE}/cron`, {
+      const res = await gatewayFetch("/api/v1/cron", {
         signal: AbortSignal.timeout(3000),
       });
       if (!res.ok) throw new Error("Failed to fetch cron jobs");
@@ -93,7 +92,7 @@ export function CronManagerPage() {
 
   const fetchHistory = async (jobId: string) => {
     try {
-      const res = await fetch(`${GATEWAY_BASE}/cron/${jobId}/history`, {
+      const res = await gatewayFetch(`/api/v1/cron/${jobId}/history`, {
         signal: AbortSignal.timeout(3000),
       });
       if (!res.ok) throw new Error("Failed to fetch history");
@@ -133,7 +132,7 @@ export function CronManagerPage() {
   const handleDelete = async (id: string) => {
     if (await showConfirm(`Delete cron job "${id}"?`)) {
       try {
-        const res = await fetch(`${GATEWAY_BASE}/cron/${id}`, {
+        const res = await gatewayFetch(`/api/v1/cron/${id}`, {
           method: "DELETE",
         });
         if (!res.ok) throw new Error("Failed to delete job");
@@ -147,9 +146,8 @@ export function CronManagerPage() {
 
   const handleToggle = async (job: CronJob) => {
     try {
-      const res = await fetch(`${GATEWAY_BASE}/cron/${job.id}`, {
+      const res = await gatewayFetch(`/api/v1/cron/${job.id}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: !job.enabled }),
       });
       if (!res.ok) throw new Error("Failed to toggle job");
@@ -161,7 +159,7 @@ export function CronManagerPage() {
 
   const handleTrigger = async (id: string) => {
     try {
-      const res = await fetch(`${GATEWAY_BASE}/cron/${id}/trigger`, {
+      const res = await gatewayFetch(`/api/v1/cron/${id}/trigger`, {
         method: "POST",
       });
       if (!res.ok) throw new Error("Failed to trigger job");
@@ -195,12 +193,11 @@ export function CronManagerPage() {
 
     try {
       const method = editingId ? "PUT" : "POST";
-      const url = editingId
-        ? `${GATEWAY_BASE}/cron/${editingId}`
-        : `${GATEWAY_BASE}/cron`;
-      const res = await fetch(url, {
+      const path = editingId
+        ? `/api/v1/cron/${editingId}`
+        : "/api/v1/cron";
+      const res = await gatewayFetch(path, {
         method,
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error("Failed to save job");

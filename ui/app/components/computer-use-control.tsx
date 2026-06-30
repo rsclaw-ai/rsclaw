@@ -24,7 +24,8 @@ import { useCallback, useEffect, useState } from "react";
 
 import { ErrorBoundary } from "./error";
 import { IconButton } from "./button";
-import { Path, RSCLAW_GATEWAY_API_BASE } from "../constant";
+import { Path } from "../constant";
+import { gatewayFetch } from "../lib/rsclaw-api";
 import { getLang } from "../locales";
 import { rsclawWs, type ComputerUseStatusPayload } from "../lib/rsclaw-ws";
 import { showConfirm, showToast } from "./ui-lib";
@@ -34,8 +35,6 @@ import ReloadIcon from "../icons/reload.svg";
 import DeleteIcon from "../icons/delete.svg";
 
 import styles from "./computer-use-control.module.scss";
-
-const GATEWAY_BASE = RSCLAW_GATEWAY_API_BASE;
 
 type SavedGrant = {
   agent_id: string;
@@ -111,7 +110,7 @@ export function ComputerUseControlPage() {
   // 1. Bypass: read current value on mount.
   const fetchBypass = useCallback(async () => {
     try {
-      const res = await fetch(`${GATEWAY_BASE}/computer-use/bypass`, {
+      const res = await gatewayFetch("/api/v1/computer-use/bypass", {
         signal: AbortSignal.timeout(3000),
       });
       if (!res.ok) throw new Error(`status ${res.status}`);
@@ -126,7 +125,7 @@ export function ComputerUseControlPage() {
   const fetchGrants = useCallback(async () => {
     setGrantsLoading(true);
     try {
-      const res = await fetch(`${GATEWAY_BASE}/computer-use/permissions`, {
+      const res = await gatewayFetch("/api/v1/computer-use/permissions", {
         signal: AbortSignal.timeout(5000),
       });
       if (!res.ok) throw new Error(`status ${res.status}`);
@@ -211,9 +210,8 @@ export function ComputerUseControlPage() {
     }
     setBypassPending(true);
     try {
-      const res = await fetch(`${GATEWAY_BASE}/computer-use/bypass`, {
+      const res = await gatewayFetch("/api/v1/computer-use/bypass", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: target }),
       });
       if (!res.ok) throw new Error(`status ${res.status}`);
@@ -240,10 +238,10 @@ export function ComputerUseControlPage() {
       );
       if (!ok) return;
       try {
-        const url = `${GATEWAY_BASE}/computer-use/permissions/${encodeURIComponent(
+        const path = `/api/v1/computer-use/permissions/${encodeURIComponent(
           grant.agent_id,
         )}/${encodeURIComponent(grant.app || "")}`;
-        const res = await fetch(url, { method: "DELETE" });
+        const res = await gatewayFetch(path, { method: "DELETE" });
         if (!res.ok) throw new Error(`status ${res.status}`);
         showToast(zh ? "已撤销" : "Revoked");
         fetchGrants();
