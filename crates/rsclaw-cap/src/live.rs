@@ -949,7 +949,19 @@ async fn actor_loop(
                 // it emitting nothing), and ACP is the resilient fallback. Other
                 // agents just respawn same-kind.
                 let retry_acp = kind == AgentKind::Opencode;
-                let mut attempt = 0u8;
+                // Two INDEPENDENT budgets:
+                //  - `respawned`: a DEAD driver (send fail / mid-turn exit) gets
+                //    one respawn — opencode via ACP, the resilient path.
+                //  - `empty_resends`: an ALIVE-but-empty turn is the opencode
+                //    cold-start "produced nothing" flake. RE-SEND to the SAME,
+                //    now-warm driver — respawning there just cold-starts again
+                //    and re-emits nothing. (Observed: the death-respawn burned
+                //    the single old retry, so the empty post-respawn turn slipped
+                //    through as "(no output)" while the user's very next message
+                //    worked on the warm driver.) An empty turn ran no tools, so
+                //    replaying the prompt is safe.
+                let mut respawned = false;
+                let mut empty_resends = 0u8;
                 let outcome = loop {
                     let send_res = driver
                         .send(ClientFrame::Prompt {
@@ -957,11 +969,11 @@ async fn actor_loop(
                         })
                         .await;
                     if let Err(e) = send_res {
-                        if attempt == 0 {
-                            if respawn_driver(&kind, &cwd, &mut driver, &sid, "send failed", &agent_sid_slot, retry_acp).await {
-                                attempt += 1;
-                                continue;
-                            }
+                        if !respawned
+                            && respawn_driver(&kind, &cwd, &mut driver, &sid, "send failed", &agent_sid_slot, retry_acp).await
+                        {
+                            respawned = true;
+                            continue;
                         }
                         break Err(anyhow!("cap_live driver send: {e}"));
                     }
@@ -987,32 +999,21 @@ async fn actor_loop(
                     };
                     match turn {
                         Ok(()) => {
-                            // A turn that "succeeds" with no text is the other
-                            // face of the opencode stream-json flake (the driver
-                            // stayed alive but produced nothing — surfaced to the
-                            // user as "[OpenCode]（无输出）"). Treat it like a
-                            // death: respawn once via ACP and replay the prompt.
-                            if reply_buf.trim().is_empty()
-                                && retry_acp
-                                && attempt == 0
-                                && respawn_driver(
-                                    &kind,
-                                    &cwd,
-                                    &mut driver,
-                                    &sid,
-                                    "empty first turn",
-                                    &agent_sid_slot,
-                                    true,
-                                )
-                                .await
-                            {
-                                attempt += 1;
+                            if reply_buf.trim().is_empty() && empty_resends < 2 {
+                                empty_resends += 1;
+                                tracing::info!(
+                                    target: "cap",
+                                    session_id = %sid,
+                                    agent = kind.as_str(),
+                                    attempt = empty_resends,
+                                    "cap_live empty turn — re-sending prompt to warm driver"
+                                );
                                 continue;
                             }
                             break Ok(reply_buf);
                         }
                         Err(e) => {
-                            if attempt == 0
+                            if !respawned
                                 && respawn_driver(
                                     &kind,
                                     &cwd,
@@ -1024,7 +1025,7 @@ async fn actor_loop(
                                 )
                                 .await
                             {
-                                attempt += 1;
+                                respawned = true;
                                 continue;
                             }
                             break Err(anyhow!("cap_live driver: {e}"));

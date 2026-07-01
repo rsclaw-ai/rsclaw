@@ -2452,14 +2452,9 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "/cap：打开会话失败：{err}",
     );
 
-    msg!("cap_install_hint_npm",
-        "en" => "{agent} not found. Run `rsclaw tools install {cmd}` to install it.",
-        "zh" => "未找到 {agent}，请运行 `rsclaw tools install {cmd}` 安装。",
-    );
-
-    msg!("cap_install_hint_go",
-        "en" => "{agent} not found. Install it from https://github.com/opencode-ai/opencode then retry /cap {cmd}.",
-        "zh" => "未找到 {agent}，请从 https://github.com/opencode-ai/opencode 安装后重试 /cap {cmd}。",
+    msg!("cap_install_hint",
+        "en" => "{agent} is not installed. Install it with `rsclaw tools install {cmd}` (or authorize the assistant to run that), then retry /cap {cmd}.",
+        "zh" => "{agent} 未安装。运行 `rsclaw tools install {cmd}` 安装(或授权助手代为执行),然后重试 /cap {cmd}。",
     );
 
     msg!("cap_fallback_protocol",
