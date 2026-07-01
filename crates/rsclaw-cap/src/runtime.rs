@@ -233,6 +233,26 @@ pub async fn spawn_driver_continue_last(
     spawn_driver_inner(kind, cwd, ResumeMode::ContinueLast).await
 }
 
+/// Spawn the ACP driver directly, bypassing the stream-json path. Used as
+/// the retry target when the stream-json driver fails or produces no output
+/// on the first turn (the opencode fork's stream-json/persist path has been
+/// flaky under cap_live's cold-start capture — ACP is the resilient fallback).
+/// Only opencode has a distinct ACP driver; other kinds fall back to their
+/// normal spawn (a no-op difference for them).
+pub async fn spawn_driver_acp(
+    kind: AgentKind,
+    cwd: &std::path::Path,
+) -> Result<Box<dyn Driver>> {
+    match kind {
+        AgentKind::Opencode => Ok(Box::new(
+            cap_rs::driver::acp::AcpDriver::opencode(&cwd)
+                .await
+                .map_err(|e| anyhow!("cap opencode ACP spawn: {e}"))?,
+        )),
+        other => spawn_driver(other, cwd).await,
+    }
+}
+
 #[derive(Copy, Clone)]
 enum ResumeMode<'a> {
     None,

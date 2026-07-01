@@ -4606,6 +4606,15 @@ impl AgentRuntime {
         // Also triggers after /clear (session may contain a summary but no user
         // messages).
         let has_user_msg = session_messages.iter().any(|m| m.role == Role::User);
+        // Fresh, per-turn wall-clock. The old code stamped the date ONCE on the
+        // first message and froze it into the session prefix "for KV cache
+        // stability" — so a session opened on day N still reported day N's date
+        // a week later, and the model reasoned about the wrong day (e.g. "it's
+        // 6/24" on 7/1). The date line lives in the session-specific USER
+        // message, not the cross-user system prompt, so the shared prefix that
+        // kvCache=2 dedupes is untouched. Messages carry no timestamp of their
+        // own in the store, so persisting this line also timestamps history.
+        let date_ctx = crate::prompt_builder::build_date_context();
         let persist_text = if !has_user_msg {
             let now = chrono::Local::now();
             let tz = now.format("%Z").to_string();
@@ -4616,9 +4625,9 @@ impl AgentRuntime {
                 tz,
                 channel,
             );
-            format!("{session_meta}\n{persist_text}")
+            format!("{date_ctx}\n{session_meta}\n{persist_text}")
         } else {
-            persist_text
+            format!("{date_ctx}\n{persist_text}")
         };
 
         let persist_msg = Message {

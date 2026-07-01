@@ -41,7 +41,8 @@ use cap_rs::driver::Driver;
 
 use super::AgentKind;
 use super::runtime::{
-    NotifTarget, run_turn, spawn_driver, spawn_driver_continue_last, spawn_driver_resume,
+    NotifTarget, run_turn, spawn_driver, spawn_driver_acp, spawn_driver_continue_last,
+    spawn_driver_resume,
 };
 
 const DEFAULT_MAX_SESSIONS: usize = 8;
@@ -749,8 +750,14 @@ async fn respawn_driver(
     sid: &str,
     reason: &str,
     agent_sid_slot: &Arc<StdMutex<Option<String>>>,
+    force_acp: bool,
 ) -> bool {
-    match spawn_driver(*kind, cwd).await {
+    let spawned = if force_acp {
+        spawn_driver_acp(*kind, cwd).await
+    } else {
+        spawn_driver(*kind, cwd).await
+    };
+    match spawned {
         Ok(fresh) => {
             if let Err(e) = driver.shutdown().await {
                 tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
@@ -936,6 +943,12 @@ async fn actor_loop(
                 // from the user. Fresh respawn = lost in-process context,
                 // which is correct here: the dead driver already lost it,
                 // and the cold-start case has no prior turns to preserve.
+                // On the retry, respawn opencode via ACP rather than the
+                // stream-json path: opencode's stream-json/persist first turn is
+                // the flaky case (dies mid-turn, or the cold-start capture leaves
+                // it emitting nothing), and ACP is the resilient fallback. Other
+                // agents just respawn same-kind.
+                let retry_acp = kind == AgentKind::Opencode;
                 let mut attempt = 0u8;
                 let outcome = loop {
                     let send_res = driver
@@ -945,7 +958,7 @@ async fn actor_loop(
                         .await;
                     if let Err(e) = send_res {
                         if attempt == 0 {
-                            if respawn_driver(&kind, &cwd, &mut driver, &sid, "send failed", &agent_sid_slot).await {
+                            if respawn_driver(&kind, &cwd, &mut driver, &sid, "send failed", &agent_sid_slot, retry_acp).await {
                                 attempt += 1;
                                 continue;
                             }
@@ -973,7 +986,31 @@ async fn actor_loop(
                         )),
                     };
                     match turn {
-                        Ok(()) => break Ok(reply_buf),
+                        Ok(()) => {
+                            // A turn that "succeeds" with no text is the other
+                            // face of the opencode stream-json flake (the driver
+                            // stayed alive but produced nothing — surfaced to the
+                            // user as "[OpenCode]（无输出）"). Treat it like a
+                            // death: respawn once via ACP and replay the prompt.
+                            if reply_buf.trim().is_empty()
+                                && retry_acp
+                                && attempt == 0
+                                && respawn_driver(
+                                    &kind,
+                                    &cwd,
+                                    &mut driver,
+                                    &sid,
+                                    "empty first turn",
+                                    &agent_sid_slot,
+                                    true,
+                                )
+                                .await
+                            {
+                                attempt += 1;
+                                continue;
+                            }
+                            break Ok(reply_buf);
+                        }
                         Err(e) => {
                             if attempt == 0
                                 && respawn_driver(
@@ -983,6 +1020,7 @@ async fn actor_loop(
                                     &sid,
                                     "exited mid-turn",
                                     &agent_sid_slot,
+                                    retry_acp,
                                 )
                                 .await
                             {

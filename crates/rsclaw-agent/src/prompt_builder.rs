@@ -364,9 +364,9 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
 
 /// Build the dynamic date/time context line.
 ///
-/// When `kv_cache_mode >= 1`, this is injected per-turn into the user
-/// message instead of the system prompt, to preserve KV cache prefix stability.
-#[allow(dead_code)]
+/// Injected per-turn into the user message (never the system prompt) so the
+/// model always sees the current wall-clock without invalidating the shared
+/// kvCache=2 system-prompt prefix.
 pub(crate) fn build_date_context() -> String {
     let now = chrono::Local::now();
     use chrono::Datelike;
