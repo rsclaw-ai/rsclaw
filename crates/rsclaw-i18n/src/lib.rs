@@ -1365,6 +1365,10 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "en" => "Account '{name}': edit / remove?",
         "zh" => "账号 '{name}'：编辑还是删除？",
     );
+    msg!("cli_account_added",
+        "en" => "Added account '{name}'.",
+        "zh" => "已添加账号 '{name}'。",
+    );
     msg!("cli_account_remove",
         "en" => "Remove account",
         "zh" => "删除账号",
@@ -1488,6 +1492,11 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "es" => "Config {label}:",
         "ko" => "{label} 설정:",
         "ru" => "Конфигурация {label}:",
+    );
+    msg!("cli_scan_add",
+        "en" => "Scan to add (QR / OAuth)",
+        "zh" => "扫码添加",
+        "fr" => "Scanner pour ajouter (QR / OAuth)",
     );
     msg!("cli_scan_rescan",
         "en" => "Scan / OAuth login (re-scan)",
@@ -2443,14 +2452,9 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "/cap：打开会话失败：{err}",
     );
 
-    msg!("cap_install_hint_npm",
-        "en" => "{agent} not found. Run `rsclaw tools install {cmd}` to install it.",
-        "zh" => "未找到 {agent}，请运行 `rsclaw tools install {cmd}` 安装。",
-    );
-
-    msg!("cap_install_hint_go",
-        "en" => "{agent} not found. Install it from https://github.com/opencode-ai/opencode then retry /cap {cmd}.",
-        "zh" => "未找到 {agent}，请从 https://github.com/opencode-ai/opencode 安装后重试 /cap {cmd}。",
+    msg!("cap_install_hint",
+        "en" => "{agent} is not installed. Install it with `rsclaw tools install {cmd}` (or authorize the assistant to run that), then retry /cap {cmd}.",
+        "zh" => "{agent} 未安装。运行 `rsclaw tools install {cmd}` 安装(或授权助手代为执行),然后重试 /cap {cmd}。",
     );
 
     msg!("cap_fallback_protocol",

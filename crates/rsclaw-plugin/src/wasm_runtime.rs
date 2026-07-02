@@ -157,6 +157,12 @@ pub struct WasmNotifyCtx {
     pub chat_id: String,
     pub session_key: String,
     pub is_group: bool,
+    /// Originating channel account (e.g. feishu app account name). Stamped onto
+    /// `OutboundMessage.account` so plugin notifications route via
+    /// `<channel>/<account>` instead of the bare `<channel>` fallback — without
+    /// it a multi-account feishu setup sends with an arbitrary app's token and
+    /// Feishu rejects open_id targets with 99992361 "open_id cross app".
+    pub account: Option<String>,
 }
 
 /// State passed into the wasmtime `Store`, available to host functions.
@@ -739,7 +745,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
                 images: vec![],
                 files: vec![],
                 channel: Some(ctx.channel.clone()),
-                account: None,
+                account: ctx.account.clone(),
             });
             Ok(Ok("dispatched".to_string()))
         } else {
@@ -762,7 +768,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
                 images: vec![image_data_uri],
                 files: vec![],
                 channel: Some(ctx.channel.clone()),
-                account: None,
+                account: ctx.account.clone(),
             }) {
                 Ok(_) => Ok(Ok("dispatched".to_string())),
                 Err(_) => Ok(Ok("no_receivers".to_string())),
@@ -806,7 +812,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
                 images: vec![],
                 files: vec![(filename, mime, path_str)],
                 channel: Some(ctx.channel.clone()),
-                account: None,
+                account: ctx.account.clone(),
             }) {
                 Ok(_) => Ok(Ok("dispatched".to_string())),
                 Err(_) => Ok(Ok("no_receivers".to_string())),

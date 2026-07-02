@@ -364,26 +364,15 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
 
 /// Build the dynamic date/time context line.
 ///
-/// When `kv_cache_mode >= 1`, this is injected per-turn into the user
-/// message instead of the system prompt, to preserve KV cache prefix stability.
-#[allow(dead_code)]
+/// Injected per-turn into the user message (never the system prompt) so the
+/// model always sees the current wall-clock without invalidating the shared
+/// kvCache=2 system-prompt prefix.
 pub(crate) fn build_date_context() -> String {
-    let now = chrono::Local::now();
-    use chrono::Datelike;
-    let weekday = now.date_naive().weekday().num_days_from_monday();
-    let last_friday = if weekday >= 4 {
-        now.date_naive() - chrono::Duration::days((weekday - 4) as i64)
-    } else {
-        now.date_naive() - chrono::Duration::days((weekday + 3) as i64)
-    };
-    let yesterday = now.date_naive() - chrono::Duration::days(1);
-    format!(
-        "Current date: {} ({}). Yesterday: {}. Last Friday: {}.",
-        now.format("%Y-%m-%d %H:%M"),
-        now.format("%A"),
-        yesterday.format("%Y-%m-%d"),
-        last_friday.format("%Y-%m-%d"),
-    )
+    // Weekday (`%a`) is included explicitly because LLMs compute date→weekday
+    // unreliably; timezone (`%Z`) disambiguates the wall-clock. Relative dates
+    // (yesterday, last Friday) are dropped — the model derives those from the
+    // date fine, and per-turn brevity matters.
+    format!("Now: {}", chrono::Local::now().format("%Y-%m-%d %H:%M %a %Z"))
 }
 
 // ---------------------------------------------------------------------------

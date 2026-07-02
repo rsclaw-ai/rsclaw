@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn missing_file_emits_default_template() {
-        let out = compose_agents_md(None, "- fact");
+        let out = compose_agents_md(None, "- fact", &[], &[]);
         assert!(out.contains(USER_BEGIN_MARKER));
         assert!(out.contains(USER_END_MARKER));
         assert!(out.contains("- fact"));

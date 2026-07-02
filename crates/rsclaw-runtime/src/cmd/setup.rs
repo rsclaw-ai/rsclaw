@@ -60,7 +60,16 @@ fn select_step(prompt: &str, items: &[&str], default: usize) -> StepResult<usize
     {
         Ok(Some(idx)) => StepResult::Next(idx),
         Ok(None) => StepResult::Back,
-        Err(_) => StepResult::Cancel,
+        Err(e) => {
+            // An Err here is NOT a user ESC (that is Ok(None)) -- it means the
+            // interactive prompt could not run at all: stdin/stdout is not a
+            // real TTY, terminal init failed, or an IO error occurred. Surface
+            // the real reason instead of silently collapsing to "cancelled",
+            // which makes `configure` look like it exits for no reason.
+            eprintln!("  ! interactive prompt failed: {e}");
+            eprintln!("    (configure needs a real terminal; not a pipe/redirect/non-TTY stdin)");
+            StepResult::Cancel
+        }
     }
 }
 
@@ -1852,6 +1861,19 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
         }
     }
 
+    // Normalize before saving: top-level channel credentials and `accounts.*`
+    // must never coexist (the gateway registers both as separate channels and
+    // the outbound router falls back to the bare key, causing Feishu 99992361
+    // "open_id cross app" / WeChat ret=-2). Whenever a channel already has
+    // `accounts.*`, strip any stale top-level credential fields so the file is
+    // always written in the canonical accounts-only shape — regardless of how
+    // the top-level keys got there (legacy import, external edit, older binary).
+    for ch in &defs.channels {
+        if !account_names(&val, &ch.name).is_empty() {
+            strip_top_fields(&mut val, &ch.name, &ch.fields);
+        }
+    }
+
     // Save only if changes were made
     if val == original {
         println!();
@@ -2443,6 +2465,47 @@ fn account_names(val: &serde_json::Value, ch_name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Derive a stable, unique account key from freshly-scanned login fields.
+/// Prefers an id-like field (feishu `appId`, wechat `botId`) so the account
+/// name is recognizable; falls back to "account". Guarantees the result does
+/// not collide with any `existing` name by appending `-2`, `-3`, … .
+fn derive_account_name(
+    ch_name: &str,
+    fields: &[(String, String)],
+    existing: &[String],
+) -> String {
+    let base = fields
+        .iter()
+        .find(|(k, _)| k == "appId" || k == "botId")
+        .map(|(_, v)| {
+            // "cli_aa9f1b763f389cdc" -> "feishu-aa9f1b76"; ids with @ sanitized.
+            let trimmed = v.trim().trim_start_matches("cli_");
+            let short: String = trimmed
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(8)
+                .collect();
+            if short.is_empty() {
+                format!("{ch_name}-account")
+            } else {
+                format!("{ch_name}-{short}")
+            }
+        })
+        .unwrap_or_else(|| format!("{ch_name}-account"));
+
+    if !existing.iter().any(|e| e == &base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !existing.iter().any(|e| e == &candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Returns true if any field listed in `fields` is set at the top-level
 /// `channels.<ch>.<field>` path (i.e. single-account legacy layout).
 fn has_top_level_fields(
@@ -2630,7 +2693,7 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
 
         // Show scan/manual/back -- default to manual if already configured
         let default_idx = if already_configured { 1 } else { 0 };
-        let opt_scan = rsclaw_i18n::t("cli_scan_rescan", lang);
+        let opt_scan = rsclaw_i18n::t("cli_scan_add", lang);
         let opt_manual = rsclaw_i18n::t("cli_manual_edit", lang);
         let opt_back = rsclaw_i18n::t("cli_back", lang);
         let options_vec = [opt_scan.as_str(), opt_manual.as_str(), opt_back.as_str()];
@@ -2639,13 +2702,39 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
             StepResult::Next(0) => match run_channel_login(&ch.name).await {
                 Ok(fields) => {
                     if ch.multi_account {
-                        ensure_json_path(val, &["channels", &ch.name, "accounts", "default"]);
+                        // Pick a target account name. The FIRST scan (no
+                        // accounts yet) lands under "default"; every later scan
+                        // ADDS a new uniquely-named account instead of silently
+                        // clobbering "default" — the old code hardcoded
+                        // "default" so each rescan overwrote the previous bot
+                        // and the account count never grew ("can't add").
+                        let existing = account_names(val, &ch.name);
+                        let acct_name = if existing.is_empty() {
+                            "default".to_string()
+                        } else {
+                            derive_account_name(&ch.name, &fields, &existing)
+                        };
+                        ensure_json_path(
+                            val,
+                            &["channels", &ch.name, "accounts", &acct_name],
+                        );
                         for (k, v) in &fields {
-                            let path = format!("channels.{}.accounts.default.{}", ch.name, k);
+                            let path =
+                                format!("channels.{}.accounts.{}.{}", ch.name, acct_name, k);
                             let _ = set_nested_value(val, &path, serde_json::json!(v));
                         }
                         toggle_channel_enabled(val, &ch.name, true);
-                        edit_channel_multi_account(val, ch, lang);
+                        println!(
+                            "  {}",
+                            rsclaw_i18n::t_fmt(
+                                "cli_account_added",
+                                lang,
+                                &[("name", &acct_name)],
+                            )
+                        );
+                        // Go straight to the policy step (pairing / group). The
+                        // old code re-entered the account list here, forcing the
+                        // user to pick "Back" before reaching policies.
                         edit_channel_policies(val, &ch.name, lang);
                         return true;
                     } else {
@@ -2715,10 +2804,10 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
                 }
                 changed = true;
             }
-            if edit_channel_multi_account(val, ch, lang) {
-                changed = true;
-            }
-            if edit_channel_policies(val, &ch.name, lang) {
+            // The account list now hosts DM/group policy as in-list items and
+            // "Back" exits cleanly, so we no longer force the policy prompts
+            // here after the user returns.
+            if edit_channel_multi_account(val, ch, lang).await {
                 changed = true;
             }
             return changed;
@@ -2766,13 +2855,30 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
 
 /// DM + Group policy selectors. Returns true if either changed.
 fn edit_channel_policies(val: &mut serde_json::Value, ch_name: &str, lang: &str) -> bool {
-    let mut changed = false;
+    let dm = edit_dm_policy(val, ch_name, lang);
+    let gp = edit_group_policy(val, ch_name, lang);
+    dm || gp
+}
 
-    let dm_path = format!("channels.{}.dmPolicy", ch_name);
-    let current_dm = get_nested_value(val, &dm_path)
+/// Current DM policy for display, e.g. "pairing".
+fn current_dm_policy(val: &serde_json::Value, ch_name: &str) -> String {
+    get_nested_value(val, &format!("channels.{}.dmPolicy", ch_name))
         .and_then(|v| v.as_str())
         .unwrap_or("pairing")
-        .to_owned();
+        .to_owned()
+}
+
+/// Current group policy for display, e.g. "allowlist".
+fn current_group_policy(val: &serde_json::Value, ch_name: &str) -> String {
+    get_nested_value(val, &format!("channels.{}.groupPolicy", ch_name))
+        .and_then(|v| v.as_str())
+        .unwrap_or("allowlist")
+        .to_owned()
+}
+
+fn edit_dm_policy(val: &mut serde_json::Value, ch_name: &str, lang: &str) -> bool {
+    let dm_path = format!("channels.{}.dmPolicy", ch_name);
+    let current_dm = current_dm_policy(val, ch_name);
     let dm_policies = &["pairing", "open", "allowlist", "disabled"];
     let dm_idx = dm_policies
         .iter()
@@ -2785,15 +2891,15 @@ fn edit_channel_policies(val: &mut serde_json::Value, ch_name: &str, lang: &str)
             ensure_json_path(val, &["channels"]);
             ensure_json_path(val, &["channels", ch_name]);
             let _ = set_nested_value(val, &dm_path, serde_json::json!(new_policy));
-            changed = true;
+            return true;
         }
     }
+    false
+}
 
+fn edit_group_policy(val: &mut serde_json::Value, ch_name: &str, lang: &str) -> bool {
     let gp_path = format!("channels.{}.groupPolicy", ch_name);
-    let current_gp = get_nested_value(val, &gp_path)
-        .and_then(|v| v.as_str())
-        .unwrap_or("allowlist")
-        .to_owned();
+    let current_gp = current_group_policy(val, ch_name);
     let gp_policies = &["allowlist", "open", "disabled"];
     let gp_idx = gp_policies
         .iter()
@@ -2806,11 +2912,10 @@ fn edit_channel_policies(val: &mut serde_json::Value, ch_name: &str, lang: &str)
             ensure_json_path(val, &["channels"]);
             ensure_json_path(val, &["channels", ch_name]);
             let _ = set_nested_value(val, &gp_path, serde_json::json!(new_policy));
-            changed = true;
+            return true;
         }
     }
-
-    changed
+    false
 }
 
 /// Asks the user whether to migrate a single-account config to multi-account
@@ -2827,15 +2932,38 @@ fn prompt_add_another_account(label: &str, lang: &str) -> bool {
 
 /// Multi-account editor: list accounts under `channels.<ch>.accounts`, with
 /// Add / Edit / Remove / Back actions. Returns true if anything changed.
-fn edit_channel_multi_account(val: &mut serde_json::Value, ch: &ChannelDef, lang: &str) -> bool {
+async fn edit_channel_multi_account(
+    val: &mut serde_json::Value,
+    ch: &ChannelDef,
+    lang: &str,
+) -> bool {
     let mut changed = false;
     loop {
         let names = account_names(val, &ch.name);
         let add_label = rsclaw_i18n::t("cli_account_add_new", lang);
+        let dm_label = rsclaw_i18n::t_fmt(
+            "cli_dm_policy",
+            lang,
+            &[("policy", &current_dm_policy(val, &ch.name))],
+        );
+        let gp_label = rsclaw_i18n::t_fmt(
+            "cli_group_policy",
+            lang,
+            &[("policy", &current_group_policy(val, &ch.name))],
+        );
         let back_label = rsclaw_i18n::t("cli_back", lang);
+
+        // Index layout: [0..n) accounts, n add, n+1 dm-policy, n+2 group-policy,
+        // n+3 back. Policies live here as menu items so "Back" cleanly exits the
+        // channel instead of being forced through the policy prompts.
+        let dm_idx = names.len() + 1;
+        let gp_idx = names.len() + 2;
+        let back_idx = names.len() + 3;
 
         let mut items: Vec<String> = names.clone();
         items.push(add_label);
+        items.push(dm_label);
+        items.push(gp_label);
         items.push(back_label);
         let items_ref: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
         let title = rsclaw_i18n::t_fmt("cli_account_list_title", lang, &[("label", &ch.label)]);
@@ -2844,6 +2972,22 @@ fn edit_channel_multi_account(val: &mut serde_json::Value, ch: &ChannelDef, lang
             StepResult::Next(i) => i,
             _ => break,
         };
+
+        if sel == dm_idx {
+            if edit_dm_policy(val, &ch.name, lang) {
+                changed = true;
+            }
+            continue;
+        }
+        if sel == gp_idx {
+            if edit_group_policy(val, &ch.name, lang) {
+                changed = true;
+            }
+            continue;
+        }
+        if sel == back_idx {
+            break;
+        }
 
         if sel == names.len() {
             // [+ Add account]
@@ -2867,12 +3011,65 @@ fn edit_channel_multi_account(val: &mut serde_json::Value, ch: &ChannelDef, lang
                 continue;
             }
             let prefix = format!("channels.{}.accounts.{}", ch.name, new_name);
-            if edit_fields_at_prefix(val, &ch.fields, &prefix, lang) {
+
+            // Login channels (feishu / wechat) can fill the new account via QR
+            // scan; non-login channels — or a user who picks "manual" — type the
+            // fields by hand. Without this the add path was manual-only, so a
+            // second bot could never be onboarded by scanning.
+            let use_scan = if ch.login {
+                let opt_scan = rsclaw_i18n::t("cli_scan_add", lang);
+                let opt_manual = rsclaw_i18n::t("cli_manual_edit", lang);
+                let auth_prompt =
+                    rsclaw_i18n::t_fmt("cli_auth_method", lang, &[("label", &ch.label)]);
+                matches!(
+                    select_step(
+                        &format!("  {auth_prompt}"),
+                        &[opt_scan.as_str(), opt_manual.as_str()],
+                        0,
+                    ),
+                    StepResult::Next(0)
+                )
+            } else {
+                false
+            };
+
+            if use_scan {
+                match run_channel_login(&ch.name).await {
+                    Ok(fields) => {
+                        ensure_json_path(
+                            val,
+                            &["channels", &ch.name, "accounts", &new_name],
+                        );
+                        for (k, v) in &fields {
+                            let path =
+                                format!("channels.{}.accounts.{}.{}", ch.name, new_name, k);
+                            let _ = set_nested_value(val, &path, serde_json::json!(v));
+                        }
+                        toggle_channel_enabled(val, &ch.name, true);
+                        println!(
+                            "  {}",
+                            rsclaw_i18n::t_fmt(
+                                "cli_account_added",
+                                lang,
+                                &[("name", &new_name)],
+                            )
+                        );
+                        changed = true;
+                    }
+                    Err(e) => {
+                        println!(
+                            "  [!] {}",
+                            rsclaw_i18n::t_fmt(
+                                "cli_login_failed",
+                                lang,
+                                &[("err", &e.to_string())],
+                            )
+                        );
+                    }
+                }
+            } else if edit_fields_at_prefix(val, &ch.fields, &prefix, lang) {
                 changed = true;
             }
-        } else if sel == names.len() + 1 {
-            // Back
-            break;
         } else {
             let acct = names[sel].clone();
             let edit_label = rsclaw_i18n::t("cli_edit", lang);

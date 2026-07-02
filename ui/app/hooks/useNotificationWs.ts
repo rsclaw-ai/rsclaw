@@ -24,7 +24,7 @@ export function useNotificationWs() {
 
     rsclawWs.connect();
 
-    const unsub = rsclawWs.onNotification((text, kind) => {
+    const unsub = rsclawWs.onNotification((text, kind, images) => {
       // Resolve a human-readable label for the kind tag.
       // task_complete   = async /task agent finished
       // async_send      = async /send agent finished
@@ -36,27 +36,42 @@ export function useNotificationWs() {
             ? "[异步发送] "
             : "";
       const labeled = badge ? `${badge}${text}` : text;
+      const hasImages = !!images && images.length > 0;
+      // Image-only pushes (e.g. the astock chart PNG) carry no text — give
+      // the toast/native popup a placeholder so they still surface.
+      const display = labeled || (hasImages ? "[图片]" : "");
 
       // Toast
-      showToast(labeled, undefined, 10000);
+      if (display) showToast(display, undefined, 10000);
 
       // Native notification
-      if (Notification?.permission === "granted") {
-        new Notification("RsClaw", { body: labeled });
+      if (display && Notification?.permission === "granted") {
+        new Notification("RsClaw", { body: display });
       }
 
       // Also add to current chat session so it's visible inline.
-      // Tag as intermediate so the chat renderer applies the muted
-      // think-block palette (see chat-message-item-intermediate in
-      // chat.module.scss) — these are notifications/progress chatter,
-      // not a real assistant reply.
+      // When the push carries images (chart PNG, login QR, ...), build a
+      // multimodal content array so the chat renderer shows the image
+      // bubble — and render it as a real assistant reply (not the muted
+      // intermediate palette), matching how channels like Feishu display it.
+      // Pure-text notifications stay intermediate (progress chatter).
+      const content = hasImages
+        ? [
+            ...(labeled ? [{ type: "text" as const, text: labeled }] : []),
+            ...images!.map((url) => ({
+              type: "image_url" as const,
+              image_url: { url },
+            })),
+          ]
+        : labeled;
+
       const session = useChatStore.getState().currentSession();
       useChatStore.getState().updateTargetSession(session, (s) => {
         s.messages.push(
           createMessage({
             role: "assistant",
-            content: labeled,
-            isIntermediate: true,
+            content,
+            isIntermediate: !hasImages,
           }),
         );
       });

@@ -78,13 +78,6 @@ const SearchChat = dynamic(
   },
 );
 
-const GatewayControlPage = dynamic(
-  async () => (await import("./gateway-control")).GatewayControlPage,
-  {
-    loading: () => <Loading noLogo />,
-  },
-);
-
 const RsClawPanel = dynamic(
   async () => (await import("./rsclaw-panel")).RsClawPanel,
   {
@@ -103,34 +96,6 @@ const OnboardingPage = dynamic(
   async () => (await import("./onboarding")).OnboardingPage,
   {
     loading: () => <Loading />,
-  },
-);
-
-const AgentManagerPage = dynamic(
-  async () => (await import("./agent-manager")).AgentManagerPage,
-  {
-    loading: () => <Loading noLogo />,
-  },
-);
-
-const ChannelConfigPage = dynamic(
-  async () => (await import("./channel-config")).ChannelConfigPage,
-  {
-    loading: () => <Loading noLogo />,
-  },
-);
-
-const CronManagerPage = dynamic(
-  async () => (await import("./cron-manager")).CronManagerPage,
-  {
-    loading: () => <Loading noLogo />,
-  },
-);
-
-const ComputerUseControlPage = dynamic(
-  async () => (await import("./computer-use-control")).ComputerUseControlPage,
-  {
-    loading: () => <Loading noLogo />,
   },
 );
 
@@ -284,15 +249,7 @@ function Screen() {
             <Route path={Path.SearchChat} element={<SearchChat />} />
             <Route path={Path.Chat} element={<Chat />} />
             <Route path={Path.Settings} element={<Settings />} />
-            <Route path={Path.GatewayControl} element={<GatewayControlPage />} />
             <Route path={Path.SetupWizard} element={<SetupWizardPage />} />
-            <Route path={Path.AgentManager} element={<AgentManagerPage />} />
-            <Route path={Path.ChannelConfig} element={<ChannelConfigPage />} />
-            <Route path={Path.CronManager} element={<CronManagerPage />} />
-            <Route
-              path={Path.ComputerUseControl}
-              element={<ComputerUseControlPage />}
-            />
             <Route path={Path.RsClawPanel} element={<RsClawPanel />} />
             <Route path={Path.Onboarding} element={<OnboardingPage />} />
           </Routes>

@@ -556,24 +556,11 @@ pub(crate) async fn try_preparse_locally_with_account(
                 let err = e.to_string();
                 let is_binary_missing = err.contains("binary not found on PATH");
                 let hint = if is_binary_missing {
-                    match kind {
-                        rsclaw_cap::AgentKind::Opencode => rsclaw_i18n::t_fmt(
-                            "cap_install_hint_go",
-                            lang,
-                            &[
-                                ("agent", kind.display_name()),
-                                ("cmd", kind.as_str()),
-                            ],
-                        ),
-                        _ => rsclaw_i18n::t_fmt(
-                            "cap_install_hint_npm",
-                            lang,
-                            &[
-                                ("agent", kind.display_name()),
-                                ("cmd", kind.as_str()),
-                            ],
-                        ),
-                    }
+                    rsclaw_i18n::t_fmt(
+                        "cap_install_hint",
+                        lang,
+                        &[("agent", kind.display_name()), ("cmd", kind.as_str())],
+                    )
                 } else {
                     rsclaw_i18n::t_fmt("cap_open_failed", lang, &[("err", &err)])
                 };
@@ -650,24 +637,11 @@ pub(crate) async fn try_preparse_locally_with_account(
                 let err = e.to_string();
                 let is_binary_missing = err.contains("binary not found on PATH");
                 let hint = if is_binary_missing {
-                    match kind {
-                        rsclaw_cap::AgentKind::Opencode => rsclaw_i18n::t_fmt(
-                            "cap_install_hint_go",
-                            lang,
-                            &[
-                                ("agent", kind.display_name()),
-                                ("cmd", kind.as_str()),
-                            ],
-                        ),
-                        _ => rsclaw_i18n::t_fmt(
-                            "cap_install_hint_npm",
-                            lang,
-                            &[
-                                ("agent", kind.display_name()),
-                                ("cmd", kind.as_str()),
-                            ],
-                        ),
-                    }
+                    rsclaw_i18n::t_fmt(
+                        "cap_install_hint",
+                        lang,
+                        &[("agent", kind.display_name()), ("cmd", kind.as_str())],
+                    )
                 } else {
                     rsclaw_i18n::t_fmt("cap_open_failed", lang, &[("err", &err)])
                 };
@@ -1680,6 +1654,7 @@ async fn try_plugin_slash(
                 chat_id: peer_id.to_owned(),
                 session_key: session_key.to_owned(),
                 is_group: false,
+                account: account.map(str::to_owned),
             });
             return Some(match plugin.call_tool_with_ctx(&command.handler, args, notify_ctx).await {
                 Ok(value) => plugin_slash_outbound(value),
