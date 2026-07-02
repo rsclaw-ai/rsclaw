@@ -1,6 +1,7 @@
 [package]
 name = "rsclaw-platform"
 version = "0.1.0"
+description = "Platform crate for RsClaw — internal workspace crate, not for direct use"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -11,7 +12,7 @@ libc = "0.2"
 sys-info = "0.9"
 which = "7"
 dirs-next = "2"
-rsclaw-config = { path = "../rsclaw-config" }
+rsclaw-config = { path = "../rsclaw-config", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"

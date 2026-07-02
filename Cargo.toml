@@ -17,41 +17,41 @@ path = "src/main.rs"
 [dependencies]
 # Composition root + RPC handlers (a2a, cmd, cron, gateway, hooks, server, ws)
 # plus the process entry point `rsclaw_runtime::run`.
-rsclaw-runtime = { path = "crates/rsclaw-runtime" }
+rsclaw-runtime = { path = "crates/rsclaw-runtime", version = "2026.6.16" }
 
 # Extracted workspace crates (crate-split, feat/crate-split)
-rsclaw-agent = { path = "crates/rsclaw-agent" }
-rsclaw-types = { path = "crates/rsclaw-types" }
-rsclaw-a2a-types = { path = "crates/rsclaw-a2a-types" }
-rsclaw-config = { path = "crates/rsclaw-config" }
-rsclaw-artifact = { path = "crates/rsclaw-artifact" }
-rsclaw-mcp = { path = "crates/rsclaw-mcp" }
-rsclaw-cap = { path = "crates/rsclaw-cap" }
-rsclaw-heartbeat = { path = "crates/rsclaw-heartbeat" }
-rsclaw-cli = { path = "crates/rsclaw-cli" }
-rsclaw-migrate = { path = "crates/rsclaw-migrate" }
-rsclaw-desktop = { path = "crates/rsclaw-desktop" }
-rsclaw-evolution = { path = "crates/rsclaw-evolution" }
-rsclaw-memory = { path = "crates/rsclaw-memory" }
-rsclaw-doc = { path = "crates/rsclaw-doc" }
-rsclaw-browser = { path = "crates/rsclaw-browser" }
-rsclaw-channel = { path = "crates/rsclaw-channel" }
-rsclaw-computer = { path = "crates/rsclaw-computer" }
-rsclaw-kb = { path = "crates/rsclaw-kb" }
-rsclaw-plugin = { path = "crates/rsclaw-plugin" }
-rsclaw-skill = { path = "crates/rsclaw-skill" }
-rsclaw-tools = { path = "crates/rsclaw-tools" }
-rsclaw-store = { path = "crates/rsclaw-store" }
-rsclaw-jobs = { path = "crates/rsclaw-jobs" }
-rsclaw-embed = { path = "crates/rsclaw-embed" }
-rsclaw-provider = { path = "crates/rsclaw-provider" }
-rsclaw-retry = { path = "crates/rsclaw-retry" }
-rsclaw-util = { path = "crates/rsclaw-util" }
-rsclaw-platform = { path = "crates/rsclaw-platform" }
-rsclaw-i18n = { path = "crates/rsclaw-i18n" }
-rsclaw-events = { path = "crates/rsclaw-events" }
-rsclaw-cron = { path = "crates/rsclaw-cron" }
-rsclaw-watch = { path = "crates/rsclaw-watch" }
+rsclaw-agent = { path = "crates/rsclaw-agent", version = "0.1.0" }
+rsclaw-types = { path = "crates/rsclaw-types", version = "0.1.0" }
+rsclaw-a2a-types = { path = "crates/rsclaw-a2a-types", version = "0.1.0" }
+rsclaw-config = { path = "crates/rsclaw-config", version = "0.1.0" }
+rsclaw-artifact = { path = "crates/rsclaw-artifact", version = "0.1.0" }
+rsclaw-mcp = { path = "crates/rsclaw-mcp", version = "0.1.0" }
+rsclaw-cap = { path = "crates/rsclaw-cap", version = "0.1.0" }
+rsclaw-heartbeat = { path = "crates/rsclaw-heartbeat", version = "0.1.0" }
+rsclaw-cli = { path = "crates/rsclaw-cli", version = "0.1.0" }
+rsclaw-migrate = { path = "crates/rsclaw-migrate", version = "0.1.0" }
+rsclaw-desktop = { path = "crates/rsclaw-desktop", version = "0.1.0" }
+rsclaw-evolution = { path = "crates/rsclaw-evolution", version = "0.1.0" }
+rsclaw-memory = { path = "crates/rsclaw-memory", version = "0.1.0" }
+rsclaw-doc = { path = "crates/rsclaw-doc", version = "0.1.0" }
+rsclaw-browser = { path = "crates/rsclaw-browser", version = "0.1.0" }
+rsclaw-channel = { path = "crates/rsclaw-channel", version = "0.1.0" }
+rsclaw-computer = { path = "crates/rsclaw-computer", version = "0.1.0" }
+rsclaw-kb = { path = "crates/rsclaw-kb", version = "0.1.0" }
+rsclaw-plugin = { path = "crates/rsclaw-plugin", version = "0.1.0" }
+rsclaw-skill = { path = "crates/rsclaw-skill", version = "0.1.0" }
+rsclaw-tools = { path = "crates/rsclaw-tools", version = "0.1.0" }
+rsclaw-store = { path = "crates/rsclaw-store", version = "0.1.0" }
+rsclaw-jobs = { path = "crates/rsclaw-jobs", version = "0.1.0" }
+rsclaw-embed = { path = "crates/rsclaw-embed", version = "0.1.0" }
+rsclaw-provider = { path = "crates/rsclaw-provider", version = "0.1.0" }
+rsclaw-retry = { path = "crates/rsclaw-retry", version = "0.1.0" }
+rsclaw-util = { path = "crates/rsclaw-util", version = "0.1.0" }
+rsclaw-platform = { path = "crates/rsclaw-platform", version = "0.1.0" }
+rsclaw-i18n = { path = "crates/rsclaw-i18n", version = "0.1.0" }
+rsclaw-events = { path = "crates/rsclaw-events", version = "0.1.0" }
+rsclaw-cron = { path = "crates/rsclaw-cron", version = "0.1.0" }
+rsclaw-watch = { path = "crates/rsclaw-watch", version = "0.1.0" }
 
 # Async runtime
 tokio        = { version = "1", features = ["full"] }

@@ -1,13 +1,14 @@
 [package]
 name = "rsclaw-cron"
 version = "0.1.0"
+description = "Cron crate for RsClaw — internal workspace crate, not for direct use"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-rsclaw-config = { path = "../rsclaw-config" }
-rsclaw-store = { path = "../rsclaw-store" }
+rsclaw-config = { path = "../rsclaw-config", version = "0.1.0" }
+rsclaw-store = { path = "../rsclaw-store", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

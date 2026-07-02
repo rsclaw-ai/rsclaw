@@ -13,38 +13,38 @@ path = "src/lib.rs"
 
 [dependencies]
 # Extracted workspace crates
-rsclaw-agent = { path = "../rsclaw-agent" }
-rsclaw-types = { path = "../rsclaw-types" }
-rsclaw-a2a-types = { path = "../rsclaw-a2a-types" }
-rsclaw-config = { path = "../rsclaw-config" }
-rsclaw-artifact = { path = "../rsclaw-artifact" }
-rsclaw-mcp = { path = "../rsclaw-mcp" }
-rsclaw-cap = { path = "../rsclaw-cap" }
-rsclaw-heartbeat = { path = "../rsclaw-heartbeat" }
-rsclaw-cli = { path = "../rsclaw-cli" }
-rsclaw-migrate = { path = "../rsclaw-migrate" }
-rsclaw-desktop = { path = "../rsclaw-desktop" }
-rsclaw-evolution = { path = "../rsclaw-evolution" }
-rsclaw-memory = { path = "../rsclaw-memory" }
-rsclaw-doc = { path = "../rsclaw-doc" }
-rsclaw-browser = { path = "../rsclaw-browser" }
-rsclaw-channel = { path = "../rsclaw-channel" }
-rsclaw-computer = { path = "../rsclaw-computer" }
-rsclaw-kb = { path = "../rsclaw-kb" }
-rsclaw-plugin = { path = "../rsclaw-plugin" }
-rsclaw-skill = { path = "../rsclaw-skill" }
-rsclaw-tools = { path = "../rsclaw-tools" }
-rsclaw-store = { path = "../rsclaw-store" }
-rsclaw-jobs = { path = "../rsclaw-jobs" }
-rsclaw-embed = { path = "../rsclaw-embed" }
-rsclaw-provider = { path = "../rsclaw-provider" }
-rsclaw-retry = { path = "../rsclaw-retry" }
-rsclaw-util = { path = "../rsclaw-util" }
-rsclaw-platform = { path = "../rsclaw-platform" }
-rsclaw-i18n = { path = "../rsclaw-i18n" }
-rsclaw-events = { path = "../rsclaw-events" }
-rsclaw-cron = { path = "../rsclaw-cron" }
-rsclaw-watch = { path = "../rsclaw-watch" }
+rsclaw-agent = { path = "../rsclaw-agent", version = "0.1.0" }
+rsclaw-types = { path = "../rsclaw-types", version = "0.1.0" }
+rsclaw-a2a-types = { path = "../rsclaw-a2a-types", version = "0.1.0" }
+rsclaw-config = { path = "../rsclaw-config", version = "0.1.0" }
+rsclaw-artifact = { path = "../rsclaw-artifact", version = "0.1.0" }
+rsclaw-mcp = { path = "../rsclaw-mcp", version = "0.1.0" }
+rsclaw-cap = { path = "../rsclaw-cap", version = "0.1.0" }
+rsclaw-heartbeat = { path = "../rsclaw-heartbeat", version = "0.1.0" }
+rsclaw-cli = { path = "../rsclaw-cli", version = "0.1.0" }
+rsclaw-migrate = { path = "../rsclaw-migrate", version = "0.1.0" }
+rsclaw-desktop = { path = "../rsclaw-desktop", version = "0.1.0" }
+rsclaw-evolution = { path = "../rsclaw-evolution", version = "0.1.0" }
+rsclaw-memory = { path = "../rsclaw-memory", version = "0.1.0" }
+rsclaw-doc = { path = "../rsclaw-doc", version = "0.1.0" }
+rsclaw-browser = { path = "../rsclaw-browser", version = "0.1.0" }
+rsclaw-channel = { path = "../rsclaw-channel", version = "0.1.0" }
+rsclaw-computer = { path = "../rsclaw-computer", version = "0.1.0" }
+rsclaw-kb = { path = "../rsclaw-kb", version = "0.1.0" }
+rsclaw-plugin = { path = "../rsclaw-plugin", version = "0.1.0" }
+rsclaw-skill = { path = "../rsclaw-skill", version = "0.1.0" }
+rsclaw-tools = { path = "../rsclaw-tools", version = "0.1.0" }
+rsclaw-store = { path = "../rsclaw-store", version = "0.1.0" }
+rsclaw-jobs = { path = "../rsclaw-jobs", version = "0.1.0" }
+rsclaw-embed = { path = "../rsclaw-embed", version = "0.1.0" }
+rsclaw-provider = { path = "../rsclaw-provider", version = "0.1.0" }
+rsclaw-retry = { path = "../rsclaw-retry", version = "0.1.0" }
+rsclaw-util = { path = "../rsclaw-util", version = "0.1.0" }
+rsclaw-platform = { path = "../rsclaw-platform", version = "0.1.0" }
+rsclaw-i18n = { path = "../rsclaw-i18n", version = "0.1.0" }
+rsclaw-events = { path = "../rsclaw-events", version = "0.1.0" }
+rsclaw-cron = { path = "../rsclaw-cron", version = "0.1.0" }
+rsclaw-watch = { path = "../rsclaw-watch", version = "0.1.0" }
 
 # Async runtime
 tokio        = { version = "1", features = ["full"] }

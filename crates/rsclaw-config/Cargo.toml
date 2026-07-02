@@ -1,6 +1,7 @@
 [package]
 name = "rsclaw-config"
 version = "0.1.0"
+description = "Config crate for RsClaw — internal workspace crate, not for direct use"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
