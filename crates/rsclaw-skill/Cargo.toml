@@ -1,7 +1,6 @@
 [package]
 name = "rsclaw-skill"
 version = "0.1.0"
-publish = false
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
