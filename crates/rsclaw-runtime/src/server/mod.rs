@@ -2962,7 +2962,7 @@ async fn save_config(
     };
 
     // H6: validate against schema before writing to disk
-    if let Err(e) = serde_json::from_value::<rsclaw_config::Config>(value) {
+    if let Err(e) = serde_json::from_value::<rsclaw_config::schema::Config>(value) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("config schema validation failed: {e}")})),

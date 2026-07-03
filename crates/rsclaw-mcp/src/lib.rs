@@ -53,10 +53,7 @@ pub struct McpClient {
     next_id: Arc<AtomicU64>,
     timeout: Duration,
     /// D5: serialise all rpc_call invocations to prevent response interleaving.
-    /// stdin and stdout are independently locked, but JSON-RPC request/response
-    /// pairing assumes serial access. This Mutex gates the entire send-receive
-    /// cycle so concurrent callers cannot read each other's responses.
-    rpc_lock: tokio::sync::Mutex<()>,
+    rpc_lock: Arc<tokio::sync::Mutex<()>>,
     /// Tools discovered via `tools/list`.
     pub tools: Vec<McpTool>,
 }
@@ -105,7 +102,7 @@ impl McpClient {
             child: Arc::new(Mutex::new(child)),
             next_id: Arc::new(AtomicU64::new(1)),
             timeout: Duration::from_secs(MCP_CALL_TIMEOUT_SECS),
-            rpc_lock: tokio::sync::Mutex::new(()),
+            rpc_lock: Arc::new(tokio::sync::Mutex::new(())),
             tools: Vec::new(),
         })
     }
