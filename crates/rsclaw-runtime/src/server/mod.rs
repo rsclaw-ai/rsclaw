@@ -2950,16 +2950,27 @@ async fn save_config(
         .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("rsclaw.json5"));
 
     // Validate the new config parses before saving.
-    if let Err(e) = json5::from_str::<serde_json::Value>(&req.raw) {
+    let value = match json5::from_str::<serde_json::Value>(&req.raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid config JSON5: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // H6: validate against schema before writing to disk
+    if let Err(e) = serde_json::from_value::<rsclaw_config::Config>(value) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid config: {e}")})),
+            Json(serde_json::json!({"error": format!("config schema validation failed: {e}")})),
         )
             .into_response();
     }
 
     // Backup current file.
-    // TODO: add full schema validation before saving (beyond JSON5 parse check).
     let backup = config_path.with_extension("json5.bak");
     if let Err(e) = std::fs::copy(&config_path, &backup) {
         tracing::warn!(error = %e, "failed to create config backup before save");
@@ -4223,6 +4234,10 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
     static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"\x1b\[[0-9;]*m").expect("ansi escape regex")
     });
+    // C2: redact common secret patterns (Bearer tokens, API keys, etc.)
+    static SECRET_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)(?:bearer |api[_-]?key[=:]\s*|sk-|token[=:]\s*)[a-zA-Z0-9_-]{16,}").expect("secret redaction regex")
+    });
 
     let lines: Vec<&str> = content.lines().rev().take(limit).collect();
     let mut logs: Vec<serde_json::Value> = Vec::new();
@@ -4278,6 +4293,9 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
             ts.to_owned()
         };
 
+        // C2: redact secrets before exposing logs via API
+        let redacted_msg = SECRET_RE.replace_all(msg, "[REDACTED]");
+
         logs.push(serde_json::json!({
             "ts": short_ts,
             "level": match level {
@@ -4286,7 +4304,7 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
                 "DEBUG" => "DEBUG",
                 _ => "INFO",
             },
-            "msg": msg,
+            "msg": redacted_msg,
         }));
     }
 
