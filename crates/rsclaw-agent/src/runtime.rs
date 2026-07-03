@@ -3672,6 +3672,43 @@ impl AgentRuntime {
         // ---------------------------------------------------------------
         // File attachment: auto-save + show 3-option menu
         // ---------------------------------------------------------------
+        // Images arriving as FILE attachments (feishu large-image → file, a
+        // dropped image file, etc.) get analyzed INLINE this turn via the
+        // vision path — NOT parked in the file-confirm menu. That menu turned
+        // image analysis into a two-step "已收到图片@up_… → 分析中 → 结果" flow;
+        // users expect one-shot recognition. Pull images out of `files` into
+        // `images` (still written to uploads/ so `@up_<id>` references keep
+        // working); only non-image files fall through to the confirm menu.
+        let (image_files, other_files): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|f| f.mime_type.starts_with("image/"));
+        let mut images = images;
+        if !image_files.is_empty() {
+            use base64::Engine as _;
+            let ws = agent_cfg
+                .workspace
+                .as_deref()
+                .or(self.live.agents.read().await.defaults.workspace.as_deref())
+                .map(expand_tilde)
+                .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"));
+            let uploads = ws.join("uploads");
+            for f in image_files {
+                let subdir = rsclaw_channel::upload_subdir(&f.mime_type, &f.filename);
+                let std_name = rsclaw_channel::upload_filename(&f.mime_type, &f.filename);
+                let dir = uploads.join(subdir);
+                let _ = std::fs::create_dir_all(&dir);
+                let saved = dir.join(&std_name);
+                let _ = std::fs::write(&saved, &f.data);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&f.data);
+                images.push(super::registry::ImageAttachment {
+                    data: format!("data:{};base64,{}", f.mime_type, b64),
+                    mime_type: f.mime_type,
+                    source_path: Some(saved.to_string_lossy().into_owned()),
+                });
+            }
+        }
+        let files = other_files;
+
         if !files.is_empty() {
             let ws = agent_cfg
                 .workspace
