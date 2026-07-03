@@ -5,11 +5,12 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::debug;
 
+use super::attachments::parse_data_url;
 use super::{Channel, OutboundMessage};
 
 pub const CLI_CHANNEL_NAME: &str = "cli";
@@ -41,9 +42,44 @@ impl Channel for CliChannel {
             let mut stdout = tokio::io::stdout();
             stdout.write_all(msg.text.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
+
+            // I7: save images to temp files and print paths
+            for (i, data_uri) in msg.images.iter().enumerate() {
+                let (mime, data) = match parse_data_url(data_uri) {
+                    Some(pair) => pair,
+                    None => {
+                        debug!("cli: skipping non-data-URI image entry {}", i);
+                        continue;
+                    }
+                };
+                let ext = super::attachments::mime_to_ext(&mime);
+                let dir = std::env::temp_dir().join("rsclaw-cli-images");
+                std::fs::create_dir_all(&dir).ok();
+                let fname = format!("image_{}{}", i, ext);
+                let path = dir.join(&fname);
+                // Decode data_uri (already parsed) and write bytes
+                use base64::Engine;
+                match base64::engine::general_purpose::STANDARD.decode(&data) {
+                    Ok(bytes) => {
+                        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+                            debug!(?e, "cli: failed to save image {}", i);
+                        } else {
+                            stdout
+                                .write_all(
+                                    format!("[image: {}]\n", path.display()).as_bytes(),
+                                )
+                                .await?;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(?e, "cli: failed to decode base64 image {}", i);
+                    }
+                }
+            }
             stdout.flush().await?;
-            if !msg.images.is_empty() {
-                tracing::debug!("cli: image sending not yet implemented");
+
+            if !msg.files.is_empty() {
+                debug!("cli: files not rendered on CLI: {:?}", msg.files.iter().map(|f| &f.0).collect::<Vec<_>>());
             }
             Ok(())
         })

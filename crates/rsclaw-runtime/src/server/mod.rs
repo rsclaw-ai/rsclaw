@@ -3016,6 +3016,33 @@ async fn openai_chat_completions(
     Json(req): Json<OaiChatRequest>,
 ) -> impl IntoResponse {
     info!(stream = req.stream, model = ?req.model, "HTTP /v1/chat/completions");
+
+    // C1: when gateway runs without auth (open mode), reject x- headers
+    // from non-loopback sources to prevent header spoofing.
+    let trusted_headers = {
+        let gw = state.live.gateway.read().await;
+        if gw.auth_token.is_none() {
+            // Only trust headers when the request comes from localhost
+            use std::net::{IpAddr, Ipv4Addr};
+            let is_local = headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+                .map(|ip| ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+                .unwrap_or(false);
+            if !is_local {
+                info!("open gateway: rejecting spoofed x- headers from non-loopback");
+                false
+            } else {
+                true
+            }
+        } else {
+            // Auth middleware validated the token — headers are trusted
+            true
+        }
+    };
+
     // Extract text from the last user message.
     let text = req
         .messages
@@ -3048,28 +3075,46 @@ async fn openai_chat_completions(
     };
 
     // Session key: prefer X-Session-Key header (desktop UI), else hash history.
-    let session_key = headers
-        .get("x-session-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-        .unwrap_or_else(|| {
-            use std::{
-                collections::hash_map::DefaultHasher,
-                hash::{Hash, Hasher},
-            };
-            let mut h = DefaultHasher::new();
-            for m in &req.messages {
-                m.role.hash(&mut h);
-                m.content.hash(&mut h);
-            }
-            format!("oai:{:x}", h.finish())
-        });
+    let session_key = if trusted_headers {
+        headers
+            .get("x-session-key")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| {
+                use std::{
+                    collections::hash_map::DefaultHasher,
+                    hash::{Hash, Hasher},
+                };
+                let mut h = DefaultHasher::new();
+                for m in &req.messages {
+                    m.role.hash(&mut h);
+                    m.content.hash(&mut h);
+                }
+                format!("oai:{:x}", h.finish())
+            })
+    } else {
+        // Untrusted: always use hash-based session key
+        use std::{
+            collections::hash_map::DefaultHasher,
+            hash::{Hash, Hasher},
+        };
+        let mut h = DefaultHasher::new();
+        for m in &req.messages {
+            m.role.hash(&mut h);
+            m.content.hash(&mut h);
+        }
+        format!("oai:{:x}", h.finish())
+    };
 
-    let peer_id = headers
-        .get("x-user-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("desktop")
-        .to_owned();
+    let peer_id = if trusted_headers {
+        headers
+            .get("x-user-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("desktop")
+            .to_owned()
+    } else {
+        "openapi".to_owned()
+    };
 
     // Extract [file:path] references from user text.
     let (text, file_images, file_files) = rsclaw_agent::registry::extract_file_refs(&text);
@@ -3079,11 +3124,15 @@ async fn openai_chat_completions(
     let msg = AgentMessage {
         session_key: session_key.clone(),
         text,
-        channel: headers
-            .get("x-channel")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("desktop")
-            .to_owned(),
+        channel: if trusted_headers {
+            headers
+                .get("x-channel")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("desktop")
+                .to_owned()
+        } else {
+            "openapi".to_owned()
+        },
         peer_id,
         chat_id: String::new(),
         reply_tx,

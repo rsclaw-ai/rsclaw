@@ -776,7 +776,7 @@ impl super::runtime::AgentRuntime {
             .as_ref()
             .and_then(|t| t.exec.as_ref())
             .and_then(|e| e.safety)
-            .unwrap_or(false);
+            .unwrap_or(true);
         if safety_enabled {
             check_read_safety(path, &full)?;
         }
@@ -971,7 +971,7 @@ impl super::runtime::AgentRuntime {
             .as_ref()
             .and_then(|t| t.exec.as_ref())
             .and_then(|e| e.safety)
-            .unwrap_or(false);
+            .unwrap_or(true);
         if safety_enabled {
             check_write_safety(&path, &full, &content)?;
         }
@@ -1086,7 +1086,7 @@ impl super::runtime::AgentRuntime {
             .as_ref()
             .and_then(|t| t.exec.as_ref())
             .and_then(|e| e.safety)
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         if safety_enabled {
             let preparse = crate::preparse::PreParseEngine::load_with_safety(true);
@@ -1434,7 +1434,7 @@ impl super::runtime::AgentRuntime {
             .as_ref()
             .and_then(|t| t.exec.as_ref())
             .and_then(|e| e.safety)
-            .unwrap_or(false);
+            .unwrap_or(true);
         let content = tokio::fs::read_to_string(&full)
             .await
             .map_err(|e| anyhow!("edit_file: cannot read `{}`: {e}", full.display()))?;
