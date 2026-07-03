@@ -1,6 +1,7 @@
 [package]
 name = "rsclaw-agent"
 version = "0.1.0"
+description = "Agent crate for RsClaw — internal workspace crate, not for direct use"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -43,27 +44,27 @@ dirs-next = "2"
 which = "7"
 
 # Extracted workspace crates
-rsclaw-types = { path = "../rsclaw-types" }
-rsclaw-a2a-types = { path = "../rsclaw-a2a-types" }
-rsclaw-config = { path = "../rsclaw-config" }
-rsclaw-provider = { path = "../rsclaw-provider" }
-rsclaw-channel = { path = "../rsclaw-channel" }
-rsclaw-skill = { path = "../rsclaw-skill" }
-rsclaw-browser = { path = "../rsclaw-browser" }
-rsclaw-kb = { path = "../rsclaw-kb" }
-rsclaw-plugin = { path = "../rsclaw-plugin" }
-rsclaw-artifact = { path = "../rsclaw-artifact" }
-rsclaw-computer = { path = "../rsclaw-computer" }
-rsclaw-mcp = { path = "../rsclaw-mcp" }
-rsclaw-memory = { path = "../rsclaw-memory" }
-rsclaw-evolution = { path = "../rsclaw-evolution" }
-rsclaw-cap = { path = "../rsclaw-cap" }
-rsclaw-cron = { path = "../rsclaw-cron" }
-rsclaw-tools = { path = "../rsclaw-tools" }
-rsclaw-util = { path = "../rsclaw-util" }
-rsclaw-i18n = { path = "../rsclaw-i18n" }
-rsclaw-events = { path = "../rsclaw-events" }
-rsclaw-platform = { path = "../rsclaw-platform" }
-rsclaw-store = { path = "../rsclaw-store" }
-rsclaw-doc = { path = "../rsclaw-doc" }
-rsclaw-jobs = { path = "../rsclaw-jobs" }
+rsclaw-types = { path = "../rsclaw-types", version = "0.1.0" }
+rsclaw-a2a-types = { path = "../rsclaw-a2a-types", version = "0.1.0" }
+rsclaw-config = { path = "../rsclaw-config", version = "0.1.0" }
+rsclaw-provider = { path = "../rsclaw-provider", version = "0.1.0" }
+rsclaw-channel = { path = "../rsclaw-channel", version = "0.1.0" }
+rsclaw-skill = { path = "../rsclaw-skill", version = "0.1.0" }
+rsclaw-browser = { path = "../rsclaw-browser", version = "0.1.0" }
+rsclaw-kb = { path = "../rsclaw-kb", version = "0.1.0" }
+rsclaw-plugin = { path = "../rsclaw-plugin", version = "0.1.0" }
+rsclaw-artifact = { path = "../rsclaw-artifact", version = "0.1.0" }
+rsclaw-computer = { path = "../rsclaw-computer", version = "0.1.0" }
+rsclaw-mcp = { path = "../rsclaw-mcp", version = "0.1.0" }
+rsclaw-memory = { path = "../rsclaw-memory", version = "0.1.0" }
+rsclaw-evolution = { path = "../rsclaw-evolution", version = "0.1.0" }
+rsclaw-cap = { path = "../rsclaw-cap", version = "0.1.0" }
+rsclaw-cron = { path = "../rsclaw-cron", version = "0.1.0" }
+rsclaw-tools = { path = "../rsclaw-tools", version = "0.1.0" }
+rsclaw-util = { path = "../rsclaw-util", version = "0.1.0" }
+rsclaw-i18n = { path = "../rsclaw-i18n", version = "0.1.0" }
+rsclaw-events = { path = "../rsclaw-events", version = "0.1.0" }
+rsclaw-platform = { path = "../rsclaw-platform", version = "0.1.0" }
+rsclaw-store = { path = "../rsclaw-store", version = "0.1.0" }
+rsclaw-doc = { path = "../rsclaw-doc", version = "0.1.0" }
+rsclaw-jobs = { path = "../rsclaw-jobs", version = "0.1.0" }

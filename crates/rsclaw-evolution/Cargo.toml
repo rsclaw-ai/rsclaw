@@ -1,6 +1,7 @@
 [package]
 name = "rsclaw-evolution"
 version = "0.1.0"
+description = "Evolution crate for RsClaw — internal workspace crate, not for direct use"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -10,4 +11,4 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
-rsclaw-config = { path = "../rsclaw-config" }
+rsclaw-config = { path = "../rsclaw-config", version = "0.1.0" }

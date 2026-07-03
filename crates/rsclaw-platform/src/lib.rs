@@ -108,31 +108,47 @@ pub fn build_runtime(_tier: MemoryTier) -> Result<tokio::runtime::Runtime> {
 // so browser/channel can resolve binaries without depending on the agent knot.
 /// Detect Chrome / Chromium binary path.
 ///
-/// Priority: user's existing system Chrome > `~/.rsclaw/tools/chrome`
-/// (Chrome for Testing we manage). The reorder is intentional — most
-/// users already have Google Chrome installed, and we want to ride on
-/// their version (security updates, extensions, profiles) rather than
-/// silently maintaining a parallel copy.
+/// Priority: real Google Chrome > `~/.rsclaw/tools/chrome` (managed Chrome
+/// for Testing) > other Chromium-family browsers (Edge / Brave / Chromium).
+/// The managed Chrome for Testing is deliberately preferred over Edge/Brave:
+/// on a machine without Google Chrome, riding on Edge forces the browser
+/// onto the system-Chrome `default` profile (see `is_system_chrome`) and
+/// runs automation on a different engine — so we'd rather use the real
+/// Chrome engine we manage, on the stable `rsclaw` profile.
 ///
-/// `tools/chrome` remains as a fallback so that machines without any
-/// Chrome at all still work after a single `rsclaw tools install chrome`.
-/// See `ensure_chrome()` for the auto-install on absence.
+/// `tools/chrome` therefore also covers machines without any Chrome at all
+/// after a single `rsclaw tools install chrome`. See `ensure_chrome()` for
+/// the auto-install on absence.
 pub fn detect_chrome() -> Option<String> {
     // 1. System-installed Chrome (well-known locations + PATH).
     #[cfg(target_os = "macos")]
     {
-        // Relative-to-Applications bundle paths, checked under both the
-        // system /Applications and the per-user ~/Applications.
-        let rel = [
-            "Google Chrome.app/Contents/MacOS/Google Chrome",
-            "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            "Brave Browser.app/Contents/MacOS/Brave Browser",
-            "Chromium.app/Contents/MacOS/Chromium",
-        ];
+        // Bundle paths checked under both the system /Applications and the
+        // per-user ~/Applications.
         let mut roots = vec![std::path::PathBuf::from("/Applications")];
         if let Some(home) = dirs_next::home_dir() {
             roots.push(home.join("Applications"));
         }
+        // 1a. Real Google Chrome first — ride on the user's own install.
+        for root in &roots {
+            let p = root.join("Google Chrome.app/Contents/MacOS/Google Chrome");
+            if p.exists() {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+        // 1b. Managed Chrome for Testing (~/.rsclaw/tools/chrome) — preferred
+        //     over Edge/Brave/Chromium so automation runs on a real Chrome
+        //     engine and the stable `rsclaw` profile instead of falling to
+        //     Edge (which is forced onto the `default` profile).
+        if let Some(m) = managed_chrome() {
+            return Some(m);
+        }
+        // 1c. Other Chromium-family system browsers.
+        let rel = [
+            "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "Brave Browser.app/Contents/MacOS/Brave Browser",
+            "Chromium.app/Contents/MacOS/Chromium",
+        ];
         for root in &roots {
             for r in &rel {
                 let p = root.join(r);
@@ -239,41 +255,38 @@ pub fn detect_chrome() -> Option<String> {
     }
 
     // 2. Fall back to ~/.rsclaw/tools/chrome (Chrome for Testing we manage).
-    let tools_dir = rsclaw_config::loader::base_dir().join("tools/chrome");
-    if tools_dir.exists() {
-        #[cfg(target_os = "macos")]
-        {
-            let candidates = [
-                "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-                "Chromium.app/Contents/MacOS/Chromium",
-                "Google Chrome.app/Contents/MacOS/Google Chrome",
-            ];
-            for name in &candidates {
-                let bin = tools_dir.join(name);
-                if bin.exists() {
-                    return Some(bin.to_string_lossy().to_string());
-                }
-            }
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let candidates = ["chrome.exe", "Google Chrome for Testing.exe"];
-            for name in &candidates {
-                let bin = tools_dir.join(name);
-                if bin.exists() {
-                    return Some(bin.to_string_lossy().to_string());
-                }
-            }
-        }
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        {
-            let bin = tools_dir.join("chrome");
-            if bin.exists() {
-                return Some(bin.to_string_lossy().to_string());
-            }
-        }
+    //    On macOS this is already tried above (before Edge/Brave); this covers
+    //    Windows/Linux and macOS machines with no system browser at all.
+    if let Some(m) = managed_chrome() {
+        return Some(m);
     }
 
+    None
+}
+
+/// Path to the rsclaw-managed Chrome for Testing under `~/.rsclaw/tools/chrome`,
+/// if a usable binary is present. Returns `None` when the dir is absent.
+fn managed_chrome() -> Option<String> {
+    let tools_dir = rsclaw_config::loader::base_dir().join("tools/chrome");
+    if !tools_dir.exists() {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    let candidates: &[&str] = &[
+        "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        "Chromium.app/Contents/MacOS/Chromium",
+        "Google Chrome.app/Contents/MacOS/Google Chrome",
+    ];
+    #[cfg(target_os = "windows")]
+    let candidates: &[&str] = &["chrome.exe", "Google Chrome for Testing.exe"];
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let candidates: &[&str] = &["chrome"];
+    for name in candidates {
+        let bin = tools_dir.join(name);
+        if bin.exists() {
+            return Some(bin.to_string_lossy().to_string());
+        }
+    }
     None
 }
 
