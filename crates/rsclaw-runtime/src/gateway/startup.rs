@@ -394,14 +394,30 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let plugins_dir = base_dir.join("plugins");
     let wasm_browser: Arc<tokio::sync::Mutex<Option<rsclaw_browser::BrowserSession>>> =
         Arc::new(tokio::sync::Mutex::new(None));
-    // Resolve default vision model for host-vlm interface.
-    let vision_model = config
+    // Resolve default vision model for the host-vlm interface (plugin
+    // `vlm_parse` — wechat/desktop screenshot parsing, etc.). Mirror the
+    // agent's `resolve_vision_chain`: an explicit `model.vision` wins; otherwise
+    // when the effective primary is a rsclaw model (explicit `rsclaw/…`, OR
+    // implicit — the built-in default is `rsclaw/rsclaw-agent-v1`) the fleet
+    // serves a dedicated vision head, so default to it. Without this, an rsclaw
+    // config that never spells out `model.vision` left plugins with `None` and
+    // every `vlm_parse` failed "no vision model configured".
+    let defaults_model = config
         .raw
         .agents
         .as_ref()
         .and_then(|a| a.defaults.as_ref())
-        .and_then(|d| d.model.as_ref())
-        .and_then(|m| m.vision_head().map(String::from));
+        .and_then(|d| d.model.as_ref());
+    let vision_model = defaults_model
+        .and_then(|m| m.vision_head().map(String::from))
+        .or_else(|| {
+            let primary_is_rsclaw = defaults_model
+                .and_then(|m| m.primary_head())
+                .map(|p| p.trim().starts_with("rsclaw/"))
+                .unwrap_or(true);
+            primary_is_rsclaw
+                .then(|| rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_string())
+        });
 
     let mut plugin_registry = load_all_plugins(
         &plugins_dir,

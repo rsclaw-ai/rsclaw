@@ -1,6 +1,7 @@
 [package]
 name = "rsclaw-channel"
 version = "0.1.0"
+description = "Channel crate for RsClaw — internal workspace crate, not for direct use"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -49,17 +50,17 @@ lark-websocket-protobuf = "0.1"
 prost = "0.13"
 tempfile = "3"
 matrix-sdk = { version = "0.9", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "sqlite"] }
-rsclaw-types = { path = "../rsclaw-types" }
-rsclaw-config = { path = "../rsclaw-config" }
-rsclaw-provider = { path = "../rsclaw-provider" }
-rsclaw-store = { path = "../rsclaw-store" }
-rsclaw-util = { path = "../rsclaw-util" }
-rsclaw-i18n = { path = "../rsclaw-i18n" }
-rsclaw-events = { path = "../rsclaw-events" }
-rsclaw-platform = { path = "../rsclaw-platform" }
-rsclaw-retry = { path = "../rsclaw-retry" }
-rsclaw-doc = { path = "../rsclaw-doc" }
-rsclaw-embed = { path = "../rsclaw-embed" }
+rsclaw-types = { path = "../rsclaw-types", version = "0.1.0" }
+rsclaw-config = { path = "../rsclaw-config", version = "0.1.0" }
+rsclaw-provider = { path = "../rsclaw-provider", version = "0.1.0" }
+rsclaw-store = { path = "../rsclaw-store", version = "0.1.0" }
+rsclaw-util = { path = "../rsclaw-util", version = "0.1.0" }
+rsclaw-i18n = { path = "../rsclaw-i18n", version = "0.1.0" }
+rsclaw-events = { path = "../rsclaw-events", version = "0.1.0" }
+rsclaw-platform = { path = "../rsclaw-platform", version = "0.1.0" }
+rsclaw-retry = { path = "../rsclaw-retry", version = "0.1.0" }
+rsclaw-doc = { path = "../rsclaw-doc", version = "0.1.0" }
+rsclaw-embed = { path = "../rsclaw-embed", version = "0.1.0" }
 
 [features]
 channel-matrix = ["dep:matrix-sdk"]

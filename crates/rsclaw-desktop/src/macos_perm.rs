@@ -87,6 +87,39 @@ pub fn query() -> MacPermissions {
     }
 }
 
+/// Surface the native macOS "grant Accessibility" request to the user: calls
+/// `AXIsProcessTrustedWithOptions` with the prompt option, which pops the
+/// system dialog AND adds this app to System Settings → Privacy & Security →
+/// Accessibility (so the user can just flip the toggle). Returns the current
+/// trust state.
+///
+/// [`query`] deliberately never prompts (it only reports); this is the call
+/// that actually asks. Fire it the first time a desktop-automation tool needs
+/// synthetic input but the grant isn't effective — otherwise `enigo` just fails
+/// with a permission error the user never saw a prompt for.
+#[cfg(target_os = "macos")]
+pub fn prompt_accessibility() -> bool {
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
+
+    // SAFETY: `kAXTrustedCheckOptionPrompt` is a framework-owned CFStringRef —
+    // wrap under the GET rule (we don't own it, must not release it). The
+    // dictionary and boolean are ours and drop at scope end.
+    let key = unsafe { CFString::wrap_under_get_rule(ffi::kAXTrustedCheckOptionPrompt) };
+    let opts = CFDictionary::from_CFType_pairs(&[(
+        key.as_CFType(),
+        CFBoolean::true_value().as_CFType(),
+    )]);
+    unsafe { ffi::AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef()) != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn prompt_accessibility() -> bool {
+    true
+}
+
 /// Query the grants and return loud warnings for any that aren't effective.
 /// Convenience wrapper for callers (e.g. gateway startup) that just want to
 /// log. Empty vec == all good (or non-macOS).
@@ -101,11 +134,18 @@ mod ffi {
     unsafe extern "C" {
         pub fn CGPreflightScreenCaptureAccess() -> bool;
     }
-    // ApplicationServices (HIServices): accessibility trust check.
+    // ApplicationServices (HIServices): accessibility trust check + prompt.
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
         // Returns CoreFoundation `Boolean` (unsigned char): 0 / 1.
         pub fn AXIsProcessTrusted() -> u8;
+        // Same, but honours options — pass a dict with
+        // `kAXTrustedCheckOptionPrompt = true` to surface the system dialog.
+        pub fn AXIsProcessTrustedWithOptions(
+            options: core_foundation::dictionary::CFDictionaryRef,
+        ) -> u8;
+        // CFStringRef key for the prompt option.
+        pub static kAXTrustedCheckOptionPrompt: core_foundation::string::CFStringRef;
     }
 }
 

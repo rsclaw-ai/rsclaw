@@ -1,6 +1,7 @@
 [package]
 name = "rsclaw-embed"
 version = "0.1.0"
+description = "Embed crate for RsClaw — internal workspace crate, not for direct use"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -16,4 +17,4 @@ candle-core = "0.9"
 candle-nn = "0.9"
 candle-transformers = "0.9"
 tokenizers = "0.21"
-rsclaw-util = { path = "../rsclaw-util" }
+rsclaw-util = { path = "../rsclaw-util", version = "0.1.0" }

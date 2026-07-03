@@ -1,6 +1,7 @@
 [package]
 name = "rsclaw-desktop"
 version = "0.1.0"
+description = "Desktop crate for RsClaw — internal workspace crate, not for direct use"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -17,10 +18,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # Screen capture + window enumeration: in-tree, script-based (screencapture /
 # PowerShell / grim·scrot·import). Replaces xcap — far faster on macOS and works
 # on Linux too (xcap was disabled there for the pipewire/libspa build chain).
-rsclaw-platform = { path = "../rsclaw-platform" }
+rsclaw-platform = { path = "../rsclaw-platform", version = "0.1.0" }
 
 # macOS: post raw CGScrollWheelEvents. enigo's decorated scroll event is ignored
 # by WeChat 4.x's CEF/radium view (verified: screenshot hash unchanged), while a
 # raw CGEvent scroll moves it. Same core-graphics version enigo already pulls in.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.25", features = ["highsierra"] }
+core-foundation = "0.10"

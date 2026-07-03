@@ -935,6 +935,28 @@ pub fn resolve_primary_model_for(
 ///      flash slot when their primary already names a rsclaw model — the same
 ///      "convention over configuration" treatment the provider gets for
 ///      api/baseUrl/prefix_id.
+/// Is the agent's EFFECTIVE primary a `rsclaw/` model? Uses the config's
+/// explicit primary head; when the config sets none, the runtime falls back to
+/// the built-in `rsclaw/rsclaw-agent-v1` default (which IS rsclaw), so a config
+/// that never writes `model.primary` still counts as rsclaw. This is what lets
+/// the rsclaw vision/flash defaults fire without the user having to spell out
+/// `primary` (the bug: the old checks only saw the explicit config head, so an
+/// implicit-default rsclaw agent got an empty vision/flash chain).
+fn effective_primary_is_rsclaw(
+    per_agent: &rsclaw_config::schema::AgentEntry,
+    defaults: &rsclaw_config::schema::AgentDefaults,
+) -> bool {
+    match per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary_head())
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()))
+    {
+        Some(p) => p.trim().starts_with("rsclaw/"),
+        None => true,
+    }
+}
+
 pub fn resolve_flash_model_for(
     per_agent: &rsclaw_config::schema::AgentEntry,
     defaults: &rsclaw_config::schema::AgentDefaults,
@@ -956,16 +978,11 @@ pub fn resolve_flash_model_for(
         return explicit;
     }
 
-    // RsClaw fleet inference (see RSCLAW_DEFAULT_FLASH).
-    let primary = per_agent
-        .model
-        .as_ref()
-        .and_then(|m| m.primary_head())
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
-    if let Some(p) = primary {
-        if p.starts_with("rsclaw/") {
-            return Some(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
-        }
+    // RsClaw fleet inference (see RSCLAW_DEFAULT_FLASH): when the effective
+    // primary is a rsclaw model (explicit OR the built-in default), the fleet
+    // serves the flash head.
+    if effective_primary_is_rsclaw(per_agent, defaults) {
+        return Some(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
     }
     None
 }
@@ -1030,17 +1047,10 @@ pub fn resolve_vision_model_for(
     // slot is sitting one HTTP hop away. Treat the inferred rsclaw
     // vision model as `Configured` (not `FallbackToPrimary`) so callers
     // skip the text-only check below — the rsclaw fleet vouches for it.
-    let primary = per_agent
-        .model
-        .as_ref()
-        .and_then(|m| m.primary_head())
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
-    if let Some(p) = primary {
-        if p.starts_with("rsclaw/") {
-            return VisionResolution::Configured(
-                rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned(),
-            );
-        }
+    if effective_primary_is_rsclaw(per_agent, defaults) {
+        return VisionResolution::Configured(
+            rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned(),
+        );
     }
 
     if let Some(name) = per_agent
@@ -1424,22 +1434,7 @@ impl AgentRuntime {
             // no explicit vision chain is configured, the fleet serves a
             // dedicated vision head — default to it (mirrors the flash default
             // rsclaw/rsclaw-flash-v1). Lets `vision: []` "just work" on rsclaw.
-            let primary_is_rsclaw = per_agent
-                .model
-                .as_ref()
-                .map(|m| m.primary_chain())
-                .into_iter()
-                .flatten()
-                .chain(
-                    defaults
-                        .model
-                        .as_ref()
-                        .map(|m| m.primary_chain())
-                        .into_iter()
-                        .flatten(),
-                )
-                .any(|m| m.trim().starts_with("rsclaw/"));
-            if primary_is_rsclaw {
+            if effective_primary_is_rsclaw(per_agent, defaults) {
                 out.push(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned());
             }
         }
@@ -1522,15 +1517,8 @@ impl AgentRuntime {
             // RsClaw fleet inference fallback (same logic as
             // resolve_flash_model_for): if primary head is rsclaw, the
             // fleet's RSCLAW_DEFAULT_FLASH is the flash model.
-            let primary_head = per_agent
-                .model
-                .as_ref()
-                .and_then(|m| m.primary_head())
-                .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
-            if let Some(p) = primary_head {
-                if p.starts_with("rsclaw/") {
-                    out.push(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
-                }
+            if effective_primary_is_rsclaw(per_agent, defaults) {
+                out.push(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
             }
         }
         // Final fallback: the primary chain. Matches the legacy
