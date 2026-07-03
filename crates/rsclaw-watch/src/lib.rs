@@ -97,7 +97,11 @@ impl WatchRegistry {
             inner: Mutex::new(HashMap::new()),
             channels,
         });
-        let _ = GLOBAL.set(registry);
+        // GLOBAL is a OnceLock<Arc<WatchRegistry>>; set() returns Err if already set.
+        // This is idempotent initialization — warn on re-init which suggests double-call.
+        if let Err(_prev) = GLOBAL.set(registry) {
+            tracing::warn!("WatchRegistry GLOBAL was already set; ignoring duplicate init");
+        }
     }
 
     pub fn global() -> Option<Arc<WatchRegistry>> {
@@ -365,13 +369,15 @@ impl WatchRegistry {
                             let is_new = last_lifecycle_sig.as_deref() != Some(&sig);
                             if is_new {
                                 last_lifecycle_sig = Some(sig);
-                                let _ = delivery::deliver(
+                                if let Err(e) = delivery::deliver(
                                     &self.channels,
                                     &channel,
                                     account.as_deref(),
                                     &peer,
                                     format!("watch {id}: {} {}", ev.event, ev.data),
-                                ).await;
+                                ).await {
+                                    tracing::warn!(error=%e, "watch delivery failed");
+                                }
                             }
                             if matches!(ev.event.as_str(), "_error" | "_disconnect") && ev.data.get("fatal").and_then(|v| v.as_bool()).unwrap_or(false) {
                                 break;
@@ -403,13 +409,15 @@ impl WatchRegistry {
                 _ = heartbeat_tick.tick() => {
                     let now = event_count.load(std::sync::atomic::Ordering::Relaxed);
                     if now == last_count_at_tick {
-                        let _ = delivery::deliver(
+                        if let Err(e) = delivery::deliver(
                             &self.channels,
                             &channel,
                             account.as_deref(),
                             &peer,
                             format!("watch {id} active, 0 events in last 10m"),
-                        ).await;
+                        ).await {
+                            tracing::warn!(error=%e, "watch delivery failed");
+                        }
                     }
                     last_count_at_tick = now;
                 }
