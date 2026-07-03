@@ -155,6 +155,11 @@ impl super::runtime::AgentRuntime {
     /// `agents.defaults.model.primary`. Used to pick a default image/video
     /// gen model when the user left those chains empty.
     pub(crate) fn primary_provider(&self) -> Option<String> {
+        // When the config sets no explicit primary, the runtime falls back to
+        // the built-in `rsclaw/rsclaw-agent-v1` default — so the effective
+        // provider is `rsclaw`. Mirror that here (instead of returning None) so
+        // provider-keyed defaults like `default_image_model` fire for an
+        // implicit-default rsclaw agent, same as the vision/flash chains.
         let head = self
             .handle
             .config
@@ -168,7 +173,8 @@ impl super::runtime::AgentRuntime {
                     .model
                     .as_ref()
                     .and_then(|m| m.primary_head())
-            })?;
+            })
+            .unwrap_or("rsclaw/rsclaw-agent-v1");
         Some(
             rsclaw_provider::registry::ProviderRegistry::parse_model(head)
                 .0
