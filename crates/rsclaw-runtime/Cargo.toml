@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw-runtime"
-version = "2026.6.20"
+version = "2026.6.26"
 edition = "2024"
 rust-version = "1.91"
 description = "rsclaw composition root: AppState/RPC handlers (a2a, cmd, cron, gateway, hooks, server, ws) + process entry point"

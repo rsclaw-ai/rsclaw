@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.6.20"
+version = "2026.6.26"
 edition = "2024"
 rust-version = "1.91"
 description = "AI Agent Engine Compatible with OpenClaw"
@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 # Composition root + RPC handlers (a2a, cmd, cron, gateway, hooks, server, ws)
 # plus the process entry point `rsclaw_runtime::run`.
-rsclaw-runtime = { path = "crates/rsclaw-runtime", version = "2026.6.20" }
+rsclaw-runtime = { path = "crates/rsclaw-runtime", version = "2026.6.26" }
 
 # Extracted workspace crates (crate-split, feat/crate-split)
 rsclaw-agent = { path = "crates/rsclaw-agent", version = "0.1.0" }
