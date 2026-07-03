@@ -1025,6 +1025,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         knowledge: knowledge_svc,
         memory: memory.clone(),
         model_health: model_health.clone(),
+        rate_limiter: Arc::new(crate::server::RateLimiter::new()),
     };
     crate::a2a::relay::start_spoke_if_configured(state.clone());
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));

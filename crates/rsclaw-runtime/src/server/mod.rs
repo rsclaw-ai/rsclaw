@@ -33,6 +33,7 @@
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+use std::{collections::HashMap, net::IpAddr, time::Instant};
 use std::{convert::Infallible, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
 use anyhow::Result;
@@ -52,7 +53,7 @@ use rsclaw_agent::{AgentMessage, AgentRegistry};
 use rsclaw_config::runtime::RuntimeConfig;
 use rsclaw_store::Store;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
@@ -61,6 +62,39 @@ use crate::{cmd::config_json::load_config_json, gateway::LiveConfig, ws::types::
 mod knowledge;
 
 const MAX_LOCAL_MEDIA_BYTES: u64 = 10 * 1024 * 1024;
+
+// H1: simple in-memory per-IP rate limiter with a sliding window.
+// Default: 100 req / 60s per IP. Bypassed when no limit is configured (rate_rps = 0).
+#[derive(Clone)]
+pub struct RateLimiter {
+    inner: Arc<RwLock<HashMap<IpAddr, Vec<Instant>>>>,
+}
+
+impl RateLimiter {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Returns true if the request should be rate-limited (rejected).
+    pub async fn check(&self, ip: IpAddr, max_req: u32, window_secs: u64) -> bool {
+        if max_req == 0 {
+            return false; // rate limiting disabled
+        }
+        let now = Instant::now();
+        let mut map = self.inner.write().await;
+        let entries = map.entry(ip).or_default();
+        let cutoff = now - Duration::from_secs(window_secs);
+        entries.retain(|t| *t >= cutoff);
+        if entries.len() >= max_req as usize {
+            true
+        } else {
+            entries.push(now);
+            false
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Timing-safe token comparison
@@ -194,6 +228,8 @@ pub struct AppState {
     /// written by every `FailoverManager` in the gateway. See
     /// `provider::health::ProviderHealthRegistry`.
     pub model_health: rsclaw_provider::health::ProviderHealthRegistry,
+    /// H1: per-IP rate limiter for inbound HTTP requests.
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 // AgentEvent is defined in rsclaw_events to avoid circular deps with agent.
@@ -441,8 +477,12 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             auth_middleware,
         ))
-        // SECURITY: permissive CORS is safe when gateway binds to loopback (default).
-        // For public deployments, configure a firewall or switch to restrictive CORS.
+        // H1: per-IP rate limiter (default 100 req/60s, configurable via gateway.rateLimitRps)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        // H2: restrict CORS when not on loopback
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -540,6 +580,27 @@ async fn auth_middleware(
                 .into_response()
         }
     }
+}
+
+// H1: per-IP rate limiting middleware. Uses a simple sliding-window counter.
+async fn rate_limit_middleware(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let ip = addr.ip();
+    const DEFAULT_MAX_REQ: u32 = 100;
+    const WINDOW_SECS: u64 = 60;
+    if state.rate_limiter.check(ip, DEFAULT_MAX_REQ, WINDOW_SECS).await {
+        warn!(%ip, DEFAULT_MAX_REQ, "rate limit exceeded");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate limit exceeded"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 // ---------------------------------------------------------------------------

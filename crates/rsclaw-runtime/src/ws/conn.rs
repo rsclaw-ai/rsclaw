@@ -12,7 +12,7 @@ use tracing::warn;
 use super::types::EventFrame;
 
 pub type ConnId = String;
-pub type OutboundTx = tokio::sync::mpsc::Sender<String>;
+pub type OutboundTx = tokio::sync::mpsc::Sender<Arc<str>>;
 
 /// Summary of an active WS connection for the `acp list` API.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -116,13 +116,10 @@ impl ConnRegistry {
 
     /// Broadcast a serialized event frame to every connected WebSocket client.
     ///
-    /// NOTE: We serialize once and `clone()` the `String` per connection.
-    /// Using `Arc<String>` would save the per-connection clone, but the
-    /// `OutboundTx` channel type (`mpsc::Sender<String>`) is shared with
-    /// per-connection streaming paths (chat, sessions) that produce unique
-    /// strings.  Changing the channel to `Arc<String>` would add an `Arc`
-    /// allocation in every single-connection send for a marginal win only in
-    /// broadcast, so we keep the simpler `String` channel.
+    /// Serializes once, wraps in `Arc<str>`, then clones the Arc per
+    /// connection (O(1) ref-count bump). Sending an `Arc<str>` through the
+    /// channel adds one Arc allocation per send for single-connection paths,
+    /// but the broadcast path now avoids O(N) string copies.
     pub async fn broadcast_all(&self, frame: EventFrame) {
         let text = match serde_json::to_string(&frame) {
             Ok(t) => t,
@@ -131,10 +128,11 @@ impl ConnRegistry {
                 return;
             }
         };
+        let shared: Arc<str> = Arc::from(text);
         let guard = self.inner.read().await;
         for handle in guard.values() {
             let h = handle.read().await;
-            if let Err(e) = h.event_tx.try_send(text.clone()) {
+            if let Err(e) = h.event_tx.try_send(Arc::clone(&shared)) {
                 warn!(conn = %h.id, "ws broadcast: outbound channel full or closed: {e}");
             }
         }
