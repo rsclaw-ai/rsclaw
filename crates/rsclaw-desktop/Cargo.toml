@@ -25,3 +25,4 @@ rsclaw-platform = { path = "../rsclaw-platform", version = "0.1.0" }
 # raw CGEvent scroll moves it. Same core-graphics version enigo already pulls in.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.25", features = ["highsierra"] }
+core-foundation = "0.10"

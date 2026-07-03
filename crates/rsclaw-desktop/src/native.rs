@@ -29,10 +29,20 @@ pub struct NativeDesktopSession;
 /// Construct a fresh `Enigo` or return an error string.
 fn new_enigo() -> Result<Enigo, String> {
     Enigo::new(&Settings::default()).map_err(|e| {
-        let hint = if cfg!(target_os = "macos")
-            && (e.to_string().contains("permission") || e.to_string().contains("simulate input"))
-        {
-            " (macOS: grant Accessibility + Input Monitoring in System Settings)"
+        let is_perm =
+            e.to_string().contains("permission") || e.to_string().contains("simulate input");
+        let hint = if cfg!(target_os = "macos") && is_perm {
+            // Surface the native macOS Accessibility dialog (once per process)
+            // so the user actually gets asked — and the app lands in the
+            // Accessibility list — instead of a silent permission failure with
+            // no prompt. `prompt_accessibility` no-ops off macOS.
+            static PROMPTED: std::sync::Once = std::sync::Once::new();
+            PROMPTED.call_once(|| {
+                let _ = crate::macos_perm::prompt_accessibility();
+            });
+            " (macOS: a permission request was raised — enable RsClaw under System \
+             Settings → Privacy & Security → Accessibility AND Input Monitoring, then \
+             quit & reopen RsClaw)"
         } else {
             ""
         };
