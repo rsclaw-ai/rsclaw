@@ -1,5 +1,5 @@
-//! Self-owned, **script-based** cross-platform screen capture + window
-//! enumeration — the in-tree replacement for the `xcap` crate.
+//! Self-owned cross-platform screen capture + window enumeration — the in-tree
+//! replacement for the `xcap` crate.
 //!
 //! Why not xcap: on macOS xcap routes through ScreenCaptureKit, which on every
 //! single grab re-enumerates `SCShareableContent` (a window-server round trip)
@@ -10,8 +10,8 @@
 //! work again.
 //!
 //! Backends:
-//! - **macOS**: `screencapture` for pixels, `python3`+Quartz for window list /
-//!   scale factor (python is already required on macOS for the Vision OCR path).
+//! - **macOS**: `screencapture` for pixels, CoreGraphics FFI for window list /
+//!   scale factor.
 //! - **Windows**: PowerShell + System.Drawing (capture) and user32 P/Invoke
 //!   (window list / per-window capture via PrintWindow).
 //! - **Linux**: `grim` (Wayland) → `scrot` → ImageMagick `import` (X11) for
@@ -107,57 +107,208 @@ mod imp {
         run_screencapture(&["-x".into(), "-o".into(), format!("-l{window_id}")], &out)
     }
 
-    const WINLIST_PY: &str = r#"import json, Quartz
-wl = Quartz.CGWindowListCopyWindowInfo(
-    Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
-    Quartz.kCGNullWindowID)
-out = []
-for w in wl or []:
-    b = w.get('kCGWindowBounds', {})
-    out.append({
-        'id': int(w.get('kCGWindowNumber', 0)),
-        'app': w.get('kCGWindowOwnerName', '') or '',
-        'title': w.get('kCGWindowName', '') or '',
-        'x': int(b.get('X', 0)), 'y': int(b.get('Y', 0)),
-        'w': int(b.get('Width', 0)), 'h': int(b.get('Height', 0)),
-        'minimized': not bool(w.get('kCGWindowIsOnscreen', True)),
-    })
-print(json.dumps(out))
-"#;
+    // ---------------------------------------------------------------
+    // CoreGraphics FFI
+    // ---------------------------------------------------------------
+
+    use core_foundation::base::CFType;
+    use core_foundation::base::TCFType;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    /// `CGRect` as returned by `CGDisplayBounds` (all `f64` / `CGFloat`).
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+
+    type CGWindowID = u32;
+    type CGDirectDisplayID = u32;
+
+    /// Option flags for `CGWindowListCopyWindowInfo`.
+    const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+    const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
+    const K_CG_NULL_WINDOW_ID: CGWindowID = 0;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGWindowListCopyWindowInfo(
+            option: u32,
+            relative_to_window: CGWindowID,
+        ) -> core_foundation::array::CFArrayRef;
+        fn CGMainDisplayID() -> CGDirectDisplayID;
+        fn CGDisplayPixelsWide(display: CGDirectDisplayID) -> usize;
+        fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFDictionaryGetValue(
+            dict: core_foundation::dictionary::CFDictionaryRef,
+            key: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CFArrayGetCount(arr: core_foundation::array::CFArrayRef) -> isize;
+        fn CFArrayGetValueAtIndex(
+            arr: core_foundation::array::CFArrayRef,
+            idx: isize,
+        ) -> *const std::ffi::c_void;
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+
+    /// Look up a key in a raw `CFDictionaryRef` and return the value as a
+    /// `CFType` (GET rule — caller does not own the returned reference).
+    /// Returns `None` if the key is absent.
+    fn dict_lookup(
+        dict: core_foundation::dictionary::CFDictionaryRef,
+        key: &str,
+    ) -> Option<CFType> {
+        let cf_key = CFString::new(key);
+        let val =
+            unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
+        if val.is_null() {
+            None
+        } else {
+            Some(unsafe { CFType::wrap_under_get_rule(val as core_foundation::base::CFTypeRef) })
+        }
+    }
+
+    /// Helper: look up a key in a `CFDictionary` and downcast it to a
+    /// `CFNumber`, returning its `i64` value.
+    fn dict_get_number(
+        dict: core_foundation::dictionary::CFDictionaryRef,
+        key: &str,
+    ) -> Option<i64> {
+        dict_lookup(dict, key)?
+            .downcast::<CFNumber>()
+            .and_then(|n| n.to_i64())
+    }
+
+    /// Helper: look up a key in a `CFDictionary` and downcast it to a
+    /// `CFString`, returning a Rust `String`.
+    fn dict_get_string(
+        dict: core_foundation::dictionary::CFDictionaryRef,
+        key: &str,
+    ) -> Option<String> {
+        dict_lookup(dict, key)?
+            .downcast::<CFString>()
+            .map(|s| s.to_string())
+    }
+
+    /// Helper: look up a key in a `CFDictionary` and return the raw
+    /// `CFDictionaryRef` for a nested dictionary.
+    fn dict_get_dict_ref(
+        dict: core_foundation::dictionary::CFDictionaryRef,
+        key: &str,
+    ) -> Option<core_foundation::dictionary::CFDictionaryRef> {
+        let cf_key = CFString::new(key);
+        let val =
+            unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
+        if val.is_null() {
+            None
+        } else {
+            Some(val as core_foundation::dictionary::CFDictionaryRef)
+        }
+    }
+
+    /// Helper: look up a key in a `CFDictionary` and interpret it as a
+    /// boolean (CFBoolean or CFNumber).
+    fn dict_get_bool(
+        dict: core_foundation::dictionary::CFDictionaryRef,
+        key: &str,
+    ) -> Option<bool> {
+        let cf = dict_lookup(dict, key)?;
+        // Try CFBoolean first (macOS actually stores kCGWindowIsOnscreen this way).
+        if let Some(b) = cf.downcast::<core_foundation::boolean::CFBoolean>() {
+            return Some(b == core_foundation::boolean::CFBoolean::true_value());
+        }
+        // Fall back to CFNumber.
+        if let Some(n) = cf.downcast::<CFNumber>() {
+            return Some(n.to_i64().unwrap_or(0) != 0);
+        }
+        None
+    }
 
     pub fn list_windows() -> Result<Vec<WindowInfo>> {
-        let out = Command::new("python3")
-            .args(["-c", WINLIST_PY])
-            .output()
-            .map_err(|e| anyhow!("python3 window list spawn failed (need pyobjc Quartz): {e}"))?;
-        if !out.status.success() {
-            return Err(anyhow!(
-                "window list failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+        let cf_array_ref = unsafe {
+            CGWindowListCopyWindowInfo(
+                K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY
+                    | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+                K_CG_NULL_WINDOW_ID,
+            )
+        };
+        if cf_array_ref.is_null() {
+            return Err(anyhow!("CGWindowListCopyWindowInfo returned NULL"));
         }
-        let wins: Vec<WindowInfo> = serde_json::from_slice(&out.stdout)
-            .map_err(|e| anyhow!("parse window list: {e}"))?;
+        let count = unsafe { CFArrayGetCount(cf_array_ref) };
+        let mut wins = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let dict_ref = unsafe { CFArrayGetValueAtIndex(cf_array_ref, i) }
+                as core_foundation::dictionary::CFDictionaryRef;
+            if dict_ref.is_null() {
+                continue;
+            }
+
+            let id = dict_get_number(dict_ref, "kCGWindowNumber").unwrap_or(0) as u64;
+            let app = dict_get_string(dict_ref, "kCGWindowOwnerName").unwrap_or_default();
+            let title = dict_get_string(dict_ref, "kCGWindowName").unwrap_or_default();
+
+            let (x, y, w, h) =
+                if let Some(bounds_ref) = dict_get_dict_ref(dict_ref, "kCGWindowBounds") {
+                    (
+                        dict_get_number(bounds_ref, "X").unwrap_or(0) as i32,
+                        dict_get_number(bounds_ref, "Y").unwrap_or(0) as i32,
+                        dict_get_number(bounds_ref, "Width").unwrap_or(0) as u32,
+                        dict_get_number(bounds_ref, "Height").unwrap_or(0) as u32,
+                    )
+                } else {
+                    (0, 0, 0, 0)
+                };
+
+            let is_onscreen = dict_get_bool(dict_ref, "kCGWindowIsOnscreen").unwrap_or(true);
+
+            wins.push(WindowInfo {
+                id,
+                app,
+                title,
+                x,
+                y,
+                w,
+                h,
+                minimized: !is_onscreen,
+            });
+        }
+        // Release the array (Create Rule — we own it).
+        unsafe { CFRelease(cf_array_ref as *const std::ffi::c_void) };
+
         Ok(wins)
     }
 
-    const SCALE_PY: &str = r#"import Quartz
-d = Quartz.CGMainDisplayID()
-px = Quartz.CGDisplayPixelsWide(d)
-b = Quartz.CGDisplayBounds(d)
-pts = b.size.width
-print(px / pts if pts else 1.0)
-"#;
-
     pub fn primary_scale_factor() -> f32 {
-        Command::new("python3")
-            .args(["-c", SCALE_PY])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok())
-            .filter(|s| *s > 0.0)
-            .unwrap_or(2.0)
+        let display = unsafe { CGMainDisplayID() };
+        let pixels_wide = unsafe { CGDisplayPixelsWide(display) } as f64;
+        let bounds = unsafe { CGDisplayBounds(display) };
+        let logical_width = bounds.size.width;
+        if logical_width > 0.0 {
+            (pixels_wide / logical_width) as f32
+        } else {
+            2.0
+        }
     }
 
     /// macOS apps don't destroy their window on close the way WeChat 4.x does on
