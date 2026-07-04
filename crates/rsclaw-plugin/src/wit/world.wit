@@ -247,6 +247,15 @@ interface host-android {
     /// [y-min, y-max) (pass 0,0 for the whole screen), and taps its center.
     /// Returns "tapped:x,y" or an error if no yellow button is found.
     android-tap-yellow-button: func(y-min: u32, y-max: u32) -> result<string, string>;
+
+    /// Force-stop both appium UiAutomator2 server packages
+    /// (io.appium.uiautomator2.server[.test]), drop the cached connection,
+    /// and relaunch + poll /status until ready (up to 30s). Use this when the
+    /// u2 server has wedged (frozen/empty a11y-tree dumps, taps no longer
+    /// registering) and plain reuse/reconnect isn't recovering it — this is
+    /// the only reliable recovery short of a manual adb session. Returns
+    /// "reset" on success or an error if the server didn't come back up.
+    android-reset-uiautomator: func() -> result<string, string>;
 }
 
 interface host-ios {

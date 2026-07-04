@@ -3464,6 +3464,27 @@ impl rsclaw::plugin::host_android::Host for HostState {
             Err(e) => Ok(Err(format!("tap failed: {e}"))),
         }
     }
+
+    async fn android_reset_uiautomator(&mut self) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        let sref = serial.as_deref();
+        // force-stop is best-effort: the packages may already be dead/wedged
+        // in a state where the command itself errors, which is fine — the
+        // point is just to make sure nothing stale is left running before we
+        // relaunch via u2_ensure below.
+        for pkg in [
+            "io.appium.uiautomator2.server",
+            "io.appium.uiautomator2.server.test",
+        ] {
+            let _ = adb_run_str(sref, &["shell", "am", "force-stop", pkg]).await;
+        }
+        // Drop the cached connection so u2_ensure does a full relaunch rather
+        // than reusing (now-dead) state; this also drops the held Child
+        // handle, whose kill_on_drop reaps the old instrumentation process.
+        let key = sref.unwrap_or("").to_string();
+        u2_conns().lock().await.remove(&key);
+        Ok(u2_ensure(sref).await.map(|_| "reset".to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
