@@ -221,6 +221,9 @@ interface host-android {
     /// Capture screenshot as data:image/png;base64,... URI.
     android-screenshot: func() -> result<string, string>;
 
+    /// Get physical screen size as JSON {width, height} (pixels).
+    android-screen-size: func() -> result<string, string>;
+
     /// Find elements by selector. Returns JSON array of {text, resource-id, content-desc, bounds, clickable}.
     /// selector-type: "resource-id" | "text" | "text-contains" | "content-desc" | "content-desc-contains" | "class"
     android-find-elements: func(selector-type: string, selector-value: string) -> result<string, string>;
