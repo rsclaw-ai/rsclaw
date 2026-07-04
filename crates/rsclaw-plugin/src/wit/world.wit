@@ -140,6 +140,8 @@ interface host-background {
         -> result<string, string>;
     /// Inspect a plugin SSE subscription scoped to the current invocation context.
     sse-status: func(name: string) -> result<string, string>;
+    /// Cancel all SSE subscriptions for this plugin/name scoped to the current context.
+    sse-unsubscribe: func(name: string) -> result<string, string>;
     /// Push an outbound message to a concrete channel/peer.
     push-outbound: func(channel: string, peer-id: string, message-json: string) -> result<string, string>;
     /// Submit a synthetic user turn to the agent queue.

@@ -16,6 +16,7 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use rsclaw_agent::{AgentMessage, AgentRegistry, FileAttachment, ImageAttachment};
@@ -301,10 +302,18 @@ type ChannelSendersMap = Arc<RwLock<HashMap<String, mpsc::Sender<OutboundMessage
 static CHANNEL_SENDERS: OnceLock<ChannelSendersMap> = OnceLock::new();
 static TASK_QUEUE: OnceLock<Arc<TaskQueueManager>> = OnceLock::new();
 static PLUGIN_BACKGROUND_KEYS: OnceLock<Arc<RwLock<HashSet<String>>>> = OnceLock::new();
+static PLUGIN_SSE_TOKENS: OnceLock<Arc<RwLock<HashMap<String, CancellationToken>>>> =
+    OnceLock::new();
 
 fn plugin_background_keys() -> Arc<RwLock<HashSet<String>>> {
     PLUGIN_BACKGROUND_KEYS
         .get_or_init(|| Arc::new(RwLock::new(HashSet::new())))
+        .clone()
+}
+
+fn plugin_sse_tokens() -> Arc<RwLock<HashMap<String, CancellationToken>>> {
+    PLUGIN_SSE_TOKENS
+        .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
         .clone()
 }
 
@@ -1761,8 +1770,20 @@ impl rsclaw_plugin::PluginBackgroundHost for GatewayPluginBackgroundHost {
             let Some(ctx) = ctx else {
                 return Err("plugin SSE subscribe requires invocation context".to_owned());
             };
+            let token = CancellationToken::new();
+            if let Ok(mut guard) = plugin_sse_tokens().write() {
+                guard.insert(key.clone(), token.clone());
+            }
+            let key_clone = key.clone();
             tokio::spawn(async move {
-                run_plugin_sse(plugin, name, url, headers_json, resume_key, ctx).await;
+                run_plugin_sse(plugin, name, url, headers_json, resume_key, ctx, token).await;
+                // Clean up after natural completion.
+                if let Ok(mut guard) = plugin_background_keys().write() {
+                    guard.remove(&key_clone);
+                }
+                if let Ok(mut guard) = plugin_sse_tokens().write() {
+                    guard.remove(&key_clone);
+                }
             });
             Ok("registered".to_owned())
         })
@@ -1775,6 +1796,19 @@ impl rsclaw_plugin::PluginBackgroundHost for GatewayPluginBackgroundHost {
         ctx: Option<rsclaw_plugin::PluginInvocationContext>,
     ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
         Box::pin(async move { Ok(plugin_sse_status_json(&plugin, &name, ctx.as_ref())) })
+    }
+
+    fn sse_unsubscribe(
+        &self,
+        plugin: String,
+        name: String,
+        ctx: Option<rsclaw_plugin::PluginInvocationContext>,
+    ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
+        Box::pin(async move {
+            let prefix = plugin_background_key_prefix("sse", &plugin, &name, ctx.as_ref());
+            let cancelled = cancel_plugin_sse_by_prefix(&prefix);
+            Ok(format!("cancelled:{cancelled}"))
+        })
     }
 
     fn push_outbound(
@@ -1848,6 +1882,34 @@ fn plugin_invocation_context_key(ctx: &rsclaw_plugin::PluginInvocationContext) -
         "agent={}:channel={}:peer={}:chat={}:session={}",
         ctx.agent_id, ctx.channel, ctx.peer_id, ctx.chat_id, ctx.session_key
     )
+}
+
+fn cancel_plugin_sse_by_prefix(prefix: &str) -> usize {
+    let keys_to_remove: Vec<String> = plugin_sse_tokens()
+        .read()
+        .map(|guard| {
+            guard
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, token)| {
+                    token.cancel();
+                    k.clone()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let count = keys_to_remove.len();
+    if let Ok(mut guard) = plugin_sse_tokens().write() {
+        for k in &keys_to_remove {
+            guard.remove(k);
+        }
+    }
+    if let Ok(mut guard) = plugin_background_keys().write() {
+        for k in &keys_to_remove {
+            guard.remove(k);
+        }
+    }
+    count
 }
 
 fn plugin_sse_status_json(
@@ -2064,6 +2126,7 @@ async fn run_plugin_sse(
     headers_json: String,
     resume_key: String,
     ctx: rsclaw_plugin::PluginInvocationContext,
+    token: CancellationToken,
 ) {
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -2078,6 +2141,9 @@ async fn run_plugin_sse(
     let headers: Value = serde_json::from_str(&headers_json).unwrap_or_else(|_| Value::Null);
     let mut backoff = Duration::from_secs(1);
     loop {
+        if token.is_cancelled() {
+            break;
+        }
         let mut req = client.get(&url).header("Accept", "text/event-stream");
         if let Some(obj) = headers.as_object() {
             for (k, v) in obj {
@@ -2086,7 +2152,12 @@ async fn run_plugin_sse(
                 }
             }
         }
-        match req.send().await {
+        let send_fut = req.send();
+        let resp = tokio::select! {
+            _ = token.cancelled() => break,
+            r = send_fut => r,
+        };
+        match resp {
             Ok(resp) => match resp.error_for_status() {
                 Ok(resp) => {
                     backoff = Duration::from_secs(1);
@@ -2094,7 +2165,12 @@ async fn run_plugin_sse(
                     let mut event_name = String::new();
                     let mut data_lines: Vec<String> = Vec::new();
                     let mut stream = resp.bytes_stream();
-                    while let Some(chunk) = stream.next().await {
+                    loop {
+                        let chunk = tokio::select! {
+                            _ = token.cancelled() => break,
+                            c = stream.next() => c,
+                        };
+                        let Some(chunk) = chunk else { break };
                         match chunk {
                             Ok(bytes) => {
                                 buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -2127,14 +2203,21 @@ async fn run_plugin_sse(
                             }
                         }
                     }
+                    if token.is_cancelled() {
+                        break;
+                    }
                 }
                 Err(e) => warn!(plugin, name, error = %e, "plugin SSE HTTP status error"),
             },
             Err(e) => warn!(plugin, name, error = %e, "plugin SSE connect failed"),
         }
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep(backoff) => {}
+        }
         backoff = (backoff * 2).min(Duration::from_secs(60));
     }
+    info!(plugin, name, "plugin SSE stopped");
 }
 
 fn format_plugin_sse_text(plugin: &str, name: &str, event_name: &str, data: &str) -> String {
