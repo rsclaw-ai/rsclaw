@@ -714,9 +714,15 @@ pub struct AgentRuntime {
     started_at: std::time::Instant,
     /// Cached workspace context (avoids re-reading unchanged files every turn).
     workspace_cache: Option<crate::workspace::WorkspaceCache>,
-    /// Cached system prompt — built once per gateway lifetime, never
-    /// invalidated (only rebuilt on gateway restart).
+    /// Cached system prompt. Rebuilt on gateway restart AND whenever the
+    /// workspace persona files (AGENTS.md / SOUL.md / …) or the inline
+    /// `system` config change — see `cached_prompt_fingerprint`.
     pub(crate) cached_system_prompt: Option<String>,
+    /// Fingerprint of the inputs `cached_system_prompt` was built from
+    /// (workspace persona files + inline `system`). When it changes, the
+    /// prompt is rebuilt so a freshly-created/edited SOUL.md / AGENTS.md takes
+    /// effect without a gateway restart.
+    cached_prompt_fingerprint: Option<u64>,
     /// Cached minimal system prompt for internal sessions
     /// (heartbeat/cron/system). Built on first internal session use.
     pub(crate) cached_minimal_prompt: Option<String>,
@@ -831,6 +837,7 @@ impl AgentRuntime {
             started_at: std::time::Instant::now(),
             workspace_cache: None,
             cached_system_prompt: None,
+            cached_prompt_fingerprint: None,
             cached_minimal_prompt: None,
             cached_tools: Vec::new(),
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3932,7 +3939,7 @@ impl AgentRuntime {
             .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"));
 
         // Load workspace context (cached -- only re-reads files whose mtime changed).
-        let ws_ctx = {
+        let mut ws_ctx = {
             let cache = self
                 .workspace_cache
                 .get_or_insert_with(|| crate::workspace::WorkspaceCache::new(&workspace));
@@ -3943,6 +3950,41 @@ impl AgentRuntime {
                 DEFAULT_TOTAL_MAX_CHARS,
             )
         };
+
+        // Fingerprint the persona inputs so a freshly-created/edited workspace
+        // file (or a changed inline `system`) rebuilds the cached prompt without
+        // a gateway restart. ws_ctx is already fresh (cache re-reads by mtime);
+        // only the assembled prompt was stuck.
+        let ws_fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ws_ctx.agents_md.hash(&mut h);
+            ws_ctx.soul_md.hash(&mut h);
+            ws_ctx.user_md.hash(&mut h);
+            ws_ctx.identity_md.hash(&mut h);
+            ws_ctx.tools_md.hash(&mut h);
+            self.handle.config.system.hash(&mut h);
+            h.finish()
+        };
+        if self.cached_prompt_fingerprint != Some(ws_fingerprint) {
+            self.cached_system_prompt = None;
+            self.cached_prompt_fingerprint = Some(ws_fingerprint);
+        }
+
+        // Precedence: an explicit inline `system` OVERRIDES the workspace
+        // SOUL.md persona (one authoritative persona, no double-identity). Drop
+        // soul_md before the prompt renders it; other workspace files (AGENTS.md
+        // project rules, USER.md, MEMORY.md, TOOLS.md) still load — they're not
+        // the persona and don't conflict with the inline system.
+        let has_inline_system = self
+            .handle
+            .config
+            .system
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_inline_system {
+            ws_ctx.soul_md = None;
+        }
 
         // Build system prompt — cached for entire gateway lifetime.
         // Only rebuilt on gateway restart.
@@ -3971,7 +4013,7 @@ impl AgentRuntime {
                     .or(self.config.agents.defaults.model.as_ref())
                     .and_then(|m| m.toolset.as_deref())
                     .map(|s| s.to_owned());
-                let prompt = build_system_prompt(
+                let mut prompt = build_system_prompt(
                     &ws_ctx,
                     &self.skills,
                     &self.wasm_plugins,
@@ -3980,6 +4022,23 @@ impl AgentRuntime {
                     toolset_owned.as_deref(),
                     self.cap_manager.is_some(),
                 );
+                // Per-agent inline persona from `agents.list[].system`. This is
+                // agent-specific → appended to the user_system tail (NOT the
+                // shared cross-agent prefix). The field had NO consumer after
+                // the crate-split, so agents that set an inline `system`
+                // (instead of a workspace SOUL.md) silently got only the
+                // generic default persona ("你是谁" → "螃蟹助手").
+                if let Some(sys) = self
+                    .handle
+                    .config
+                    .system
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(sys);
+                }
                 // DEBUG: dump full system prompt to file for inspection
                 if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
                     let dump_path =
