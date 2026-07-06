@@ -6906,7 +6906,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw"
-version = "2026.6.20"
+version = "2026.6.26"
 dependencies = [
  "aes",
  "anycli",
@@ -7332,6 +7332,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "core-foundation",
  "core-graphics",
  "enigo",
  "image",
@@ -7644,7 +7645,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw-runtime"
-version = "2026.6.16"
+version = "2026.6.26"
 dependencies = [
  "aes",
  "anycli",

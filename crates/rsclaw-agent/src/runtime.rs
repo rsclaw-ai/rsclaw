@@ -714,9 +714,15 @@ pub struct AgentRuntime {
     started_at: std::time::Instant,
     /// Cached workspace context (avoids re-reading unchanged files every turn).
     workspace_cache: Option<crate::workspace::WorkspaceCache>,
-    /// Cached system prompt — built once per gateway lifetime, never
-    /// invalidated (only rebuilt on gateway restart).
+    /// Cached system prompt. Rebuilt on gateway restart AND whenever the
+    /// workspace persona files (AGENTS.md / SOUL.md / …) or the inline
+    /// `system` config change — see `cached_prompt_fingerprint`.
     pub(crate) cached_system_prompt: Option<String>,
+    /// Fingerprint of the inputs `cached_system_prompt` was built from
+    /// (workspace persona files + inline `system`). When it changes, the
+    /// prompt is rebuilt so a freshly-created/edited SOUL.md / AGENTS.md takes
+    /// effect without a gateway restart.
+    cached_prompt_fingerprint: Option<u64>,
     /// Cached minimal system prompt for internal sessions
     /// (heartbeat/cron/system). Built on first internal session use.
     pub(crate) cached_minimal_prompt: Option<String>,
@@ -831,6 +837,7 @@ impl AgentRuntime {
             started_at: std::time::Instant::now(),
             workspace_cache: None,
             cached_system_prompt: None,
+            cached_prompt_fingerprint: None,
             cached_minimal_prompt: None,
             cached_tools: Vec::new(),
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -935,6 +942,28 @@ pub fn resolve_primary_model_for(
 ///      flash slot when their primary already names a rsclaw model — the same
 ///      "convention over configuration" treatment the provider gets for
 ///      api/baseUrl/prefix_id.
+/// Is the agent's EFFECTIVE primary a `rsclaw/` model? Uses the config's
+/// explicit primary head; when the config sets none, the runtime falls back to
+/// the built-in `rsclaw/rsclaw-agent-v1` default (which IS rsclaw), so a config
+/// that never writes `model.primary` still counts as rsclaw. This is what lets
+/// the rsclaw vision/flash defaults fire without the user having to spell out
+/// `primary` (the bug: the old checks only saw the explicit config head, so an
+/// implicit-default rsclaw agent got an empty vision/flash chain).
+fn effective_primary_is_rsclaw(
+    per_agent: &rsclaw_config::schema::AgentEntry,
+    defaults: &rsclaw_config::schema::AgentDefaults,
+) -> bool {
+    match per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary_head())
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()))
+    {
+        Some(p) => p.trim().starts_with("rsclaw/"),
+        None => true,
+    }
+}
+
 pub fn resolve_flash_model_for(
     per_agent: &rsclaw_config::schema::AgentEntry,
     defaults: &rsclaw_config::schema::AgentDefaults,
@@ -956,16 +985,11 @@ pub fn resolve_flash_model_for(
         return explicit;
     }
 
-    // RsClaw fleet inference (see RSCLAW_DEFAULT_FLASH).
-    let primary = per_agent
-        .model
-        .as_ref()
-        .and_then(|m| m.primary_head())
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
-    if let Some(p) = primary {
-        if p.starts_with("rsclaw/") {
-            return Some(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
-        }
+    // RsClaw fleet inference (see RSCLAW_DEFAULT_FLASH): when the effective
+    // primary is a rsclaw model (explicit OR the built-in default), the fleet
+    // serves the flash head.
+    if effective_primary_is_rsclaw(per_agent, defaults) {
+        return Some(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
     }
     None
 }
@@ -1030,17 +1054,10 @@ pub fn resolve_vision_model_for(
     // slot is sitting one HTTP hop away. Treat the inferred rsclaw
     // vision model as `Configured` (not `FallbackToPrimary`) so callers
     // skip the text-only check below — the rsclaw fleet vouches for it.
-    let primary = per_agent
-        .model
-        .as_ref()
-        .and_then(|m| m.primary_head())
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
-    if let Some(p) = primary {
-        if p.starts_with("rsclaw/") {
-            return VisionResolution::Configured(
-                rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned(),
-            );
-        }
+    if effective_primary_is_rsclaw(per_agent, defaults) {
+        return VisionResolution::Configured(
+            rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned(),
+        );
     }
 
     if let Some(name) = per_agent
@@ -1424,22 +1441,7 @@ impl AgentRuntime {
             // no explicit vision chain is configured, the fleet serves a
             // dedicated vision head — default to it (mirrors the flash default
             // rsclaw/rsclaw-flash-v1). Lets `vision: []` "just work" on rsclaw.
-            let primary_is_rsclaw = per_agent
-                .model
-                .as_ref()
-                .map(|m| m.primary_chain())
-                .into_iter()
-                .flatten()
-                .chain(
-                    defaults
-                        .model
-                        .as_ref()
-                        .map(|m| m.primary_chain())
-                        .into_iter()
-                        .flatten(),
-                )
-                .any(|m| m.trim().starts_with("rsclaw/"));
-            if primary_is_rsclaw {
+            if effective_primary_is_rsclaw(per_agent, defaults) {
                 out.push(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned());
             }
         }
@@ -1522,15 +1524,8 @@ impl AgentRuntime {
             // RsClaw fleet inference fallback (same logic as
             // resolve_flash_model_for): if primary head is rsclaw, the
             // fleet's RSCLAW_DEFAULT_FLASH is the flash model.
-            let primary_head = per_agent
-                .model
-                .as_ref()
-                .and_then(|m| m.primary_head())
-                .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
-            if let Some(p) = primary_head {
-                if p.starts_with("rsclaw/") {
-                    out.push(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
-                }
+            if effective_primary_is_rsclaw(per_agent, defaults) {
+                out.push(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
             }
         }
         // Final fallback: the primary chain. Matches the legacy
@@ -3684,6 +3679,43 @@ impl AgentRuntime {
         // ---------------------------------------------------------------
         // File attachment: auto-save + show 3-option menu
         // ---------------------------------------------------------------
+        // Images arriving as FILE attachments (feishu large-image → file, a
+        // dropped image file, etc.) get analyzed INLINE this turn via the
+        // vision path — NOT parked in the file-confirm menu. That menu turned
+        // image analysis into a two-step "已收到图片@up_… → 分析中 → 结果" flow;
+        // users expect one-shot recognition. Pull images out of `files` into
+        // `images` (still written to uploads/ so `@up_<id>` references keep
+        // working); only non-image files fall through to the confirm menu.
+        let (image_files, other_files): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|f| f.mime_type.starts_with("image/"));
+        let mut images = images;
+        if !image_files.is_empty() {
+            use base64::Engine as _;
+            let ws = agent_cfg
+                .workspace
+                .as_deref()
+                .or(self.live.agents.read().await.defaults.workspace.as_deref())
+                .map(expand_tilde)
+                .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"));
+            let uploads = ws.join("uploads");
+            for f in image_files {
+                let subdir = rsclaw_channel::upload_subdir(&f.mime_type, &f.filename);
+                let std_name = rsclaw_channel::upload_filename(&f.mime_type, &f.filename);
+                let dir = uploads.join(subdir);
+                let _ = std::fs::create_dir_all(&dir);
+                let saved = dir.join(&std_name);
+                let _ = std::fs::write(&saved, &f.data);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&f.data);
+                images.push(super::registry::ImageAttachment {
+                    data: format!("data:{};base64,{}", f.mime_type, b64),
+                    mime_type: f.mime_type,
+                    source_path: Some(saved.to_string_lossy().into_owned()),
+                });
+            }
+        }
+        let files = other_files;
+
         if !files.is_empty() {
             let ws = agent_cfg
                 .workspace
@@ -3907,7 +3939,7 @@ impl AgentRuntime {
             .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"));
 
         // Load workspace context (cached -- only re-reads files whose mtime changed).
-        let ws_ctx = {
+        let mut ws_ctx = {
             let cache = self
                 .workspace_cache
                 .get_or_insert_with(|| crate::workspace::WorkspaceCache::new(&workspace));
@@ -3918,6 +3950,41 @@ impl AgentRuntime {
                 DEFAULT_TOTAL_MAX_CHARS,
             )
         };
+
+        // Fingerprint the persona inputs so a freshly-created/edited workspace
+        // file (or a changed inline `system`) rebuilds the cached prompt without
+        // a gateway restart. ws_ctx is already fresh (cache re-reads by mtime);
+        // only the assembled prompt was stuck.
+        let ws_fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ws_ctx.agents_md.hash(&mut h);
+            ws_ctx.soul_md.hash(&mut h);
+            ws_ctx.user_md.hash(&mut h);
+            ws_ctx.identity_md.hash(&mut h);
+            ws_ctx.tools_md.hash(&mut h);
+            self.handle.config.system.hash(&mut h);
+            h.finish()
+        };
+        if self.cached_prompt_fingerprint != Some(ws_fingerprint) {
+            self.cached_system_prompt = None;
+            self.cached_prompt_fingerprint = Some(ws_fingerprint);
+        }
+
+        // Precedence: an explicit inline `system` OVERRIDES the workspace
+        // SOUL.md persona (one authoritative persona, no double-identity). Drop
+        // soul_md before the prompt renders it; other workspace files (AGENTS.md
+        // project rules, USER.md, MEMORY.md, TOOLS.md) still load — they're not
+        // the persona and don't conflict with the inline system.
+        let has_inline_system = self
+            .handle
+            .config
+            .system
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_inline_system {
+            ws_ctx.soul_md = None;
+        }
 
         // Build system prompt — cached for entire gateway lifetime.
         // Only rebuilt on gateway restart.
@@ -3946,7 +4013,7 @@ impl AgentRuntime {
                     .or(self.config.agents.defaults.model.as_ref())
                     .and_then(|m| m.toolset.as_deref())
                     .map(|s| s.to_owned());
-                let prompt = build_system_prompt(
+                let mut prompt = build_system_prompt(
                     &ws_ctx,
                     &self.skills,
                     &self.wasm_plugins,
@@ -3955,6 +4022,23 @@ impl AgentRuntime {
                     toolset_owned.as_deref(),
                     self.cap_manager.is_some(),
                 );
+                // Per-agent inline persona from `agents.list[].system`. This is
+                // agent-specific → appended to the user_system tail (NOT the
+                // shared cross-agent prefix). The field had NO consumer after
+                // the crate-split, so agents that set an inline `system`
+                // (instead of a workspace SOUL.md) silently got only the
+                // generic default persona ("你是谁" → "螃蟹助手").
+                if let Some(sys) = self
+                    .handle
+                    .config
+                    .system
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(sys);
+                }
                 // DEBUG: dump full system prompt to file for inspection
                 if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
                     let dump_path =
