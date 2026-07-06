@@ -1,0 +1,49 @@
+[package]
+name = "astock-core"
+version = "0.0.1"
+edition = "2024"
+description = "A 股数据获取、算法、渲染的独立核心库 (A-share data, algo, rendering core library)"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["stock", "china", "a-share", "tushare", "eastmoney"]
+categories = ["finance"]
+publish = true
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+async-trait = "0.1"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 错误处理
+anyhow = "1"
+thiserror = "2"
+
+# 日志
+tracing = "0.1"
+
+# 日期
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# HTTP (可选, 默认启用)
+reqwest = { version = "0.12", features = ["json"], optional = true }
+
+# URL 编码
+urlencoding = "2"
+
+# 编码转换 (GBK 等)
+encoding_rs = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[features]
+default = ["http-reqwest"]
+http-reqwest = ["dep:reqwest"]
+# pytdx python 子进程桥接 (预留, 暂未实现)
+ptdx-bridge = []
+# WASM 编译时启用 (预留)
+wasm = []
