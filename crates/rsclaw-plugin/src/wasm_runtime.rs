@@ -2931,6 +2931,34 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
 }
 
 // ---------------------------------------------------------------------------
+// host-ocr trait implementation
+// ---------------------------------------------------------------------------
+
+impl rsclaw::plugin::host_ocr::Host for HostState {
+    async fn ocr_image(
+        &mut self,
+        image_data_uri: String,
+        prompt: String,
+        max_tokens: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        let Some(client) = rsclaw_kb::OcrClient::from_config() else {
+            return Ok(Err(
+                "ocr-image: no OCR endpoint configured (set kb.ocr in rsclaw.json5)".to_string(),
+            ));
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            client.ocr(&image_data_uri, Some(&prompt), Some(max_tokens))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("ocr_image: task join failed: {e}"))?;
+        match result {
+            Ok(text) => Ok(Ok(text)),
+            Err(e) => Ok(Err(format!("ocr_image request failed: {e:#}"))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // host-android trait implementation
 // ---------------------------------------------------------------------------
 
@@ -4136,6 +4164,11 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
         |state: &mut HostState| state,
     )
     .map_err(|e| anyhow::anyhow!("failed to add host-vlm linker interfaces: {e}"))?;
+    rsclaw::plugin::host_ocr::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state: &mut HostState| state,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to add host-ocr linker interfaces: {e}"))?;
     rsclaw::plugin::host_android::add_to_linker::<
         HostState,
         wasmtime::component::HasSelf<HostState>,
