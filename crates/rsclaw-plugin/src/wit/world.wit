@@ -387,6 +387,17 @@ interface host-vlm {
         -> result<string, string>;
 }
 
+interface host-ocr {
+    /// OCR an already-captured image (any platform — the plugin captured it via its own
+    /// android-screenshot/ios-screenshot/desktop-screenshot-window primitive) via the
+    /// dedicated rsclaw-ocr-v1 model. Returns the model's raw text output — plain verbatim
+    /// text, or a caller-requested structured format (e.g. bbox-annotated JSON), depending
+    /// entirely on how `prompt` is worded.
+    /// image-data-uri must be data:image/...;base64,... format.
+    ocr-image: func(image-data-uri: string, prompt: string, max-tokens: u32)
+        -> result<string, string>;
+}
+
 interface plugin-api {
     handle-tool: func(tool-name: string, args-json: string) -> result<string, string>;
 }
@@ -406,5 +417,6 @@ world jimeng-plugin {
     import host-ios;
     import host-desktop;
     import host-vlm;
+    import host-ocr;
     export plugin-api;
 }
