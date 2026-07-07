@@ -5,9 +5,8 @@
 //! handler, which is bound to `AgentRuntime` and therefore stays in root.
 
 use anyhow::{Result, anyhow};
-use serde_json::{Value, json};
-
 pub use rsclaw_kb::OcrClient;
+use serde_json::{Value, json};
 
 impl super::runtime::AgentRuntime {
     /// OCR an image to verbatim text via the `kb.ocr` endpoint. Accepts a
@@ -60,14 +59,16 @@ impl super::runtime::AgentRuntime {
             // per-call override would need a richer client API. Keep it
             // config-driven for now and note the requested lang.
             let _ = &lang;
-            client.ocr(&payload)
+            client.ocr(&payload, None, None)
         })
         .await
         .map_err(|e| anyhow!("ocr: task join failed: {e}"))?;
 
         match text {
             Ok(t) if !t.trim().is_empty() => Ok(json!({ "text": t.trim() })),
-            Ok(_) => Ok(json!({ "text": "", "note": "OCR returned no text (blank or non-text image)." })),
+            Ok(_) => {
+                Ok(json!({ "text": "", "note": "OCR returned no text (blank or non-text image)." }))
+            }
             Err(e) => Ok(json!({
                 "error": format!("ocr request failed: {e:#}"),
                 "hint": "Endpoint may be down or the image unreadable. Retry once; if it persists tell the user."

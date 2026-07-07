@@ -46,7 +46,7 @@ impl Canonicalizer for ImageCanonicalizer {
         let b64 = base64::engine::general_purpose::STANDARD.encode(input.bytes);
         let data_uri = format!("data:{};base64,{}", input.mime, b64);
         let text = client
-            .ocr(&data_uri)
+            .ocr(&data_uri, None, None)
             .context("kb image canonicalize: OCR request failed")?;
         let body = text.trim().to_string();
         if body.is_empty() {
