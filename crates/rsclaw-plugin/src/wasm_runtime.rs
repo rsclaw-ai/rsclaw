@@ -3904,6 +3904,32 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         }
     }
 
+    async fn ios_set_pasteboard(
+        &mut self,
+        content_type: String,
+        base64_content: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let payload =
+            serde_json::json!({"contentType": content_type, "content": base64_content});
+        let resp = match cli
+            .post(format!("{base}/wda/setPasteboard"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA setPasteboard: {e}"))),
+        };
+        if resp.status().is_success() {
+            Ok(Ok("ok".to_string()))
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Ok(Err(format!("WDA setPasteboard returned {status}: {body}")))
+        }
+    }
+
     async fn ios_current_app(&mut self) -> HostTrapResult<Result<String, String>> {
         let (base, cli) = self.wda_base_and_client();
         let resp = match cli

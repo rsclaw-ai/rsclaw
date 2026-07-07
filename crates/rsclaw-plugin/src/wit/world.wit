@@ -302,6 +302,13 @@ interface host-ios {
 
     /// Terminate app by bundle id.
     ios-terminate-app: func(bundle-id: string) -> result<string, string>;
+
+    /// Set the iOS device system pasteboard via WDA. `content-type` is one of
+    /// "plaintext" | "image" | "url"; `base64-content` is the base64 payload
+    /// (raw PNG/JPEG bytes for "image"). Lets a plugin put an image/file on the
+    /// clipboard so it can be pasted into a chat — the only route to sending a
+    /// real attachment on iOS (there is no album/file-push host capability).
+    ios-set-pasteboard: func(content-type: string, base64-content: string) -> result<string, string>;
 }
 
 interface host-desktop {
