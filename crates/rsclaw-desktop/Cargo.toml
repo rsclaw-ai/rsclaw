@@ -26,3 +26,8 @@ rsclaw-platform = { path = "../rsclaw-platform", version = "0.1.0" }
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
+# Native on-device OCR via the Vision framework (VNRecognizeTextRequest) — the
+# in-tree replacement for the previous python3 + pyobjc Vision shell-out.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSURL", "NSDictionary"] }
+objc2-vision = "0.3"

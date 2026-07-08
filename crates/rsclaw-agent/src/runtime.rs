@@ -201,6 +201,9 @@ pub(crate) struct PluginUserToolSelection {
     pub description: String,
     pub input_schema: Value,
     /// v2 toolGroups: feature group this tool belongs to, if declared.
+    /// Populated during selection; retained for grouping/telemetry even
+    /// though no reader consumes it yet.
+    #[allow(dead_code)]
     pub group: Option<String>,
 }
 

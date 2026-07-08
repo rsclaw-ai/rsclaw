@@ -84,8 +84,17 @@ impl OcrClient {
     }
 
     /// Run OCR on an image. `image` is a data URI (`data:image/png;base64,…`)
-    /// or an `http(s)://` URL. Returns the extracted text (`content`).
-    pub fn ocr(&self, image: &str) -> Result<String> {
+    /// or an `http(s)://` URL. `prompt` overrides the model's default OCR
+    /// instruction (e.g. to request bbox-annotated JSON instead of plain
+    /// verbatim text) — `None` preserves today's default request shape.
+    /// `max_tokens` bounds the response length — `None` uses the endpoint's
+    /// own default. Returns the extracted text (`content`).
+    pub fn ocr(
+        &self,
+        image: &str,
+        prompt: Option<&str>,
+        max_tokens: Option<u32>,
+    ) -> Result<String> {
         let mut body = serde_json::json!({
             "image": image,
             "stream": false,
@@ -95,6 +104,12 @@ impl OcrClient {
         }
         if let Some(l) = &self.lang {
             body["lang"] = serde_json::json!(l);
+        }
+        if let Some(p) = prompt {
+            body["prompt"] = serde_json::json!(p);
+        }
+        if let Some(mt) = max_tokens {
+            body["max_tokens"] = serde_json::json!(mt);
         }
 
         let send = || async {
@@ -113,9 +128,8 @@ impl OcrClient {
             anyhow::Ok(resp.json::<serde_json::Value>().await?)
         };
         let resp: serde_json::Value = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                tokio::task::block_in_place(|| handle.block_on(send())).context("ocr request failed")?
-            }
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(send()))
+                .context("ocr request failed")?,
             Err(_) => tokio::runtime::Runtime::new()
                 .context("failed to create temp runtime for ocr")?
                 .block_on(send())
@@ -147,9 +161,7 @@ impl OcrClient {
 /// config and relies entirely on the env var — without the env fallback here
 /// rerank/embed/ocr sent no Bearer and the fleet 401'd ("missing
 /// Authorization: Bearer header"), silently degrading KB rerank to fused order.
-pub(crate) fn rsclaw_provider_key(
-    cfg: &rsclaw_config::runtime::RuntimeConfig,
-) -> Option<String> {
+pub(crate) fn rsclaw_provider_key(cfg: &rsclaw_config::runtime::RuntimeConfig) -> Option<String> {
     cfg.raw
         .models
         .as_ref()
@@ -157,7 +169,11 @@ pub(crate) fn rsclaw_provider_key(
         .and_then(|p| p.api_key.as_ref())
         .and_then(|s| s.resolve_early())
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("RSCLAW_API_KEY").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("RSCLAW_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| std::env::var("RSCLAW_KEY").ok().filter(|s| !s.is_empty()))
 }
 
@@ -177,7 +193,10 @@ pub(crate) fn rsclaw_provider_base_url(
         .and_then(|p| p.base_url.as_ref())
         .map(|s| {
             let t = s.trim().trim_end_matches('/');
-            t.strip_suffix("/agent").unwrap_or(t).trim_end_matches('/').to_owned()
+            t.strip_suffix("/agent")
+                .unwrap_or(t)
+                .trim_end_matches('/')
+                .to_owned()
         })
         .filter(|s| !s.is_empty())
 }

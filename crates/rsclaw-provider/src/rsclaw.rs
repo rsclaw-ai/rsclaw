@@ -1003,7 +1003,7 @@ impl RsclawProvider {
     }
 
     async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
-        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
                 system: split.dynamic_system,
@@ -1017,6 +1017,7 @@ impl RsclawProvider {
             model: &split.model,
             dynamic_prefix,
             user_tools: top_level_user_tools,
+            user_system: top_level_user_system,
             options: Some(split.options.clone()),
         };
         // 180s caps the worst-case prefix-decode time for a fresh
@@ -1078,7 +1079,7 @@ impl RsclawProvider {
             &user_system_owned
         };
         let history: Vec<Value> = serialize_replay_history(&filtered);
-        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
                 system: split.dynamic_system,
@@ -1092,6 +1093,7 @@ impl RsclawProvider {
             model: &split.model,
             dynamic_prefix,
             user_tools: top_level_user_tools,
+            user_system: top_level_user_system,
             history,
             options: Some(split.options.clone()),
         };
@@ -1632,6 +1634,14 @@ struct CreateSessionReq<'a> {
     /// (base, user) pair regardless of which path the client took.
     #[serde(skip_serializing_if = "slice_ref_is_empty")]
     user_tools: &'a [Value],
+    /// Registry-path per-session system text: the segment that would live
+    /// in `dynamic_prefix.user_system` on the dynamic path. Surfaced at the
+    /// top level here (alongside `prefix_id`) because `dynamic_prefix` is
+    /// omitted on the registry path; the worker overlays it on top of the
+    /// registered base KV. Skipped when empty so degenerate sessions match
+    /// the prior byte shape.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    user_system: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
 }
@@ -1654,6 +1664,9 @@ struct ReplayReq<'a> {
     /// the comment there for the position-selection rule.
     #[serde(skip_serializing_if = "slice_ref_is_empty")]
     user_tools: &'a [Value],
+    /// Registry-path per-session system text. See `CreateSessionReq::user_system`.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    user_system: &'a str,
     history: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
@@ -1675,19 +1688,33 @@ struct ReplayReq<'a> {
 fn prefix_fields<'a>(
     prefix_id: &'a str,
     dynamic: DynamicPrefixWire<'a>,
-) -> (Option<&'a str>, Option<DynamicPrefixWire<'a>>, &'a [Value]) {
+) -> (
+    Option<&'a str>,
+    Option<DynamicPrefixWire<'a>>,
+    &'a [Value],
+    &'a str,
+) {
     if prefix_id.is_empty() {
-        // Dynamic path: dynamic_prefix.user_tools already carries the
-        // per-session private tools; the top-level slot stays empty
-        // (skip_serializing_if drops it from the wire body).
-        (None, Some(dynamic), &[])
+        // Dynamic path: dynamic_prefix.{user_tools,user_system} already
+        // carry the per-session segment; the top-level slots stay empty
+        // (skip_serializing_if drops them from the wire body).
+        (None, Some(dynamic), &[], "")
     } else {
-        // Registry path: lift user_tools out of the dropped
-        // dynamic_prefix and surface them at the top level. The base
-        // (system + builtin tools) lives in the worker's static slot
-        // so dynamic_prefix itself is omitted.
+        // Registry path: the base (system + builtin tools) lives in the
+        // worker's static slot so dynamic_prefix itself is omitted — but
+        // the per-session segment still has to reach the worker. Lift both
+        // user_tools AND user_system out of the dropped dynamic_prefix and
+        // surface them at the top level, where the worker layers them on
+        // top of the registered base KV (the base layer being registered
+        // does not preclude a per-session user_system overlay).
         let top_level_user_tools = dynamic.user_tools;
-        (Some(prefix_id), None, top_level_user_tools)
+        let top_level_user_system = dynamic.user_system;
+        (
+            Some(prefix_id),
+            None,
+            top_level_user_tools,
+            top_level_user_system,
+        )
     }
 }
 
@@ -4534,7 +4561,7 @@ data: {"type":"block_stop","index":0}
             parameters: json!({"type":"object"}),
         });
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
-        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
                 system: split.dynamic_system,
@@ -4548,6 +4575,7 @@ data: {"type":"block_stop","index":0}
             model: &split.model,
             dynamic_prefix,
             user_tools: top_level_user_tools,
+            user_system: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -4571,9 +4599,12 @@ data: {"type":"block_stop","index":0}
             v.get("user_suffix").is_none(),
             "user_suffix is the legacy name; never send (top-level or otherwise)"
         );
-        assert!(
-            v.get("user_system").is_none(),
-            "user_system lives inside dynamic_prefix, never at top-level"
+        // Registry path lifts the per-session system segment to the top
+        // level (dynamic_prefix is omitted, so it has nowhere else to go).
+        // The worker overlays it on top of the registered base KV.
+        assert_eq!(
+            v["user_system"], "<suf>",
+            "registry path must surface user_system at the top level"
         );
         assert!(
             v.get("plugins_system").is_none(),
@@ -4604,7 +4635,7 @@ data: {"type":"block_stop","index":0}
             parameters: json!({"type":"object"}),
         });
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
-        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
                 system: split.dynamic_system,
@@ -4618,6 +4649,7 @@ data: {"type":"block_stop","index":0}
             model: &split.model,
             dynamic_prefix,
             user_tools: top_level_user_tools,
+            user_system: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -4651,7 +4683,7 @@ data: {"type":"block_stop","index":0}
             parameters: json!({"type":"object"}),
         });
         let split = split_request(&req, "", false).unwrap();
-        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
                 system: split.dynamic_system,
@@ -4665,6 +4697,7 @@ data: {"type":"block_stop","index":0}
             model: &split.model,
             dynamic_prefix,
             user_tools: top_level_user_tools,
+            user_system: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -4705,7 +4738,7 @@ data: {"type":"block_stop","index":0}
         });
         // Empty prefix_id forces the dynamic-LRU path.
         let split = split_request(&req, "", false).unwrap();
-        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
                 system: split.dynamic_system,
@@ -4719,6 +4752,7 @@ data: {"type":"block_stop","index":0}
             model: &split.model,
             dynamic_prefix,
             user_tools: top_level_user_tools,
+            user_system: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();

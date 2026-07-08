@@ -2386,6 +2386,30 @@ async fn u2_screenshot_b64(serial: Option<&str>) -> Result<String, String> {
         .ok_or_else(|| "u2 screenshot: empty value".to_string())
 }
 
+/// Get window size via the u2 server's W3C `/window/size` endpoint. Returns
+/// `{width, height}` in physical pixels — same shape adb's `wm size` yields.
+async fn u2_screen_size(serial: Option<&str>) -> Result<(u32, u32), String> {
+    let (base, sid) = u2_session(serial).await?;
+    let client = host_http_client()?;
+    let resp = client
+        .get(format!("{base}/session/{}/window/size", u2_url_encode(&sid)))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("u2 window size: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("u2 window size http {}", resp.status()));
+    }
+    let v: Value = resp.json().await.map_err(|e| format!("u2 window size body: {e}"))?;
+    let value = v.get("value").unwrap_or(&v);
+    let width = value.get("width").and_then(Value::as_u64);
+    let height = value.get("height").and_then(Value::as_u64);
+    match (width, height) {
+        (Some(w), Some(h)) => Ok((w as u32, h as u32)),
+        _ => Err("u2 window size: missing width/height in response".to_string()),
+    }
+}
+
 async fn u2_status_ok(base: &str) -> bool {
     let Ok(client) = host_http_client() else { return false };
     match client
@@ -2907,6 +2931,34 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
 }
 
 // ---------------------------------------------------------------------------
+// host-ocr trait implementation
+// ---------------------------------------------------------------------------
+
+impl rsclaw::plugin::host_ocr::Host for HostState {
+    async fn ocr_image(
+        &mut self,
+        image_data_uri: String,
+        prompt: String,
+        max_tokens: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        let Some(client) = rsclaw_kb::OcrClient::from_config() else {
+            return Ok(Err(
+                "ocr-image: no OCR endpoint configured (set kb.ocr in rsclaw.json5)".to_string(),
+            ));
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            client.ocr(&image_data_uri, Some(&prompt), Some(max_tokens))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("ocr_image: task join failed: {e}"))?;
+        match result {
+            Ok(text) => Ok(Ok(text)),
+            Err(e) => Ok(Err(format!("ocr_image request failed: {e:#}"))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // host-android trait implementation
 // ---------------------------------------------------------------------------
 
@@ -3115,35 +3167,44 @@ impl rsclaw::plugin::host_android::Host for HostState {
 
     async fn android_current_activity(&mut self) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
-        // Try the focused window first (works on most Android versions
-        // and matches what the user sees on screen). Fall back to the
-        // resumed activity from `dumpsys activity activities` when the
-        // window service doesn't expose mCurrentFocus in the expected
-        // shape — happens on some single-user images and during ANR.
-        if let Ok(out) = adb_run_str(
-            serial.as_deref(),
-            &["shell", "dumpsys", "window", "windows"],
-        )
-        .await
-            && let Some(activity) = parse_current_focus_activity(&out)
-        {
-            return Ok(Ok(activity));
+        // `dumpsys window windows` is the legacy invocation; on Android
+        // 12+ (API 31+) the `windows` sub-argument was dropped and the
+        // service just ignores it / omits mCurrentFocus, so try the
+        // modern `dumpsys window` form too. Order: old windows arg, then
+        // bare `dumpsys window`, then `dumpsys activity activities`
+        // (mResumedActivity), then `dumpsys activity top` (the `ACTIVITY
+        // <pkg>/<cls>` header line), which has been stable since Android
+        // 4.x and is the most version-portable of the four.
+        for args in [
+            &["shell", "dumpsys", "window", "windows"][..],
+            &["shell", "dumpsys", "window"][..],
+        ] {
+            if let Ok(out) = adb_run_str(serial.as_deref(), args).await
+                && let Some(activity) = parse_current_focus_activity(&out)
+            {
+                return Ok(Ok(activity));
+            }
         }
-        match adb_run_str(
+        if let Ok(out) = adb_run_str(
             serial.as_deref(),
             &["shell", "dumpsys", "activity", "activities"],
         )
         .await
+            && let Some(activity) = parse_resumed_activity(&out)
         {
-            Ok(out) => match parse_resumed_activity(&out) {
+            return Ok(Ok(activity));
+        }
+        match adb_run_str(serial.as_deref(), &["shell", "dumpsys", "activity", "top"]).await {
+            Ok(out) => match parse_activity_top(&out) {
                 Some(activity) => Ok(Ok(activity)),
                 None => Ok(Err(
-                    "could not determine current activity (neither mCurrentFocus nor \
-                     mResumedActivity matched in dumpsys output)"
+                    "could not determine current activity (mCurrentFocus, \
+                     mResumedActivity, and `dumpsys activity top` all failed \
+                     to match on this device)"
                         .to_string(),
                 )),
             },
-            Err(e) => Ok(Err(format!("dumpsys activity activities failed: {e}"))),
+            Err(e) => Ok(Err(format!("dumpsys activity top failed: {e}"))),
         }
     }
 
@@ -3194,6 +3255,28 @@ impl rsclaw::plugin::host_android::Host for HostState {
         }
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
         Ok(Ok(format!("data:image/png;base64,{b64}")))
+    }
+
+    async fn android_screen_size(&mut self) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        // Prefer u2's /window/size (reuses the persistent instrumentation
+        // connection, same rationale as android_screenshot's u2-first path).
+        // Fall back to `adb shell wm size` when u2 isn't up.
+        if let Ok((width, height)) = u2_screen_size(serial.as_deref()).await {
+            return Ok(Ok(serde_json::json!({"width": width, "height": height}).to_string()));
+        }
+        let out = match adb_run_str(serial.as_deref(), &["shell", "wm", "size"]).await {
+            Ok(o) => o,
+            Err(e) => return Ok(Err(format!("wm size: {e}"))),
+        };
+        match parse_wm_size(&out) {
+            Some((width, height)) => {
+                Ok(Ok(serde_json::json!({"width": width, "height": height}).to_string()))
+            }
+            None => Ok(Err(format!(
+                "android_screen_size: could not parse `wm size` output: {out:?}"
+            ))),
+        }
     }
 
     async fn android_find_elements(
@@ -3821,6 +3904,32 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         }
     }
 
+    async fn ios_set_pasteboard(
+        &mut self,
+        content_type: String,
+        base64_content: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let (base, cli) = self.wda_base_and_client();
+        let payload =
+            serde_json::json!({"contentType": content_type, "content": base64_content});
+        let resp = match cli
+            .post(format!("{base}/wda/setPasteboard"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("WDA setPasteboard: {e}"))),
+        };
+        if resp.status().is_success() {
+            Ok(Ok("ok".to_string()))
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Ok(Err(format!("WDA setPasteboard returned {status}: {body}")))
+        }
+    }
+
     async fn ios_current_app(&mut self) -> HostTrapResult<Result<String, String>> {
         let (base, cli) = self.wda_base_and_client();
         let resp = match cli
@@ -3934,11 +4043,16 @@ fn parse_current_focus_activity(dumpsys_output: &str) -> Option<String> {
 
 /// Parse `mResumedActivity: ActivityRecord{xxxx u0 <package>/<Activity> ...}`
 /// out of `dumpsys activity activities`. Used as a fallback when
-/// `mCurrentFocus` parsing didn't resolve.
+/// `mCurrentFocus` parsing didn't resolve. Some AOSP forks rename the field
+/// to `ResumedActivity` or `topResumedActivity` (no `m` prefix) — matched
+/// too since the `ActivityRecord{...}` envelope is identical.
 fn parse_resumed_activity(dumpsys_output: &str) -> Option<String> {
     for line in dumpsys_output.lines() {
         let trimmed = line.trim_start();
-        if !trimmed.starts_with("mResumedActivity") {
+        if !(trimmed.starts_with("mResumedActivity")
+            || trimmed.starts_with("ResumedActivity")
+            || trimmed.starts_with("topResumedActivity"))
+        {
             continue;
         }
         let open = trimmed.find('{')?;
@@ -3952,6 +4066,56 @@ fn parse_resumed_activity(dumpsys_output: &str) -> Option<String> {
         return Some(tok.to_string());
     }
     None
+}
+
+/// Parse the `ACTIVITY <package>/<Activity> <hash> pid=<pid>` header line
+/// out of `dumpsys activity top`. This subcommand and its header format
+/// have been stable since Android 4.x, making it the most version-portable
+/// of the activity-detection strategies — used as the final fallback.
+fn parse_activity_top(dumpsys_output: &str) -> Option<String> {
+    for line in dumpsys_output.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("ACTIVITY ") {
+            continue;
+        }
+        let rest = trimmed.strip_prefix("ACTIVITY ")?;
+        let tok = rest
+            .split_whitespace()
+            .next()
+            .filter(|s| s.contains('/'))?;
+        return Some(tok.to_string());
+    }
+    None
+}
+
+/// Parse `Physical size: <W>x<H>` out of `adb shell wm size`. Prefers the
+/// "Override size" line when present (set by `wm size WxH` for testing/
+/// scaling) since that's what the display actually renders at; falls back
+/// to "Physical size" otherwise.
+fn parse_wm_size(output: &str) -> Option<(u32, u32)> {
+    let mut physical = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let is_override = trimmed.starts_with("Override size");
+        let is_physical = trimmed.starts_with("Physical size");
+        if !is_override && !is_physical {
+            continue;
+        }
+        let Some((_, dims)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let Some((w, h)) = dims.trim().split_once('x') else {
+            continue;
+        };
+        let (Ok(w), Ok(h)) = (w.trim().parse(), h.trim().parse()) else {
+            continue;
+        };
+        if is_override {
+            return Some((w, h));
+        }
+        physical = Some((w, h));
+    }
+    physical
 }
 
 // ---------------------------------------------------------------------------
@@ -4026,6 +4190,11 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
         |state: &mut HostState| state,
     )
     .map_err(|e| anyhow::anyhow!("failed to add host-vlm linker interfaces: {e}"))?;
+    rsclaw::plugin::host_ocr::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state: &mut HostState| state,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to add host-ocr linker interfaces: {e}"))?;
     rsclaw::plugin::host_android::add_to_linker::<
         HostState,
         wasmtime::component::HasSelf<HostState>,
@@ -4552,6 +4721,68 @@ mod android_helper_tests {
             parse_resumed_activity(dump).as_deref(),
             Some("com.example.foo/.MainActivity")
         );
+    }
+
+    #[test]
+    fn parse_resumed_activity_no_m_prefix_shape() {
+        // Some AOSP forks drop the Hungarian-notation `m` prefix.
+        let dump = concat!(
+            "ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)\n",
+            "  ResumedActivity: ActivityRecord{1234 u0 com.example.foo/.MainActivity t42}\n",
+        );
+        assert_eq!(
+            parse_resumed_activity(dump).as_deref(),
+            Some("com.example.foo/.MainActivity")
+        );
+    }
+
+    #[test]
+    fn parse_resumed_activity_top_resumed_shape() {
+        let dump = concat!(
+            "ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)\n",
+            "  topResumedActivity: ActivityRecord{1234 u0 com.example.foo/.MainActivity t42}\n",
+        );
+        assert_eq!(
+            parse_resumed_activity(dump).as_deref(),
+            Some("com.example.foo/.MainActivity")
+        );
+    }
+
+    #[test]
+    fn parse_activity_top_typical_shape() {
+        let dump = concat!(
+            "TASK com.example.foo id=42\n",
+            "  ACTIVITY com.example.foo/.MainActivity 7a1b2c3 pid=1234\n",
+            "    Local Activity 7a1b2c3 State:\n",
+        );
+        assert_eq!(
+            parse_activity_top(dump).as_deref(),
+            Some("com.example.foo/.MainActivity")
+        );
+    }
+
+    #[test]
+    fn parse_activity_top_returns_none_without_slash() {
+        let dump = "ACTIVITY MANAGER RUNNING PROCESSES\n  something else\n";
+        assert_eq!(parse_activity_top(dump), None);
+    }
+
+    #[test]
+    fn parse_wm_size_physical_only() {
+        let out = "Physical size: 1080x2340\n";
+        assert_eq!(parse_wm_size(out), Some((1080, 2340)));
+    }
+
+    #[test]
+    fn parse_wm_size_prefers_override() {
+        let out = "Physical size: 1080x2340\nOverride size: 720x1560\n";
+        assert_eq!(parse_wm_size(out), Some((720, 1560)));
+    }
+
+    #[test]
+    fn parse_wm_size_returns_none_on_garbage() {
+        assert_eq!(parse_wm_size("nonsense\n"), None);
+        assert_eq!(parse_wm_size(""), None);
     }
 
     #[test]

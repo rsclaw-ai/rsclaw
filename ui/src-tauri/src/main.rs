@@ -877,7 +877,7 @@ html,body{margin:0;padding:0;width:100vw;height:100vh;background:transparent;ove
 /// window already exists is a no-op.
 #[tauri::command]
 async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::{LogicalPosition, LogicalSize, WebviewUrl, WebviewWindowBuilder};
+    use tauri::{PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
 
     eprintln!("[glow] open_glow_overlay: enter");
     if app.get_webview_window("computer-use-glow").is_some() {
@@ -890,13 +890,23 @@ async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| format!("primary_monitor: {e}"))?
         .ok_or_else(|| "no primary monitor".to_string())?;
     let scale = monitor.scale_factor();
+    // `size`/`pos` are PHYSICAL pixels — the monitor's authoritative bounds.
     let size = monitor.size();
     let pos = monitor.position();
+    // Logical values are only a rough seed for the builder; the exact
+    // coverage is set via PhysicalSize/PhysicalPosition after build (below).
+    // Do NOT rely on physical/scale to equal the logical desktop size: in a
+    // macOS *scaled* display mode ("looks like 1440" on a 2560×1600 panel)
+    // that identity breaks, and the window ends up a ring smaller than the
+    // screen — the "uniform blank margin" bug. Physical bounds are exact.
     let logical_w = size.width as f64 / scale;
     let logical_h = size.height as f64 / scale;
     let logical_x = pos.x as f64 / scale;
     let logical_y = pos.y as f64 / scale;
-    eprintln!("[glow] geom logical=({logical_w}x{logical_h}) at ({logical_x},{logical_y}) scale={scale}");
+    eprintln!(
+        "[glow] geom physical=({}x{}) at ({},{}) logical_seed=({logical_w}x{logical_h}) scale={scale}",
+        size.width, size.height, pos.x, pos.y
+    );
 
     use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
     let encoded = utf8_percent_encode(GLOW_OVERLAY_HTML, NON_ALPHANUMERIC).to_string();
@@ -925,12 +935,15 @@ async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
     window
         .set_ignore_cursor_events(true)
         .map_err(|e| format!("set_ignore_cursor_events: {e}"))?;
-    // Resize/reposition once visible to be sure the geometry stuck.
+    // Snap to the monitor's exact PHYSICAL bounds. This is the fix for the
+    // "uniform blank margin" bug: in a scaled display mode the logical seed
+    // above is smaller than the real desktop, so a logical-sized window
+    // leaves a gap all around. Physical bounds match the panel 1:1.
     window
-        .set_size(LogicalSize::new(logical_w, logical_h))
+        .set_size(PhysicalSize::new(size.width, size.height))
         .map_err(|e| format!("set_size: {e}"))?;
     window
-        .set_position(LogicalPosition::new(logical_x, logical_y))
+        .set_position(PhysicalPosition::new(pos.x, pos.y))
         .map_err(|e| format!("set_position: {e}"))?;
     window.show().map_err(|e| format!("show: {e}"))?;
     eprintln!("[glow] window shown ok");

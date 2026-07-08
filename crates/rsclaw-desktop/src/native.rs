@@ -9,7 +9,7 @@ use std::process::Command;
 
 use base64::Engine;
 use enigo::{
-    Axis, Button, Coordinate,
+    Button, Coordinate,
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Mouse, Settings,
 };
@@ -225,11 +225,11 @@ fn capture_app_window(app_name: &str) -> Result<String, String> {
     Ok(capture::png_to_data_uri(&png))
 }
 
-/// On-device OCR of an app window via macOS Vision (through `python3` +
-/// pyobjc, same shell-out pattern as `cgwindow_fallback`). Captures the
-/// window by id (occlusion-proof) to a temp PNG, runs accurate text
-/// recognition, and returns a JSON array of recognised lines with 0-1000
-/// relative centre coords: `[{"text":"东升","x":143,"y":699}, ...]`.
+/// On-device OCR of an app window. On Windows uses WinRT
+/// `Windows.Media.Ocr`; on macOS native Vision FFI is planned (currently
+/// returns an empty result and callers fall back to VLM grounding).
+/// Returns a JSON array of recognised lines with 0-1000 relative centre
+/// coords: `[{"text":"东升","x":143,"y":699}, ...]`.
 /// Far more precise than VLM grounding for clicking a named row.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn ocr_window(_app_name: &str) -> Result<String, String> {
@@ -510,79 +510,101 @@ foreach($l in $res.Lines){
 $out | ConvertTo-Json -Compress -Depth 3
 "#;
 
+/// macOS on-device OCR via the Vision framework (`VNRecognizeTextRequest`),
+/// called through objc2 FFI — the in-tree replacement for the previous
+/// python3 + pyobjc Vision shell-out. Captures the app's frontmost window by id
+/// (occlusion-proof `screencapture -l`), runs text recognition, and emits the
+/// same JSON shape as the Windows path: `[{"text","conf","x","y","sx","sy"}]`
+/// where x/y are 0-1000 window-relative line centres and sx/sy are
+/// screen-absolute (logical-point) click points.
 #[cfg(target_os = "macos")]
 fn ocr_window(app_name: &str) -> Result<String, String> {
-    let win = find_app_window(app_name)?;
-    // Bounds of the EXACT window we OCR (frontmost match — may be a CEF popover
-    // that AppleScript/get_main_window can't see). Passing them to the OCR driver
-    // lets it emit screen-absolute click points, so callers never have to re-resolve
-    // the window (and never mis-scale a popover's coords by the main window).
-    let (wx, wy, ww, wh) = (win.x, win.y, win.w, win.h);
-    // Capture the exact window by id (occlusion-proof) to a temp PNG for python.
-    let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
-    let tmp = std::env::temp_dir().join(format!(
-        "rsclaw_ocr_{}_{}.png",
-        std::process::id(),
-        win.id
-    ));
-    std::fs::write(&tmp, &png).map_err(|e| format!("write OCR temp PNG: {e}"))?;
-    let out = Command::new("python3")
-        .arg("-c")
-        .arg(OCR_VISION_PY)
-        .arg(&tmp)
-        .arg(wx.to_string())
-        .arg(wy.to_string())
-        .arg(ww.to_string())
-        .arg(wh.to_string())
-        .output()
-        .map_err(|e| format!("python3 OCR spawn failed (need pyobjc Vision): {e}"))?;
-    let _ = std::fs::remove_file(&tmp);
-    if !out.status.success() {
-        return Err(format!(
-            "Vision OCR failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
+    use objc2::AnyThread;
+    use objc2_foundation::{NSArray, NSDictionary, NSString, NSURL};
+    use objc2_vision::{
+        VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel,
+    };
 
-/// macOS Vision text-recognition driver (run via `python3 -c`). Reads an image
-/// path from argv[1] and the OCR'd window's screen bounds from argv[2..6]
-/// (x,y,w,h in logical points). Prints `[{"text","conf","x","y","sx","sy"}]`:
-/// `x`/`y` are 0-1000 top-left window-relative; `sx`/`sy` are screen-absolute
-/// click points (window origin + relative offset) so callers click without
-/// re-resolving the window. RecognitionLevel 0 = accurate (1 misses small CJK).
-#[cfg(target_os = "macos")]
-const OCR_VISION_PY: &str = r#"import sys, json, Vision, Quartz
-from Foundation import NSURL
-url = NSURL.fileURLWithPath_(sys.argv[1])
-wx, wy, ww, wh = (int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])) if len(sys.argv) >= 6 else (0, 0, 0, 0)
-src = Quartz.CGImageSourceCreateWithURL(url, None)
-cg = Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
-req = Vision.VNRecognizeTextRequest.alloc().init()
-req.setRecognitionLevel_(0)
-req.setRecognitionLanguages_(['zh-Hans', 'zh-Hant', 'en'])
-h = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg, {})
-h.performRequests_error_([req], None)
-out = []
-for o in (req.results() or []):
-    c = o.topCandidates_(1)
-    if not c:
-        continue
-    b = o.boundingBox()
-    fx = b.origin.x + b.size.width / 2.0            # 0-1 left-origin
-    fy = 1.0 - (b.origin.y + b.size.height / 2.0)   # 0-1 top-origin (Vision is bottom-left)
-    # `conf` is Vision's per-line confidence scaled to 0-100. Clean CJK reads
-    # score ~100; partial / edge-clipped glyphs (the source of garbled text when
-    # scrolling) score ~30. Callers can drop low-confidence lines.
-    out.append({'text': c[0].string(),
-                'conf': int(c[0].confidence() * 100),
-                'x': int(fx * 1000),
-                'y': int(fy * 1000),
-                'sx': int(wx + fx * ww),
-                'sy': int(wy + fy * wh)})
-print(json.dumps(out, ensure_ascii=False))
-"#;
+    let win = find_app_window(app_name)?;
+    let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
+    if png.is_empty() {
+        return Ok("[]".to_string());
+    }
+    // Vision reads the image from a file URL (avoids constructing a CGImage from
+    // raw bytes). Write a per-process temp PNG, OCR it, then delete.
+    let tmp = std::env::temp_dir().join(format!("rsclaw_ocr_{}.png", std::process::id()));
+    std::fs::write(&tmp, &png).map_err(|e| format!("write OCR temp PNG: {e}"))?;
+
+    let result = (|| -> Result<String, String> {
+        let path = NSString::from_str(&tmp.to_string_lossy());
+        let url = NSURL::fileURLWithPath(&path);
+        let options = NSDictionary::new();
+        let handler = unsafe {
+            VNImageRequestHandler::initWithURL_options(
+                VNImageRequestHandler::alloc(),
+                &url,
+                &options,
+            )
+        };
+
+        let request = VNRecognizeTextRequest::new();
+        request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
+        request.setUsesLanguageCorrection(true);
+        // The chat apps this drives are Simplified Chinese + English.
+        let zh = NSString::from_str("zh-Hans");
+        let en = NSString::from_str("en-US");
+        let langs = NSArray::from_slice(&[&*zh, &*en]);
+        request.setRecognitionLanguages(&langs);
+
+        let req_ref: &VNRequest = &request;
+        let requests = NSArray::from_slice(&[req_ref]);
+        handler
+            .performRequests_error(&requests)
+            .map_err(|e| format!("Vision performRequests failed: {e}"))?;
+
+        let observations = match request.results() {
+            Some(o) => o,
+            None => return Ok("[]".to_string()),
+        };
+
+        let (wx, wy, ww, wh) = (win.x as f64, win.y as f64, win.w as f64, win.h as f64);
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for obs in observations.iter() {
+            let candidates = obs.topCandidates(1);
+            let Some(top) = candidates.firstObject() else {
+                continue;
+            };
+            let text = top.string().to_string();
+            if text.trim().is_empty() {
+                continue;
+            }
+            let conf = (top.confidence() as f64 * 100.0).round() as i64;
+            // boundingBox is normalised [0,1] with a BOTTOM-LEFT origin.
+            let bb = unsafe { obs.boundingBox() };
+            let midx = bb.origin.x + bb.size.width / 2.0;
+            let midy = bb.origin.y + bb.size.height / 2.0;
+            // Flip Y to a top-left origin for both the 0-1000 relative coord and
+            // the screen-absolute click point.
+            let top_y = 1.0 - midy;
+            let rx = (midx * 1000.0).round() as i64;
+            let ry = (top_y * 1000.0).round() as i64;
+            let sx = (wx + midx * ww).round() as i64;
+            let sy = (wy + top_y * wh).round() as i64;
+            out.push(serde_json::json!({
+                "text": text,
+                "conf": conf,
+                "x": rx,
+                "y": ry,
+                "sx": sx,
+                "sy": sy,
+            }));
+        }
+        Ok(serde_json::Value::Array(out).to_string())
+    })();
+
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
 
 /// Convert a macOS bundle-id to the process name used by System Events.
 /// E.g. "com.tencent.xinWeChat" -> "WeChat", "com.apple.Safari" -> "Safari".
@@ -747,48 +769,138 @@ fn parse_key(name: &str) -> Option<Key> {
 /// Fallback to Core Graphics window list when AppleScript/System Events
 /// can't enumerate windows (common with sandboxed apps like WeChat).
 /// Only works on macOS; returns an error on other platforms.
+#[cfg(target_os = "macos")]
 fn cgwindow_fallback(owner_name: &str) -> Result<String, String> {
-    let owner_escaped = owner_name.replace('"', r#"\""#).replace('\'', "'\"'\"'");
-    let py = format!(
-        r#"import Quartz, json
-wl = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID)
-best = None
-best_area = 0
-for w in wl:
-    if w.get('kCGWindowOwnerName','') != '{}':
-        continue
-    b = w.get('kCGWindowBounds',{{}})
-    x, y, wi, h = int(b.get('X',0)), int(b.get('Y',0)), int(b.get('Width',0)), int(b.get('Height',0))
-    if wi < 200 or h < 200:
-        continue
-    area = wi * h
-    if area > best_area:
-        best_area = area
-        best = (x, y, wi, h)
-if best:
-    print(json.dumps({{'x':best[0],'y':best[1],'w':best[2],'h':best[3]}}))
-else:
-    print('')
-"#,
-        owner_escaped
-    );
-    match Command::new("python3").args(["-c", &py]).output() {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if text.is_empty() {
-                Err(format!(
-                    "cgwindow_fallback: no {owner_name} window found via CGWindowList"
-                ))
-            } else {
-                Ok(text)
-            }
-        }
-        Ok(out) => Err(format!(
-            "cgwindow_fallback: python3 failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )),
-        Err(e) => Err(format!("cgwindow_fallback: python3 spawn failed: {e}")),
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    const K_CG_WINDOW_LIST_OPTION_ALL: u32 = 0;
+    const K_CG_NULL_WINDOW_ID: u32 = 0;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGWindowListCopyWindowInfo(
+            option: u32,
+            relative_to_window: u32,
+        ) -> core_foundation::array::CFArrayRef;
     }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFArrayGetCount(arr: core_foundation::array::CFArrayRef) -> isize;
+        fn CFArrayGetValueAtIndex(
+            arr: core_foundation::array::CFArrayRef,
+            idx: isize,
+        ) -> *const std::ffi::c_void;
+        fn CFDictionaryGetValue(
+            dict: core_foundation::dictionary::CFDictionaryRef,
+            key: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+
+    /// Look up a value in a raw CFDictionaryRef by key string.
+    fn dict_val(
+        dict: core_foundation::dictionary::CFDictionaryRef,
+        key: &str,
+    ) -> Option<CFType> {
+        let cf_key = CFString::new(key);
+        let val =
+            unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
+        if val.is_null() {
+            None
+        } else {
+            Some(unsafe {
+                CFType::wrap_under_get_rule(val as core_foundation::base::CFTypeRef)
+            })
+        }
+    }
+
+    fn dict_num(
+        dict: core_foundation::dictionary::CFDictionaryRef,
+        key: &str,
+    ) -> i64 {
+        dict_val(dict, key)
+            .and_then(|cf| cf.downcast::<CFNumber>())
+            .and_then(|n| n.to_i64())
+            .unwrap_or(0)
+    }
+
+    fn dict_str(
+        dict: core_foundation::dictionary::CFDictionaryRef,
+        key: &str,
+    ) -> String {
+        dict_val(dict, key)
+            .and_then(|cf| cf.downcast::<CFString>())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
+
+    fn dict_dict_ref(
+        dict: core_foundation::dictionary::CFDictionaryRef,
+        key: &str,
+    ) -> Option<core_foundation::dictionary::CFDictionaryRef> {
+        let cf_key = CFString::new(key);
+        let val =
+            unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
+        if val.is_null() {
+            None
+        } else {
+            Some(val as core_foundation::dictionary::CFDictionaryRef)
+        }
+    }
+
+    let cf_array_ref = unsafe {
+        CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTION_ALL, K_CG_NULL_WINDOW_ID)
+    };
+    if cf_array_ref.is_null() {
+        return Err("cgwindow_fallback: CGWindowListCopyWindowInfo returned NULL".to_string());
+    }
+    let count = unsafe { CFArrayGetCount(cf_array_ref) };
+    let mut best: Option<(i32, i32, u32, u32)> = None;
+    let mut best_area: u64 = 0;
+    for i in 0..count {
+        let dict_ref = unsafe { CFArrayGetValueAtIndex(cf_array_ref, i) }
+            as core_foundation::dictionary::CFDictionaryRef;
+        if dict_ref.is_null() {
+            continue;
+        }
+        if dict_str(dict_ref, "kCGWindowOwnerName") != owner_name {
+            continue;
+        }
+        let bounds_ref = match dict_dict_ref(dict_ref, "kCGWindowBounds") {
+            Some(b) => b,
+            None => continue,
+        };
+        let x = dict_num(bounds_ref, "X") as i32;
+        let y = dict_num(bounds_ref, "Y") as i32;
+        let w = dict_num(bounds_ref, "Width") as u32;
+        let h = dict_num(bounds_ref, "Height") as u32;
+        if w < 200 || h < 200 {
+            continue;
+        }
+        let area = w as u64 * h as u64;
+        if area > best_area {
+            best_area = area;
+            best = Some((x, y, w, h));
+        }
+    }
+    // Release the array (Create Rule — we own it).
+    unsafe { CFRelease(cf_array_ref as *const std::ffi::c_void) };
+    match best {
+        Some((x, y, w, h)) => Ok(format!("{{\"x\":{x},\"y\":{y},\"w\":{w},\"h\":{h}}}")),
+        None => Err(format!(
+            "cgwindow_fallback: no {owner_name} window found via CGWindowList"
+        )),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cgwindow_fallback(owner_name: &str) -> Result<String, String> {
+    Err(format!(
+        "cgwindow_fallback: not supported on this platform (owner: {owner_name})"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,49 +1262,71 @@ end tell"#,
 
     async fn mouse_drag(&self, x1: u32, y1: u32, x2: u32, y2: u32) -> Result<String, String> {
         tokio::task::spawn_blocking(move || {
-            if cfg!(target_os = "macos") {
-                // macOS: use Python+Quartz for reliable multi-step dragging.
+            #[cfg(target_os = "macos")]
+            {
+                // macOS: post raw CGEvents for reliable multi-step dragging.
                 // enigo's move_mouse does not produce the exact CGEvent sequence
                 // that WeChat's screenshot overlay requires.
-                let py = format!(
-                    r#"import time, Quartz
-steps = 20
-x1, y1, x2, y2 = {}, {}, {}, {}
+                use core_graphics::event::{
+                    CGEvent, CGEventTapLocation, CGEventType, CGMouseButton,
+                };
+                use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+                use core_graphics::geometry::CGPoint;
+                use std::thread::sleep;
+                use std::time::Duration;
 
-# mouseDown @ start
-Quartz.CGEventPost(Quartz.kCGHIDEventTap,
-    Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown,
-        Quartz.CGPoint(x1, y1), Quartz.kCGMouseButtonLeft))
-time.sleep(0.1)
+                let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                    .map_err(|()| "mouse_drag: CGEventSource::new failed".to_string())?;
 
-# mouseDragged 20 times
-for i in range(1, steps + 1):
-    t = i / steps
-    cx = x1 + (x2 - x1) * t
-    cy = y1 + (y2 - y1) * t
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap,
-        Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDragged,
-            Quartz.CGPoint(cx, cy), Quartz.kCGMouseButtonLeft))
-    time.sleep(0.025)
+                let start = CGPoint::new(x1 as f64, y1 as f64);
+                let end = CGPoint::new(x2 as f64, y2 as f64);
+                let steps: u32 = 20;
 
-# mouseUp @ end
-time.sleep(0.1)
-Quartz.CGEventPost(Quartz.kCGHIDEventTap,
-    Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp,
-        Quartz.CGPoint(x2, y2), Quartz.kCGMouseButtonLeft))
-print('ok')
-"#,
-                    x1, y1, x2, y2
-                );
-                match Command::new("python3").args(["-c", &py]).output() {
-                    Ok(out) if out.status.success() => Ok("ok".to_string()),
-                    Ok(out) => Err(format!(
-                        "mouse_drag: python3 failed: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    )),
-                    Err(e) => Err(format!("mouse_drag: python3 spawn failed: {e}")),
+                // mouseDown at start
+                let down = CGEvent::new_mouse_event(
+                    source.clone(),
+                    CGEventType::LeftMouseDown,
+                    start,
+                    CGMouseButton::Left,
+                )
+                .map_err(|()| "mouse_drag: new_mouse_event(LeftMouseDown) failed".to_string())?;
+                down.post(CGEventTapLocation::HID);
+                sleep(Duration::from_millis(100));
+
+                // 20 interpolated mouseDragged events
+                for i in 1..=steps {
+                    let t = i as f64 / steps as f64;
+                    let cx = x1 as f64 + (x2 as f64 - x1 as f64) * t;
+                    let cy = y1 as f64 + (y2 as f64 - y1 as f64) * t;
+                    let pt = CGPoint::new(cx, cy);
+                    let drag = CGEvent::new_mouse_event(
+                        source.clone(),
+                        CGEventType::LeftMouseDragged,
+                        pt,
+                        CGMouseButton::Left,
+                    )
+                    .map_err(|()| {
+                        format!("mouse_drag: new_mouse_event(LeftMouseDragged) step {i} failed")
+                    })?;
+                    drag.post(CGEventTapLocation::HID);
+                    sleep(Duration::from_millis(25));
                 }
-            } else {
+
+                // mouseUp at end
+                sleep(Duration::from_millis(100));
+                let up = CGEvent::new_mouse_event(
+                    source,
+                    CGEventType::LeftMouseUp,
+                    end,
+                    CGMouseButton::Left,
+                )
+                .map_err(|()| "mouse_drag: new_mouse_event(LeftMouseUp) failed".to_string())?;
+                up.post(CGEventTapLocation::HID);
+
+                return Ok("ok".to_string());
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
                 let mut enigo = new_enigo()?;
                 let (fx, fy) = scale_for_input(x1, y1);
                 let (tx, ty) = scale_for_input(x2, y2);
@@ -1520,53 +1654,49 @@ print('ok')
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
                 let tmp = format!("/tmp/rsclaw_cb_{}.png", std::process::id());
-                let py = format!(
-                    r#"from AppKit import NSPasteboard, NSBitmapImageRep, NSPasteboardTypeTIFF, NSPNGFileType
-import sys
-pb = NSPasteboard.generalPasteboard()
-data = pb.dataForType_(NSPasteboardTypeTIFF)
-if data is None:
-    print('CLIPBOARD_EMPTY', file=sys.stderr)
-    sys.exit(1)
-rep = NSBitmapImageRep.imageRepWithData_(data)
-if rep is None:
-    print('REP_NONE', file=sys.stderr)
-    sys.exit(1)
-png = rep.representationUsingType_properties_(NSPNGFileType, None)
-if png is None:
-    print('PNG_NONE', file=sys.stderr)
-    sys.exit(1)
-with open('{}', 'wb') as f:
-    f.write(bytes(png))
-print('ok')
-"#,
-                    tmp
+                // Use AppleScript to read the clipboard as PNG data and write to
+                // a temp file. This replaces the previous python3 + AppKit
+                // shell-out with a zero-dependency osascript call.
+                let script = format!(
+                    r#"try
+    set img to the clipboard as <<class PNGf>>
+    set f to open for access POSIX file "{tmp}" with write permission
+    write img to f
+    close access f
+    return "ok"
+on error
+    return "NOIMG"
+end try"#,
+                    tmp = tmp
                 );
-                match Command::new("python3").args(["-c", &py]).output() {
+                match Command::new("osascript").args(["-e", &script]).output() {
                     Ok(out) if out.status.success() => {
+                        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if stdout.contains("NOIMG") {
+                            return Err(
+                                "clipboard_get_image: clipboard has no image \
+                                 (screenshot likely failed)"
+                                    .to_string(),
+                            );
+                        }
                         match std::fs::read(&tmp) {
                             Ok(bytes) => {
                                 let _ = std::fs::remove_file(&tmp);
                                 if bytes.is_empty() {
                                     return Err("clipboard_get_image: empty image".to_string());
                                 }
-                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                let b64 =
+                                    base64::engine::general_purpose::STANDARD.encode(&bytes);
                                 Ok(format!("data:image/png;base64,{b64}"))
                             }
                             Err(e) => Err(format!("clipboard_get_image: read temp file: {e}")),
                         }
                     }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        if stderr.contains("CLIPBOARD_EMPTY") {
-                            return Err("clipboard_get_image: clipboard has no image (screenshot likely failed)".to_string());
-                        }
-                        Err(format!(
-                            "clipboard_get_image: python3 failed: {}",
-                            stderr
-                        ))
-                    }
-                    Err(e) => Err(format!("clipboard_get_image: python3 spawn failed: {e}")),
+                    Ok(out) => Err(format!(
+                        "clipboard_get_image: osascript failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )),
+                    Err(e) => Err(format!("clipboard_get_image: osascript spawn failed: {e}")),
                 }
             } else {
                 Err("clipboard_get_image: not yet implemented on this platform".to_string())

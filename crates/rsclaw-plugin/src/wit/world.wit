@@ -221,6 +221,9 @@ interface host-android {
     /// Capture screenshot as data:image/png;base64,... URI.
     android-screenshot: func() -> result<string, string>;
 
+    /// Get physical screen size as JSON {width, height} (pixels).
+    android-screen-size: func() -> result<string, string>;
+
     /// Find elements by selector. Returns JSON array of {text, resource-id, content-desc, bounds, clickable}.
     /// selector-type: "resource-id" | "text" | "text-contains" | "content-desc" | "content-desc-contains" | "class"
     android-find-elements: func(selector-type: string, selector-value: string) -> result<string, string>;
@@ -299,6 +302,13 @@ interface host-ios {
 
     /// Terminate app by bundle id.
     ios-terminate-app: func(bundle-id: string) -> result<string, string>;
+
+    /// Set the iOS device system pasteboard via WDA. `content-type` is one of
+    /// "plaintext" | "image" | "url"; `base64-content` is the base64 payload
+    /// (raw PNG/JPEG bytes for "image"). Lets a plugin put an image/file on the
+    /// clipboard so it can be pasted into a chat — the only route to sending a
+    /// real attachment on iOS (there is no album/file-push host capability).
+    ios-set-pasteboard: func(content-type: string, base64-content: string) -> result<string, string>;
 }
 
 interface host-desktop {
@@ -384,6 +394,17 @@ interface host-vlm {
         -> result<string, string>;
 }
 
+interface host-ocr {
+    /// OCR an already-captured image (any platform — the plugin captured it via its own
+    /// android-screenshot/ios-screenshot/desktop-screenshot-window primitive) via the
+    /// dedicated rsclaw-ocr-v1 model. Returns the model's raw text output — plain verbatim
+    /// text, or a caller-requested structured format (e.g. bbox-annotated JSON), depending
+    /// entirely on how `prompt` is worded.
+    /// image-data-uri must be data:image/...;base64,... format.
+    ocr-image: func(image-data-uri: string, prompt: string, max-tokens: u32)
+        -> result<string, string>;
+}
+
 interface plugin-api {
     handle-tool: func(tool-name: string, args-json: string) -> result<string, string>;
 }
@@ -403,5 +424,6 @@ world jimeng-plugin {
     import host-ios;
     import host-desktop;
     import host-vlm;
+    import host-ocr;
     export plugin-api;
 }
