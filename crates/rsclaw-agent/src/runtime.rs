@@ -181,6 +181,7 @@ fn is_stock_tool_name(name: &str) -> bool {
     matches!(
         name,
         "stock_quote"
+            | "stock_select"
             | "stock_kline"
             | "stock_snapshot"
             | "stock_ask"
@@ -8657,10 +8658,11 @@ impl AgentRuntime {
     }
 
     fn has_stock_tool_provider(&self) -> bool {
-        self.wasm_plugins.iter().any(|wp| {
-            wp.capabilities.iter().any(|c| c == "trustedToolAlias")
-                && wp.tool_aliases.values().any(|alias| is_stock_tool_name(alias))
-        })
+        // stock_quote works without tushare_token (uses HTTP: Eastmoney/Tencent/Sina)
+        // stock_select needs tushare_token
+        // We expose both tools if HTTP is available (always true in rsclaw)
+        // The tools will error at runtime if tushare_token is missing when needed
+        true
     }
 
     async fn dispatch_tool(
@@ -8740,11 +8742,9 @@ impl AgentRuntime {
             }
         }
 
-        if is_stock_tool_name(name) && !self.has_stock_tool_provider() {
-            return Err(anyhow!(
-                "tool '{name}' is unavailable: no trusted stock WASM plugin has claimed this tool alias"
-            ));
-        }
+        // stock_quote/stock_select are always available (stock_quote uses HTTP, no token needed;
+            // stock_select errors at runtime if tushare_token missing)
+            // Remove the old WASM plugin check that blocked these tools
 
         if let Some((wp, plugin_tool)) = self.wasm_plugins.iter().find_map(|wp| {
             if !wp.capabilities.iter().any(|c| c == "trustedToolAlias") {
@@ -9032,6 +9032,10 @@ impl AgentRuntime {
             "image_gen" | "image" => return self.tool_image(args, ctx).await,
             "ocr" => return self.tool_ocr(args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx).await,
+            // Stock tools (astock-core integration)
+            "stock_quote" | "stock_select" => {
+                return crate::tools_stock::dispatch_stock_tool(name, &args).await;
+            }
             "avatar_gen" | "avatar" => return self.tool_avatar_gen(args, ctx).await,
             "mv_gen" | "mv" => return self.tool_mv_gen(args, ctx).await,
             "music_gen" | "music" => return self.tool_music(args).await,

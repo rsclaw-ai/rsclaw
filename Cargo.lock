@@ -7160,6 +7160,8 @@ version = "0.1.0"
 dependencies = [
  "anycli",
  "anyhow",
+ "astock-core",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "dirs-next",
@@ -7419,7 +7421,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "core-foundation",
+ "core-foundation 0.10.1",
  "core-graphics",
  "enigo",
  "image",
@@ -7640,7 +7642,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "core-foundation",
+ "core-foundation 0.10.1",
  "dirs-next",
  "image",
  "libc",

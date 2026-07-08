@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 # Externals (versions mirrored from the root workspace Cargo.toml)
 anyhow = "1"
+async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
@@ -68,3 +69,6 @@ rsclaw-platform = { path = "../rsclaw-platform", version = "0.1.0" }
 rsclaw-store = { path = "../rsclaw-store", version = "0.1.0" }
 rsclaw-doc = { path = "../rsclaw-doc", version = "0.1.0" }
 rsclaw-jobs = { path = "../rsclaw-jobs", version = "0.1.0" }
+
+# A-stock core library (独立 crate, 通过 trait 注入能力)
+astock-core = { path = "../astock-core" }

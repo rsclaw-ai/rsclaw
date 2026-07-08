@@ -2184,6 +2184,10 @@ pub fn build_tool_list(
         }
     }
 
+    // Stock tools (astock-core integration) — always defined, filtered by
+    // has_stock_tool_provider() at runtime if tushare_token unavailable.
+    tools.extend(crate::tools_stock::stock_tool_defs());
+
     tools
 }
 

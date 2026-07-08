@@ -53,6 +53,8 @@ pub mod tools_skill;
 pub mod tools_video;
 pub mod tools_voice;
 pub mod tools_web;
+pub mod stock_capability;
+pub mod tools_stock;
 pub mod trace_capture;
 pub mod video;
 pub use rsclaw_types::turn_metrics;

@@ -9,7 +9,7 @@ use std::process::Command;
 
 use base64::Engine;
 use enigo::{
-    Button, Coordinate,
+    Axis, Button, Coordinate,
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Mouse, Settings,
 };
