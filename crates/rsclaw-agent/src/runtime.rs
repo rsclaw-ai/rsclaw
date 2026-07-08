@@ -182,6 +182,9 @@ fn is_stock_tool_name(name: &str) -> bool {
         name,
         "stock_quote"
             | "stock_select"
+            | "stock_lhb"
+            | "stock_debate"
+            | "stock_iwencai"
             | "stock_kline"
             | "stock_snapshot"
             | "stock_ask"
@@ -8967,7 +8970,7 @@ impl AgentRuntime {
             "read_artifact" => return self.tool_read_artifact(ctx, args).await,
             "read_session_archive" => return self.tool_read_session_archive(ctx, args).await,
             "knowledge_base" | "kb_search" => return self.tool_knowledge_base(args).await,
-            "stock_quote" | "stock_kline" | "stock_snapshot" | "stock_ask" | "stock_query"
+            "stock_kline" | "stock_snapshot" | "stock_ask" | "stock_query"
             | "stock_chart" | "stock_watchlist" => {
                 return Err(anyhow!(
                     "tool '{name}' is provided by the stock plugin alias layer, but no loaded plugin claimed this exact alias"
@@ -9033,8 +9036,17 @@ impl AgentRuntime {
             "ocr" => return self.tool_ocr(args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx).await,
             // Stock tools (astock-core integration)
-            "stock_quote" | "stock_select" => {
-                return crate::tools_stock::dispatch_stock_tool(name, &args).await;
+            "stock_quote" | "stock_select" | "stock_lhb" | "stock_iwencai" => {
+                return crate::tools_stock::dispatch_stock_tool(name, &args, None).await;
+            }
+            "stock_debate" => {
+                // stock_debate needs LLM context
+                // Clone failover to get a fresh context (cooldowns/failure_counts reset)
+                let stock_ctx = crate::tools_stock::StockToolContext::new(
+                    Arc::clone(&self.providers),
+                    self.failover.clone(),
+                );
+                return crate::tools_stock::dispatch_stock_tool(name, &args, Some(&stock_ctx)).await;
             }
             "avatar_gen" | "avatar" => return self.tool_avatar_gen(args, ctx).await,
             "mv_gen" | "mv" => return self.tool_mv_gen(args, ctx).await,

@@ -1,14 +1,20 @@
 //! astock-core capability adapters for rsclaw.
 //!
-//! Bridges rsclaw's built-in implementations (BrowserPool, config)
+//! Bridges rsclaw's built-in implementations (BrowserPool, config, LLM providers)
 //! to astock-core's trait interfaces, enabling the stock tools to work.
 
 use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use futures::StreamExt;
 
-use astock_core::capability::{CdpCapability, TabHandle, ConfigProvider};
+use astock_core::capability::{CdpCapability, TabHandle, ConfigProvider, LlmCapability, LlmMessage, LlmRole};
+use rsclaw_provider::{
+    LlmRequest, Message, MessageContent, Role, StreamEvent,
+    registry::ProviderRegistry,
+    failover::FailoverManager,
+};
 
 // ============================================================================
 // CDP Adapter - bridges rsclaw-browser::BrowserPool to CdpCapability
@@ -83,10 +89,13 @@ fn load_raw_config() -> Option<Value> {
 ///
 /// Reads stock-related settings from rsclaw.json5:
 /// - `astock.tushare_token` or `tushare_token`
+/// - `astock.llm_model` or `stock_llm_model` (model for debate)
 /// - `astock.*` other settings
 pub struct RsclawConfig {
     /// Cached tushare token
-    tushare_token: Option<String>,
+    pub tushare_token: Option<String>,
+    /// Model for stock LLM operations (debate, etc.)
+    pub llm_model: Option<String>,
 }
 
 impl RsclawConfig {
@@ -111,7 +120,21 @@ impl RsclawConfig {
                     .map(String::from)
             });
 
-        Self { tushare_token }
+        // Try astock.llm_model first, then stock_llm_model
+        let llm_model = cfg
+            .as_ref()
+            .and_then(|c| c.get("astock"))
+            .and_then(|a| a.get("llm_model"))
+            .and_then(|m| m.as_str())
+            .map(String::from)
+            .or_else(|| {
+                cfg.as_ref()
+                    .and_then(|c| c.get("stock_llm_model"))
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            });
+
+        Self { tushare_token, llm_model }
     }
 }
 
@@ -119,6 +142,7 @@ impl std::fmt::Debug for RsclawConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RsclawConfig")
             .field("tushare_token", &self.tushare_token.as_ref().map(|_| "set"))
+            .field("llm_model", &self.llm_model)
             .finish()
     }
 }
@@ -152,4 +176,116 @@ impl ConfigProvider for RsclawConfig {
 /// Create HTTP client for stock engine.
 pub fn create_http_client() -> Result<astock_core::capability::DefaultHttp> {
     astock_core::capability::DefaultHttp::new()
+}
+
+// ============================================================================
+// LLM Adapter - bridge rsclaw providers to astock-core LlmCapability
+// ============================================================================
+
+/// Context for stock LLM operations.
+/// Holds references to rsclaw's provider registry and failover manager.
+pub struct StockLlmContext {
+    pub providers: Arc<ProviderRegistry>,
+    pub failover: FailoverManager,
+    pub default_model: String,
+}
+
+impl StockLlmContext {
+    pub fn new(
+        providers: Arc<ProviderRegistry>,
+        failover: FailoverManager,
+        default_model: String,
+    ) -> Self {
+        Self { providers, failover, default_model }
+    }
+
+    /// Create a boxed LlmCapability adapter.
+    pub fn into_capability(self) -> Box<dyn LlmCapability + Send> {
+        Box::new(RsclawLlm(self))
+    }
+}
+
+impl std::fmt::Debug for StockLlmContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StockLlmContext")
+            .field("model", &self.default_model)
+            .finish()
+    }
+}
+
+/// Adapter from rsclaw's LLM provider system to astock-core's LlmCapability.
+pub struct RsclawLlm(pub StockLlmContext);
+
+impl std::fmt::Debug for RsclawLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RsclawLlm")
+            .field("model", &self.0.default_model)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl LlmCapability for RsclawLlm {
+    async fn chat(&self, messages: &[LlmMessage]) -> Result<String> {
+        // Convert astock-core messages to rsclaw-provider messages
+        let rsclaw_messages: Vec<Message> = messages
+            .iter()
+            .map(|m| Message {
+                role: match m.role {
+                    LlmRole::System => Role::System,
+                    LlmRole::User => Role::User,
+                    LlmRole::Assistant => Role::Assistant,
+                },
+                content: MessageContent::Text(m.content.clone()),
+                rsclaw_hidden: None,
+            })
+            .collect();
+
+        // Build request
+        let request = LlmRequest {
+            model: self.0.default_model.clone(),
+            messages: rsclaw_messages,
+            tools: vec![],  // No tools for simple chat
+            max_tokens: Some(500),  // Debate responses are short
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+
+        // Call LLM through failover manager
+        // Note: failover.call requires mutable reference, so we need to clone
+        let mut failover = self.0.failover.clone();
+        let stream = failover.call(request, &*self.0.providers).await?;
+
+        // Collect streaming response
+        let mut output = String::new();
+        let mut stream = stream;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(delta)) => {
+                    output.push_str(&delta);
+                }
+                Ok(StreamEvent::Done { .. }) => {
+                    break;
+                }
+                Ok(StreamEvent::ReasoningDelta(delta)) => {
+                    // Some models emit reasoning separately
+                    if output.is_empty() {
+                        output.push_str(&delta);
+                    }
+                }
+                Ok(StreamEvent::ToolCall { .. }) => {
+                    // Not expected for simple chat, ignore
+                }
+                Ok(StreamEvent::Error(e)) => {
+                    // Stream reported an error
+                    return Err(anyhow::anyhow!("LLM stream error: {}", e));
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(output)
+    }
 }

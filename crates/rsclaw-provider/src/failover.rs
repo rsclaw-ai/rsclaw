@@ -63,6 +63,26 @@ pub struct FailoverManager {
     model_health: ProviderHealthRegistry,
 }
 
+// Clone is useful for stock tools that need a separate failover context
+// while sharing the same model_health registry.
+impl Clone for FailoverManager {
+    fn clone(&self) -> Self {
+        Self {
+            order: self.order.clone(),
+            // cooldowns and failure_counts are intentionally NOT cloned
+            // because they represent transient state that should reset
+            // for each new context. Stock tools should start fresh.
+            cooldowns: HashMap::new(),
+            failure_counts: HashMap::new(),
+            api_keys: self.api_keys.clone(),
+            fallbacks: self.fallbacks.clone(),
+            retry: self.retry.clone(),
+            // model_health IS cloned because it's shared across the process
+            model_health: self.model_health.clone(),
+        }
+    }
+}
+
 impl FailoverManager {
     pub fn new(
         order: HashMap<String, Vec<String>>,
