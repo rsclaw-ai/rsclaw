@@ -1438,7 +1438,11 @@ async fn execute_tool(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let tool_name = body.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-    let args = body.get("args").cloned().unwrap_or(serde_json::json!({}));
+    let args = body
+        .get("args")
+        .or_else(|| body.get("arguments"))
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     if tool_name.is_empty() {
         return Json(serde_json::json!({"error": "tool name required"}));

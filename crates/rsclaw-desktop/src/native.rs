@@ -31,18 +31,23 @@ fn new_enigo() -> Result<Enigo, String> {
     Enigo::new(&Settings::default()).map_err(|e| {
         let is_perm =
             e.to_string().contains("permission") || e.to_string().contains("simulate input");
-        let hint = if cfg!(target_os = "macos") && is_perm {
-            // Surface the native macOS Accessibility dialog (once per process)
-            // so the user actually gets asked — and the app lands in the
-            // Accessibility list — instead of a silent permission failure with
-            // no prompt. `prompt_accessibility` no-ops off macOS.
-            static PROMPTED: std::sync::Once = std::sync::Once::new();
-            PROMPTED.call_once(|| {
-                let _ = crate::macos_perm::prompt_accessibility();
-            });
-            " (macOS: a permission request was raised — enable RsClaw under System \
-             Settings → Privacy & Security → Accessibility AND Input Monitoring, then \
-             quit & reopen RsClaw)"
+        let hint = if is_perm {
+            #[cfg(target_os = "macos")]
+            {
+                // Surface the native macOS Accessibility dialog (once per process)
+                // so the user actually gets asked — and the app lands in the
+                // Accessibility list — instead of a silent permission failure with
+                // no prompt.
+                static PROMPTED: std::sync::Once = std::sync::Once::new();
+                PROMPTED.call_once(|| {
+                    let _ = crate::macos_perm::prompt_accessibility();
+                });
+                return format!("enigo init failed: {e} (macOS: a permission request was raised \
+                    — enable RsClaw under System Settings → Privacy & Security → \
+                    Accessibility AND Input Monitoring, then quit & reopen RsClaw)");
+            }
+            #[cfg(not(target_os = "macos"))]
+            " (check input permissions)"
         } else {
             ""
         };
@@ -409,22 +414,134 @@ fn wechat_screenshot_png(win: &capture::WindowInfo) -> Result<Vec<u8>, String> {
 /// Prints the same JSON shape as macOS: `[{"text","conf","x","y","sx","sy"}]` with
 /// x/y 0-1000 window-relative and sx/sy screen-absolute click points. Because the
 /// captured image IS the window rect at a known origin, sx/sy land correctly.
+/// Capture the WeChat window via the Alt+A built-in screenshot tool (sync, for
+/// use inside spawn_blocking / sync OCR context). WeChat's WDA_EXCLUDEFROMCAPTURE
+/// blanks all GDI/BitBlt captures — Alt+A is the only reliable path on Windows.
+/// Returns (png_bytes, win_x, win_y, win_w, win_h) where the bounds let the OCR
+/// driver compute screen-absolute click coordinates.
+#[cfg(target_os = "windows")]
+fn wechat_altA_screenshot_sync(app_name: &str) -> Result<(Vec<u8>, i32, i32, u32, u32), String> {
+    use std::os::windows::process::CommandExt;
+    let proc_name = if app_name.to_lowercase().contains("weixin") {
+        "Weixin"
+    } else {
+        "WeChat"
+    };
+    // Focus WeChat via AttachThreadInput and get its window rect.
+    let ps_focus = format!(
+        r#"$sig=@'
+using System; using System.Runtime.InteropServices;
+public class FWOCR {{
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a,uint b,bool f);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out RECT r);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT{{public int L,T,R,B;}}
+  public static string Go(IntPtr h){{
+    ShowWindow(h,5);
+    IntPtr fg=GetForegroundWindow(); uint pid; uint fgT=GetWindowThreadProcessId(fg,out pid);
+    uint cur=GetCurrentThreadId(); AttachThreadInput(cur,fgT,true);
+    BringWindowToTop(h); SetForegroundWindow(h); AttachThreadInput(cur,fgT,false);
+    RECT r; GetWindowRect(h,out r);
+    return r.L+","+r.T+","+(r.R-r.L)+","+(r.B-r.T);
+  }}
+}}
+'@
+Add-Type $sig -ErrorAction SilentlyContinue
+$p=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*' -and $_.MainWindowHandle -ne 0}} | Select-Object -First 1
+if(-not $p){{
+  $wx=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*'}} | Select-Object -First 1
+  if($wx){{ $path=$wx.Path; if($path){{ Start-Process $path }} }}
+  Start-Sleep -Milliseconds 1500
+  $p=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*' -and $_.MainWindowHandle -ne 0}} | Select-Object -First 1
+}}
+if($p){{ [FWOCR]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
+        proc = proc_name
+    );
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_focus]);
+    cmd.creation_flags(0x08000000);
+    let focus_stdout = cmd.output()
+        .map(|o| o.stdout)
+        .unwrap_or_else(|_| b"0,0,1200,800".to_vec());
+    let s = String::from_utf8_lossy(&focus_stdout);
+    let parts: Vec<i64> = s.trim().split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    let (wx, wy, ww, wh, cx, cy) = if parts.len() == 4 {
+        let x = parts[0] as i32;
+        let y = parts[1] as i32;
+        let w = parts[2].max(1) as u32;
+        let h = parts[3].max(1) as u32;
+        (x, y, w, h, x + (w as i32 / 2), y + (h as i32 / 2))
+    } else {
+        (0, 0, 1200u32, 800u32, 600i32, 400i32)
+    };
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    // Clear clipboard.
+    let mut clr = Command::new("powershell");
+    clr.args(["-NoProfile", "-STA", "-Command",
+        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::Clear()"]);
+    clr.creation_flags(0x08000000);
+    let _ = clr.output();
+    // Press Alt+A via enigo.
+    let mut enigo = new_enigo()?;
+    enigo.key(enigo::Key::Alt, enigo::Direction::Press).map_err(|e| format!("alt press: {e}"))?;
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    enigo.key(enigo::Key::Unicode('a'), enigo::Direction::Click).map_err(|e| format!("a: {e}"))?;
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    enigo.key(enigo::Key::Alt, enigo::Direction::Release).map_err(|e| format!("alt release: {e}"))?;
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    // Hover over window centre so the overlay selects the WeChat window.
+    let (lx, ly) = scale_for_input(cx as u32, cy as u32);
+    enigo.move_mouse(lx, ly, enigo::Coordinate::Abs).map_err(|e| format!("mouse move: {e}"))?;
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    // Confirm screenshot.
+    enigo.key(enigo::Key::Return, enigo::Direction::Click).map_err(|e| format!("enter: {e}"))?;
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    // Read PNG from clipboard.
+    let tmp = std::env::temp_dir().join(format!("rsclaw_ocr_altA_{}.png", std::process::id()));
+    let ps_read = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; \
+         Add-Type -AssemblyName System.Drawing; \
+         $img=[System.Windows.Forms.Clipboard]::GetImage(); \
+         if($img -eq $null){{ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }}; \
+         $img.Save('{}',[System.Drawing.Imaging.ImageFormat]::Png); 'ok'",
+        tmp.display()
+    );
+    let mut ps_cmd = Command::new("powershell");
+    ps_cmd.args(["-NoProfile", "-STA", "-Command", &ps_read]);
+    ps_cmd.creation_flags(0x08000000);
+    match ps_cmd.output() {
+        Ok(out) if out.status.success() => match std::fs::read(&tmp) {
+            Ok(bytes) => {
+                let _ = std::fs::remove_file(&tmp);
+                if bytes.is_empty() {
+                    Err("Alt+A OCR screenshot: empty clipboard image".to_string())
+                } else {
+                    Ok((bytes, wx, wy, ww, wh))
+                }
+            }
+            Err(e) => Err(format!("Alt+A OCR screenshot: read temp: {e}")),
+        },
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            Err(format!("Alt+A OCR screenshot: clipboard empty or PS failed: {stderr}"))
+        }
+        Err(e) => Err(format!("Alt+A OCR screenshot: powershell spawn: {e}")),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn ocr_window(app_name: &str) -> Result<String, String> {
     let lname = app_name.to_lowercase();
     let (png, wx, wy, ww, wh) = if lname.contains("wechat") || lname.contains("weixin") {
-        // WeChat: bring its window to the FOREGROUND first (it shares the desktop with
-        // the douyin browser, which steals focus), then full-screen grab. Foregrounding
-        // (SetForegroundWindow, NO resize) is safe — only resize/maximise blanks the CEF
-        // surface. Capture is a full-screen CopyFromScreen (risk-control-proof, unlike
-        // PrintWindow). WeChat must be left maximised so its UI fills the screen.
-        // ww=wh=0 tells the OCR driver the image pixels ARE screen coordinates.
-        if let Ok(win) = find_app_window(app_name) {
-            focus_window(win.id);
-            std::thread::sleep(std::time::Duration::from_millis(350));
-        }
-        let png = capture::capture_full_png().map_err(|e| e.to_string())?;
-        (png, 0i32, 0i32, 0u32, 0u32)
+        // WeChat uses WDA_EXCLUDEFROMCAPTURE — GDI/BitBlt captures come back blank.
+        // Use WeChat's built-in Alt+A screenshot (captures itself, saves to clipboard).
+        let (bytes, x, y, w, h) = wechat_altA_screenshot_sync(app_name)?;
+        (bytes, x, y, w, h)
     } else {
         let win = find_app_window(app_name)?;
         let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
@@ -792,6 +909,104 @@ else:
 }
 
 // ---------------------------------------------------------------------------
+// Inherent helpers
+// ---------------------------------------------------------------------------
+
+impl NativeDesktopSession {
+    /// Windows: capture WeChat via its OWN built-in screenshot (Alt+A), routing
+    /// pixels through the clipboard. Avoids GDI/PrintWindow (which WeChat blanks
+    /// via WDA_EXCLUDEFROMCAPTURE) and the screen-capture risk-control that
+    /// white-screens / force-logs-out the client.
+    async fn wechat_builtin_screenshot(&self, bundle_id: &str) -> Result<String, String> {
+        // 1. Find WeChat's HWND and window bounds, then force-focus using
+        //    AttachThreadInput (plain SetForegroundWindow is ignored from a
+        //    background gateway process).
+        let bl = bundle_id.to_lowercase();
+        let proc_name = if bl.contains("weixin") { "Weixin" } else { "WeChat" };
+        let ps_focus = format!(
+            r#"$sig=@'
+using System; using System.Runtime.InteropServices;
+public class FW2 {{
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a,uint b,bool f);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out RECT r);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT{{public int L,T,R,B;}}
+  public static string Go(IntPtr h){{
+    ShowWindow(h,5);
+    IntPtr fg=GetForegroundWindow(); uint pid; uint fgT=GetWindowThreadProcessId(fg,out pid);
+    uint cur=GetCurrentThreadId(); AttachThreadInput(cur,fgT,true);
+    BringWindowToTop(h); SetForegroundWindow(h); AttachThreadInput(cur,fgT,false);
+    RECT r; GetWindowRect(h,out r);
+    return r.L+","+r.T+","+(r.R-r.L)+","+(r.B-r.T);
+  }}
+}}
+'@
+Add-Type $sig -ErrorAction SilentlyContinue
+$p=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*' -and $_.MainWindowHandle -ne 0}} | Select-Object -First 1
+if(-not $p){{
+  # WeChat is in the system tray (no visible window). Launch the exe to restore it.
+  $wx=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*'}} | Select-Object -First 1
+  if($wx){{
+    $path=$wx.Path
+    if($path){{ Start-Process $path }}
+  }}
+  Start-Sleep -Milliseconds 1500
+  $p=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*' -and $_.MainWindowHandle -ne 0}} | Select-Object -First 1
+}}
+if($p){{ [FW2]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
+            proc = proc_name
+        );
+        let (cx, cy) = tokio::task::spawn_blocking({
+            let ps = ps_focus.clone();
+            move || -> (u32, u32) {
+                let mut cmd = Command::new("powershell");
+                cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps]);
+                #[cfg(windows)]
+                { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }
+                let out = cmd.output().unwrap_or(std::process::Output {
+                    status: std::process::ExitStatus::default(),
+                    stdout: vec![],
+                    stderr: vec![],
+                });
+                let s = String::from_utf8_lossy(&out.stdout);
+                let parts: Vec<i64> = s.trim().split(',')
+                    .filter_map(|p| p.trim().parse().ok()).collect();
+                if parts.len() == 4 {
+                    let x = parts[0].max(0) as u32;
+                    let y = parts[1].max(0) as u32;
+                    let w = parts[2].max(1) as u32;
+                    let h = parts[3].max(1) as u32;
+                    (x + w / 2, y + h / 2)
+                } else {
+                    (700, 450)
+                }
+            }
+        })
+        .await
+        .unwrap_or((700, 450));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // 2. Clear clipboard so we don't read a stale image.
+        let _ = self.clipboard_set("").await;
+        // 3. Trigger WeChat screenshot overlay: Alt+A.
+        self.key_press("a", &["alt".to_string()]).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        // 4. Move cursor over the WeChat window center so the overlay hover-selects it.
+        let _ = self.mouse_move(cx, cy).await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        // 5. Press Enter to confirm the highlighted window capture → clipboard.
+        let _ = self.key_press("Return", &[]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // 6. Read the screenshot from the clipboard.
+        self.clipboard_get_image().await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DesktopSession impl
 // ---------------------------------------------------------------------------
 
@@ -1027,6 +1242,19 @@ end tell"#,
     }
 
     async fn screenshot_window(&self, bundle_id: &str) -> Result<String, String> {
+        // Windows WeChat blanks GDI/PrintWindow captures (WDA_EXCLUDEFROMCAPTURE),
+        // and repeated GDI screen capture trips its risk-control (white-screen /
+        // forced logout). Use WeChat's OWN built-in screenshot (Alt+A → clipboard),
+        // which can capture itself and is a sanctioned user action.
+        if cfg!(target_os = "windows") {
+            let bl = bundle_id.to_lowercase();
+            if bl.contains("wechat") || bl.contains("weixin") || bl.contains("xinwechat") {
+                match self.wechat_builtin_screenshot(bundle_id).await {
+                    Ok(img) => return Ok(img),
+                    Err(e) => warn!("wechat builtin screenshot failed ({e}); falling back"),
+                }
+            }
+        }
         // Primary path: direct window-backing-store capture (overlap-proof,
         // no app-side screenshot UI, so it never pollutes a chat input box).
         let app_name = bundle_to_app_name(bundle_id);
@@ -1567,6 +1795,52 @@ print('ok')
                         ))
                     }
                     Err(e) => Err(format!("clipboard_get_image: python3 spawn failed: {e}")),
+                }
+            } else if cfg!(target_os = "windows") {
+                // Windows: WeChat's built-in screenshot (Alt+A) copies to the
+                // clipboard as an image. Read it via WinForms Clipboard.GetImage
+                // (needs an STA thread) and PNG-encode. Using WeChat's own capture
+                // avoids the GDI/PrintWindow path that WeChat blanks via
+                // WDA_EXCLUDEFROMCAPTURE.
+                let tmp = std::env::temp_dir()
+                    .join(format!("rsclaw_cb_{}.png", std::process::id()));
+                let ps = format!(
+                    "Add-Type -AssemblyName System.Windows.Forms; \
+                     Add-Type -AssemblyName System.Drawing; \
+                     $img=[System.Windows.Forms.Clipboard]::GetImage(); \
+                     if($img -eq $null){{ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }}; \
+                     $img.Save('{}',[System.Drawing.Imaging.ImageFormat]::Png); \
+                     'ok'",
+                    tmp.display()
+                );
+                #[allow(unused_mut)]
+                let mut ps_cmd = Command::new("powershell");
+                ps_cmd.args(["-NoProfile", "-STA", "-Command", &ps]);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    ps_cmd.creation_flags(0x08000000);
+                }
+                match ps_cmd.output() {
+                    Ok(out) if out.status.success() => match std::fs::read(&tmp) {
+                        Ok(bytes) => {
+                            let _ = std::fs::remove_file(&tmp);
+                            if bytes.is_empty() {
+                                return Err("clipboard_get_image: empty image".to_string());
+                            }
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            Ok(format!("data:image/png;base64,{b64}"))
+                        }
+                        Err(e) => Err(format!("clipboard_get_image: read temp file: {e}")),
+                    },
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        if stderr.contains("CLIPBOARD_EMPTY") {
+                            return Err("clipboard_get_image: clipboard has no image (screenshot likely failed)".to_string());
+                        }
+                        Err(format!("clipboard_get_image: powershell failed: {stderr}"))
+                    }
+                    Err(e) => Err(format!("clipboard_get_image: powershell spawn failed: {e}")),
                 }
             } else {
                 Err("clipboard_get_image: not yet implemented on this platform".to_string())
