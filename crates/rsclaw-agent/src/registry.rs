@@ -1077,6 +1077,7 @@ mod tests {
             agent_dir: None,
             system: None,
             temperature: None,
+            daemon: false,
         }
     }
 

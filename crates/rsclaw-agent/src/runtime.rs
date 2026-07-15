@@ -6584,6 +6584,9 @@ impl AgentRuntime {
                 }
                 match event? {
                     StreamEvent::TextDelta(delta) => {
+                        if delta.is_empty() {
+                            continue;
+                        }
                         // Close <think> tag when transitioning from reasoning to text.
                         if thinking_budget.unwrap_or(0) > 0
                             && !reasoning_buf.is_empty()

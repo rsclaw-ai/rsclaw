@@ -49,3 +49,4 @@ ui/src-tauri/gen/
 # tokenizer.json are tiny and stay in the repo.
 ui/src-tauri/resources/bge-small-zh/model.safetensors
 .gstack/
+.rscode/

@@ -232,6 +232,13 @@ impl VlmDriver<'_> {
         // that fall back to "I should call tool X" meta-prose without
         // ever emitting an Action.
         const MAX_CONSECUTIVE_UNPARSEABLE: usize = 3;
+        // Distinct from the above: a *completely empty* reply is a
+        // transient fleet decoder dropout (rsclaw-vision-v1 occasionally
+        // streams zero tokens), NOT a format error the model can correct.
+        // Retry the same turn a few times before it counts as unparseable,
+        // so a couple of dropped frames don't abort an otherwise-fine run.
+        let mut empty_retries = 0usize;
+        const MAX_EMPTY_RETRIES: usize = 3;
 
         loop {
             if self.abort.load(Ordering::SeqCst) {
@@ -337,9 +344,15 @@ impl VlmDriver<'_> {
                         return Ok(DriverOutcome::UserAbort { steps });
                     }
                     Err(e) => {
-                        warn!(error = %e, "VLM stream failed");
+                        // `{e:#}` joins the full anyhow source chain on one
+                        // line — without the alternate flag only the outermost
+                        // `.context("provider.stream() failed to start")` shows
+                        // and the real cause (HTTP status, connect error,
+                        // endpoint-unsupported, routing bail) is swallowed.
+                        let chain = format!("{e:#}");
+                        warn!(error = %chain, "VLM stream failed");
                         return Ok(DriverOutcome::OperatorError {
-                            message: format!("vlm stream: {e}"),
+                            message: format!("vlm stream: {chain}"),
                             steps,
                         });
                     }
@@ -349,6 +362,21 @@ impl VlmDriver<'_> {
             // 3d. Parse.
             let mut parsed = parse_vlm_response(&prediction, self.coord_format);
             if parsed.is_empty() {
+                // Empty reply → transient decoder dropout. Re-request the
+                // same turn (fresh screenshot) instead of feeding a bogus
+                // "you forgot Action:" reminder the model can't act on.
+                // Only exhausted retries fall through to the format-error
+                // path below.
+                if prediction.trim().is_empty() && empty_retries < MAX_EMPTY_RETRIES {
+                    empty_retries += 1;
+                    warn!(
+                        retries = empty_retries,
+                        streak = consecutive_unparseable,
+                        "VLM returned an empty prediction (decoder dropout); retrying same turn"
+                    );
+                    continue;
+                }
+                empty_retries = 0;
                 consecutive_unparseable += 1;
                 warn!(
                     prediction = %prediction.chars().take(200).collect::<String>(),
@@ -392,8 +420,9 @@ impl VlmDriver<'_> {
                 );
                 parsed.truncate(1);
             }
-            // Got at least one action — reset the streak counter.
+            // Got at least one action — reset the streak counters.
             consecutive_unparseable = 0;
+            empty_retries = 0;
 
             // 3e. Execute each action.
             for pa in parsed {
@@ -851,7 +880,7 @@ async fn verify_finished_claim(
             ok
         }
         Err(e) => {
-            warn!(error = %e, "VlmDriver: finished verification failed");
+            warn!(error = %format!("{e:#}"), "VlmDriver: finished verification failed");
             false
         }
     }
