@@ -28,12 +28,6 @@
 // imports resolve to the extracted crates.
 use rsclaw_config as config;
 use rsclaw_provider as provider;
-use rsclaw_store as store;
-use rsclaw_util as util;
-use rsclaw_i18n as i18n;
-use rsclaw_events as events;
-use rsclaw_platform as sys;
-use rsclaw_embed as embed;
 
 pub mod attachments;
 pub mod auth;
