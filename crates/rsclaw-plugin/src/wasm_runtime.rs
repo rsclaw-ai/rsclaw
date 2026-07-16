@@ -1239,12 +1239,16 @@ fn host_http_client() -> std::result::Result<reqwest::Client, String> {
         return Ok(client.clone());
     }
     let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .use_rustls_tls()
-            .tls_built_in_root_certs(true)
-            .build()
-            .map_err(|e| e.to_string())?;
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        // A dead device tunnel must not consume the whole WASM epoch. Calls
+        // that legitimately need more time set an explicit per-request
+        // timeout; WDA/Uiautomator probes inherit this bounded fallback.
+        .timeout(Duration::from_secs(20))
+        .use_rustls_tls()
+        .tls_built_in_root_certs(true)
+        .build()
+        .map_err(|e| e.to_string())?;
     let _ = HOST_HTTP_CLIENT.set(client);
     HOST_HTTP_CLIENT
         .get()
@@ -3237,24 +3241,25 @@ impl rsclaw::plugin::host_android::Host for HostState {
 
     async fn android_screenshot(&mut self) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
-        // Prefer u2 /screenshot (reuses the persistent instrumentation
-        // connection — no per-frame `adb exec-out screencap` child, which on
-        // some mirror/scrcpy setups visibly flashes the display).
+        // Use `adb exec-out screencap -p` FIRST because u2's /screenshot can
+        // return a stale frame that diverges from the actual display (observed
+        // on WeChat + Bing scenario 2026-07-16). A per-frame ADB child is
+        // slightly slower but always reflects the current physical screen,
+        // which is the only correct basis for plugin-level UI decisions.
+        match adb_run_bytes(serial.as_deref(), &["exec-out", "screencap", "-p"]).await {
+            Ok(png_bytes) if png_bytes.len() >= 24 => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+                return Ok(Ok(format!("data:image/png;base64,{b64}")));
+            }
+            Ok(_) => { /* truncated — fall through to u2 */ }
+            Err(_) => { /* adb failed — fall through to u2 */ }
+        }
+        // Fallback: u2 /screenshot (reuses persistent instrumentation, but
+        // may lag the real display by one or more frames).
         if let Ok(b64) = u2_screenshot_b64(serial.as_deref()).await {
             return Ok(Ok(format!("data:image/png;base64,{b64}")));
         }
-        let png_bytes =
-            match adb_run_bytes(serial.as_deref(), &["exec-out", "screencap", "-p"]).await {
-                Ok(b) => b,
-                Err(e) => return Ok(Err(e)),
-            };
-        if png_bytes.len() < 24 {
-            return Ok(Err(
-                "android_screenshot: screencap returned empty/truncated data".to_string(),
-            ));
-        }
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-        Ok(Ok(format!("data:image/png;base64,{b64}")))
+        Ok(Err("android_screenshot: both ADB screencap and u2 screenshot failed".to_string()))
     }
 
     async fn android_screen_size(&mut self) -> HostTrapResult<Result<String, String>> {
@@ -3606,10 +3611,19 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         };
         let session_id = body
             .pointer("/value/currentSession")
+            .or_else(|| body.pointer("/value/sessionId"))
+            // WDA 14.1 reports the active session at the top level rather
+            // than under `value`. Without this fallback every tool call
+            // treats a live session as absent and sends subsequent commands
+            // to the sessionless endpoint, which WDA rejects with 404.
+            .or_else(|| body.pointer("/sessionId"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if !session_id.is_empty() {
             self.wda_url = Some(format!("{base}/session/{session_id}"));
+            if let Ok(mut cached) = wda_session_url_cache().lock() {
+                *cached = self.wda_url.clone();
+            }
         } else {
             // Create a new session (W3C WebDriver format)
             let payload = serde_json::json!({
@@ -3647,6 +3661,9 @@ impl rsclaw::plugin::host_ios::Host for HostState {
                 ));
             }
             self.wda_url = Some(format!("{base}/session/{sid}"));
+            if let Ok(mut cached) = wda_session_url_cache().lock() {
+                *cached = self.wda_url.clone();
+            }
         }
         Ok(Ok(base))
     }
@@ -3766,6 +3783,9 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         if resp.status().is_success() {
             Ok(Ok("tapped".to_string()))
         } else {
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                clear_wda_session_cache(&base);
+            }
             Ok(Err(format!("WDA tap returned {}", resp.status())))
         }
     }
@@ -3788,6 +3808,9 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         if resp.status().is_success() {
             Ok(Ok("typed".to_string()))
         } else {
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                clear_wda_session_cache(&base);
+            }
             Ok(Err(format!("WDA type returned {}", resp.status())))
         }
     }
@@ -3824,15 +3847,24 @@ impl rsclaw::plugin::host_ios::Host for HostState {
 
     async fn ios_get_labels(&mut self) -> HostTrapResult<Result<String, String>> {
         let (base, cli) = self.wda_base_and_client();
-        let resp = match cli
-            .get(format!("{base}/source"))
-            .send()
-            .await
+        // WDA's session-scoped `/source` can wedge after a reconnect even
+        // though the sessionless endpoint is healthy. Source is read-only and
+        // does not need a session, so always probe the root endpoint.
+        let source_base = base.split("/session/").next().unwrap_or(&base);
+        let resp = match tokio::time::timeout(
+            Duration::from_secs(12),
+            cli.get(format!("{source_base}/source")).send(),
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(e) => return Ok(Err(format!("WDA source: {e}"))),
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Ok(Err(format!("WDA source: {error}"))),
+            Err(_) => return Ok(Err("WDA source timed out after 12s".to_string())),
         };
         if !resp.status().is_success() {
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                clear_wda_session_cache(&base);
+            }
             return Ok(Err(format!("WDA source returned {}", resp.status())));
         }
         let body: serde_json::Value = match resp.json().await {
@@ -4005,6 +4037,12 @@ impl HostState {
             .wda_url
             .as_ref()
             .cloned()
+            .or_else(|| {
+                wda_session_url_cache()
+                    .lock()
+                    .ok()
+                    .and_then(|cached| cached.clone())
+            })
             .unwrap_or_else(|| "http://localhost:8100".to_string());
         let cli = host_http_client().unwrap_or_else(|_| {
             reqwest::Client::builder()
@@ -4012,6 +4050,28 @@ impl HostState {
                 .expect("failed to build reqwest client")
         });
         (base, cli)
+    }
+}
+
+/// WIT host imports may be served by short-lived HostState instances. Keep the
+/// single-device WDA session URL process-wide so a connect import and a later
+/// tap/type import use the same session-scoped endpoint.
+fn wda_session_url_cache() -> &'static std::sync::Mutex<Option<String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Drop a stale session-scoped URL after WDA reports 404. The next plugin
+/// operation calls `ios_connect` and establishes/reuses the live session.
+fn clear_wda_session_cache(base: &str) {
+    if !base.contains("/session/") {
+        return;
+    }
+    if let Ok(mut cached) = wda_session_url_cache().lock()
+        && cached.as_deref() == Some(base)
+    {
+        *cached = None;
     }
 }
 
