@@ -548,23 +548,55 @@ If any QA check is ambiguous or a breaking change touches `ws/` or
 
 ## Build instructions
 
+### Local fast build
+
 ```bash
 # Fast local build (uses release-dev profile, runs cargo brd internally)
 cargo brd
 # Binary output: ~/git/rsclaw/target/release-dev/rsclaw
-
-# First time or after git pull: install git hooks first
-cd ~/git/rsclaw && git config core.hooksPath .githooks
-
-# Plugin wasm (separate repo)
-cd ~/dev/rsclaw-plugins/wechat-android
-cargo build --target wasm32-wasip2 --release
-./deploy.sh release
 ```
 
 Use `~/git/rsclaw/target/release-dev/rsclaw` to start the gateway after build.
 The `release-dev` profile is optimized but preserves debug symbols. Do NOT use
 `cargo build --release` — it takes much longer and produces a less convenient path.
+
+### Remote cross-compilation (macstudio — faster ARM Mac)
+
+Use this when native compilation is slow or blocked. The remote machine has the
+same ARM architecture so no cross-compilation toolchain is needed.
+
+```bash
+# 1. Sync source to remote (exclude target/ to avoid sending old build artifacts)
+cls rsync -n macstudio ~/git/rsclaw/ ~/git/rsclaw/ --exclude target/
+
+# 2. Build on macstudio via `cls run`
+cls run -n macstudio 'cd ~/git/rsclaw && cargo brd'
+
+# 3. Download the binary back to the local release-dev target
+cls download -n macstudio ~/git/rsclaw/target/release-dev/rsclaw ~/git/rsclaw/target/release-dev/rsclaw
+
+# 4. Restart the release-dev gateway
+~/git/rsclaw/target/release-dev/rsclaw restart
+```
+
+⚠️ macstudio 上若报 `sccache: No such file or directory`，说明 sccache 未安装；临时绕过：
+```bash
+cls run -n macstudio 'cd ~/git/rsclaw && SCCACHE= cargo brd'
+```
+
+### Plugin wasm (separate repo)
+
+```bash
+cd ~/dev/rsclaw-plugins/wechat-android
+cargo build --target wasm32-wasip2 --release
+./deploy.sh release
+```
+
+### First-time setup
+
+```bash
+cd ~/git/rsclaw && git config core.hooksPath .githooks
+```
 
 ## Three-repo handoff rules
 

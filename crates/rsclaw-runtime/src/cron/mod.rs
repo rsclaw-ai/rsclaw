@@ -688,7 +688,8 @@ impl CronRunner {
                                 // Device availability is transient. Keep the minute-level
                                 // sales monitor alive so it reconnects promptly and still
                                 // reaches its ten-minute friend-request sweep after recovery.
-                                state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
+                                state.next_run_at_ms =
+                                    job.schedule.compute_next_run(completion_time);
                                 info!(
                                     job_id = %job.id,
                                     consecutive_errors = state.consecutive_errors,
@@ -1341,7 +1342,8 @@ async fn run_wechat_ios_monitor_preflight(
         plugin.call_tool("monitor_tick", serde_json::json!({})),
     )
     .await
-    .map_err(|_| anyhow!("wechat-ios monitor_tick timed out after 35s"))?;
+    .map_err(|_| anyhow!("wechat-ios monitor_tick timed out after 35s"))
+    .and_then(|result| result);
     match tokio::time::timeout(
         Duration::from_secs(10),
         plugin.call_tool("release_ui_lock", serde_json::json!({ "holder": holder })),
