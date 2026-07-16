@@ -946,7 +946,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 Arc::clone(&ws_conns),
                 Some(shutdown.clone()),
             )
-            .with_daemon_agent_ids(config.agents.daemon_agent_ids());
+            .with_daemon_agent_ids(config.agents.daemon_agent_ids())
+            .with_wasm_plugins(Arc::clone(&wasm_plugins));
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
                     error!("cron runner error: {e:#}");
