@@ -546,6 +546,26 @@ If any QA check is ambiguous or a breaking change touches `ws/` or
 
 ---
 
+## Build instructions
+
+```bash
+# Fast local build (uses release-dev profile, runs cargo brd internally)
+cargo brd
+# Binary output: ~/git/rsclaw/target/release-dev/rsclaw
+
+# First time or after git pull: install git hooks first
+cd ~/git/rsclaw && git config core.hooksPath .githooks
+
+# Plugin wasm (separate repo)
+cd ~/dev/rsclaw-plugins/wechat-android
+cargo build --target wasm32-wasip2 --release
+./deploy.sh release
+```
+
+Use `~/git/rsclaw/target/release-dev/rsclaw` to start the gateway after build.
+The `release-dev` profile is optimized but preserves debug symbols. Do NOT use
+`cargo build --release` — it takes much longer and produces a less convenient path.
+
 ## Three-repo handoff rules
 
 When designing a feature, decide which repo it belongs in **before writing

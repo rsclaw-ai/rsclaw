@@ -913,7 +913,9 @@ pub fn export_cron_jobs_to_file(jobs: &[CronJob]) {
         }
     };
     if let Some(parent) = cron_file.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(dir=%parent.display(), error=%e, "failed to create cron directory");
+        }
     }
     let tmp = format!("{}.tmp", cron_file.display());
     if let Err(e) = std::fs::write(&tmp, &json) {

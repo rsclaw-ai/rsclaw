@@ -6,9 +6,9 @@
 //! Schedule format: standard 5-field cron "min hr dom mon dow".
 //! Timezone: stored in schedule but currently executes in UTC.
 //!
-//! Each job runs in an isolated session (`cron:<jobId>`) or a persistent
-//! session (`session:<key>`). Concurrent runs are capped by
-//! `max_concurrent_runs`.
+//! Each job run uses an isolated session (`cron:<jobId>:<run timestamp>`)
+//! unless the job explicitly configures a persistent session key. Concurrent
+//! runs are capped by `max_concurrent_runs`.
 //!
 //! The DATA / PERSISTENCE / PURE-COMPUTE layer lives in the lower
 //! `rsclaw-cron` crate; this module re-exports those items (so existing
@@ -75,6 +75,8 @@ const CANCEL_BY_RELOAD: &str = "cron: cancelled by reload";
 pub struct CronRunner {
     jobs: Vec<CronJob>,
     agents: Arc<AgentRegistry>,
+    /// Optional direct WASM plugin access for deterministic cron preflights.
+    wasm_plugins: Option<Arc<Vec<rsclaw_plugin::WasmPlugin>>>,
     /// Agent IDs whose cron turns run without a timeout (daemon loops).
     daemon_agent_ids: Vec<String>,
     channels: Arc<ChannelManager>,
@@ -143,6 +145,7 @@ impl CronRunner {
         Self {
             jobs,
             agents,
+            wasm_plugins: None,
             channels,
             run_log_dir,
             store_path,
@@ -162,6 +165,14 @@ impl CronRunner {
     #[must_use]
     pub fn with_daemon_agent_ids(mut self, ids: Vec<String>) -> Self {
         self.daemon_agent_ids = ids;
+        self
+    }
+
+    /// Enable deterministic WASM preflights for jobs that opt in through
+    /// `wakeMode`.
+    #[must_use]
+    pub fn with_wasm_plugins(mut self, plugins: Arc<Vec<rsclaw_plugin::WasmPlugin>>) -> Self {
+        self.wasm_plugins = Some(plugins);
         self
     }
 
@@ -673,33 +684,46 @@ impl CronRunner {
                             state.last_status = Some("error".to_string());
                             state.last_error = error_msg;
 
-                            // Apply exponential backoff for errored jobs
-                            let backoff = error_backoff_ms(state.consecutive_errors);
-                            let backoff_next = completion_time + backoff;
-                            let normal_next = job.schedule.compute_next_run(completion_time);
-                            // Use whichever is later: the natural next run or the backoff delay
-                            state.next_run_at_ms = Some(
-                                normal_next
-                                    .map(|n| n.max(backoff_next))
-                                    .unwrap_or(backoff_next),
-                            );
-
-                            info!(
-                                job_id = %job.id,
-                                consecutive_errors = state.consecutive_errors,
-                                backoff_ms = backoff,
-                                next_run_at_ms = state.next_run_at_ms,
-                                "cron: applying error backoff"
-                            );
-
-                            // Auto-disable after max consecutive errors
-                            if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                                warn!(
+                            if job.wake_mode.as_deref() == Some("wechat-ios-monitor") {
+                                // Device availability is transient. Keep the minute-level
+                                // sales monitor alive so it reconnects promptly and still
+                                // reaches its ten-minute friend-request sweep after recovery.
+                                state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
+                                info!(
                                     job_id = %job.id,
                                     consecutive_errors = state.consecutive_errors,
-                                    "cron: disabling job after repeated failures"
+                                    next_run_at_ms = state.next_run_at_ms,
+                                    "cron: monitor error; keeping scheduled cadence"
                                 );
-                                job.enabled = false;
+                            } else {
+                                // Apply exponential backoff for errored jobs
+                                let backoff = error_backoff_ms(state.consecutive_errors);
+                                let backoff_next = completion_time + backoff;
+                                let normal_next = job.schedule.compute_next_run(completion_time);
+                                // Use whichever is later: the natural next run or the backoff delay
+                                state.next_run_at_ms = Some(
+                                    normal_next
+                                        .map(|n| n.max(backoff_next))
+                                        .unwrap_or(backoff_next),
+                                );
+
+                                info!(
+                                    job_id = %job.id,
+                                    consecutive_errors = state.consecutive_errors,
+                                    backoff_ms = backoff,
+                                    next_run_at_ms = state.next_run_at_ms,
+                                    "cron: applying error backoff"
+                                );
+
+                                // Auto-disable after max consecutive errors
+                                if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                    warn!(
+                                        job_id = %job.id,
+                                        consecutive_errors = state.consecutive_errors,
+                                        "cron: disabling job after repeated failures"
+                                    );
+                                    job.enabled = false;
+                                }
                             }
                         }
                     }
@@ -836,6 +860,7 @@ impl CronRunner {
                 cancel_flags.insert(job.id.clone(), Arc::clone(&cancelled));
                 let job_id_for_log = job.id.clone(); // Clone BEFORE async move
                 let agents = Arc::clone(&self.agents);
+                let wasm_plugins = self.wasm_plugins.clone();
                 let daemon_agent_ids = self.daemon_agent_ids.clone();
                 let channels = Arc::clone(&self.channels);
                 let run_log_dir = self.run_log_dir.clone();
@@ -856,10 +881,34 @@ impl CronRunner {
                         .unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
+                    let preflight_result = if job.wake_mode.as_deref() == Some("wechat-ios-monitor")
+                    {
+                        match run_wechat_ios_monitor_preflight(&job, wasm_plugins.as_deref()).await
+                        {
+                            Ok(tick) => match tick_has_work(&tick) {
+                                Ok(false) => Some(Ok("monitor tick: no changes".to_string())),
+                                Ok(true) => {
+                                    job.bake_message(format!(
+                                        "{}\n\n确定性 monitor_tick 结果（已完成 UI 锁保护）；只处理此结果中的待办，不要再次调用 monitor_tick：\n{}",
+                                        job.effective_message(),
+                                        tick
+                                    ));
+                                    None
+                                }
+                                Err(error) => Some(Err(error)),
+                            },
+                            Err(error) => Some(Err(error)),
+                        }
+                    } else {
+                        None
+                    };
+
                     // systemEvent: deliver payload text directly — no agent call needed.
                     // execCommand: execute the command directly, bypassing agent and session
                     // history.
-                    let result: Result<String> = if job.payload.as_ref().and_then(|p| match p {
+                    let result: Result<String> = if let Some(result) = preflight_result {
+                        result
+                    } else if job.payload.as_ref().and_then(|p| match p {
                         CronPayload::Structured { kind, .. } => kind.as_deref(),
                         _ => None,
                     }) == Some("systemEvent")
@@ -1240,6 +1289,7 @@ impl Clone for CronRunner {
         Self {
             jobs: self.jobs.clone(),
             agents: Arc::clone(&self.agents),
+            wasm_plugins: self.wasm_plugins.clone(),
             daemon_agent_ids: self.daemon_agent_ids.clone(),
             channels: Arc::clone(&self.channels),
             run_log_dir: self.run_log_dir.clone(),
@@ -1258,6 +1308,83 @@ impl Clone for CronRunner {
 // Internal helpers (runner-only — touch rsclaw_agent / crate::gateway)
 // ---------------------------------------------------------------------------
 
+async fn run_wechat_ios_monitor_preflight(
+    job: &CronJob,
+    plugins: Option<&Vec<rsclaw_plugin::WasmPlugin>>,
+) -> Result<String> {
+    let plugins = plugins.context("wechat-ios monitor preflight has no WASM plugin registry")?;
+    let plugin = plugins
+        .iter()
+        .find(|plugin| plugin.name == "wechat-ios")
+        .context("wechat-ios monitor preflight plugin is not loaded")?;
+    let holder = format!("cron-preflight:{}", job.id);
+    let lock = plugin
+        .call_tool(
+            "acquire_ui_lock",
+            serde_json::json!({ "holder": holder, "ttlSecs": 330 }),
+        )
+        .await?;
+    let acquired = lock
+        .get("acquired")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !acquired {
+        return Ok(serde_json::json!({ "skipped": "ui_lock_busy" }).to_string());
+    }
+
+    // A tunnel can accept TCP and then stop forwarding WDA bytes forever.
+    // Bound the whole component invocation as a second line of defence; the
+    // plugin-level request timeout cannot protect cron if the transport stalls
+    // below reqwest's cancellation point.
+    let tick = tokio::time::timeout(
+        Duration::from_secs(35),
+        plugin.call_tool("monitor_tick", serde_json::json!({})),
+    )
+    .await
+    .map_err(|_| anyhow!("wechat-ios monitor_tick timed out after 35s"))?;
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        plugin.call_tool("release_ui_lock", serde_json::json!({ "holder": holder })),
+    )
+    .await
+    {
+        Ok(Err(error)) => {
+            warn!(job_id = %job.id, error = %error, "cron monitor preflight failed to release UI lock");
+        }
+        Err(_) => {
+            warn!(job_id = %job.id, "cron monitor preflight release_ui_lock timed out");
+        }
+        Ok(Ok(_)) => {}
+    }
+    let tick = tick?;
+    Ok(match tick {
+        serde_json::Value::String(text) => text,
+        value => value.to_string(),
+    })
+}
+
+fn tick_has_work(tick: &str) -> Result<bool> {
+    let value: serde_json::Value = serde_json::from_str(tick)
+        .with_context(|| format!("invalid monitor_tick result: {tick}"))?;
+    if value.get("skipped").is_some() {
+        return Ok(false);
+    }
+    let active = value
+        .get("activeChat")
+        .and_then(|active| active.get("needsReply"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let changed = value
+        .get("changedChats")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|chats| !chats.is_empty());
+    let contact_badge = value
+        .get("contactBadge")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(active || changed || contact_badge)
+}
+
 async fn run_cron_job(
     job: &CronJob,
     agents: &AgentRegistry,
@@ -1266,7 +1393,7 @@ async fn run_cron_job(
     let session_key = job
         .session_key
         .clone()
-        .unwrap_or_else(|| format!("cron:{}", job.id));
+        .unwrap_or_else(|| format!("cron:{}:{}", job.id, chrono::Utc::now().timestamp_millis()));
 
     let handle = agents
         .get(&job.agent_id)
