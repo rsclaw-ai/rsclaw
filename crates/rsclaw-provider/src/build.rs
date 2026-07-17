@@ -183,7 +183,16 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                 _ => {
                     // OpenAI-compatible (covers openai-completions,
                     // llama.cpp, vLLM, SGLang, etc.)
-                    let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                    // H3: only fall back to OPENAI_API_KEY for providers
+                    // explicitly targeting OpenAI's own API endpoint.
+                    let key = if let Some(ref url) = base_url {
+                        // Custom endpoint — don't leak OPENAI_API_KEY to third-party APIs.
+                        // Use the provider's own key or leave it unset.
+                        api_key
+                    } else {
+                        // Defaults to OpenAI's API — use the standard env var.
+                        api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                    };
                     if let Some(url) = base_url {
                         Arc::new(OpenAiProvider::with_user_agent(url, key, user_agent))
                     } else {

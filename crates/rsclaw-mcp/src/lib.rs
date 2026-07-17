@@ -52,6 +52,8 @@ pub struct McpClient {
     child: Arc<Mutex<Child>>,
     next_id: Arc<AtomicU64>,
     timeout: Duration,
+    /// D5: serialise all rpc_call invocations to prevent response interleaving.
+    rpc_lock: Arc<tokio::sync::Mutex<()>>,
     /// Tools discovered via `tools/list`.
     pub tools: Vec<McpTool>,
 }
@@ -100,6 +102,7 @@ impl McpClient {
             child: Arc::new(Mutex::new(child)),
             next_id: Arc::new(AtomicU64::new(1)),
             timeout: Duration::from_secs(MCP_CALL_TIMEOUT_SECS),
+            rpc_lock: Arc::new(tokio::sync::Mutex::new(())),
             tools: Vec::new(),
         })
     }
@@ -188,6 +191,7 @@ impl McpClient {
     // -----------------------------------------------------------------------
 
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
+        let _lock = self.rpc_lock.lock().await; // D5: serialise access
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let request = json!({

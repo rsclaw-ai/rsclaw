@@ -137,7 +137,20 @@ fn resolve_includes(value: &mut serde_json::Value, base_dir: &Path, depth: usize
                 } else {
                     base_dir.join(&path_str)
                 };
-                let included = load_include_file(&include_path, depth + 1)?;
+                // H5: reject path traversal (../, symlinks, etc.)
+                let canonical = include_path.canonicalize().with_context(|| {
+                    format!("$include path does not exist: {}", include_path.display())
+                })?;
+                let canonical_base = base_dir.canonicalize().with_context(|| {
+                    format!("$include base dir does not exist: {}", base_dir.display())
+                })?;
+                if !canonical.starts_with(&canonical_base) {
+                    anyhow::bail!(
+                        "$include path escapes base directory: {}",
+                        include_path.display()
+                    );
+                }
+                let included = load_include_file(&canonical, depth + 1)?;
                 map.insert(key, included);
             }
 

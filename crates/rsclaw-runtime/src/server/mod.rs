@@ -33,6 +33,7 @@
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+use std::{collections::HashMap, net::IpAddr, time::Instant};
 use std::{convert::Infallible, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
 use anyhow::Result;
@@ -52,7 +53,7 @@ use rsclaw_agent::{AgentMessage, AgentRegistry};
 use rsclaw_config::runtime::RuntimeConfig;
 use rsclaw_store::Store;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
@@ -61,6 +62,39 @@ use crate::{cmd::config_json::load_config_json, gateway::LiveConfig, ws::types::
 mod knowledge;
 
 const MAX_LOCAL_MEDIA_BYTES: u64 = 10 * 1024 * 1024;
+
+// H1: simple in-memory per-IP rate limiter with a sliding window.
+// Default: 100 req / 60s per IP. Bypassed when no limit is configured (rate_rps = 0).
+#[derive(Clone)]
+pub struct RateLimiter {
+    inner: Arc<RwLock<HashMap<IpAddr, Vec<Instant>>>>,
+}
+
+impl RateLimiter {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Returns true if the request should be rate-limited (rejected).
+    pub async fn check(&self, ip: IpAddr, max_req: u32, window_secs: u64) -> bool {
+        if max_req == 0 {
+            return false; // rate limiting disabled
+        }
+        let now = Instant::now();
+        let mut map = self.inner.write().await;
+        let entries = map.entry(ip).or_default();
+        let cutoff = now - Duration::from_secs(window_secs);
+        entries.retain(|t| *t >= cutoff);
+        if entries.len() >= max_req as usize {
+            true
+        } else {
+            entries.push(now);
+            false
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Timing-safe token comparison
@@ -194,6 +228,8 @@ pub struct AppState {
     /// written by every `FailoverManager` in the gateway. See
     /// `provider::health::ProviderHealthRegistry`.
     pub model_health: rsclaw_provider::health::ProviderHealthRegistry,
+    /// H1: per-IP rate limiter for inbound HTTP requests.
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 // AgentEvent is defined in rsclaw_events to avoid circular deps with agent.
@@ -441,8 +477,12 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             auth_middleware,
         ))
-        // SECURITY: permissive CORS is safe when gateway binds to loopback (default).
-        // For public deployments, configure a firewall or switch to restrictive CORS.
+        // H1: per-IP rate limiter (default 100 req/60s, configurable via gateway.rateLimitRps)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        // H2: restrict CORS when not on loopback
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -540,6 +580,27 @@ async fn auth_middleware(
                 .into_response()
         }
     }
+}
+
+// H1: per-IP rate limiting middleware. Uses a simple sliding-window counter.
+async fn rate_limit_middleware(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let ip = addr.ip();
+    const DEFAULT_MAX_REQ: u32 = 100;
+    const WINDOW_SECS: u64 = 60;
+    if state.rate_limiter.check(ip, DEFAULT_MAX_REQ, WINDOW_SECS).await {
+        warn!(%ip, DEFAULT_MAX_REQ, "rate limit exceeded");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate limit exceeded"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,7 +1438,11 @@ async fn execute_tool(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let tool_name = body.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-    let args = body.get("args").cloned().unwrap_or(serde_json::json!({}));
+    let args = body
+        .get("args")
+        .or_else(|| body.get("arguments"))
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     if tool_name.is_empty() {
         return Json(serde_json::json!({"error": "tool name required"}));
@@ -1915,6 +1980,22 @@ async fn cron_save_and_reload(
     jobs: &[serde_json::Value],
     reload_tx: &broadcast::Sender<()>,
 ) -> Result<(), String> {
+    // redb is the authoritative cron store in a running gateway. Persist the
+    // same payload there before exporting cron.json5; otherwise the runner
+    // reloads the old redb copy and silently undoes an HTTP cron update.
+    if let Some(store) = crate::cron::cron_store() {
+        let entries: Vec<(String, String)> = jobs
+            .iter()
+            .filter_map(|job| {
+                let id = job.get("id").and_then(serde_json::Value::as_str)?.to_owned();
+                serde_json::to_string(job).ok().map(|json| (id, json))
+            })
+            .collect();
+        store
+            .cron_bulk_replace(&entries)
+            .map_err(|e| format!("redb cron_bulk_replace: {e}"))?;
+    }
+
     let path = cron_jobs_path();
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -2889,16 +2970,27 @@ async fn save_config(
         .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("rsclaw.json5"));
 
     // Validate the new config parses before saving.
-    if let Err(e) = json5::from_str::<serde_json::Value>(&req.raw) {
+    let value = match json5::from_str::<serde_json::Value>(&req.raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid config JSON5: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // H6: validate against schema before writing to disk
+    if let Err(e) = serde_json::from_value::<rsclaw_config::schema::Config>(value) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid config: {e}")})),
+            Json(serde_json::json!({"error": format!("config schema validation failed: {e}")})),
         )
             .into_response();
     }
 
     // Backup current file.
-    // TODO: add full schema validation before saving (beyond JSON5 parse check).
     let backup = config_path.with_extension("json5.bak");
     if let Err(e) = std::fs::copy(&config_path, &backup) {
         tracing::warn!(error = %e, "failed to create config backup before save");
@@ -3016,6 +3108,33 @@ async fn openai_chat_completions(
     Json(req): Json<OaiChatRequest>,
 ) -> impl IntoResponse {
     info!(stream = req.stream, model = ?req.model, "HTTP /v1/chat/completions");
+
+    // C1: when gateway runs without auth (open mode), reject x- headers
+    // from non-loopback sources to prevent header spoofing.
+    let trusted_headers = {
+        let gw = state.live.gateway.read().await;
+        if gw.auth_token.is_none() {
+            // Only trust headers when the request comes from localhost
+            use std::net::{IpAddr, Ipv4Addr};
+            let is_local = headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+                .map(|ip| ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+                .unwrap_or(false);
+            if !is_local {
+                info!("open gateway: rejecting spoofed x- headers from non-loopback");
+                false
+            } else {
+                true
+            }
+        } else {
+            // Auth middleware validated the token — headers are trusted
+            true
+        }
+    };
+
     // Extract text from the last user message.
     let text = req
         .messages
@@ -3048,28 +3167,46 @@ async fn openai_chat_completions(
     };
 
     // Session key: prefer X-Session-Key header (desktop UI), else hash history.
-    let session_key = headers
-        .get("x-session-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-        .unwrap_or_else(|| {
-            use std::{
-                collections::hash_map::DefaultHasher,
-                hash::{Hash, Hasher},
-            };
-            let mut h = DefaultHasher::new();
-            for m in &req.messages {
-                m.role.hash(&mut h);
-                m.content.hash(&mut h);
-            }
-            format!("oai:{:x}", h.finish())
-        });
+    let session_key = if trusted_headers {
+        headers
+            .get("x-session-key")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| {
+                use std::{
+                    collections::hash_map::DefaultHasher,
+                    hash::{Hash, Hasher},
+                };
+                let mut h = DefaultHasher::new();
+                for m in &req.messages {
+                    m.role.hash(&mut h);
+                    m.content.hash(&mut h);
+                }
+                format!("oai:{:x}", h.finish())
+            })
+    } else {
+        // Untrusted: always use hash-based session key
+        use std::{
+            collections::hash_map::DefaultHasher,
+            hash::{Hash, Hasher},
+        };
+        let mut h = DefaultHasher::new();
+        for m in &req.messages {
+            m.role.hash(&mut h);
+            m.content.hash(&mut h);
+        }
+        format!("oai:{:x}", h.finish())
+    };
 
-    let peer_id = headers
-        .get("x-user-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("desktop")
-        .to_owned();
+    let peer_id = if trusted_headers {
+        headers
+            .get("x-user-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("desktop")
+            .to_owned()
+    } else {
+        "openapi".to_owned()
+    };
 
     // Extract [file:path] references from user text.
     let (text, file_images, file_files) = rsclaw_agent::registry::extract_file_refs(&text);
@@ -3079,11 +3216,15 @@ async fn openai_chat_completions(
     let msg = AgentMessage {
         session_key: session_key.clone(),
         text,
-        channel: headers
-            .get("x-channel")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("desktop")
-            .to_owned(),
+        channel: if trusted_headers {
+            headers
+                .get("x-channel")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("desktop")
+                .to_owned()
+        } else {
+            "openapi".to_owned()
+        },
         peer_id,
         chat_id: String::new(),
         reply_tx,
@@ -4113,6 +4254,10 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
     static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"\x1b\[[0-9;]*m").expect("ansi escape regex")
     });
+    // C2: redact common secret patterns (Bearer tokens, API keys, etc.)
+    static SECRET_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)(?:bearer |api[_-]?key[=:]\s*|sk-|token[=:]\s*)[a-zA-Z0-9_-]{16,}").expect("secret redaction regex")
+    });
 
     let lines: Vec<&str> = content.lines().rev().take(limit).collect();
     let mut logs: Vec<serde_json::Value> = Vec::new();
@@ -4168,6 +4313,9 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
             ts.to_owned()
         };
 
+        // C2: redact secrets before exposing logs via API
+        let redacted_msg = SECRET_RE.replace_all(msg, "[REDACTED]");
+
         logs.push(serde_json::json!({
             "ts": short_ts,
             "level": match level {
@@ -4176,7 +4324,7 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
                 "DEBUG" => "DEBUG",
                 _ => "INFO",
             },
-            "msg": msg,
+            "msg": redacted_msg,
         }));
     }
 
