@@ -1963,6 +1963,74 @@ async fn adb_run_bytes(serial: Option<&str>, sub: &[&str]) -> Result<Vec<u8>, St
     Ok(out.stdout)
 }
 
+/// Stage one approved local file under Android's app-picker-visible directory.
+async fn adb_stage_file(
+    serial: Option<&str>,
+    source: &std::path::Path,
+    media_kind: &str,
+) -> Result<String, String> {
+    if !matches!(media_kind, "image" | "file" | "audio") {
+        return Err(format!(
+            "android_stage_file: unsupported media kind '{media_kind}' (expected image, file, or audio)"
+        ));
+    }
+    let extension = source
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 16
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default();
+    let digest = Sha256::digest(source.to_string_lossy().as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let remote_dir = "/sdcard/Download/rsclaw";
+    let remote_path = format!("{remote_dir}/rsclaw_{suffix}{extension}");
+    adb_run_str(serial, &["shell", "mkdir", "-p", remote_dir]).await?;
+
+    let mut command = tokio::process::Command::new("adb");
+    if let Some(serial) = serial {
+        command.arg("-s").arg(serial);
+    }
+    let source = source.to_string_lossy();
+    let output = command
+        .args(["push", source.as_ref(), remote_path.as_str()])
+        .output()
+        .await
+        .map_err(|error| format!("android_stage_file: adb push spawn failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "android_stage_file: adb push {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if matches!(media_kind, "image" | "audio") {
+        let media_uri = format!("file://{remote_path}");
+        adb_run_str(
+            serial,
+            &[
+                "shell",
+                "am",
+                "broadcast",
+                "-a",
+                "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                "-d",
+                &media_uri,
+            ],
+        )
+        .await?;
+    }
+    Ok(remote_path)
+}
+
 /// Characters refused in any `input text` payload that ultimately runs
 /// through the device's shell via `adb shell`. The shell sees the whole
 /// trailing argv joined with spaces, so `\n`, `\r`, `\0` would let an
@@ -3009,12 +3077,24 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             recall: None,
         };
 
-        match provider.stream(req).await {
-            Ok(mut stream) => {
+        // A one-minute monitor cannot afford a single visual read holding the
+        // device UI for minutes. Thirty seconds leaves room for recovery and
+        // the next cron tick; callers retry on an explicit error.
+        let mut stream = match tokio::time::timeout(Duration::from_secs(30), provider.stream(req)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Ok(Err(format!("vlm_parse provider error: {e}"))),
+            Err(_) => return Ok(Err("vlm_parse provider setup timed out after 30s".to_string())),
+        };
+        {
                 let mut text = String::new();
                 let mut reasoning = String::new();
                 use futures::StreamExt;
-                while let Some(event) = stream.next().await {
+                loop {
+                    let event = match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+                        Ok(event) => event,
+                        Err(_) => return Ok(Err("vlm_parse stream timed out after 30s".to_string())),
+                    };
+                    let Some(event) = event else { break };
                     match event {
                         Ok(rsclaw_provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
                         Ok(rsclaw_provider::StreamEvent::ReasoningDelta(d)) => {
@@ -3036,8 +3116,6 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
                     text
                 };
                 Ok(Ok(result))
-            }
-            Err(e) => Ok(Err(format!("vlm_parse provider error: {e}"))),
         }
     }
 }
@@ -3199,6 +3277,19 @@ impl rsclaw::plugin::host_android::Host for HostState {
         Ok(Ok("clipboard_set".to_string()))
     }
 
+    async fn android_stage_file(
+        &mut self,
+        local_path: String,
+        media_kind: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let source = match canonicalize_browser_upload_path(&self.plugin_name, &local_path) {
+            Ok(path) => path,
+            Err(error) => return Ok(Err(error)),
+        };
+        let serial = self.android_serial.clone();
+        Ok(adb_stage_file(serial.as_deref(), &source, &media_kind).await)
+    }
+
     async fn android_paste(&mut self) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
         match adb_run_str(
@@ -3323,17 +3414,41 @@ impl rsclaw::plugin::host_android::Host for HostState {
 
     async fn android_launch_app(&mut self, pkg: String) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
-        Ok(adb_run_str(
+        // Monkey is accepted by most devices, but after an automation-service
+        // reconnect this Samsung can return to Home without foregrounding the
+        // package. Resolve the launcher activity and start it explicitly so
+        // callers can verify the requested app rather than a stale activity.
+        if let Ok(resolved) = adb_run_str(
             serial.as_deref(),
             &[
                 "shell",
-                "monkey",
-                "-p",
-                &pkg,
+                "cmd",
+                "package",
+                "resolve-activity",
+                "--brief",
+                "-a",
+                "android.intent.action.MAIN",
                 "-c",
                 "android.intent.category.LAUNCHER",
-                "1",
+                &pkg,
             ],
+        )
+        .await
+            && let Some(component) = resolved.lines().rev().find(|line| line.contains('/'))
+        {
+            return Ok(adb_run_str(
+                serial.as_deref(),
+                &["shell", "am", "start", "-n", component.trim()],
+            )
+            .await
+            .map(|_| format!("launched {pkg}")));
+        }
+        Ok(adb_run_str(
+            serial.as_deref(),
+            // Some OEM builds route the explicit launcher-category variant
+            // back to the automation companion instead of the requested app.
+            // The package-scoped Monkey launch is the device-verified path.
+            &["shell", "monkey", "-p", &pkg, "1"],
         )
         .await
         .map(|_| format!("launched {pkg}")))
