@@ -14,6 +14,7 @@
 //!   - `WasmPlugin`     — live WASM plugin handle (wasmtime)
 //!   - `load_all_plugins()` — unified loader that dispatches by runtime
 
+mod android_uiauto;
 pub mod host_methods;
 pub mod js_runtime;
 pub mod manifest;

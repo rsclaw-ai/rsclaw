@@ -188,82 +188,15 @@ interface host-media {
 }
 
 interface host-android {
-    /// Tap screen at absolute coordinate.
-    android-tap: func(x: u32, y: u32) -> result<string, string>;
+    /// Run one allowlisted, non-sensitive `cls android` agent operation.
+    /// `args-json` is an object using camelCase option names. Customer text and
+    /// selectors must use `android-uiauto-raw` instead of process arguments.
+    android-call: func(command: string, args-json: string) -> result<string, string>;
 
-    /// Swipe from (x1,y1) to (x2,y2) over duration-ms milliseconds.
-    android-swipe: func(x1: u32, y1: u32, x2: u32, y2: u32, duration-ms: u32) -> result<string, string>;
-
-    /// Type text into the currently focused element (equivalent to send_keys).
-    android-type: func(text: string) -> result<string, string>;
-
-    /// Set Android primary clipboard text.
-    android-clipboard-set: func(text: string) -> result<string, string>;
-
-    /// Copy one local media file into Android's controlled rsclaw directory
-    /// and return its absolute device path. `media-kind` is image, file, or
-    /// audio; images and audio are indexed for application media pickers.
-    android-stage-file: func(local-path: string, media-kind: string) -> result<string, string>;
-
-    /// Paste Android primary clipboard text into the currently focused input.
-    android-paste: func() -> result<string, string>;
-
-    /// Press a hardware/nav key by name: back, home, enter.
-    android-press: func(key: string) -> result<string, string>;
-
-    /// Get full UI hierarchy as XML. Set compressed=false for WebView or Flutter content.
-    android-get-ui-xml: func(compressed: bool) -> result<string, string>;
-
-    /// Get current foreground "package/ActivityName".
-    android-current-activity: func() -> result<string, string>;
-
-    /// Launch app by package name and wait for it to become foreground.
-    android-launch-app: func(pkg: string) -> result<string, string>;
-
-    /// Force-stop app by package name.
-    android-stop-app: func(pkg: string) -> result<string, string>;
-
-    /// Capture screenshot as data:image/png;base64,... URI.
-    android-screenshot: func() -> result<string, string>;
-
-    /// Get physical screen size as JSON {width, height} (pixels).
-    android-screen-size: func() -> result<string, string>;
-
-    /// Find elements by selector. Returns JSON array of {text, resource-id, content-desc, bounds, clickable}.
-    /// selector-type: "resource-id" | "text" | "text-contains" | "content-desc" | "content-desc-contains" | "class"
-    android-find-elements: func(selector-type: string, selector-value: string) -> result<string, string>;
-
-    /// Tap the first element matching selector. Returns "tapped" or error.
-    android-tap-element: func(selector-type: string, selector-value: string) -> result<string, string>;
-
-    /// Get text content of the first element matching selector.
-    android-get-element-text: func(selector-type: string, selector-value: string) -> result<string, string>;
-
-    /// Set text of the first element matching selector, clearing existing content.
-    android-set-element-text: func(selector-type: string, selector-value: string, text: string) -> result<string, string>;
-
-    /// Return whether any element matching selector is currently on screen.
-    android-element-exists: func(selector-type: string, selector-value: string) -> result<bool, string>;
-
-    /// Wait up to timeout-ms for an element matching selector to appear. Returns "found" or error.
-    android-wait-for-element: func(selector-type: string, selector-value: string, timeout-ms: u32) -> result<string, string>;
-
-    /// Tap the brand-yellow primary button by its RENDERED COLOR. Flutter confirm
-    /// dialogs (下架/删除/取消订单/发货) expose no UI tree, so element selectors
-    /// can't find their 确定/确认 button — but it's always the bright-yellow action.
-    /// Screenshots, finds the largest yellow region within the vertical band
-    /// [y-min, y-max) (pass 0,0 for the whole screen), and taps its center.
-    /// Returns "tapped:x,y" or an error if no yellow button is found.
-    android-tap-yellow-button: func(y-min: u32, y-max: u32) -> result<string, string>;
-
-    /// Force-stop both appium UiAutomator2 server packages
-    /// (io.appium.uiautomator2.server[.test]), drop the cached connection,
-    /// and relaunch + poll /status until ready (up to 30s). Use this when the
-    /// u2 server has wedged (frozen/empty a11y-tree dumps, taps no longer
-    /// registering) and plain reuse/reconnect isn't recovering it — this is
-    /// the only reliable recovery short of a manual adb session. Returns
-    /// "reset" on success or an error if the server didn't come back up.
-    android-reset-uiautomator: func() -> result<string, string>;
+    /// Forward one native UIAutomator2/WebDriver request through the CLS tunnel.
+    /// The optional JSON body is passed through a private temporary file, and
+    /// the native server JSON body is returned without a host envelope.
+    android-uiauto-raw: func(method: string, path: string, json-body: option<string>) -> result<string, string>;
 }
 
 interface host-ios {
