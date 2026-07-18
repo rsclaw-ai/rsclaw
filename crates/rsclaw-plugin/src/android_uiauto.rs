@@ -28,7 +28,7 @@ const INPUT_TEXT_COMMAND: &str = "input-text";
 const WAKEUP_KEYCODE: u16 = 224;
 const WAKEUP_SCREEN_DELAY: Duration = Duration::from_millis(500);
 const BLACK_PIXEL_THRESHOLD: u8 = 8;
-const MAX_VISIBLE_NEAR_BLACK_FRAME_PERCENT: u64 = 2;
+const MAX_VISIBLE_NEAR_BLACK_FRAME_PERCENT: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
@@ -1343,7 +1343,7 @@ mod tests {
             }
         }));
         assert!(!is_black_frame(100, 100, |x, y| {
-            if y < 2 || (x == 0 && y == 2) {
+            if y < 5 || (x == 0 && y == 5) {
                 [255, 255, 255, 255]
             } else {
                 [0, 0, 0, 255]
