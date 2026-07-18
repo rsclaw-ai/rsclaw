@@ -1,11 +1,14 @@
 //! CLS tunnel transport for Android agent and UIAutomator2 host imports.
 //!
-//! The gateway never opens ADB itself. High-level calls are deliberately
-//! limited to operations whose arguments do not contain customer text. Native
-//! WebDriver requests carry JSON through a mode-0600 temporary file so message
-//! bodies and selectors are not exposed in the process argument list.
+//! The gateway never opens ADB or the CLS AccessibilityService. Every device
+//! operation goes through the tunneled UIAutomator2/WebDriver server. Native
+//! request JSON uses a mode-0600 temporary file so message bodies and selectors
+//! are not exposed in the process argument list.
 
-use std::{fs::OpenOptions, io::Write, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::VecDeque, fs::OpenOptions, io::Write, path::PathBuf, process::Stdio,
+    time::Duration,
+};
 
 use base64::Engine as _;
 use serde_json::{Map, Value};
@@ -20,6 +23,8 @@ const MAX_PATH_BYTES: usize = 512;
 const MAX_STRING_ARG_BYTES: usize = 4096;
 const MAX_SELECTOR_BYTES: usize = 64 * 1024;
 const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
+const CONTACT_BADGE_COMMAND: &str = "contact-badge";
+const INPUT_TEXT_COMMAND: &str = "input-text";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
@@ -123,7 +128,7 @@ impl Drop for TempJsonFile {
     }
 }
 
-/// Run one non-sensitive high-level `cls android` agent command.
+/// Run one allowlisted UIAutomator2 operation.
 pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, String> {
     if args_json.len() > MAX_ARGS_BYTES {
         return Err(format!(
@@ -131,8 +136,234 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         ));
     }
     let config = Config::from_env()?;
+    if command == CONTACT_BADGE_COMMAND {
+        validate_no_args(command, args_json)?;
+        return detect_contact_badge(&config).await;
+    }
+    if command == INPUT_TEXT_COMMAND {
+        return input_text(args_json).await;
+    }
     let args = build_call_args(&config, command, args_json)?;
     run_cls(&config.cls_bin, &args, deadline_for(command)).await
+}
+
+async fn input_text(args_json: &str) -> Result<String, String> {
+    let body = input_text_body(args_json)?;
+    let session = uiauto_session_id().await?;
+    raw("POST", &format!("/session/{session}/keys"), Some(&body)).await
+}
+
+fn input_text_body(args_json: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android uiauto: invalid args JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "android uiauto: args JSON must be an object".to_string())?;
+    if object.len() != 1 || !object.contains_key("text") {
+        return Err("android uiauto: `input-text` requires exactly `text`".to_string());
+    }
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "android uiauto: `text` must be a string".to_string())?;
+    if text.is_empty() || text.len() > MAX_INPUT_TEXT_BYTES || text.contains('\0') {
+        return Err(format!(
+            "android uiauto: `text` must be 1-{MAX_INPUT_TEXT_BYTES} bytes without NUL"
+        ));
+    }
+    serde_json::to_string(&serde_json::json!({
+        "text": text,
+        "replace": true,
+    }))
+    .map_err(|error| format!("android uiauto: encode focused input body: {error}"))
+}
+
+async fn uiauto_session_id() -> Result<String, String> {
+    let sessions = raw("GET", "/sessions", None).await?;
+    if let Some(session) = session_id_from_response(&sessions) {
+        return Ok(session);
+    }
+    let body = serde_json::json!({
+        "capabilities": {
+            "alwaysMatch": {
+                "platformName": "Android",
+                "appium:automationName": "UiAutomator2",
+                "appium:noReset": true,
+                "appium:newCommandTimeout": 300,
+            }
+        }
+    })
+    .to_string();
+    let created = raw("POST", "/session", Some(&body)).await?;
+    session_id_from_response(&created)
+        .ok_or_else(|| "android uiauto: session response missing sessionId".to_string())
+}
+
+fn session_id_from_response(raw: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    value
+        .get("value")
+        .and_then(|value| {
+            value.get("sessionId").or_else(|| {
+                let row = value.as_array().and_then(|rows| rows.first())?;
+                row.get("sessionId").or_else(|| row.get("id"))
+            })
+        })
+        .or_else(|| value.get("sessionId"))
+        .and_then(Value::as_str)
+        .filter(|session| !session.is_empty())
+        .map(str::to_string)
+}
+
+async fn detect_contact_badge(config: &Config) -> Result<String, String> {
+    let args = uiauto_base_args(config, "screenshot");
+    let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
+    let response: Value = serde_json::from_str(&response)
+        .map_err(|error| format!("android uiauto: invalid screenshot response: {error}"))?;
+    let encoded = response
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "android uiauto: screenshot response has no base64 data".to_string())?;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("android uiauto: invalid screenshot base64: {error}"))?;
+    let image = rsclaw_platform::capture::png_to_rgba(&png)
+        .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
+    let probe = contact_badge_probe(image.width(), image.height(), |x, y| {
+        image.get_pixel(x, y).0
+    });
+    serde_json::to_string(&serde_json::json!({
+        "badge": probe.badge,
+        "count": u8::from(probe.badge),
+        "source": "pixel",
+        "redPixels": probe.red_pixels,
+        "largestClusterPixels": probe.largest_cluster_pixels,
+    }))
+    .map_err(|error| format!("android uiauto: encode badge result: {error}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContactBadgeProbe {
+    badge: bool,
+    red_pixels: u32,
+    largest_cluster_pixels: u32,
+}
+
+fn contact_badge_probe(
+    width: u32,
+    height: u32,
+    mut pixel_at: impl FnMut(u32, u32) -> [u8; 4],
+) -> ContactBadgeProbe {
+    if width == 0 || height == 0 {
+        return ContactBadgeProbe {
+            badge: false,
+            red_pixels: 0,
+            largest_cluster_pixels: 0,
+        };
+    }
+
+    // The second item in WeChat's four-column bottom navigation is Contacts.
+    // Ratios keep the probe independent of Android resolution and pixel density.
+    let left = width.saturating_mul(34) / 100;
+    let right = width.saturating_mul(47) / 100;
+    let top = height.saturating_mul(85) / 100;
+    let bottom = height.saturating_mul(94) / 100;
+    let roi_width = right.saturating_sub(left).max(1);
+    let roi_height = bottom.saturating_sub(top).max(1);
+    let mask_len = usize::try_from(roi_width)
+        .ok()
+        .and_then(|value| {
+            usize::try_from(roi_height)
+                .ok()
+                .and_then(|height| value.checked_mul(height))
+        })
+        .unwrap_or(0);
+    if mask_len == 0 {
+        return ContactBadgeProbe {
+            badge: false,
+            red_pixels: 0,
+            largest_cluster_pixels: 0,
+        };
+    }
+
+    let mut mask = vec![false; mask_len];
+    let mut red_pixels = 0_u32;
+    for y in top..bottom {
+        for x in left..right {
+            let [red, green, blue, alpha] = pixel_at(x, y);
+            let is_badge_red = alpha >= 200
+                && red >= 220
+                && green <= 155
+                && blue <= 155
+                && red.saturating_sub(green) >= 70
+                && red.saturating_sub(blue) >= 70;
+            if is_badge_red {
+                let index = ((y - top) * roi_width + (x - left)) as usize;
+                mask[index] = true;
+                red_pixels += 1;
+            }
+        }
+    }
+
+    let mut visited = vec![false; mask_len];
+    let mut largest_cluster_pixels = 0_u32;
+    for index in 0..mask_len {
+        if !mask[index] || visited[index] {
+            continue;
+        }
+        visited[index] = true;
+        let mut queue = VecDeque::from([index]);
+        let mut cluster_pixels = 0_u32;
+        while let Some(current) = queue.pop_front() {
+            cluster_pixels += 1;
+            let x = current % roi_width as usize;
+            let y = current / roi_width as usize;
+            for (next_x, next_y) in [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ] {
+                if next_x >= roi_width as usize || next_y >= roi_height as usize {
+                    continue;
+                }
+                let next = next_y * roi_width as usize + next_x;
+                if mask[next] && !visited[next] {
+                    visited[next] = true;
+                    queue.push_back(next);
+                }
+            }
+        }
+        largest_cluster_pixels = largest_cluster_pixels.max(cluster_pixels);
+    }
+
+    // A real badge is a solid circle; isolated antialiasing noise stays well below
+    // this screen-relative area threshold on both low- and high-density devices.
+    let min_cluster_pixels = (u64::from(width) * u64::from(width) / 2_500).max(24) as u32;
+    ContactBadgeProbe {
+        badge: largest_cluster_pixels >= min_cluster_pixels,
+        red_pixels,
+        largest_cluster_pixels,
+    }
+}
+
+fn validate_no_args(command: &str, args_json: &str) -> Result<(), String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android uiauto: invalid args JSON: {error}"))?;
+    match value.as_object() {
+        Some(object) if object.is_empty() => Ok(()),
+        Some(object) => {
+            let key = object
+                .keys()
+                .next()
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            Err(format!(
+                "android uiauto: unknown `{command}` argument `{key}`"
+            ))
+        }
+        None => Err("android uiauto: args JSON must be an object".to_string()),
+    }
 }
 
 /// Forward one native UIAutomator2/WebDriver JSON request through CLS.
@@ -202,7 +433,7 @@ fn build_call_args(config: &Config, command: &str, args_json: &str) -> Result<Ve
     validate_object_keys(command, object, specs)?;
     validate_command_requirements(command, object, specs)?;
 
-    let mut args = agent_base_args(config, command);
+    let mut args = uiauto_base_args(config, command);
     for spec in specs {
         let Some(value) = object.get(spec.key) else {
             continue;
@@ -210,15 +441,6 @@ fn build_call_args(config: &Config, command: &str, args_json: &str) -> Result<Ve
         append_option(&mut args, *spec, value)?;
     }
     Ok(args)
-}
-
-fn agent_base_args(config: &Config, command: &str) -> Vec<String> {
-    vec![
-        "android".to_string(),
-        command.to_string(),
-        "-n".to_string(),
-        config.node.clone(),
-    ]
 }
 
 fn uiauto_base_args(config: &Config, command: &str) -> Vec<String> {
@@ -396,6 +618,7 @@ fn validate_raw_body(method: &str, path: &str, body: Option<&Value>) -> Result<(
     match segments.as_slice() {
         ["session", _, "element" | "elements"] => validate_element_locator(body),
         ["session", _, "actions"] => validate_touch_actions(body),
+        ["session", _, "keys"] => validate_focused_keys(body),
         ["session", _, "element", _, "click" | "clear"] => validate_empty_object(body),
         ["session", _, "element", _, "value"] => validate_element_value(body),
         ["session", _, "appium", "device", "press_keycode"] => validate_keycode(body),
@@ -474,6 +697,21 @@ fn validate_element_value(body: &Value) -> Result<(), String> {
     }
     if reconstructed != text {
         return Err("android uiauto raw: text and value must encode the same input".to_string());
+    }
+    Ok(())
+}
+
+fn validate_focused_keys(body: &Value) -> Result<(), String> {
+    let object = object_with_keys(body, &["text", "replace"])?;
+    if object.len() != 2 {
+        return Err("android uiauto raw: keys body requires text and replace".to_string());
+    }
+    let text = required_string(object, "text", MAX_INPUT_TEXT_BYTES)?;
+    if text.is_empty() || text.contains('\0') {
+        return Err("android uiauto raw: keys text must be non-empty without NUL".to_string());
+    }
+    if object.get("replace").and_then(Value::as_bool) != Some(true) {
+        return Err("android uiauto raw: keys replace must be true".to_string());
     }
     Ok(())
 }
@@ -763,7 +1001,7 @@ fn session_endpoint_allowed(method: &str, segments: &[&str]) -> bool {
     match (method, segments) {
         ("GET", ["source" | "screenshot"])
         | ("GET", ["window", "current", "size"])
-        | ("POST", ["element" | "elements" | "actions"])
+        | ("POST", ["element" | "elements" | "actions" | "keys"])
         | (
             "POST",
             [
@@ -810,6 +1048,18 @@ fn is_safe_attribute(value: &str) -> bool {
 }
 
 async fn run_cls(cls_bin: &str, args: &[String], timeout: Duration) -> Result<String, String> {
+    let stdout = run_cls_process(cls_bin, args, timeout).await?;
+    let value: Value = serde_json::from_slice(&stdout)
+        .map_err(|error| format!("android uiauto: cls returned invalid JSON: {error}"))?;
+    serde_json::to_string(&value)
+        .map_err(|error| format!("android uiauto: response serialization failed: {error}"))
+}
+
+async fn run_cls_process(
+    cls_bin: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
     let mut command = tokio::process::Command::new(cls_bin);
     command
         .args(args)
@@ -856,10 +1106,7 @@ async fn run_cls(cls_bin: &str, args: &[String], timeout: Duration) -> Result<St
             status
         ));
     }
-    let value: Value = serde_json::from_slice(&stdout)
-        .map_err(|error| format!("android uiauto: cls returned invalid JSON: {error}"))?;
-    serde_json::to_string(&value)
-        .map_err(|error| format!("android uiauto: response serialization failed: {error}"))
+    Ok(stdout)
 }
 
 fn summarize_cls_error(error: &str) -> &str {
@@ -943,6 +1190,72 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn input_text_body_keeps_utf8_in_private_webdriver_json() {
+        let body = input_text_body(r#"{"text":"你好\n宝宝"}"#).expect("valid input text");
+        let value: Value = serde_json::from_str(&body).expect("valid WebDriver JSON");
+        assert_eq!(value["text"], "你好\n宝宝");
+        assert_eq!(value["replace"], true);
+    }
+
+    #[test]
+    fn input_text_body_rejects_missing_extra_empty_and_nul_values() {
+        assert!(input_text_body("{}").is_err());
+        assert!(input_text_body(r#"{"text":"ok","extra":true}"#).is_err());
+        assert!(input_text_body(r#"{"text":""}"#).is_err());
+        assert!(input_text_body("{\"text\":\"a\\u0000b\"}").is_err());
+    }
+
+    #[test]
+    fn parses_existing_and_new_uiautomator2_session_ids() {
+        assert_eq!(
+            session_id_from_response(r#"{"value":[{"sessionId":"existing"}]}"#).as_deref(),
+            Some("existing")
+        );
+        assert_eq!(
+            session_id_from_response(r#"{"value":{"sessionId":"created"}}"#).as_deref(),
+            Some("created")
+        );
+        assert_eq!(session_id_from_response(r#"{"value":[]}"#), None);
+    }
+
+    #[test]
+    fn contact_badge_probe_detects_solid_red_cluster_in_normalized_region() {
+        let mut pixels = vec![[20, 20, 20, 255]; 1_000 * 2_000];
+        for y in 1_780..1_820 {
+            for x in 400..440 {
+                pixels[y * 1_000 + x] = [250, 75, 75, 255];
+            }
+        }
+
+        let probe =
+            contact_badge_probe(1_000, 2_000, |x, y| pixels[y as usize * 1_000 + x as usize]);
+        assert!(probe.badge);
+        assert_eq!(probe.red_pixels, 1_600);
+        assert_eq!(probe.largest_cluster_pixels, 1_600);
+    }
+
+    #[test]
+    fn contact_badge_probe_ignores_noise_and_red_outside_contacts() {
+        let mut pixels = vec![[20, 20, 20, 255]; 1_000 * 2_000];
+        for y in 1_780..1_790 {
+            for x in 400..410 {
+                pixels[y * 1_000 + x] = [250, 75, 75, 255];
+            }
+        }
+        for y in 1_780..1_840 {
+            for x in 80..140 {
+                pixels[y * 1_000 + x] = [250, 75, 75, 255];
+            }
+        }
+
+        let probe =
+            contact_badge_probe(1_000, 2_000, |x, y| pixels[y as usize * 1_000 + x as usize]);
+        assert!(!probe.badge);
+        assert_eq!(probe.red_pixels, 100);
+        assert_eq!(probe.largest_cluster_pixels, 100);
+    }
+
     fn config() -> Config {
         Config {
             cls_bin: "cls".to_string(),
@@ -952,15 +1265,18 @@ mod tests {
     }
 
     #[test]
-    fn builds_typed_agent_args_without_a_shell() {
+    fn builds_typed_uiautomator2_args_without_a_shell() {
         let args = build_call_args(&config(), "tap", r#"{"x":20,"y":40}"#).unwrap();
         assert_eq!(
             args,
             [
                 "android",
+                "uiauto",
                 "tap",
                 "-n",
                 "android-dev",
+                "--port",
+                "6790",
                 "--x",
                 "20",
                 "--y",
@@ -1012,6 +1328,22 @@ mod tests {
             Ok("POST")
         );
         assert!(validate_raw_request("GET", "/session/abc/window/current/size", None).is_ok());
+        assert!(
+            validate_raw_request(
+                "POST",
+                "/session/abc/keys",
+                Some(r#"{"text":"你好","replace":true}"#),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_raw_request(
+                "POST",
+                "/session/abc/keys",
+                Some(r#"{"text":"你好","replace":false}"#),
+            )
+            .is_err()
+        );
         assert!(validate_raw_request("GET", "/session/abc/window/rect", None).is_err());
         assert!(
             validate_raw_request("GET", "/session/abc/appium/device/current_package", None)
