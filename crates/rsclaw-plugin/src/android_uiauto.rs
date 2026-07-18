@@ -25,6 +25,8 @@ const MAX_SELECTOR_BYTES: usize = 64 * 1024;
 const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
 const CONTACT_BADGE_COMMAND: &str = "contact-badge";
 const INPUT_TEXT_COMMAND: &str = "input-text";
+const PASTE_KEYCODE: u16 = 279;
+const CLIPBOARD_LABEL: &str = "rsclaw-input";
 const WAKEUP_KEYCODE: u16 = 224;
 const WAKEUP_SCREEN_DELAY: Duration = Duration::from_millis(500);
 const BLACK_PIXEL_THRESHOLD: u8 = 8;
@@ -155,12 +157,30 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
 }
 
 async fn input_text(args_json: &str) -> Result<String, String> {
-    let body = input_text_body(args_json)?;
+    let text = input_text_value(args_json)?;
     let session = uiauto_session_id().await?;
-    raw("POST", &format!("/session/{session}/keys"), Some(&body)).await
+    let clipboard = serde_json::json!({
+        "content": base64::engine::general_purpose::STANDARD.encode(text.as_bytes()),
+        "contentType": "plaintext",
+        "label": CLIPBOARD_LABEL,
+    })
+    .to_string();
+    raw(
+        "POST",
+        &format!("/session/{session}/appium/device/set_clipboard"),
+        Some(&clipboard),
+    )
+    .await?;
+    let paste = serde_json::json!({ "keycode": PASTE_KEYCODE }).to_string();
+    raw(
+        "POST",
+        &format!("/session/{session}/appium/device/press_keycode"),
+        Some(&paste),
+    )
+    .await
 }
 
-fn input_text_body(args_json: &str) -> Result<String, String> {
+fn input_text_value(args_json: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(args_json)
         .map_err(|error| format!("android uiauto: invalid args JSON: {error}"))?;
     let object = value
@@ -178,11 +198,7 @@ fn input_text_body(args_json: &str) -> Result<String, String> {
             "android uiauto: `text` must be 1-{MAX_INPUT_TEXT_BYTES} bytes without NUL"
         ));
     }
-    serde_json::to_string(&serde_json::json!({
-        "text": text,
-        "replace": true,
-    }))
-    .map_err(|error| format!("android uiauto: encode focused input body: {error}"))
+    Ok(text.to_string())
 }
 
 async fn uiauto_session_id() -> Result<String, String> {
@@ -1267,19 +1283,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_text_body_keeps_utf8_in_private_webdriver_json() {
-        let body = input_text_body(r#"{"text":"你好\n宝宝"}"#).expect("valid input text");
-        let value: Value = serde_json::from_str(&body).expect("valid WebDriver JSON");
-        assert_eq!(value["text"], "你好\n宝宝");
-        assert_eq!(value["replace"], true);
+    fn input_text_value_keeps_utf8_for_clipboard_paste() {
+        let text = input_text_value(r#"{"text":"你好\n宝宝"}"#).expect("valid input text");
+        assert_eq!(text, "你好\n宝宝");
     }
 
     #[test]
-    fn input_text_body_rejects_missing_extra_empty_and_nul_values() {
-        assert!(input_text_body("{}").is_err());
-        assert!(input_text_body(r#"{"text":"ok","extra":true}"#).is_err());
-        assert!(input_text_body(r#"{"text":""}"#).is_err());
-        assert!(input_text_body("{\"text\":\"a\\u0000b\"}").is_err());
+    fn input_text_value_rejects_missing_extra_empty_and_nul_values() {
+        assert!(input_text_value("{}").is_err());
+        assert!(input_text_value(r#"{"text":"ok","extra":true}"#).is_err());
+        assert!(input_text_value(r#"{"text":""}"#).is_err());
+        assert!(input_text_value("{\"text\":\"a\\u0000b\"}").is_err());
     }
 
     #[test]

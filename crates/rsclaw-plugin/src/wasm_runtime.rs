@@ -1908,7 +1908,7 @@ pub(crate) fn allocate_dl_paths(filename: &str, count: usize) -> Result<Vec<Stri
         return Ok(paths);
     }
     Err("allocate_artifact: could not pick a unique name after 10 attempts".to_owned())
-    }
+}
 
 impl HostState {
     fn invocation_context(&self) -> Option<crate::PluginInvocationContext> {
@@ -2160,37 +2160,26 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             }
         };
 
-        // Downscale the screenshot before sending. Full-res window captures
-        // (~1834px) encode to ~2744 vision tokens and ship a multi-MB PNG over
-        // the Mac→cloud→GPU hop, which dominates per-call latency (~71s observed).
-        // Cap the long edge at 1280 and re-encode JPEG q85 — cuts both wire bytes
-        // and image tokens. Safe for navigation: the plugin maps VLM boxes in
-        // 0-1000 normalized space, independent of pixel dimensions. Any
-        // parse/decode/resize failure falls back to the original URI.
-        let image_data_uri = {
-            let downscaled = image_data_uri
-                .split_once(";base64,")
-                .and_then(|(header, b64)| {
-                    let mime = header
-                        .strip_prefix("data:")
-                        .unwrap_or("image/png")
-                        .to_string();
-                    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-                    let (new_bytes, new_mime) = rsclaw_util::downscale_image_for_vision(
-                        &bytes,
-                        &mime,
-                        256 * 1024,
-                        1280,
-                        85,
-                    )
+        // UI-TARS-style Action coordinates are authored against the exact image
+        // supplied to the model. Keep its dimensions unchanged so Android
+        // plugins can pass Action coordinates directly to UIAutomator2. Only
+        // unusually large payloads are JPEG-reencoded at the same dimensions.
+        let image_data_uri = image_data_uri
+            .split_once(";base64,")
+            .and_then(|(header, encoded)| {
+                let mime = header.strip_prefix("data:").unwrap_or("image/png");
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
                     .ok()?;
-                    Some(format!(
-                        "data:{new_mime};base64,{}",
-                        base64::engine::general_purpose::STANDARD.encode(&new_bytes)
-                    ))
-                });
-            downscaled.unwrap_or(image_data_uri)
-        };
+                let (bytes, mime) =
+                    rsclaw_util::reencode_image_for_vision(&bytes, mime, 2 * 1024 * 1024, 85)
+                        .ok()?;
+                Some(format!(
+                    "data:{mime};base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                ))
+            })
+            .unwrap_or(image_data_uri);
 
         let messages = vec![rsclaw_provider::Message {
             role: rsclaw_provider::Role::User,
@@ -2226,44 +2215,44 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
         // the next cron tick; callers retry on an explicit error.
         let mut stream =
             match tokio::time::timeout(Duration::from_secs(30), provider.stream(req)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Ok(Err(format!("vlm_parse provider error: {e}"))),
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Ok(Err(format!("vlm_parse provider error: {e}"))),
                 Err(_) => {
                     return Ok(Err(
                         "vlm_parse provider setup timed out after 30s".to_string()
                     ));
                 }
-        };
+            };
         {
-                let mut text = String::new();
-                let mut reasoning = String::new();
-                use futures::StreamExt;
-                loop {
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            use futures::StreamExt;
+            loop {
                 let event = match tokio::time::timeout(Duration::from_secs(30), stream.next()).await
                 {
-                        Ok(event) => event,
-                        Err(_) => return Ok(Err("vlm_parse stream timed out after 30s".to_string())),
-                    };
-                    let Some(event) = event else { break };
-                    match event {
-                        Ok(rsclaw_provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
+                    Ok(event) => event,
+                    Err(_) => return Ok(Err("vlm_parse stream timed out after 30s".to_string())),
+                };
+                let Some(event) = event else { break };
+                match event {
+                    Ok(rsclaw_provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
                     Ok(rsclaw_provider::StreamEvent::ReasoningDelta(d)) => reasoning.push_str(&d),
-                        Ok(rsclaw_provider::StreamEvent::Done { .. }) => break,
-                        Ok(rsclaw_provider::StreamEvent::ToolCall { .. }) => {}
-                        Ok(rsclaw_provider::StreamEvent::Error(e)) => {
-                            return Ok(Err(format!("vlm_parse stream error: {e}")));
-                        }
-                        Err(e) => {
-                            return Ok(Err(format!("vlm_parse stream error: {e}")));
-                        }
+                    Ok(rsclaw_provider::StreamEvent::Done { .. }) => break,
+                    Ok(rsclaw_provider::StreamEvent::ToolCall { .. }) => {}
+                    Ok(rsclaw_provider::StreamEvent::Error(e)) => {
+                        return Ok(Err(format!("vlm_parse stream error: {e}")));
+                    }
+                    Err(e) => {
+                        return Ok(Err(format!("vlm_parse stream error: {e}")));
                     }
                 }
-                let result = if text.trim().is_empty() {
-                    reasoning
-                } else {
-                    text
-                };
-                Ok(Ok(result))
+            }
+            let result = if text.trim().is_empty() {
+                reasoning
+            } else {
+                text
+            };
+            Ok(Ok(result))
         }
     }
 }
@@ -2316,8 +2305,8 @@ impl rsclaw::plugin::host_android::Host for HostState {
         json_body: Option<String>,
     ) -> HostTrapResult<Result<String, String>> {
         Ok(crate::android_uiauto::raw(&method, &path, json_body.as_deref()).await)
-                }
-            }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // host-ios trait implementation (WebDriverAgent)
@@ -3371,4 +3360,4 @@ mod android_helper_tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
-    }
+}

@@ -105,6 +105,31 @@ pub fn downscale_image_for_vision(
     Ok((buf, "image/jpeg".to_string()))
 }
 
+/// Re-encode an oversized vision image without changing its pixel dimensions.
+///
+/// UI action models ground coordinates against the pixels they receive. This
+/// helper therefore only reduces JPEG quality after a byte-size threshold; it
+/// never resizes the image.
+pub fn reencode_image_for_vision(
+    data: &[u8],
+    original_mime: &str,
+    byte_threshold: usize,
+    quality: u8,
+) -> anyhow::Result<(Vec<u8>, String)> {
+    if data.len() <= byte_threshold {
+        return Ok((data.to_vec(), original_mime.to_string()));
+    }
+    let image = image::load_from_memory(data)
+        .map_err(|error| anyhow::anyhow!("vision re-encode: decode failed: {error}"))?;
+    let mut encoded = Vec::with_capacity(data.len() / 2);
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality);
+    image
+        .to_rgb8()
+        .write_with_encoder(encoder)
+        .map_err(|error| anyhow::anyhow!("vision re-encode: jpeg encode failed: {error}"))?;
+    Ok((encoded, "image/jpeg".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,7 +159,8 @@ mod tests {
 }
 
 // Path helpers (crate-split): expand_tilde + canonicalize_external_path lifted
-// from agent/runtime.rs so plugin/tools can normalize paths without the agent knot.
+// from agent/runtime.rs so plugin/tools can normalize paths without the agent
+// knot.
 /// Expand a leading `~/` to the user's home directory.
 pub fn expand_tilde(p: &str) -> std::path::PathBuf {
     if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
@@ -144,7 +170,8 @@ pub fn expand_tilde(p: &str) -> std::path::PathBuf {
     } else {
         std::path::PathBuf::from(p)
     }
-}/// Canonicalize a path received from an external source (tool output, plugin
+}
+/// Canonicalize a path received from an external source (tool output, plugin
 /// result, LLM-generated argument). Performs:
 ///   1. `~/...` expansion via [`expand_tilde`]
 ///   2. If still relative, joins with `workspace`
@@ -154,10 +181,7 @@ pub fn expand_tilde(p: &str) -> std::path::PathBuf {
 /// This is the single entry point for turning untrusted path strings into
 /// filesystem paths the host will actually read/write. Call this instead of
 /// `PathBuf::from(s)` at module boundaries.
-pub fn canonicalize_external_path(
-    input: &str,
-    workspace: &std::path::Path,
-) -> std::path::PathBuf {
+pub fn canonicalize_external_path(input: &str, workspace: &std::path::Path) -> std::path::PathBuf {
     use std::path::Component;
     let expanded = expand_tilde(input);
     let absolute = if expanded.is_absolute() {
