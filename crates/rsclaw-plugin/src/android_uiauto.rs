@@ -25,6 +25,10 @@ const MAX_SELECTOR_BYTES: usize = 64 * 1024;
 const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
 const CONTACT_BADGE_COMMAND: &str = "contact-badge";
 const INPUT_TEXT_COMMAND: &str = "input-text";
+const WAKEUP_KEYCODE: u16 = 224;
+const WAKEUP_SCREEN_DELAY: Duration = Duration::from_millis(500);
+const BLACK_PIXEL_THRESHOLD: u8 = 8;
+const MAX_VISIBLE_BLACK_FRAME_PER_THOUSAND: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
@@ -144,6 +148,9 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         return input_text(args_json).await;
     }
     let args = build_call_args(&config, command, args_json)?;
+    if command == "screenshot" {
+        return screenshot_with_wakeup(&config).await;
+    }
     run_cls(&config.cls_bin, &args, deadline_for(command)).await
 }
 
@@ -216,17 +223,8 @@ fn session_id_from_response(raw: &str) -> Option<String> {
 }
 
 async fn detect_contact_badge(config: &Config) -> Result<String, String> {
-    let args = uiauto_base_args(config, "screenshot");
-    let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
-    let response: Value = serde_json::from_str(&response)
-        .map_err(|error| format!("android uiauto: invalid screenshot response: {error}"))?;
-    let encoded = response
-        .get("data")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "android uiauto: screenshot response has no base64 data".to_string())?;
-    let png = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|error| format!("android uiauto: invalid screenshot base64: {error}"))?;
+    let response = screenshot_with_wakeup(config).await?;
+    let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
     let probe = contact_badge_probe(image.width(), image.height(), |x, y| {
@@ -240,6 +238,81 @@ async fn detect_contact_badge(config: &Config) -> Result<String, String> {
         "largestClusterPixels": probe.largest_cluster_pixels,
     }))
     .map_err(|error| format!("android uiauto: encode badge result: {error}"))
+}
+
+async fn screenshot_with_wakeup(config: &Config) -> Result<String, String> {
+    let args = uiauto_base_args(config, "screenshot");
+    let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
+    if !screenshot_is_black(&response)? {
+        return Ok(response);
+    }
+
+    tracing::info!(
+        node = %config.node,
+        "Android screenshot is black; waking the device through UIAutomator2"
+    );
+    let mut wake_args = uiauto_base_args(config, "key");
+    wake_args.push("--keycode".to_string());
+    wake_args.push(WAKEUP_KEYCODE.to_string());
+    run_cls(&config.cls_bin, &wake_args, deadline_for("key")).await?;
+    tokio::time::sleep(WAKEUP_SCREEN_DELAY).await;
+
+    let retry = uiauto_base_args(config, "screenshot");
+    let response = run_cls(&config.cls_bin, &retry, deadline_for("screenshot")).await?;
+    if screenshot_is_black(&response)? {
+        return Err(
+            "android uiauto: screenshot remains black after UIAutomator2 wakeup; device may be locked or its display unavailable"
+                .to_string(),
+        );
+    }
+    Ok(response)
+}
+
+fn screenshot_png(response: &str) -> Result<Vec<u8>, String> {
+    let response: Value = serde_json::from_str(response)
+        .map_err(|error| format!("android uiauto: invalid screenshot response: {error}"))?;
+    let encoded = response
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "android uiauto: screenshot response has no base64 data".to_string())?;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("android uiauto: invalid screenshot base64: {error}"))?;
+    Ok(png)
+}
+
+fn screenshot_is_black(response: &str) -> Result<bool, String> {
+    let png = screenshot_png(response)?;
+    let image = rsclaw_platform::capture::png_to_rgba(&png)
+        .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
+    Ok(is_black_frame(image.width(), image.height(), |x, y| {
+        image.get_pixel(x, y).0
+    }))
+}
+
+fn is_black_frame(width: u32, height: u32, mut pixel_at: impl FnMut(u32, u32) -> [u8; 4]) -> bool {
+    let total_pixels = u64::from(width) * u64::from(height);
+    if total_pixels == 0 {
+        return false;
+    }
+    let visible_limit = (total_pixels / 1_000).max(MAX_VISIBLE_BLACK_FRAME_PER_THOUSAND);
+    let mut visible_pixels = 0_u64;
+    for y in 0..height {
+        for x in 0..width {
+            let [red, green, blue, alpha] = pixel_at(x, y);
+            if alpha > 0
+                && (red > BLACK_PIXEL_THRESHOLD
+                    || green > BLACK_PIXEL_THRESHOLD
+                    || blue > BLACK_PIXEL_THRESHOLD)
+            {
+                visible_pixels += 1;
+                if visible_pixels > visible_limit {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1254,6 +1327,25 @@ mod tests {
         assert!(!probe.badge);
         assert_eq!(probe.red_pixels, 100);
         assert_eq!(probe.largest_cluster_pixels, 100);
+    }
+
+    #[test]
+    fn black_frame_detection_tolerates_a_tiny_status_indicator_only() {
+        assert!(is_black_frame(100, 100, |_, _| [0, 0, 0, 255]));
+        assert!(is_black_frame(100, 100, |x, y| {
+            if x == 0 && y == 0 {
+                [255, 255, 255, 255]
+            } else {
+                [0, 0, 0, 255]
+            }
+        }));
+        assert!(!is_black_frame(100, 100, |x, y| {
+            if x < 11 && y == 0 {
+                [255, 255, 255, 255]
+            } else {
+                [0, 0, 0, 255]
+            }
+        }));
     }
 
     fn config() -> Config {
