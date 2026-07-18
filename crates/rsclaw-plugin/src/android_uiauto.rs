@@ -28,7 +28,7 @@ const INPUT_TEXT_COMMAND: &str = "input-text";
 const WAKEUP_KEYCODE: u16 = 224;
 const WAKEUP_SCREEN_DELAY: Duration = Duration::from_millis(500);
 const BLACK_PIXEL_THRESHOLD: u8 = 8;
-const MAX_VISIBLE_BLACK_FRAME_PER_THOUSAND: u64 = 1;
+const MAX_VISIBLE_NEAR_BLACK_FRAME_PERCENT: u64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
@@ -295,7 +295,10 @@ fn is_black_frame(width: u32, height: u32, mut pixel_at: impl FnMut(u32, u32) ->
     if total_pixels == 0 {
         return false;
     }
-    let visible_limit = (total_pixels / 1_000).max(MAX_VISIBLE_BLACK_FRAME_PER_THOUSAND);
+    // Android's always-on display renders a clock and status icons over an
+    // otherwise black frame. Treat it as asleep so a screenshot request can
+    // wake the device instead of feeding an unusable image to a plugin.
+    let visible_limit = (total_pixels * MAX_VISIBLE_NEAR_BLACK_FRAME_PERCENT / 100).max(1);
     let mut visible_pixels = 0_u64;
     for y in 0..height {
         for x in 0..width {
@@ -1340,7 +1343,7 @@ mod tests {
             }
         }));
         assert!(!is_black_frame(100, 100, |x, y| {
-            if x < 11 && y == 0 {
+            if y < 2 || (x == 0 && y == 2) {
                 [255, 255, 255, 255]
             } else {
                 [0, 0, 0, 255]
