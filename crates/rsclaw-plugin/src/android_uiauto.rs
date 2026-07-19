@@ -26,6 +26,7 @@ const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
 const CONTACT_BADGE_COMMAND: &str = "contact-badge";
 const KEYBOARD_VISIBLE_COMMAND: &str = "keyboard-visible";
 const SEND_BUTTON_COMMAND: &str = "send-button";
+const LATEST_MESSAGE_BUBBLE_COMMAND: &str = "latest-message-bubble";
 const INPUT_TEXT_COMMAND: &str = "input-text";
 const PASTE_KEYCODE: u16 = 279;
 const CLIPBOARD_LABEL: &str = "rsclaw";
@@ -160,6 +161,10 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     if command == SEND_BUTTON_COMMAND {
         validate_no_args(command, args_json)?;
         return detect_send_button(&config).await;
+    }
+    if command == LATEST_MESSAGE_BUBBLE_COMMAND {
+        validate_no_args(command, args_json)?;
+        return detect_latest_message_bubble(&config).await;
     }
     if command == INPUT_TEXT_COMMAND {
         return input_text(args_json).await;
@@ -296,6 +301,166 @@ async fn detect_send_button(config: &Config) -> Result<String, String> {
         "source": "pixel",
     }))
     .map_err(|error| format!("android uiauto: encode send-button result: {error}"))
+}
+
+async fn detect_latest_message_bubble(config: &Config) -> Result<String, String> {
+    let response = screenshot_with_wakeup(config).await?;
+    let png = screenshot_png(&response)?;
+    let image = rsclaw_platform::capture::png_to_rgba(&png)
+        .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
+    let probe = latest_message_bubble_probe(image.width(), image.height(), |x, y| {
+        image.get_pixel(x, y).0
+    });
+    serde_json::to_string(&serde_json::json!({
+        "found": probe.is_some(),
+        "side": probe.map(|region| region.side.as_str()),
+        "left": probe.map(|region| region.left),
+        "top": probe.map(|region| region.top),
+        "right": probe.map(|region| region.right),
+        "bottom": probe.map(|region| region.bottom),
+        "pixels": probe.map(|region| region.pixels),
+        "source": "pixel-component",
+    }))
+    .map_err(|error| format!("android uiauto: encode message-bubble result: {error}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageBubbleSide {
+    Incoming,
+    Outgoing,
+}
+
+impl MessageBubbleSide {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Incoming => "incoming",
+            Self::Outgoing => "outgoing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MessageBubbleRegion {
+    side: MessageBubbleSide,
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+    pixels: u32,
+}
+
+fn message_bubble_pixel(red: u8, green: u8, blue: u8, alpha: u8) -> u8 {
+    if alpha < 200 {
+        return 0;
+    }
+    let red = i16::from(red);
+    let green = i16::from(green);
+    let blue = i16::from(blue);
+    if green >= 80 && green - red >= 25 && green - blue >= 15 {
+        return 2;
+    }
+    let max = red.max(green).max(blue);
+    let min = red.min(green).min(blue);
+    if max - min <= 12 && ((30..=125).contains(&max) || (210..=255).contains(&max)) {
+        return 1;
+    }
+    0
+}
+
+fn latest_message_bubble_probe(
+    width: u32,
+    height: u32,
+    mut pixel_at: impl FnMut(u32, u32) -> [u8; 4],
+) -> Option<MessageBubbleRegion> {
+    if width < 20 || height < 20 {
+        return None;
+    }
+    let x_start = width * 3 / 100;
+    let x_end = width * 97 / 100;
+    let y_start = height * 8 / 100;
+    let y_end = height * 80 / 100;
+    let mut classes = vec![0_u8; (width as usize).saturating_mul(height as usize)];
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            let [red, green, blue, alpha] = pixel_at(x, y);
+            classes[y as usize * width as usize + x as usize] =
+                message_bubble_pixel(red, green, blue, alpha);
+        }
+    }
+    let mut visited = vec![false; classes.len()];
+    let mut queue = VecDeque::new();
+    let mut best: Option<MessageBubbleRegion> = None;
+    let min_pixels = (u64::from(width) * u64::from(height) / 2_000).max(400) as u32;
+
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            let index = y as usize * width as usize + x as usize;
+            let class = classes[index];
+            if class == 0 || visited[index] {
+                continue;
+            }
+            visited[index] = true;
+            queue.push_back((x, y));
+            let mut left = x;
+            let mut right = x;
+            let mut top = y;
+            let mut bottom = y;
+            let mut pixels = 0_u32;
+            while let Some((current_x, current_y)) = queue.pop_front() {
+                pixels = pixels.saturating_add(1);
+                left = left.min(current_x);
+                right = right.max(current_x);
+                top = top.min(current_y);
+                bottom = bottom.max(current_y);
+                let neighbors = [
+                    (current_x.wrapping_sub(1), current_y),
+                    (current_x.saturating_add(1), current_y),
+                    (current_x, current_y.wrapping_sub(1)),
+                    (current_x, current_y.saturating_add(1)),
+                ];
+                for (next_x, next_y) in neighbors {
+                    if next_x < x_start || next_x >= x_end || next_y < y_start || next_y >= y_end {
+                        continue;
+                    }
+                    let next_index = next_y as usize * width as usize + next_x as usize;
+                    if !visited[next_index] && classes[next_index] == class {
+                        visited[next_index] = true;
+                        queue.push_back((next_x, next_y));
+                    }
+                }
+            }
+            let region_width = right.saturating_sub(left).saturating_add(1);
+            let region_height = bottom.saturating_sub(top).saturating_add(1);
+            if pixels < min_pixels
+                || region_width < width * 5 / 100
+                || region_width > width * 85 / 100
+                || region_height < height / 100
+                || region_height > height * 40 / 100
+            {
+                continue;
+            }
+            let side = if class == 1 {
+                MessageBubbleSide::Incoming
+            } else {
+                MessageBubbleSide::Outgoing
+            };
+            let region = MessageBubbleRegion {
+                side,
+                left,
+                top,
+                right: right.saturating_add(1),
+                bottom: bottom.saturating_add(1),
+                pixels,
+            };
+            if best.is_none_or(|current| {
+                region.bottom > current.bottom
+                    || (region.bottom == current.bottom && region.pixels > current.pixels)
+            }) {
+                best = Some(region);
+            }
+        }
+    }
+    best
 }
 
 async fn detect_keyboard_visible(config: &Config) -> Result<String, String> {
@@ -1772,6 +1937,55 @@ mod tests {
         assert_eq!((probe.left, probe.top), (820, 1_300));
         assert_eq!((probe.right, probe.bottom), (960, 1_380));
         assert_eq!((probe.x, probe.y), (890, 1_340));
+    }
+
+    #[test]
+    fn latest_message_bubble_probe_prefers_lowest_incoming_component() {
+        let probe = latest_message_bubble_probe(1_000, 2_000, |x, y| {
+            if (650..920).contains(&x) && (550..760).contains(&y) {
+                [20, 190, 95, 255]
+            } else if (90..620).contains(&x) && (1_100..1_260).contains(&y) {
+                [52, 52, 52, 255]
+            } else {
+                [20, 20, 20, 255]
+            }
+        })
+        .expect("latest incoming bubble");
+
+        assert_eq!(probe.side, MessageBubbleSide::Incoming);
+        assert_eq!((probe.left, probe.top), (90, 1_100));
+        assert_eq!((probe.right, probe.bottom), (620, 1_260));
+    }
+
+    #[test]
+    fn latest_message_bubble_probe_prefers_lowest_outgoing_component() {
+        let probe = latest_message_bubble_probe(1_000, 2_000, |x, y| {
+            if (90..620).contains(&x) && (550..710).contains(&y) {
+                [52, 52, 52, 255]
+            } else if (650..920).contains(&x) && (1_100..1_310).contains(&y) {
+                [20, 190, 95, 255]
+            } else {
+                [20, 20, 20, 255]
+            }
+        })
+        .expect("latest outgoing bubble");
+
+        assert_eq!(probe.side, MessageBubbleSide::Outgoing);
+        assert_eq!((probe.left, probe.top), (650, 1_100));
+        assert_eq!((probe.right, probe.bottom), (920, 1_310));
+    }
+
+    #[test]
+    fn latest_message_bubble_probe_rejects_full_width_gray_chrome() {
+        let probe = latest_message_bubble_probe(1_000, 2_000, |x, y| {
+            if (30..970).contains(&x) && (1_100..1_250).contains(&y) {
+                [52, 52, 52, 255]
+            } else {
+                [20, 20, 20, 255]
+            }
+        });
+
+        assert!(probe.is_none());
     }
 
     #[test]
