@@ -7,12 +7,11 @@
 //! construction + `resolve_flash_model_for` on the root side, where those
 //! types live.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::anyhow;
-
 use rsclaw_agent::registry::{AgentMessage, AgentRegistry};
+
 use crate::gateway::shutdown::ShutdownCoordinator;
 
 pub struct RuntimeHeartbeatHost {
@@ -86,7 +85,10 @@ impl rsclaw_heartbeat::HeartbeatHost for RuntimeHeartbeatHost {
     }
 
     fn is_draining(&self) -> bool {
-        self.shutdown.as_ref().map(|s| s.is_draining()).unwrap_or(false)
+        self.shutdown
+            .as_ref()
+            .map(|s| s.is_draining())
+            .unwrap_or(false)
     }
 
     fn begin_work(&self) -> Option<Box<dyn std::any::Any + Send>> {

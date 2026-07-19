@@ -1,11 +1,11 @@
 use anyhow::Result;
+use rsclaw_cli::ConfigCommand;
+use rsclaw_config as config;
 
 use super::{
     config_json::{get_nested_value, load_config_json, remove_nested_value, set_nested_value},
     style::*,
 };
-use rsclaw_cli::ConfigCommand;
-use rsclaw_config as config;
 
 pub async fn cmd_config(sub: ConfigCommand) -> Result<()> {
     match sub {

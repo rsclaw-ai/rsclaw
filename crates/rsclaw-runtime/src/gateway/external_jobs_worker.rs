@@ -11,6 +11,9 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
+use rsclaw_channel::OutboundMessage;
+use rsclaw_config::runtime::RuntimeConfig;
+use rsclaw_store::RedbStore;
 use serde_json::json;
 use tokio::sync::{Semaphore, broadcast};
 use tracing::{debug, error, info, warn};
@@ -19,9 +22,6 @@ use super::{
     external_jobs::{ExternalJob, ExternalJobKind, ExternalJobStatus, PollOutcome},
     shutdown::ShutdownCoordinator,
 };
-use rsclaw_channel::OutboundMessage;
-use rsclaw_config::runtime::RuntimeConfig;
-use rsclaw_store::RedbStore;
 
 /// Seconds between worker ticks when nothing is due — small enough that
 /// new jobs start polling promptly, large enough to keep redb scans cheap.

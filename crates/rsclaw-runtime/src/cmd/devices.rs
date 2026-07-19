@@ -1,7 +1,6 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-
 use rsclaw_cli::devices::DevicesCommand;
+use serde::{Deserialize, Serialize};
 
 /// A paired device entry.
 #[derive(Debug, Serialize, Deserialize, Clone)]

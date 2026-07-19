@@ -68,6 +68,12 @@ const STUCK_RUN_MS: u64 = 2 * 60 * 60 * 1000; // 2 hours
 /// `consecutive_errors` is not bumped and the new job version starts clean.
 const CANCEL_BY_RELOAD: &str = "cron: cancelled by reload";
 
+/// Wake-mode prefix for a plugin-owned, read-only cron preflight.
+const PLUGIN_PREFLIGHT_WAKE_MODE_PREFIX: &str = "plugin-preflight:";
+
+/// Bound plugin preflights so an unavailable external UI cannot stall cron.
+const PLUGIN_PREFLIGHT_TIMEOUT_SECS: u64 = 75;
+
 // ---------------------------------------------------------------------------
 // CronRunner
 // ---------------------------------------------------------------------------
@@ -684,13 +690,12 @@ impl CronRunner {
                             state.last_status = Some("error".to_string());
                             state.last_error = error_msg;
 
-                            if matches!(
-                                job.wake_mode.as_deref(),
-                                Some("wechat-ios-monitor" | "wechat-android-monitor")
-                            ) {
-                                // Device availability is transient. Keep the minute-level
-                                // sales monitor alive so it reconnects promptly and still
-                                // reaches its ten-minute friend-request sweep after recovery.
+                            if job.wake_mode.as_deref().is_some_and(|wake_mode| {
+                                wake_mode.starts_with(PLUGIN_PREFLIGHT_WAKE_MODE_PREFIX)
+                            }) {
+                                // Preflight failures generally mean a transient dependency is
+                                // unavailable. Preserve the configured cadence so monitoring
+                                // resumes promptly when that dependency recovers.
                                 state.next_run_at_ms =
                                     job.schedule.compute_next_run(completion_time);
                                 info!(
@@ -885,28 +890,26 @@ impl CronRunner {
                         .unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
-                    let preflight_result = if let Some(plugin_name) = wechat_monitor_plugin(job.wake_mode.as_deref()) {
-                        match run_wechat_monitor_preflight(&job, wasm_plugins.as_deref(), plugin_name).await
-                        {
-                            Ok(tick) => match tick_has_work(&tick) {
-                                Ok(false) => Some(Ok("monitor tick: no changes".to_string())),
-                                Ok(true) => {
+                    let preflight_result = match parse_plugin_preflight(job.wake_mode.as_deref()) {
+                        Ok(Some(preflight)) => {
+                            match run_plugin_preflight(wasm_plugins.as_deref(), &preflight).await {
+                                Ok(outcome) if !outcome.should_run => {
+                                    Some(Ok("plugin preflight: no work".to_string()))
+                                }
+                                Ok(outcome) => {
                                     job.bake_message(format!(
-                                        "{}\n\n确定性 monitor_tick 结果（已完成 UI 锁保护）；只处理此结果中的待办，不要再次调用 monitor_tick：\n{}",
-                                        job.effective_message(),
-                                        tick
-                                    ));
+                                    "{}\n\nPlugin preflight result (already executed; do not call it again):\n{}",
+                                    job.effective_message(),
+                                    outcome.result
+                                ));
                                     None
                                 }
                                 Err(error) => Some(Err(error)),
-                            },
-                            Err(error) => Some(Err(error)),
+                            }
                         }
-                    } else {
-                        None
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
                     };
-                    let monitor_agent_turn = preflight_result.is_none()
-                        && wechat_monitor_plugin(job.wake_mode.as_deref()).is_some();
 
                     // systemEvent: deliver payload text directly — no agent call needed.
                     // execCommand: execute the command directly, bypassing agent and session
@@ -956,22 +959,6 @@ impl CronRunner {
                             }
                         }
                     };
-                    if monitor_agent_turn {
-                        if let Some(plugin_name) = wechat_monitor_plugin(job.wake_mode.as_deref()) {
-                            if let Err(error) = release_wechat_monitor_agent_lock(
-                                wasm_plugins.as_deref(),
-                                plugin_name,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    job_id = %job.id,
-                                    error = %error,
-                                    "cron: monitor agent lock cleanup failed"
-                                );
-                            }
-                        }
-                    }
                     let duration_ms = current_timestamp_ms() - start_time;
                     drop(permit);
 
@@ -1329,119 +1316,103 @@ impl Clone for CronRunner {
 // Internal helpers (runner-only — touch rsclaw_agent / crate::gateway)
 // ---------------------------------------------------------------------------
 
-fn wechat_monitor_plugin(wake_mode: Option<&str>) -> Option<&'static str> {
-    match wake_mode {
-        Some("wechat-ios-monitor") => Some("wechat-ios"),
-        Some("wechat-android-monitor") => Some("wechat-android"),
-        _ => None,
-    }
+#[derive(Debug, PartialEq, Eq)]
+struct PluginPreflight {
+    plugin_name: String,
+    tool_name: String,
 }
 
-async fn run_wechat_monitor_preflight(
-    job: &CronJob,
+#[derive(Debug, PartialEq, Eq)]
+struct PluginPreflightOutcome {
+    result: String,
+    should_run: bool,
+}
+
+fn parse_plugin_preflight(wake_mode: Option<&str>) -> Result<Option<PluginPreflight>> {
+    let Some(wake_mode) = wake_mode else {
+        return Ok(None);
+    };
+    let Some(spec) = wake_mode.strip_prefix(PLUGIN_PREFLIGHT_WAKE_MODE_PREFIX) else {
+        return Ok(None);
+    };
+    let mut parts = spec.split(':');
+    let plugin_name = parts.next().unwrap_or_default();
+    let tool_name = parts.next().unwrap_or_default();
+    if plugin_name.is_empty() || tool_name.is_empty() || parts.next().is_some() {
+        return Err(anyhow!(
+            "invalid plugin preflight wakeMode; expected plugin-preflight:<plugin>:<tool>"
+        ));
+    }
+    Ok(Some(PluginPreflight {
+        plugin_name: plugin_name.to_string(),
+        tool_name: tool_name.to_string(),
+    }))
+}
+
+async fn run_plugin_preflight(
     plugins: Option<&Vec<rsclaw_plugin::WasmPlugin>>,
-    plugin_name: &str,
-) -> Result<String> {
-    let plugins = plugins.context("wechat monitor preflight has no WASM plugin registry")?;
+    preflight: &PluginPreflight,
+) -> Result<PluginPreflightOutcome> {
+    let plugins = plugins.context("plugin preflight has no WASM plugin registry")?;
     let plugin = plugins
         .iter()
-        .find(|plugin| plugin.name == plugin_name)
-        .with_context(|| format!("{plugin_name} monitor preflight plugin is not loaded"))?;
-    let holder = format!("cron-preflight:{}", job.id);
-    // Android's preflight performs a bounded 35-second screenshot pass. A
-    // short lease lets the next minute recover promptly after cancellation;
-    // iOS retains its longer lease for WDA's slower friend-request path.
-    let ttl_secs = if plugin_name == "wechat-android" { 90 } else { 330 };
-    let lock = plugin
-        .call_tool(
-            "acquire_ui_lock",
-            serde_json::json!({ "holder": holder, "ttlSecs": ttl_secs }),
+        .find(|plugin| plugin.name == preflight.plugin_name)
+        .with_context(|| {
+            format!(
+                "plugin preflight target {} is not loaded",
+                preflight.plugin_name
+            )
+        })?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(PLUGIN_PREFLIGHT_TIMEOUT_SECS),
+        plugin.call_tool(&preflight.tool_name, serde_json::json!({})),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "plugin preflight {}.{} timed out after {}s",
+            preflight.plugin_name,
+            preflight.tool_name,
+            PLUGIN_PREFLIGHT_TIMEOUT_SECS
         )
-        .await?;
-    let acquired = lock
-        .get("acquired")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if !acquired {
-        return Ok(serde_json::json!({ "skipped": "ui_lock_busy" }).to_string());
-    }
-
-    // A tunnel can accept TCP and then stop forwarding WDA bytes forever.
-    // Bound the whole component invocation as a second line of defence; the
-    // plugin-level request timeout cannot protect cron if the transport stalls
-    // below reqwest's cancellation point.
-    let timeout_secs = if plugin_name == "wechat-android" { 55 } else { 35 };
-    let tick = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        plugin.call_tool("monitor_tick", serde_json::json!({})),
-    )
-    .await
-    .map_err(|_| anyhow!("{plugin_name} monitor_tick timed out after {timeout_secs}s"))
-    .and_then(|result| result);
-    match tokio::time::timeout(
-        Duration::from_secs(10),
-        plugin.call_tool("release_ui_lock", serde_json::json!({ "holder": holder })),
-    )
-    .await
-    {
-        Ok(Err(error)) => {
-            warn!(job_id = %job.id, error = %error, "cron monitor preflight failed to release UI lock");
-        }
-        Err(_) => {
-            warn!(job_id = %job.id, "cron monitor preflight release_ui_lock timed out");
-        }
-        Ok(Ok(_)) => {}
-    }
-    let tick = tick?;
-    Ok(match tick {
+    })??;
+    let result = match result {
         serde_json::Value::String(text) => text,
         value => value.to_string(),
-    })
+    };
+    let value: serde_json::Value = serde_json::from_str(&result)
+        .with_context(|| format!("plugin preflight returned invalid JSON: {result}"))?;
+    let should_run = value
+        .get("shouldRun")
+        .and_then(serde_json::Value::as_bool)
+        .context("plugin preflight result is missing boolean shouldRun")?;
+    Ok(PluginPreflightOutcome { result, should_run })
 }
 
-/// Release the monitor agent's own UI lease after its cron turn completes.
-///
-/// The preflight uses a distinct holder and releases it before the agent turn.
-/// Models are instructed to release the subsequent `cron` lease, but cleanup
-/// here keeps a missed tool call from suppressing the next one-minute sweep.
-async fn release_wechat_monitor_agent_lock(
-    plugins: Option<&Vec<rsclaw_plugin::WasmPlugin>>,
-    plugin_name: &str,
-) -> Result<()> {
-    let plugins = plugins.context("wechat monitor lock cleanup has no WASM plugin registry")?;
-    let plugin = plugins
-        .iter()
-        .find(|plugin| plugin.name == plugin_name)
-        .with_context(|| format!("{plugin_name} monitor lock cleanup plugin is not loaded"))?;
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        plugin.call_tool("release_ui_lock", serde_json::json!({ "holder": "cron" })),
-    )
-    .await
-    .map_err(|_| anyhow!("{plugin_name} monitor agent lock cleanup timed out"))??;
-    Ok(())
-}
+#[cfg(test)]
+mod plugin_preflight_tests {
+    use super::{PluginPreflight, parse_plugin_preflight};
 
-fn tick_has_work(tick: &str) -> Result<bool> {
-    let value: serde_json::Value = serde_json::from_str(tick)
-        .with_context(|| format!("invalid monitor_tick result: {tick}"))?;
-    if value.get("skipped").is_some() {
-        return Ok(false);
+    #[test]
+    fn parses_plugin_and_tool_from_wake_mode() {
+        let parsed = parse_plugin_preflight(Some("plugin-preflight:sample-plugin:scan"))
+            .expect("valid preflight")
+            .expect("preflight present");
+        assert_eq!(
+            parsed,
+            PluginPreflight {
+                plugin_name: "sample-plugin".to_string(),
+                tool_name: "scan".to_string(),
+            }
+        );
     }
-    let active = value
-        .get("activeChat")
-        .and_then(|active| active.get("needsReply"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let changed = value
-        .get("changedChats")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|chats| !chats.is_empty());
-    let contact_badge = value
-        .get("contactBadge")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    Ok(active || changed || contact_badge)
+
+    #[test]
+    fn rejects_incomplete_plugin_preflight_wake_mode() {
+        let error = parse_plugin_preflight(Some("plugin-preflight:sample-plugin"))
+            .expect_err("missing tool must fail");
+        assert!(error.to_string().contains("expected plugin-preflight"));
+    }
 }
 
 async fn run_cron_job(

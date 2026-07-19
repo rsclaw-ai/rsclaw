@@ -24,11 +24,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use rsclaw_agent::AgentMessage;
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::server::AppState;
-use rsclaw_agent::AgentMessage;
 
 // ---------------------------------------------------------------------------
 // Response
@@ -54,7 +54,10 @@ pub async fn handle_webhook(
     // Clone the Arc out of the lock before .await to avoid holding a
     // !Send RwLockReadGuard across the yield point.
     let custom_ch = {
-        let map = state.custom_webhooks.read().expect("custom_webhooks lock poisoned");
+        let map = state
+            .custom_webhooks
+            .read()
+            .expect("custom_webhooks lock poisoned");
         map.get(path.as_str()).cloned()
     };
     if let Some(ch) = custom_ch {

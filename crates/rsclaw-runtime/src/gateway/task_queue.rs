@@ -13,23 +13,22 @@ use std::{
 use anyhow::Result;
 use futures::StreamExt as _;
 use md5::{Digest, Md5};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tokio::sync::{Notify, mpsc};
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
-
 use rsclaw_agent::{AgentMessage, AgentRegistry, FileAttachment, ImageAttachment};
 use rsclaw_channel::OutboundMessage;
 use rsclaw_store::redb_store::RedbStore;
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 // Records lifted to rsclaw-types (crate-split); re-exported.
-pub use rsclaw_types::{Priority, TaskStatus, QueuedFile, QueuedMessage, QueuedTask, default_max_turns, compute_hash};
-
+pub use rsclaw_types::{
+    Priority, QueuedFile, QueuedMessage, QueuedTask, TaskStatus, compute_hash, default_max_turns,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::{Notify, mpsc};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 /// Outcome of a single agent turn, used by the auto-continue supervisor.
 ///
@@ -56,11 +55,7 @@ pub enum TaskOutcome {
 }
 
 // StructuredOutcome/Completion/Recommend lifted to rsclaw-types (crate-split).
-pub use rsclaw_types::{StructuredOutcome, Completion, Recommend};
-
-
-
-pub use rsclaw_types::SkipEntry;
+pub use rsclaw_types::{Completion, Recommend, SkipEntry, StructuredOutcome};
 
 /// What the worker should do after grading a turn's outcome.
 ///
@@ -158,16 +153,11 @@ pub fn decide_action(outcome: &TaskOutcome, turn: u32, max_turns: u32) -> Dispat
 // `OnceLock<Mutex<HashMap>>` is intentional — no DashMap dependency, and the
 // contention profile (one writer per turn per session) doesn't warrant it.
 
-// pending-outcome staging map lifted to rsclaw-types (crate-split); re-exported.
-pub use rsclaw_types::{stage_pending_outcome, drain_pending_outcome};
-
-
-
-
-
-
+// pending-outcome staging map lifted to rsclaw-types (crate-split);
+// re-exported.
 /// Default max turns for /task mode.
 pub use rsclaw_types::{TASK_DEFAULT_MAX_TURNS, TASK_DEFAULT_TTL_SECS};
+pub use rsclaw_types::{drain_pending_outcome, stage_pending_outcome};
 
 /// Parse `/task` prefix and extract turn/timeout flags.
 ///
@@ -263,7 +253,6 @@ fn parse_duration_str(s: &str) -> Option<u64> {
     }
     if total > 0 { Some(total) } else { None }
 }
-
 
 // ---------------------------------------------------------------------------
 // Queue stats
@@ -1670,9 +1659,17 @@ impl rsclaw_types::BriefingSink for GatewayBriefingSink {
         is_group: bool,
         priority: Priority,
     ) -> anyhow::Result<(String, bool)> {
-        let tq = get_task_queue()
-            .ok_or_else(|| anyhow::anyhow!("task queue not installed"))?;
-        submit_to_queue(&tq, session_key, text, channel, peer_id, chat_id, is_group, priority)
+        let tq = get_task_queue().ok_or_else(|| anyhow::anyhow!("task queue not installed"))?;
+        submit_to_queue(
+            &tq,
+            session_key,
+            text,
+            channel,
+            peer_id,
+            chat_id,
+            is_group,
+            priority,
+        )
     }
 
     fn push_outbound(
@@ -1742,7 +1739,9 @@ impl rsclaw_plugin::PluginBackgroundHost for GatewayPluginBackgroundHost {
                             .clone()
                             .or_else(|| ctx_for_task.as_ref().map(|c| c.session_key.clone()))
                             .unwrap_or_else(|| format!("plugin:{plugin}:{name}:{slot}"));
-                        if let Err(e) = submit_plugin_agent_turn(&session, &prompt, "{}", ctx_for_task.as_ref()) {
+                        if let Err(e) =
+                            submit_plugin_agent_turn(&session, &prompt, "{}", ctx_for_task.as_ref())
+                        {
                             warn!(plugin, name, slot, error = %e, "plugin cron submit failed");
                         }
                     }
@@ -1818,7 +1817,9 @@ impl rsclaw_plugin::PluginBackgroundHost for GatewayPluginBackgroundHost {
         message_json: String,
         ctx: Option<rsclaw_plugin::PluginInvocationContext>,
     ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
-        Box::pin(async move { push_plugin_outbound(&channel, &peer_id, &message_json, ctx.as_ref()) })
+        Box::pin(
+            async move { push_plugin_outbound(&channel, &peer_id, &message_json, ctx.as_ref()) },
+        )
     }
 
     fn submit_agent_turn(
@@ -2093,7 +2094,11 @@ fn json_file_tuple(value: &Value) -> Option<(String, String, String)> {
             .and_then(|s| s.to_str())
             .unwrap_or("plugin-file")
             .to_owned();
-        (path.to_owned(), filename, "application/octet-stream".to_owned())
+        (
+            path.to_owned(),
+            filename,
+            "application/octet-stream".to_owned(),
+        )
     } else {
         let obj = value.as_object()?;
         let path = obj.get("path").and_then(Value::as_str)?.to_owned();
@@ -2180,7 +2185,12 @@ async fn run_plugin_sse(
                                     if line.is_empty() {
                                         if !data_lines.is_empty() {
                                             let data = data_lines.join("\n");
-                                            let text = format_plugin_sse_text(&plugin, &name, &event_name, &data);
+                                            let text = format_plugin_sse_text(
+                                                &plugin,
+                                                &name,
+                                                &event_name,
+                                                &data,
+                                            );
                                             let _ = push_plugin_outbound(
                                                 &ctx.channel,
                                                 &ctx.peer_id,
@@ -2221,7 +2231,11 @@ async fn run_plugin_sse(
 }
 
 fn format_plugin_sse_text(plugin: &str, name: &str, event_name: &str, data: &str) -> String {
-    let label = if event_name.is_empty() { "event" } else { event_name };
+    let label = if event_name.is_empty() {
+        "event"
+    } else {
+        event_name
+    };
     if let Ok(v) = serde_json::from_str::<Value>(data) {
         if let Some(code) = v.get("code").and_then(Value::as_str) {
             let stock_name = v.get("name").and_then(Value::as_str).unwrap_or("");
@@ -2232,9 +2246,9 @@ fn format_plugin_sse_text(plugin: &str, name: &str, event_name: &str, data: &str
     format!("[{plugin}/{name}] {label}: {data}")
 }
 
-/// Root-side `rsclaw_types::TaskQueueHost` impl (crate-split P3 trait inversion).
-/// Lets rsclaw-agent's `task` tool enqueue background tasks via the gateway
-/// queue without depending on the gateway crate. Injected at startup.
+/// Root-side `rsclaw_types::TaskQueueHost` impl (crate-split P3 trait
+/// inversion). Lets rsclaw-agent's `task` tool enqueue background tasks via the
+/// gateway queue without depending on the gateway crate. Injected at startup.
 pub struct GatewayTaskQueueHost;
 
 impl rsclaw_types::TaskQueueHost for GatewayTaskQueueHost {
@@ -2273,7 +2287,8 @@ mod plugin_background_tests {
         let a = ctx("peer-a");
         let b = ctx("peer-b");
         let key_a = plugin_background_key("cron", "market", "market.briefing", None, Some(&a));
-        let key_a_again = plugin_background_key("cron", "market", "market.briefing", None, Some(&a));
+        let key_a_again =
+            plugin_background_key("cron", "market", "market.briefing", None, Some(&a));
         let key_b = plugin_background_key("cron", "market", "market.briefing", None, Some(&b));
 
         assert_eq!(key_a, key_a_again);
@@ -2327,5 +2342,4 @@ mod plugin_background_tests {
         assert_eq!(other_peer["active"].as_bool(), Some(false));
         assert_eq!(other_peer["count"].as_u64(), Some(0));
     }
-
 }

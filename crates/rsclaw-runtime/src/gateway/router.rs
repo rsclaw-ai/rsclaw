@@ -12,13 +12,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tracing::debug;
-
 use rsclaw_agent::registry::AgentRegistry;
 use rsclaw_config::{
-        runtime::RuntimeConfig,
-        schema::{BindingConfig, BindingMatch},
-    };
+    runtime::RuntimeConfig,
+    schema::{BindingConfig, BindingMatch},
+};
+use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Incoming message descriptor
@@ -174,7 +173,6 @@ fn binding_matches(rule: &BindingMatch, msg: &InboundMessage) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rsclaw_config::{
         runtime::{
             AgentsRuntime, ChannelRuntime, ExtRuntime, GatewayRuntime, ModelRuntime, OpsRuntime,
@@ -185,6 +183,8 @@ mod tests {
             SessionConfig,
         },
     };
+
+    use super::*;
 
     fn make_router(agents: Vec<AgentEntry>, bindings: Vec<BindingConfig>) -> Router {
         let cfg = Arc::new(RuntimeConfig {

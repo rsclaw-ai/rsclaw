@@ -1,7 +1,7 @@
 use anyhow::Result;
+use rsclaw_cli::BackupCommand;
 
 use super::style::*;
-use rsclaw_cli::BackupCommand;
 
 pub async fn cmd_backup(sub: BackupCommand) -> Result<()> {
     match sub {

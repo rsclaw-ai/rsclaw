@@ -25,6 +25,7 @@ rsclaw-kb = { path = "../rsclaw-kb", version = "0.1.0" }
 rsclaw-browser = { path = "../rsclaw-browser", version = "0.1.0" }
 rsclaw-memory = { path = "../rsclaw-memory", version = "0.1.0" }
 rsclaw-desktop = { path = "../rsclaw-desktop", version = "0.1.0" }
+rsclaw-computer = { path = "../rsclaw-computer", version = "0.1.0" }
 json5 = "1"
 base64 = "0.22"
 ed25519-dalek = "2"

@@ -1,5 +1,4 @@
 use anyhow::Result;
-
 use rsclaw_cli::dns::DnsCommand;
 
 pub async fn cmd_dns(sub: DnsCommand) -> Result<()> {

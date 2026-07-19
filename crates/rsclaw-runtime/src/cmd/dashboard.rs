@@ -1,5 +1,4 @@
 use anyhow::Result;
-
 use rsclaw_config as config;
 
 pub async fn cmd_dashboard(no_open: bool) -> Result<()> {

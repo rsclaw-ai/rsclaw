@@ -1,5 +1,4 @@
 use anyhow::Result;
-
 use rsclaw_cli::UninstallArgs;
 use rsclaw_config as config;
 

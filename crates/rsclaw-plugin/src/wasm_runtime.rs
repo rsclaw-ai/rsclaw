@@ -187,10 +187,6 @@ struct HostState {
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     /// Default vision model name for host-vlm interface.
     vision_model: Option<String>,
-    /// ADB device serial (`RSCLAW_ANDROID_SERIAL` env var). Passed `-s
-    /// <serial>` to every adb invocation; `None` uses the single attached
-    /// device (adb default).
-    android_serial: Option<String>,
     /// WDA session URL (`RSCLAW_IOS_WDA_URL` env var, default
     /// `http://localhost:8100`). Set when `ios-connect` succeeds.
     wda_url: Option<String>,
@@ -219,7 +215,6 @@ fn new_host_state(
         desktop: rsclaw_desktop::create_session(),
         providers,
         vision_model,
-        android_serial: std::env::var("RSCLAW_ANDROID_SERIAL").ok(),
         wda_url: None,
     }
 }
@@ -1915,857 +1910,6 @@ pub(crate) fn allocate_dl_paths(filename: &str, count: usize) -> Result<Vec<Stri
     Err("allocate_artifact: could not pick a unique name after 10 attempts".to_owned())
 }
 
-// ---------------------------------------------------------------------------
-// ADB helper functions (host-android)
-// ---------------------------------------------------------------------------
-
-/// Run `adb [-s SERIAL] SUBCMD...` and return stdout as UTF-8.
-async fn adb_run_str(serial: Option<&str>, sub: &[&str]) -> Result<String, String> {
-    let mut args: Vec<String> = Vec::with_capacity(sub.len() + 2);
-    if let Some(s) = serial {
-        args.push("-s".into());
-        args.push(s.into());
-    }
-    for &s in sub {
-        args.push(s.into());
-    }
-    let out = tokio::process::Command::new("adb")
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| format!("adb spawn failed: {e} (is adb in PATH?)"))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("adb ({}): {}", out.status, stderr.trim()));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Run `adb [-s SERIAL] SUBCMD...` and return raw stdout bytes (screencap).
-async fn adb_run_bytes(serial: Option<&str>, sub: &[&str]) -> Result<Vec<u8>, String> {
-    let mut args: Vec<String> = Vec::with_capacity(sub.len() + 2);
-    if let Some(s) = serial {
-        args.push("-s".into());
-        args.push(s.into());
-    }
-    for &s in sub {
-        args.push(s.into());
-    }
-    let out = tokio::process::Command::new("adb")
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| format!("adb spawn failed: {e} (is adb in PATH?)"))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("adb ({}): {}", out.status, stderr.trim()));
-    }
-    Ok(out.stdout)
-}
-
-/// Stage one approved local file under Android's app-picker-visible directory.
-async fn adb_stage_file(
-    serial: Option<&str>,
-    source: &std::path::Path,
-    media_kind: &str,
-) -> Result<String, String> {
-    if !matches!(media_kind, "image" | "file" | "audio") {
-        return Err(format!(
-            "android_stage_file: unsupported media kind '{media_kind}' (expected image, file, or audio)"
-        ));
-    }
-    let extension = source
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .filter(|extension| {
-            !extension.is_empty()
-                && extension.len() <= 16
-                && extension
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric())
-        })
-        .map(|extension| format!(".{extension}"))
-        .unwrap_or_default();
-    let digest = Sha256::digest(source.to_string_lossy().as_bytes());
-    let suffix = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let remote_dir = "/sdcard/Download/rsclaw";
-    let remote_path = format!("{remote_dir}/rsclaw_{suffix}{extension}");
-    adb_run_str(serial, &["shell", "mkdir", "-p", remote_dir]).await?;
-
-    let mut command = tokio::process::Command::new("adb");
-    if let Some(serial) = serial {
-        command.arg("-s").arg(serial);
-    }
-    let source = source.to_string_lossy();
-    let output = command
-        .args(["push", source.as_ref(), remote_path.as_str()])
-        .output()
-        .await
-        .map_err(|error| format!("android_stage_file: adb push spawn failed: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "android_stage_file: adb push {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    if matches!(media_kind, "image" | "audio") {
-        let media_uri = format!("file://{remote_path}");
-        adb_run_str(
-            serial,
-            &[
-                "shell",
-                "am",
-                "broadcast",
-                "-a",
-                "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
-                "-d",
-                &media_uri,
-            ],
-        )
-        .await?;
-    }
-    Ok(remote_path)
-}
-
-/// Characters refused in any `input text` payload that ultimately runs
-/// through the device's shell via `adb shell`. The shell sees the whole
-/// trailing argv joined with spaces, so `\n`, `\r`, `\0` would let an
-/// attacker-supplied text smuggle a second command after the first.
-/// Quoting/escaping `input text` arguments correctly across device shells
-/// (sh / mksh / toybox) is far harder than rejecting the small set of
-/// metacharacters that have no legitimate use in user-visible input.
-const ADB_INPUT_REFUSED_CHARS: &[char] = &[
-    ';', '&', '|', '>', '<', '$', '`', '\\', '"', '\'', '\n', '\r', '\0',
-];
-
-/// Per-call counter that names temp UI dumps on the device so concurrent
-/// callers from different plugins don't clobber the same path.
-static ADB_UI_DUMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Dump the UI hierarchy via uiautomator and return the XML string.
-///
-/// Writes to a unique path under `/sdcard/` per call (process pid +
-/// monotonically increasing counter) so two concurrent
-/// `android-get-ui-xml` calls don't race over the same file. Best-effort
-/// removes the temp file after reading so /sdcard doesn't accumulate
-/// dumps over a long session — failure to remove is silent (the next
-/// call uses a fresh path anyway).
-async fn adb_ui_xml(serial: Option<&str>, compressed: bool) -> Result<String, String> {
-    // Prefer the UIAutomator2 server: the built-in `uiautomator dump` blocks
-    // waiting for the UI to go idle and is KILLED on apps with continuous
-    // animation/content (Xianyu, Douyin, …). u2's /source dumps immediately.
-    // Fall back to the legacy dump if u2 can't be brought up (e.g. server APK
-    // not installed on the device).
-    match u2_ui_xml(serial).await {
-        Ok(xml) => return Ok(xml),
-        Err(e) => {
-            tracing::warn!("u2 source unavailable ({e}); falling back to uiautomator dump");
-        }
-    }
-    let seq = ADB_UI_DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dest = format!("/sdcard/rsclaw_ui_dump_{}_{}.xml", std::process::id(), seq);
-    let dump_args: &[&str] = if compressed {
-        &["shell", "uiautomator", "dump", "--compressed", &dest]
-    } else {
-        &["shell", "uiautomator", "dump", &dest]
-    };
-    adb_run_str(serial, dump_args)
-        .await
-        .map_err(|e| format!("uiautomator dump: {e}"))?;
-    let xml = adb_run_str(serial, &["exec-out", "cat", &dest]).await?;
-    let _ = adb_run_str(serial, &["shell", "rm", "-f", &dest]).await;
-    Ok(xml)
-}
-
-// ---------------------------------------------------------------------------
-// UIAutomator2 server backend (host-android UI reads)
-// ---------------------------------------------------------------------------
-
-/// Device-side port the appium-uiautomator2 server listens on.
-const U2_DEVICE_PORT: u16 = 6790;
-
-struct U2Conn {
-    base: String,
-    /// A live u2 WebDriver session id (needed for /element/active + setValue).
-    /// `/source` is served session-less so reads don't require this.
-    session: Option<String>,
-    /// Held so the `am instrument` adb child isn't reaped (it keeps the
-    /// on-device server alive). Never awaited.
-    _instr: Option<tokio::process::Child>,
-}
-
-/// Per-serial u2 connection cache (process-global; HostState is per-call).
-fn u2_conns() -> &'static Mutex<std::collections::HashMap<String, U2Conn>> {
-    static M: OnceLock<Mutex<std::collections::HashMap<String, U2Conn>>> = OnceLock::new();
-    M.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Per-serial setup guards — prevents concurrent u2 setup of the SAME device
-/// while allowing different devices to set up in parallel.
-fn u2_setup_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
-    static M: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-    M.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Clone the cached base URL for a serial, releasing the lock immediately.
-async fn u2_cached_base(key: &str) -> Option<String> {
-    u2_conns().lock().await.get(key).map(|c| c.base.clone())
-}
-
-/// Local forwarded port for a serial — distinct per device so multiple
-/// devices don't collide. Derived deterministically from the serial.
-fn u2_local_port(serial: Option<&str>) -> u16 {
-    match serial {
-        None => 6790,
-        Some(s) => {
-            let mut h: u32 = 2166136261;
-            for b in s.bytes() {
-                h = (h ^ b as u32).wrapping_mul(16777619);
-            }
-            6800 + (h % 600) as u16 // 6800..7400
-        }
-    }
-}
-
-/// Ensure the u2 server is running and forwarded; return its base URL.
-///
-/// The main connection cache lock is only held for brief map reads/writes,
-/// never across ADB commands, HTTP calls, or the readiness poll loop. A
-/// per-serial guard prevents concurrent setup of the same device while
-/// allowing different devices to set up in parallel.
-async fn u2_ensure(serial: Option<&str>) -> Result<String, String> {
-    let key = serial.unwrap_or("").to_string();
-
-    // Fast path: grab the cached base URL, release the lock, then verify
-    // liveness via HTTP without holding it.
-    if let Some(base) = u2_cached_base(&key).await {
-        if u2_status_ok(&base).await {
-            return Ok(base);
-        }
-        u2_conns().lock().await.remove(&key);
-    }
-
-    // Per-serial setup guard: only one task sets up a given device at a
-    // time, but different devices can set up concurrently.
-    let setup_guard = {
-        let mut locks = u2_setup_locks().lock().await;
-        locks
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    };
-    let _setup_guard = setup_guard.lock().await;
-
-    // Re-check cache: another task may have completed setup while we waited.
-    if let Some(base) = u2_cached_base(&key).await {
-        if u2_status_ok(&base).await {
-            return Ok(base);
-        }
-        u2_conns().lock().await.remove(&key);
-    }
-
-    // Require the server APKs (cls/appium install these; we don't bundle them).
-    let pkgs = adb_run_str(serial, &["shell", "pm", "list", "packages"]).await?;
-    if !pkgs.contains("io.appium.uiautomator2.server.test") {
-        return Err(
-            "appium-uiautomator2-server not installed on device (run `cls android uiauto setup` \
-             or appium first)"
-                .into(),
-        );
-    }
-
-    let local = u2_local_port(serial);
-    let base = format!("http://127.0.0.1:{local}");
-    let fwd = format!("tcp:{local}");
-    let dev = format!("tcp:{U2_DEVICE_PORT}");
-    adb_run_str(serial, &["forward", &fwd, &dev])
-        .await
-        .map_err(|e| format!("adb forward: {e}"))?;
-
-    // Already up (started by a previous run / cls / appium)? Reuse it.
-    if u2_status_ok(&base).await {
-        let session = u2_open_session(&base).await;
-        u2_conns().lock().await.insert(
-            key.clone(),
-            U2Conn {
-                base: base.clone(),
-                session,
-                _instr: None,
-            },
-        );
-        return Ok(base);
-    }
-
-    // Spawn the instrumentation server (long-lived; held in the cache).
-    // kill_on_drop ensures the process is terminated when a stale U2Conn is
-    // evicted from the cache, preventing orphaned instrumentation processes.
-    let mut cmd = tokio::process::Command::new("adb");
-    if let Some(s) = serial {
-        cmd.arg("-s").arg(s);
-    }
-    cmd.args([
-        "shell",
-        "am",
-        "instrument",
-        "-w",
-        "-e",
-        "disableAnalytics",
-        "true",
-        "io.appium.uiautomator2.server.test/androidx.test.runner.AndroidJUnitRunner",
-    ]);
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn u2 instrument: {e}"))?;
-
-    // Poll /status up to ~30s.
-    let mut ok = false;
-    for _ in 0..60 {
-        if u2_status_ok(&base).await {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    if !ok {
-        return Err("u2 server did not become ready within 30s".into());
-    }
-    let session = u2_open_session(&base).await;
-    u2_conns().lock().await.insert(
-        key,
-        U2Conn {
-            base: base.clone(),
-            session,
-            _instr: Some(child),
-        },
-    );
-    Ok(base)
-}
-
-/// Reuse an existing u2 session or create one. Returns None on failure
-/// (reads via /source still work; only focused-input needs a session).
-async fn u2_open_session(base: &str) -> Option<String> {
-    let client = host_http_client().ok()?;
-    // Reuse.
-    if let Ok(resp) = client
-        .get(format!("{base}/sessions"))
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-        && let Ok(v) = resp.json::<Value>().await
-        && let Some(id) = v
-            .get("value")
-            .and_then(|a| a.as_array())
-            .and_then(|a| a.first())
-            .and_then(|s| s.get("sessionId").or_else(|| s.get("id")))
-            .and_then(|x| x.as_str())
-        && !id.is_empty()
-    {
-        return Some(id.to_string());
-    }
-    // Create.
-    let caps = json!({"capabilities":{"alwaysMatch":{
-        "platformName":"Android","appium:automationName":"UiAutomator2","appium:noReset":true}}});
-    let resp = client
-        .post(format!("{base}/session"))
-        .json(&caps)
-        .timeout(std::time::Duration::from_secs(20))
-        .send()
-        .await
-        .ok()?;
-    let v: Value = resp.json().await.ok()?;
-    v.pointer("/value/sessionId")
-        .or_else(|| v.get("sessionId"))
-        .and_then(|x| x.as_str())
-        .map(String::from)
-}
-
-/// ADBKeyboard (com.android.adbkeyboard) IME package — injects arbitrary
-/// Unicode into the focused field via broadcast, IME-level, so it works even on
-/// Flutter-rendered inputs that expose NO accessibility element (where u2's
-/// element/setValue has nothing to target). This is the only reliable CJK path
-/// for such pages.
-const ADBKB_IME: &str = "com.android.adbkeyboard/.AdbIME";
-const ADBKB_PKG: &str = "com.android.adbkeyboard";
-
-/// Tracks which serials already have ADBKeyboard selected as the active IME.
-fn adbkb_ready() -> &'static Mutex<std::collections::HashSet<String>> {
-    static M: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    M.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-}
-
-/// Ensure ADBKeyboard is installed and selected as the active IME for `serial`.
-/// Self-healing: verifies the ACTUAL current IME rather than trusting the cache
-/// alone — the device IME can be changed out from under us (manual switch,
-/// another app), which previously left the cache stale and made CJK input
-/// silently no-op.
-async fn adbkb_ensure(serial: Option<&str>) -> Result<(), String> {
-    let key = serial.unwrap_or("").to_string();
-    // Fast path: cached AND the device confirms ADBKeyboard is still active.
-    if adbkb_ready().lock().await.contains(&key)
-        && adb_run_str(
-            serial,
-            &["shell", "settings", "get", "secure", "default_input_method"],
-        )
-        .await
-        .map(|out| out.contains(ADBKB_IME))
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    let pkgs = adb_run_str(serial, &["shell", "pm", "list", "packages"]).await?;
-    if !pkgs.contains(ADBKB_PKG) {
-        return Err(
-            "ADBKeyboard not installed (needed for CJK on Flutter inputs); \
-                    sideload https://github.com/senzhk/ADBKeyBoard ADBKeyboard.apk"
-                .into(),
-        );
-    }
-    if let Err(e) = adb_run_str(serial, &["shell", "ime", "enable", ADBKB_IME]).await {
-        tracing::warn!(serial = ?serial, error = %e, "best-effort ime enable ADBKeyboard");
-    }
-    adb_run_str(serial, &["shell", "ime", "set", ADBKB_IME])
-        .await
-        .map_err(|e| format!("ime set ADBKeyboard: {e}"))?;
-    // Let the IME switch settle.
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    adbkb_ready().lock().await.insert(key);
-    Ok(())
-}
-
-/// Type `text` into the focused field via ADBKeyboard's base64 broadcast.
-async fn adbkb_type(serial: Option<&str>, text: &str) -> Result<(), String> {
-    adbkb_ensure(serial).await?;
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    adb_run_str(
-        serial,
-        &[
-            "shell",
-            "am",
-            "broadcast",
-            "-a",
-            "ADB_INPUT_B64",
-            "--es",
-            "msg",
-            &b64,
-        ],
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| format!("ADBKeyboard broadcast: {e}"))
-}
-
-/// Percent-encode a string for safe use in a URL path segment. u2 session and
-/// element IDs come from the server's JSON responses and are typically
-/// alphanumeric, but encode defensively against any special characters.
-fn u2_url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// Type `text` into the currently FOCUSED element via u2 (Unicode-capable —
-/// the device-side instrumentation handles CJK, unlike `adb shell input text`
-/// which is ASCII-only). Caller is expected to have already focused the field
-/// (e.g. by tapping it). Returns Err if u2 / a session isn't available.
-async fn u2_type_focused(serial: Option<&str>, text: &str) -> Result<(), String> {
-    let base = u2_ensure(serial).await?;
-    let sid = {
-        let map = u2_conns().lock().await;
-        map.get(serial.unwrap_or(""))
-            .and_then(|c| c.session.clone())
-            .ok_or("u2 session unavailable")?
-    };
-    let client = host_http_client()?;
-    // Focused element.
-    let resp = client
-        .get(format!(
-            "{base}/session/{}/element/active",
-            u2_url_encode(&sid)
-        ))
-        .timeout(std::time::Duration::from_secs(8))
-        .send()
-        .await
-        .map_err(|e| format!("u2 active element: {e}"))?;
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("u2 active body: {e}"))?;
-    let aid = v
-        .get("value")
-        .and_then(|x| {
-            x.get("ELEMENT")
-                .or_else(|| x.get("element-6066-11e4-a52e-4f735466cecf"))
-        })
-        .and_then(|x| x.as_str())
-        .ok_or("no focused element (tap the field first)")?
-        .to_string();
-    let body = json!({ "text": text, "value": [text] });
-    let resp = client
-        .post(format!(
-            "{base}/session/{}/element/{}/value",
-            u2_url_encode(&sid),
-            u2_url_encode(&aid),
-        ))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("u2 setValue: {e}"))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("u2 setValue http {}", resp.status()))
-    }
-}
-
-/// Resolve `(base, session_id)` for a serial, bringing the u2 server up if
-/// needed. Every gesture below needs a live session (W3C `/actions` and
-/// `/screenshot` are session-scoped on this server build).
-async fn u2_session(serial: Option<&str>) -> Result<(String, String), String> {
-    let base = u2_ensure(serial).await?;
-    let sid = {
-        let map = u2_conns().lock().await;
-        map.get(serial.unwrap_or(""))
-            .and_then(|c| c.session.clone())
-    };
-    match sid {
-        Some(s) => Ok((base, s)),
-        None => Err("u2 session unavailable".into()),
-    }
-}
-
-/// Tap at `(x, y)` via the u2 server's W3C `/actions` endpoint — no `adb shell
-/// input` process per call, so no screen flash and no adb spawn storm in tight
-/// monitor loops.
-async fn u2_tap(serial: Option<&str>, x: u32, y: u32) -> Result<(), String> {
-    let (base, sid) = u2_session(serial).await?;
-    let client = host_http_client()?;
-    let body = json!({"actions":[{
-    "type":"pointer","id":"finger1","parameters":{"pointerType":"touch"},
-    "actions":[
-        {"type":"pointerMove","duration":0,"x":x,"y":y},
-        {"type":"pointerDown","button":0},
-        {"type":"pause","duration":60},
-        {"type":"pointerUp","button":0}
-    ]}]});
-    let resp = client
-        .post(format!("{base}/session/{}/actions", u2_url_encode(&sid)))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("u2 tap: {e}"))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("u2 tap http {}", resp.status()))
-    }
-}
-
-/// Swipe from `(x1,y1)` to `(x2,y2)` over `duration_ms` via the u2 `/actions`
-/// endpoint (a single held pointer move, like a finger drag).
-async fn u2_swipe(
-    serial: Option<&str>,
-    x1: u32,
-    y1: u32,
-    x2: u32,
-    y2: u32,
-    duration_ms: u32,
-) -> Result<(), String> {
-    let (base, sid) = u2_session(serial).await?;
-    let client = host_http_client()?;
-    let dur = duration_ms.max(1);
-    let body = json!({"actions":[{
-    "type":"pointer","id":"finger1","parameters":{"pointerType":"touch"},
-    "actions":[
-        {"type":"pointerMove","duration":0,"x":x1,"y":y1},
-        {"type":"pointerDown","button":0},
-        {"type":"pointerMove","duration":dur,"x":x2,"y":y2},
-        {"type":"pointerUp","button":0}
-    ]}]});
-    let resp = client
-        .post(format!("{base}/session/{}/actions", u2_url_encode(&sid)))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs((dur / 1000 + 12) as u64))
-        .send()
-        .await
-        .map_err(|e| format!("u2 swipe: {e}"))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("u2 swipe http {}", resp.status()))
-    }
-}
-
-/// Capture a screenshot via the u2 `/screenshot` endpoint. Returns the raw
-/// (un-prefixed) base64 PNG string. Unlike `adb exec-out screencap`, this
-/// reuses the persistent instrumentation connection — no per-frame adb child.
-async fn u2_screenshot_b64(serial: Option<&str>) -> Result<String, String> {
-    let (base, sid) = u2_session(serial).await?;
-    let client = host_http_client()?;
-    let resp = client
-        .get(format!("{base}/session/{}/screenshot", u2_url_encode(&sid)))
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| format!("u2 screenshot: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("u2 screenshot http {}", resp.status()));
-    }
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("u2 screenshot body: {e}"))?;
-    v.get("value")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "u2 screenshot: empty value".to_string())
-}
-
-/// Get window size via the u2 server's W3C `/window/size` endpoint. Returns
-/// `{width, height}` in physical pixels — same shape adb's `wm size` yields.
-async fn u2_screen_size(serial: Option<&str>) -> Result<(u32, u32), String> {
-    let (base, sid) = u2_session(serial).await?;
-    let client = host_http_client()?;
-    let resp = client
-        .get(format!(
-            "{base}/session/{}/window/size",
-            u2_url_encode(&sid)
-        ))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("u2 window size: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("u2 window size http {}", resp.status()));
-    }
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("u2 window size body: {e}"))?;
-    let value = v.get("value").unwrap_or(&v);
-    let width = value.get("width").and_then(Value::as_u64);
-    let height = value.get("height").and_then(Value::as_u64);
-    match (width, height) {
-        (Some(w), Some(h)) => Ok((w as u32, h as u32)),
-        _ => Err("u2 window size: missing width/height in response".to_string()),
-    }
-}
-
-async fn u2_status_ok(base: &str) -> bool {
-    let Ok(client) = host_http_client() else {
-        return false;
-    };
-    match client
-        .get(format!("{base}/status"))
-        .timeout(std::time::Duration::from_secs(4))
-        .send()
-        .await
-    {
-        Ok(r) => r.status().is_success(),
-        Err(_) => false,
-    }
-}
-
-/// Fetch the current UI hierarchy from u2 and normalize it to the legacy
-/// `<node ...>` tag shape the rest of the host (and plugins) parse.
-async fn u2_ui_xml(serial: Option<&str>) -> Result<String, String> {
-    let base = u2_ensure(serial).await?;
-    // The sessionless `GET /source` errors on this server build; the page
-    // source must be fetched under a live session (esp. for Flutter pages
-    // whose semantics tree only materializes within a session).
-    let sid = {
-        let map = u2_conns().lock().await;
-        map.get(serial.unwrap_or(""))
-            .and_then(|c| c.session.clone())
-    };
-    let path = match &sid {
-        Some(s) => format!("{base}/session/{}/source", u2_url_encode(s)),
-        None => format!("{base}/source"),
-    };
-    let client = host_http_client()?;
-    let resp = client
-        .get(&path)
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| format!("u2 /source: {e}"))?;
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("u2 /source body: {e}"))?;
-    // u2 returns {"value":"<xml>"} (or sometimes raw XML).
-    let xml = serde_json::from_str::<Value>(&body)
-        .ok()
-        .and_then(|v| v.get("value").and_then(|x| x.as_str()).map(String::from))
-        .unwrap_or(body);
-    Ok(u2_normalize_xml(&xml))
-}
-
-/// u2 emits one element per class-named tag (`<android.widget.TextView .../>`)
-/// whereas the built-in dump uses `<node class="…" …>`. The host/plugin
-/// parsers key on `<node `, so rewrite every element tag name — both open
-/// and closing — to `node` (attributes on open tags, including the existing
-/// `class="…"`, are preserved).
-fn u2_normalize_xml(xml: &str) -> String {
-    let mut out = String::with_capacity(xml.len() + 64);
-    let mut chars = xml.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if c == '<' {
-            if let Some(&(_, n)) = chars.peek() {
-                if n.is_ascii_alphabetic() {
-                    // Element open tag — consume the tag name, emit `node`.
-                    let mut name = String::new();
-                    while let Some(&(_, ch)) = chars.peek() {
-                        if ch.is_whitespace() || ch == '>' || ch == '/' {
-                            break;
-                        }
-                        name.push(ch);
-                        chars.next();
-                    }
-                    let _ = (i, name);
-                    out.push_str("<node");
-                    continue;
-                } else if n == '/' {
-                    // Possible closing tag — consume '/' and peek further.
-                    chars.next();
-                    if let Some(&(_, m)) = chars.peek()
-                        && m.is_ascii_alphabetic()
-                    {
-                        let mut name = String::new();
-                        while let Some(&(_, ch)) = chars.peek() {
-                            if ch.is_whitespace() || ch == '>' {
-                                break;
-                            }
-                            name.push(ch);
-                            chars.next();
-                        }
-                        let _ = (i, name);
-                        out.push_str("</node");
-                        continue;
-                    }
-                    // Not an element close; emit consumed chars as-is.
-                    out.push_str("</");
-                    continue;
-                }
-            }
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Decode XML character references (e.g. `&#10;` → newline) found in
-/// uiautomator attribute values.
-fn adb_xml_unescape(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&#10;", "\n")
-        .replace("&#xA;", "\n")
-}
-
-/// Extract a single XML attribute value from a `<node ...>` tag string.
-fn adb_xml_attr<'a>(node: &'a str, attr: &str) -> &'a str {
-    let needle = format!(" {}=\"", attr);
-    match node.find(&needle) {
-        None => "",
-        Some(i) => {
-            let s = i + needle.len();
-            match node[s..].find('"') {
-                None => "",
-                Some(e) => &node[s..s + e],
-            }
-        }
-    }
-}
-
-/// Parse `"[x1,y1][x2,y2]"` bounds string and return the center coordinate.
-fn adb_bounds_center(bounds: &str) -> (i32, i32) {
-    let coords: Vec<i32> = bounds
-        .split(|c: char| !c.is_ascii_digit() && c != '-')
-        .filter(|s: &&str| !s.is_empty())
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    if coords.len() >= 4 {
-        ((coords[0] + coords[2]) / 2, (coords[1] + coords[3]) / 2)
-    } else {
-        (0, 0)
-    }
-}
-
-/// Scan UI XML for `<node>` tags and return those matching the selector.
-fn adb_match_elements(xml: &str, sel_type: &str, sel_val: &str) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while let Some(rel) = xml[pos..].find("<node ") {
-        let start = pos + rel;
-        // Opening tag ends at the first `>` (attribute values use &gt; for literal
-        // `>`).
-        let tag_end = xml[start..]
-            .find('>')
-            .map(|r| start + r + 1)
-            .unwrap_or(xml.len());
-        let node = &xml[start..tag_end.min(xml.len())];
-        pos = tag_end.max(start + 1);
-
-        // Decode `text` AND `content-desc` — both come through XML
-        // attribute encoding (text containing `"` arrives as `&quot;`,
-        // newlines as `&#10;`). The earlier code only decoded `content-
-        // desc`, which meant `text="Don't"` showed up in matches and
-        // JSON as `Don&apos;t` and `text-contains` would miss obvious
-        // user-visible strings. Match against the decoded form so
-        // selectors see what a human reading the screen sees.
-        let text = adb_xml_unescape(adb_xml_attr(node, "text"));
-        let rid = adb_xml_attr(node, "resource-id");
-        let cdesc = adb_xml_unescape(adb_xml_attr(node, "content-desc"));
-        let class = adb_xml_attr(node, "class");
-        let bounds = adb_xml_attr(node, "bounds");
-        let clickable = adb_xml_attr(node, "clickable") == "true";
-
-        let matched = match sel_type {
-            "resource-id" => rid == sel_val,
-            "text" => text == sel_val,
-            "text-contains" => !sel_val.is_empty() && text.contains(sel_val),
-            "content-desc" => cdesc == sel_val,
-            "content-desc-contains" => !sel_val.is_empty() && cdesc.contains(sel_val),
-            "class" => class == sel_val,
-            _ => false,
-        };
-        if !matched {
-            continue;
-        }
-
-        let (cx, cy) = adb_bounds_center(bounds);
-        out.push(serde_json::json!({
-            "text": text,
-            "resource-id": rid,
-            "content-desc": cdesc,
-            "bounds": {"centerX": cx, "centerY": cy, "raw": bounds},
-            "clickable": clickable,
-        }));
-    }
-    out
-}
-
 impl HostState {
     fn invocation_context(&self) -> Option<crate::PluginInvocationContext> {
         self.notify_ctx
@@ -3016,34 +2160,26 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             }
         };
 
-        // Android plugins act on absolute screenshot pixels. Resizing changes
-        // the visual geometry the model sees and can make a grounded tap miss.
-        // Keep that geometry intact; only re-encode unusually large payloads
-        // as JPEG to bound wire size. Any parse/decode failure keeps the original.
-        let image_data_uri = {
-            let downscaled = image_data_uri
-                .split_once(";base64,")
-                .and_then(|(header, b64)| {
-                    let mime = header
-                        .strip_prefix("data:")
-                        .unwrap_or("image/png")
-                        .to_string();
-                    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-                    let (new_bytes, new_mime) = rsclaw_util::downscale_image_for_vision(
-                        &bytes,
-                        &mime,
-                        1 * 1024 * 1024,
-                        u32::MAX,
-                        85,
-                    )
+        // UI-TARS-style Action coordinates are authored against the exact image
+        // supplied to the model. Keep its dimensions unchanged so Android
+        // plugins can pass Action coordinates directly to UIAutomator2. Only
+        // unusually large payloads are JPEG-reencoded at the same dimensions.
+        let image_data_uri = image_data_uri
+            .split_once(";base64,")
+            .and_then(|(header, encoded)| {
+                let mime = header.strip_prefix("data:").unwrap_or("image/png");
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
                     .ok()?;
-                    Some(format!(
-                        "data:{new_mime};base64,{}",
-                        base64::engine::general_purpose::STANDARD.encode(&new_bytes)
-                    ))
-                });
-            downscaled.unwrap_or(image_data_uri)
-        };
+                let (bytes, mime) =
+                    rsclaw_util::reencode_image_for_vision(&bytes, mime, 2 * 1024 * 1024, 85)
+                        .ok()?;
+                Some(format!(
+                    "data:{mime};base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                ))
+            })
+            .unwrap_or(image_data_uri);
 
         let messages = vec![rsclaw_provider::Message {
             role: rsclaw_provider::Role::User,
@@ -3074,45 +2210,49 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             recall: None,
         };
 
-        // A one-minute monitor cannot afford a single visual read holding the
-        // device UI for minutes. Thirty seconds leaves room for recovery and
-        // the next cron tick; callers retry on an explicit error.
-        let mut stream = match tokio::time::timeout(Duration::from_secs(30), provider.stream(req)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Ok(Err(format!("vlm_parse provider error: {e}"))),
-            Err(_) => return Ok(Err("vlm_parse provider setup timed out after 30s".to_string())),
-        };
+        // Bound both connection setup and streaming so one visual read cannot
+        // consume more than roughly half of a one-minute monitor interval.
+        // Callers retry on a later tick instead of holding the device UI.
+        let mut stream =
+            match tokio::time::timeout(Duration::from_secs(15), provider.stream(req)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Ok(Err(format!("vlm_parse provider error: {e}"))),
+                Err(_) => {
+                    return Ok(Err(
+                        "vlm_parse provider setup timed out after 15s".to_string()
+                    ));
+                }
+            };
         {
-                let mut text = String::new();
-                let mut reasoning = String::new();
-                use futures::StreamExt;
-                loop {
-                    let event = match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
-                        Ok(event) => event,
-                        Err(_) => return Ok(Err("vlm_parse stream timed out after 30s".to_string())),
-                    };
-                    let Some(event) = event else { break };
-                    match event {
-                        Ok(rsclaw_provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
-                        Ok(rsclaw_provider::StreamEvent::ReasoningDelta(d)) => {
-                            reasoning.push_str(&d)
-                        }
-                        Ok(rsclaw_provider::StreamEvent::Done { .. }) => break,
-                        Ok(rsclaw_provider::StreamEvent::ToolCall { .. }) => {}
-                        Ok(rsclaw_provider::StreamEvent::Error(e)) => {
-                            return Ok(Err(format!("vlm_parse stream error: {e}")));
-                        }
-                        Err(e) => {
-                            return Ok(Err(format!("vlm_parse stream error: {e}")));
-                        }
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            let stream_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            use futures::StreamExt;
+            loop {
+                let event = match tokio::time::timeout_at(stream_deadline, stream.next()).await {
+                    Ok(event) => event,
+                    Err(_) => return Ok(Err("vlm_parse stream timed out after 15s".to_string())),
+                };
+                let Some(event) = event else { break };
+                match event {
+                    Ok(rsclaw_provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
+                    Ok(rsclaw_provider::StreamEvent::ReasoningDelta(d)) => reasoning.push_str(&d),
+                    Ok(rsclaw_provider::StreamEvent::Done { .. }) => break,
+                    Ok(rsclaw_provider::StreamEvent::ToolCall { .. }) => {}
+                    Ok(rsclaw_provider::StreamEvent::Error(e)) => {
+                        return Ok(Err(format!("vlm_parse stream error: {e}")));
+                    }
+                    Err(e) => {
+                        return Ok(Err(format!("vlm_parse stream error: {e}")));
                     }
                 }
-                let result = if text.trim().is_empty() {
-                    reasoning
-                } else {
-                    text
-                };
-                Ok(Ok(result))
+            }
+            let result = if text.trim().is_empty() {
+                reasoning
+            } else {
+                text
+            };
+            Ok(Ok(result))
         }
     }
 }
@@ -3150,654 +2290,111 @@ impl rsclaw::plugin::host_ocr::Host for HostState {
 // ---------------------------------------------------------------------------
 
 impl rsclaw::plugin::host_android::Host for HostState {
-    async fn android_tap(&mut self, x: u32, y: u32) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        // Prefer u2 /actions — no `adb shell input` child per tap, so no screen
-        // flash and no adb spawn storm in tight monitor loops. Fall back to adb
-        // only if the u2 server can't be reached.
-        if u2_tap(serial.as_deref(), x, y).await.is_ok() {
-            return Ok(Ok("tapped".to_string()));
-        }
-        let (xs, ys) = (x.to_string(), y.to_string());
-        Ok(
-            adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys])
-                .await
-                .map(|_| "tapped".to_string()),
-        )
-    }
-
-    async fn android_swipe(
+    async fn android_call(
         &mut self,
-        x1: u32,
-        y1: u32,
-        x2: u32,
-        y2: u32,
-        duration_ms: u32,
+        command: String,
+        args_json: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        if u2_swipe(serial.as_deref(), x1, y1, x2, y2, duration_ms)
-            .await
-            .is_ok()
-        {
-            return Ok(Ok("swiped".to_string()));
-        }
-        let (s1, s2, s3, s4, s5) = (
-            x1.to_string(),
-            y1.to_string(),
-            x2.to_string(),
-            y2.to_string(),
-            duration_ms.to_string(),
-        );
-        Ok(adb_run_str(
-            serial.as_deref(),
-            &["shell", "input", "swipe", &s1, &s2, &s3, &s4, &s5],
-        )
-        .await
-        .map(|_| "swiped".to_string()))
+        Ok(crate::android_uiauto::call(&command, &args_json).await)
     }
 
-    async fn android_type(&mut self, text: String) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        // Types into the currently FOCUSED field (caller taps to focus first).
-        // For non-ASCII (CJK), prefer ADBKeyboard: u2 element/setValue can
-        // "succeed" (HTTP 200) yet only commit a stray char on Flutter-backed
-        // EditTexts (e.g. the Xianyu chat input), so it must NOT run first for CJK.
-        if !text.is_ascii() {
-            match adbkb_type(serial.as_deref(), &text).await {
-                Ok(()) => return Ok(Ok("typed".to_string())),
-                Err(e) => {
-                    if u2_type_focused(serial.as_deref(), &text).await.is_ok() {
-                        return Ok(Ok("typed".to_string()));
-                    }
-                    return Ok(Err(format!("CJK input needs ADBKeyboard/u2: {e}")));
-                }
+    async fn android_uiauto_raw(
+        &mut self,
+        method: String,
+        path: String,
+        json_body: Option<String>,
+    ) -> HostTrapResult<Result<String, String>> {
+        Ok(crate::android_uiauto::raw(&method, &path, json_body.as_deref()).await)
+    }
+
+    async fn android_vlm_drive(
+        &mut self,
+        instruction: String,
+        max_steps: u32,
+    ) -> HostTrapResult<Result<String, String>> {
+        use std::sync::atomic::AtomicBool;
+
+        use rsclaw_computer::{
+            CoordSpace, DriverOutcome, VlmDriver,
+            app_rules::AppRuleSet,
+            parser::CoordFormat,
+            permission::{CheckFut, PermissionDecision, PermissionStore, RecordFut},
+        };
+
+        struct PluginPermission;
+        impl PermissionStore for PluginPermission {
+            fn check<'a>(&'a self, _agent_id: &'a str, _app: &'a str) -> CheckFut<'a> {
+                Box::pin(async { Ok(Some(PermissionDecision::AllowOnce)) })
+            }
+            fn record<'a>(
+                &'a self,
+                _agent_id: &'a str,
+                _app: &'a str,
+                _decision: PermissionDecision,
+            ) -> RecordFut<'a> {
+                Box::pin(async { Ok(()) })
+            }
+            fn revoke<'a>(&'a self, _agent_id: &'a str, _app: &'a str) -> RecordFut<'a> {
+                Box::pin(async { Ok(()) })
+            }
+            fn bypass_all(&self) -> bool {
+                true
             }
         }
-        // ASCII: u2 element/setValue is fast on native EditTexts.
-        if u2_type_focused(serial.as_deref(), &text).await.is_ok() {
-            return Ok(Ok("typed".to_string()));
-        }
-        // ADBKeyboard broadcast — IME-level, works on Flutter inputs too.
-        match adbkb_type(serial.as_deref(), &text).await {
-            Ok(()) => return Ok(Ok("typed".to_string())),
-            Err(e) => {
-                tracing::warn!("ADBKeyboard unavailable ({e}); falling back to adb input text");
-            }
-        }
-        // 3) adb input text — ASCII only, last resort.
-        if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
-            return Ok(Err(format!(
-                "android_type: refusing text with shell metachar '{}' (strip and retry)",
-                bad.escape_debug()
-            )));
-        }
-        let escaped = text.replace(' ', "%s");
-        Ok(
-            adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
-                .await
-                .map(|_| "typed".to_string()),
-        )
-    }
 
-    async fn android_clipboard_set(
-        &mut self,
-        text: String,
-    ) -> HostTrapResult<Result<String, String>> {
-        if text.contains('\0') {
+        let Some(registry) = self.providers.clone() else {
             return Ok(Err(
-                "android_clipboard_set: refusing text containing NUL".to_string()
+                "android-vlm-drive: provider registry unavailable".to_string()
             ));
-        }
-        const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
-        if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
-            return Ok(Err(format!(
-                "android_clipboard_set: text too large ({} bytes, max {})",
-                text.len(),
-                MAX_CLIPBOARD_TEXT_BYTES
-            )));
-        }
-        let serial = self.android_serial.clone();
-        let output = match adb_run_str(
-            serial.as_deref(),
-            &["shell", "cmd", "clipboard", "set", "text", "rsclaw", &text],
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(err) => return Ok(Err(err)),
         };
-        if output.contains("No shell command implementation") {
+        let Some(model_name) = self.vision_model.clone() else {
             return Ok(Err(
-                "android_clipboard_set: device does not implement `cmd clipboard`".to_string(),
+                "android-vlm-drive: vision model unavailable".to_string()
             ));
-        }
-        Ok(Ok("clipboard_set".to_string()))
-    }
-
-    async fn android_stage_file(
-        &mut self,
-        local_path: String,
-        media_kind: String,
-    ) -> HostTrapResult<Result<String, String>> {
-        let source = match canonicalize_browser_upload_path(&self.plugin_name, &local_path) {
-            Ok(path) => path,
-            Err(error) => return Ok(Err(error)),
         };
-        let serial = self.android_serial.clone();
-        Ok(adb_stage_file(serial.as_deref(), &source, &media_kind).await)
-    }
-
-    async fn android_paste(&mut self) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        match adb_run_str(
-            serial.as_deref(),
-            &["shell", "input", "keyevent", "KEYCODE_PASTE"],
-        )
-        .await
-        {
-            Ok(_) => Ok(Ok("pasted".to_string())),
-            Err(first) => Ok(adb_run_str(
-                serial.as_deref(),
-                &["shell", "input", "keyevent", "279"],
-            )
-            .await
-            .map(|_| "pasted".to_string())
-            .map_err(|second| format!("android_paste failed: {first}; fallback failed: {second}"))),
-        }
-    }
-
-    async fn android_press(&mut self, key: String) -> HostTrapResult<Result<String, String>> {
-        // Pseudo-key (not a keyevent): make ADBKeyboard the active IME. Needed to
-        // prime the IME BEFORE a long-press→全选 text-replace on Flutter inputs —
-        // switching IME after a selection drops it, so the plugin primes first,
-        // selects, then types (adbkb_ensure caches, so the later type won't
-        // re-switch and clobber the selection).
-        if matches!(key.to_lowercase().as_str(), "ime-adbkb" | "ime_adbkb") {
-            let serial = self.android_serial.clone();
-            return Ok(adbkb_ensure(serial.as_deref())
-                .await
-                .map(|_| "ime adbkb".to_string()));
-        }
-        let kc = match key.to_lowercase().as_str() {
-            "back" => "KEYCODE_BACK",
-            "home" => "KEYCODE_HOME",
-            "menu" => "KEYCODE_MENU",
-            "enter" | "return" => "KEYCODE_ENTER",
-            "tab" => "KEYCODE_TAB",
-            "delete" | "del" => "KEYCODE_DEL",
-            "forward-del" | "forward_del" => "KEYCODE_FORWARD_DEL",
-            "move-end" | "move_end" => "KEYCODE_MOVE_END",
-            "move-home" | "move_home" => "KEYCODE_MOVE_HOME",
-            "space" => "KEYCODE_SPACE",
-            "escape" | "esc" => "KEYCODE_ESCAPE",
-            "search" => "KEYCODE_SEARCH",
-            "recent" | "recents" | "app-switch" => "KEYCODE_APP_SWITCH",
-            "power" => "KEYCODE_POWER",
-            "volume-up" | "vol-up" => "KEYCODE_VOLUME_UP",
-            "volume-down" | "vol-down" => "KEYCODE_VOLUME_DOWN",
-            "volume-mute" | "vol-mute" => "KEYCODE_VOLUME_MUTE",
-            "media-play" | "play" => "KEYCODE_MEDIA_PLAY",
-            "media-pause" | "pause" => "KEYCODE_MEDIA_PAUSE",
-            "media-play-pause" => "KEYCODE_MEDIA_PLAY_PAUSE",
-            "media-next" | "next" => "KEYCODE_MEDIA_NEXT",
-            "media-previous" | "media-prev" | "prev" => "KEYCODE_MEDIA_PREVIOUS",
-            "page-up" => "KEYCODE_PAGE_UP",
-            "page-down" => "KEYCODE_PAGE_DOWN",
-            other => {
-                return Ok(Err(format!(
-                    "android_press: unknown key '{other}'; supported: \
-                     back/home/menu/enter/tab/delete/space/escape/search/recent/power/\
-                     volume-up/volume-down/volume-mute/media-play/media-pause/\
-                     media-play-pause/media-next/media-previous/page-up/page-down"
-                )));
+        let (provider_name, _) = registry.resolve_model(&model_name);
+        let provider = match registry.get(provider_name) {
+            Ok(provider) => provider,
+            Err(error) => return Ok(Err(format!("android-vlm-drive: {error}"))),
+        };
+        let operator = crate::android_vlm::AndroidUiautoOperator;
+        let rules = AppRuleSet::default();
+        let driver = VlmDriver {
+            operator: &operator,
+            provider,
+            model_name: model_name.clone(),
+            coord_format: CoordFormat::Auto,
+            coord_space: CoordSpace::for_model(&model_name),
+            max_loop: max_steps.clamp(1, 30) as usize,
+            abort: Arc::new(AtomicBool::new(false)),
+            app_rules: &rules,
+            permission: Arc::new(PluginPermission),
+            agent_id: format!("plugin:{}", self.plugin_name),
+            app: "WeChat Android".to_string(),
+            permission_emit: None,
+            headless_auto_allow: true,
+            status_emit: None,
+            run_id: format!("android-vlm-drive-{}", uuid::Uuid::new_v4().simple()),
+        };
+        let outcome = match driver.run(&instruction).await {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(Err(format!("android-vlm-drive: {error:#}"))),
+        };
+        let value = match outcome {
+            DriverOutcome::Finished { content, steps } => {
+                json!({"kind":"finished","content":content,"steps":steps})
+            }
+            DriverOutcome::CallUser { reason, steps } => {
+                json!({"kind":"call_user","reason":reason,"steps":steps})
+            }
+            DriverOutcome::MaxLoop { steps } => json!({"kind":"max_loop","steps":steps}),
+            DriverOutcome::UserAbort { steps } => json!({"kind":"user_abort","steps":steps}),
+            DriverOutcome::PermissionDenied => json!({"kind":"permission_denied"}),
+            DriverOutcome::OperatorError { message, steps } => {
+                json!({"kind":"operator_error","message":message,"steps":steps})
             }
         };
-        let serial = self.android_serial.clone();
-        Ok(
-            adb_run_str(serial.as_deref(), &["shell", "input", "keyevent", kc])
-                .await
-                .map(|_| format!("pressed {key}")),
-        )
-    }
-
-    async fn android_get_ui_xml(
-        &mut self,
-        compressed: bool,
-    ) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        Ok(adb_ui_xml(serial.as_deref(), compressed).await)
-    }
-
-    async fn android_current_activity(&mut self) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        // `dumpsys window windows` is the legacy invocation; on Android
-        // 12+ (API 31+) the `windows` sub-argument was dropped and the
-        // service just ignores it / omits mCurrentFocus, so try the
-        // modern `dumpsys window` form too. Order: old windows arg, then
-        // bare `dumpsys window`, then `dumpsys activity activities`
-        // (mResumedActivity), then `dumpsys activity top` (the `ACTIVITY
-        // <pkg>/<cls>` header line), which has been stable since Android
-        // 4.x and is the most version-portable of the four.
-        for args in [
-            &["shell", "dumpsys", "window", "windows"][..],
-            &["shell", "dumpsys", "window"][..],
-        ] {
-            if let Ok(out) = adb_run_str(serial.as_deref(), args).await
-                && let Some(activity) = parse_current_focus_activity(&out)
-            {
-                return Ok(Ok(activity));
-            }
-        }
-        if let Ok(out) = adb_run_str(
-            serial.as_deref(),
-            &["shell", "dumpsys", "activity", "activities"],
-        )
-        .await
-            && let Some(activity) = parse_resumed_activity(&out)
-        {
-            return Ok(Ok(activity));
-        }
-        match adb_run_str(serial.as_deref(), &["shell", "dumpsys", "activity", "top"]).await {
-            Ok(out) => match parse_activity_top(&out) {
-                Some(activity) => Ok(Ok(activity)),
-                None => Ok(Err("could not determine current activity (mCurrentFocus, \
-                     mResumedActivity, and `dumpsys activity top` all failed \
-                     to match on this device)"
-                    .to_string())),
-            },
-            Err(e) => Ok(Err(format!("dumpsys activity top failed: {e}"))),
-        }
-    }
-
-    async fn android_launch_app(&mut self, pkg: String) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        // Monkey is accepted by most devices, but after an automation-service
-        // reconnect this Samsung can return to Home without foregrounding the
-        // package. Resolve the launcher activity and start it explicitly so
-        // callers can verify the requested app rather than a stale activity.
-        if let Ok(resolved) = adb_run_str(
-            serial.as_deref(),
-            &[
-                "shell",
-                "cmd",
-                "package",
-                "resolve-activity",
-                "--brief",
-                "-a",
-                "android.intent.action.MAIN",
-                "-c",
-                "android.intent.category.LAUNCHER",
-                &pkg,
-            ],
-        )
-        .await
-            && let Some(component) = resolved.lines().rev().find(|line| line.contains('/'))
-        {
-            return Ok(adb_run_str(
-                serial.as_deref(),
-                &["shell", "am", "start", "-n", component.trim()],
-            )
-            .await
-            .map(|_| format!("launched {pkg}")));
-        }
-        Ok(adb_run_str(
-            serial.as_deref(),
-            // Some OEM builds route the explicit launcher-category variant
-            // back to the automation companion instead of the requested app.
-            // The package-scoped Monkey launch is the device-verified path.
-            &["shell", "monkey", "-p", &pkg, "1"],
-        )
-        .await
-        .map(|_| format!("launched {pkg}")))
-    }
-
-    async fn android_stop_app(&mut self, pkg: String) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        Ok(
-            adb_run_str(serial.as_deref(), &["shell", "am", "force-stop", &pkg])
-                .await
-                .map(|_| format!("stopped {pkg}")),
-        )
-    }
-
-    async fn android_screenshot(&mut self) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        // Use `adb exec-out screencap -p` FIRST because u2's /screenshot can
-        // return a stale frame that diverges from the actual display (observed
-        // on WeChat + Bing scenario 2026-07-16). A per-frame ADB child is
-        // slightly slower but always reflects the current physical screen,
-        // which is the only correct basis for plugin-level UI decisions.
-        match adb_run_bytes(serial.as_deref(), &["exec-out", "screencap", "-p"]).await {
-            Ok(png_bytes) if png_bytes.len() >= 24 => {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-                return Ok(Ok(format!("data:image/png;base64,{b64}")));
-            }
-            Ok(_) => { /* truncated — fall through to u2 */ }
-            Err(_) => { /* adb failed — fall through to u2 */ }
-        }
-        // Fallback: u2 /screenshot (reuses persistent instrumentation, but
-        // may lag the real display by one or more frames).
-        if let Ok(b64) = u2_screenshot_b64(serial.as_deref()).await {
-            return Ok(Ok(format!("data:image/png;base64,{b64}")));
-        }
-        Ok(Err(
-            "android_screenshot: both ADB screencap and u2 screenshot failed".to_string(),
-        ))
-    }
-
-    async fn android_screen_size(&mut self) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        // Prefer u2's /window/size (reuses the persistent instrumentation
-        // connection, same rationale as android_screenshot's u2-first path).
-        // Fall back to `adb shell wm size` when u2 isn't up.
-        if let Ok((width, height)) = u2_screen_size(serial.as_deref()).await {
-            return Ok(Ok(
-                serde_json::json!({"width": width, "height": height}).to_string()
-            ));
-        }
-        let out = match adb_run_str(serial.as_deref(), &["shell", "wm", "size"]).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("wm size: {e}"))),
-        };
-        match parse_wm_size(&out) {
-            Some((width, height)) => Ok(Ok(
-                serde_json::json!({"width": width, "height": height}).to_string()
-            )),
-            None => Ok(Err(format!(
-                "android_screen_size: could not parse `wm size` output: {out:?}"
-            ))),
-        }
-    }
-
-    async fn android_find_elements(
-        &mut self,
-        selector_type: String,
-        selector_value: String,
-    ) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        let xml = match adb_ui_xml(serial.as_deref(), false).await {
-            Ok(x) => x,
-            Err(e) => return Ok(Err(e)),
-        };
-        let elements = adb_match_elements(&xml, &selector_type, &selector_value);
-        Ok(Ok(
-            serde_json::to_string(&elements).unwrap_or_else(|_| "[]".to_string())
-        ))
-    }
-
-    async fn android_tap_element(
-        &mut self,
-        selector_type: String,
-        selector_value: String,
-    ) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        let xml = match adb_ui_xml(serial.as_deref(), false).await {
-            Ok(x) => x,
-            Err(e) => return Ok(Err(e)),
-        };
-        let elements = adb_match_elements(&xml, &selector_type, &selector_value);
-        let el = match elements.first() {
-            Some(e) => e.clone(),
-            None => {
-                return Ok(Err(format!(
-                    "element not found: {selector_type}={selector_value}"
-                )));
-            }
-        };
-        let cx = el["bounds"]["centerX"].as_i64().unwrap_or(0) as u32;
-        let cy = el["bounds"]["centerY"].as_i64().unwrap_or(0) as u32;
-        if u2_tap(serial.as_deref(), cx, cy).await.is_ok() {
-            return Ok(Ok("tapped".to_string()));
-        }
-        let (xs, ys) = (cx.to_string(), cy.to_string());
-        Ok(
-            adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys])
-                .await
-                .map(|_| "tapped".to_string()),
-        )
-    }
-
-    async fn android_get_element_text(
-        &mut self,
-        selector_type: String,
-        selector_value: String,
-    ) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        let xml = match adb_ui_xml(serial.as_deref(), false).await {
-            Ok(x) => x,
-            Err(e) => return Ok(Err(e)),
-        };
-        let elements = adb_match_elements(&xml, &selector_type, &selector_value);
-        match elements.first() {
-            Some(el) => Ok(Ok(el["text"].as_str().unwrap_or("").to_string())),
-            None => Ok(Err(format!(
-                "element not found: {selector_type}={selector_value}"
-            ))),
-        }
-    }
-
-    async fn android_set_element_text(
-        &mut self,
-        selector_type: String,
-        selector_value: String,
-        text: String,
-    ) -> HostTrapResult<Result<String, String>> {
-        // NB: no early metachar rejection here — the u2 path (below) sets text
-        // via instrumentation, not the shell, so CJK/punctuation are fine. The
-        // adb fallback re-checks metachars before it runs.
-        let serial = self.android_serial.clone();
-        // Find element and get center coords.
-        let xml = match adb_ui_xml(serial.as_deref(), false).await {
-            Ok(x) => x,
-            Err(e) => return Ok(Err(e)),
-        };
-        let elements = adb_match_elements(&xml, &selector_type, &selector_value);
-        let el = match elements.first() {
-            Some(e) => e.clone(),
-            None => {
-                return Ok(Err(format!(
-                    "element not found: {selector_type}={selector_value}"
-                )));
-            }
-        };
-        let cx = el["bounds"]["centerX"].as_i64().unwrap_or(0) as u32;
-        let cy = el["bounds"]["centerY"].as_i64().unwrap_or(0) as u32;
-        let (xs, ys) = (cx.to_string(), cy.to_string());
-
-        // Single tap → double tap → triple tap to select all existing text.
-        for _ in 0..3u8 {
-            if let Err(e) =
-                adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys]).await
-            {
-                return Ok(Err(format!("tap to focus failed: {e}")));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        // The field is now focused. CJK → ADBKeyboard (works on Flutter too);
-        // else u2 element/setValue; else adb input text (ASCII).
-        if !text.is_ascii() {
-            match adbkb_type(serial.as_deref(), &text).await {
-                Ok(()) => return Ok(Ok("set".to_string())),
-                Err(e) => {
-                    if let Ok(()) = u2_type_focused(serial.as_deref(), &text).await {
-                        return Ok(Ok("set".to_string()));
-                    }
-                    return Ok(Err(format!("CJK input failed: {e}")));
-                }
-            }
-        }
-        if u2_type_focused(serial.as_deref(), &text).await.is_ok() {
-            return Ok(Ok("set".to_string()));
-        }
-        if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
-            return Ok(Err(format!(
-                "android_set_element_text: refusing text with shell metachar '{}'",
-                bad.escape_debug()
-            )));
-        }
-        let escaped = text.replace(' ', "%s");
-        Ok(
-            adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
-                .await
-                .map(|_| "set".to_string()),
-        )
-    }
-
-    async fn android_element_exists(
-        &mut self,
-        selector_type: String,
-        selector_value: String,
-    ) -> HostTrapResult<Result<bool, String>> {
-        let serial = self.android_serial.clone();
-        let xml = match adb_ui_xml(serial.as_deref(), false).await {
-            Ok(x) => x,
-            Err(e) => return Ok(Err(e)),
-        };
-        let elements = adb_match_elements(&xml, &selector_type, &selector_value);
-        Ok(Ok(!elements.is_empty()))
-    }
-
-    async fn android_wait_for_element(
-        &mut self,
-        selector_type: String,
-        selector_value: String,
-        timeout_ms: u32,
-    ) -> HostTrapResult<Result<String, String>> {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
-        let serial = self.android_serial.clone();
-        // Surface ADB failure after a small streak — otherwise a
-        // disconnected device or a wedged uiautomator service silently
-        // burns the entire timeout returning "timeout" instead of the
-        // real error (much harder to diagnose from a plugin caller).
-        const MAX_CONSECUTIVE_ADB_FAILURES: u8 = 3;
-        let mut consecutive_failures: u8 = 0;
-        let mut last_err: Option<String> = None;
-        loop {
-            match adb_ui_xml(serial.as_deref(), false).await {
-                Ok(xml) => {
-                    consecutive_failures = 0;
-                    if !adb_match_elements(&xml, &selector_type, &selector_value).is_empty() {
-                        return Ok(Ok("found".to_string()));
-                    }
-                }
-                Err(e) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    last_err = Some(e);
-                    if consecutive_failures >= MAX_CONSECUTIVE_ADB_FAILURES {
-                        return Ok(Err(format!(
-                            "android_wait_for_element: adb ui dump failed {} times in a row: {}",
-                            consecutive_failures,
-                            last_err.unwrap_or_default()
-                        )));
-                    }
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                let suffix = match last_err {
-                    Some(e) => format!(" (last error: {e})"),
-                    None => String::new(),
-                };
-                return Ok(Err(format!(
-                    "timeout waiting for {selector_type}={selector_value} after {timeout_ms}ms{suffix}"
-                )));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-    }
-
-    async fn android_tap_yellow_button(
-        &mut self,
-        y_min: u32,
-        y_max: u32,
-    ) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        // Raw screencap (RGBA, no PNG decode): 12- or 16-byte header (w,h,format
-        // [,colorspace]) then width*height*4 bytes.
-        let raw = match adb_run_bytes(serial.as_deref(), &["exec-out", "screencap"]).await {
-            Ok(b) => b,
-            Err(e) => return Ok(Err(format!("screencap: {e}"))),
-        };
-        if raw.len() < 16 {
-            return Ok(Err("screencap: data too small".to_string()));
-        }
-        let rd =
-            |i: usize| u32::from_le_bytes([raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]) as usize;
-        let (w, h) = (rd(0), rd(4));
-        if w == 0 || h == 0 || w > 20000 || h > 20000 {
-            return Ok(Err(format!("screencap: bad header {w}x{h}")));
-        }
-        let body = w * h * 4;
-        let hdr = if raw.len() >= 16 + body {
-            16
-        } else if raw.len() >= 12 + body {
-            12
-        } else {
-            return Ok(Err("screencap: truncated body".to_string()));
-        };
-        let data = &raw[hdr..hdr + body];
-        let ymin = y_min as usize;
-        let ymax = if y_max == 0 || (y_max as usize) > h {
-            h
-        } else {
-            y_max as usize
-        };
-        // Centroid of brand-yellow pixels (R~255,G~215,B~0). Sample every 2px.
-        let (mut sx, mut sy, mut n): (u64, u64, u64) = (0, 0, 0);
-        let mut y = ymin;
-        while y < ymax {
-            let row = y * w * 4;
-            let mut x = 0;
-            while x < w {
-                let p = row + x * 4;
-                let (r, g, b) = (data[p] as i32, data[p + 1] as i32, data[p + 2] as i32);
-                if r > 230 && (185..235).contains(&g) && b < 95 {
-                    sx += x as u64;
-                    sy += y as u64;
-                    n += 1;
-                }
-                x += 2;
-            }
-            y += 2;
-        }
-        if n < 80 {
-            return Ok(Err(
-                "android_tap_yellow_button: no yellow button found".to_string()
-            ));
-        }
-        let (cx, cy) = ((sx / n) as u32, (sy / n) as u32);
-        match adb_run_str(
-            serial.as_deref(),
-            &["shell", "input", "tap", &cx.to_string(), &cy.to_string()],
-        )
-        .await
-        {
-            Ok(_) => Ok(Ok(format!("tapped:{cx},{cy}"))),
-            Err(e) => Ok(Err(format!("tap failed: {e}"))),
-        }
-    }
-
-    async fn android_reset_uiautomator(&mut self) -> HostTrapResult<Result<String, String>> {
-        let serial = self.android_serial.clone();
-        let sref = serial.as_deref();
-        // force-stop is best-effort: the packages may already be dead/wedged
-        // in a state where the command itself errors, which is fine — the
-        // point is just to make sure nothing stale is left running before we
-        // relaunch via u2_ensure below.
-        for pkg in [
-            "io.appium.uiautomator2.server",
-            "io.appium.uiautomator2.server.test",
-        ] {
-            let _ = adb_run_str(sref, &["shell", "am", "force-stop", pkg]).await;
-        }
-        // Drop the cached connection so u2_ensure does a full relaunch rather
-        // than reusing (now-dead) state; this also drops the held Child
-        // handle, whose kill_on_drop reaps the old instrumentation process.
-        let key = sref.unwrap_or("").to_string();
-        u2_conns().lock().await.remove(&key);
-        Ok(u2_ensure(sref).await.map(|_| "reset".to_string()))
+        Ok(Ok(value.to_string()))
     }
 }
 
@@ -4298,106 +2895,6 @@ fn clear_wda_session_cache(base: &str) {
     {
         *cached = None;
     }
-}
-
-/// Parse `mCurrentFocus=Window{xxxx [u0 ]<package>/<Activity>}` out of
-/// `dumpsys window windows`. Returns the `<package>/<Activity>` slug
-/// without the surrounding `Window{...}` envelope. Handles both the
-/// multi-user (`u0 `) and single-user (no `u0`) shapes.
-fn parse_current_focus_activity(dumpsys_output: &str) -> Option<String> {
-    for line in dumpsys_output.lines() {
-        if !line.contains("mCurrentFocus") {
-            continue;
-        }
-        let open = line.find('{')?;
-        let close = line[open..].find('}').map(|r| open + r)?;
-        let inside = &line[open + 1..close];
-        // The activity is the last whitespace-separated token; on multi-
-        // user images it's preceded by a `u<N>` marker, on single-user
-        // images it follows the hash directly. Both shapes resolve by
-        // taking the trailing token that contains `/`.
-        let tok = inside
-            .split_whitespace()
-            .rfind(|t| t.contains('/'))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())?;
-        return Some(tok.to_string());
-    }
-    None
-}
-
-/// Parse `mResumedActivity: ActivityRecord{xxxx u0 <package>/<Activity> ...}`
-/// out of `dumpsys activity activities`. Used as a fallback when
-/// `mCurrentFocus` parsing didn't resolve. Some AOSP forks rename the field
-/// to `ResumedActivity` or `topResumedActivity` (no `m` prefix) — matched
-/// too since the `ActivityRecord{...}` envelope is identical.
-fn parse_resumed_activity(dumpsys_output: &str) -> Option<String> {
-    for line in dumpsys_output.lines() {
-        let trimmed = line.trim_start();
-        if !(trimmed.starts_with("mResumedActivity")
-            || trimmed.starts_with("ResumedActivity")
-            || trimmed.starts_with("topResumedActivity"))
-        {
-            continue;
-        }
-        let open = trimmed.find('{')?;
-        let close = trimmed[open..].find('}').map(|r| open + r)?;
-        let inside = &trimmed[open + 1..close];
-        let tok = inside
-            .split_whitespace()
-            .find(|t| t.contains('/'))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())?;
-        return Some(tok.to_string());
-    }
-    None
-}
-
-/// Parse the `ACTIVITY <package>/<Activity> <hash> pid=<pid>` header line
-/// out of `dumpsys activity top`. This subcommand and its header format
-/// have been stable since Android 4.x, making it the most version-portable
-/// of the activity-detection strategies — used as the final fallback.
-fn parse_activity_top(dumpsys_output: &str) -> Option<String> {
-    for line in dumpsys_output.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("ACTIVITY ") {
-            continue;
-        }
-        let rest = trimmed.strip_prefix("ACTIVITY ")?;
-        let tok = rest.split_whitespace().next().filter(|s| s.contains('/'))?;
-        return Some(tok.to_string());
-    }
-    None
-}
-
-/// Parse `Physical size: <W>x<H>` out of `adb shell wm size`. Prefers the
-/// "Override size" line when present (set by `wm size WxH` for testing/
-/// scaling) since that's what the display actually renders at; falls back
-/// to "Physical size" otherwise.
-fn parse_wm_size(output: &str) -> Option<(u32, u32)> {
-    let mut physical = None;
-    for line in output.lines() {
-        let trimmed = line.trim();
-        let is_override = trimmed.starts_with("Override size");
-        let is_physical = trimmed.starts_with("Physical size");
-        if !is_override && !is_physical {
-            continue;
-        }
-        let Some((_, dims)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let Some((w, h)) = dims.trim().split_once('x') else {
-            continue;
-        };
-        let (Ok(w), Ok(h)) = (w.trim().parse(), h.trim().parse()) else {
-            continue;
-        };
-        if is_override {
-            return Some((w, h));
-        }
-        physical = Some((w, h));
-    }
-    physical
 }
 
 // ---------------------------------------------------------------------------
@@ -4952,188 +3449,5 @@ mod android_helper_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn xml_unescape_handles_common_entities() {
-        assert_eq!(adb_xml_unescape("plain"), "plain");
-        assert_eq!(adb_xml_unescape("Don&apos;t"), "Don't");
-        assert_eq!(adb_xml_unescape("a&amp;b"), "a&b");
-        assert_eq!(
-            adb_xml_unescape("quote &quot; lt &lt; gt &gt;"),
-            "quote \" lt < gt >"
-        );
-        assert_eq!(adb_xml_unescape("line1&#10;line2"), "line1\nline2");
-        assert_eq!(adb_xml_unescape("line1&#xA;line2"), "line1\nline2");
-    }
-
-    #[test]
-    fn xml_attr_extracts_quoted_value() {
-        let node =
-            r#"<node text="hello world" resource-id="com.x:id/foo" bounds="[0,0][100,200]">"#;
-        assert_eq!(adb_xml_attr(node, "text"), "hello world");
-        assert_eq!(adb_xml_attr(node, "resource-id"), "com.x:id/foo");
-        assert_eq!(adb_xml_attr(node, "bounds"), "[0,0][100,200]");
-        assert_eq!(adb_xml_attr(node, "missing"), "");
-    }
-
-    #[test]
-    fn bounds_center_handles_typical_shape() {
-        assert_eq!(adb_bounds_center("[0,0][100,200]"), (50, 100));
-        assert_eq!(adb_bounds_center("[10,20][50,60]"), (30, 40));
-    }
-
-    #[test]
-    fn bounds_center_handles_malformed() {
-        // Missing one number → defaults to (0,0) rather than panicking.
-        assert_eq!(adb_bounds_center("[0,0]"), (0, 0));
-        assert_eq!(adb_bounds_center(""), (0, 0));
-        assert_eq!(adb_bounds_center("garbage"), (0, 0));
-    }
-
-    #[test]
-    fn match_elements_decodes_text_attribute() {
-        let xml = concat!(
-            "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>",
-            "<hierarchy rotation=\"0\">",
-            "<node text=\"Don&apos;t panic\" resource-id=\"id1\" content-desc=\"\" ",
-            "class=\"android.widget.TextView\" bounds=\"[0,0][100,40]\" clickable=\"false\"/>",
-            "</hierarchy>"
-        );
-        // text-contains should hit on the decoded apostrophe form, not the
-        // raw &apos; sequence — the bug-fix case for the unescape change.
-        let hits = adb_match_elements(xml, "text-contains", "Don't");
-        assert_eq!(hits.len(), 1, "expected one match, got: {hits:?}");
-        assert_eq!(hits[0]["text"].as_str(), Some("Don't panic"));
-        // And the raw escaped form should NOT match anymore.
-        let no_hits = adb_match_elements(xml, "text-contains", "Don&apos;t");
-        assert!(no_hits.is_empty());
-    }
-
-    #[test]
-    fn match_elements_resource_id_exact() {
-        let xml = concat!(
-            "<hierarchy>",
-            "<node text=\"A\" resource-id=\"com.x:id/btn\" content-desc=\"\" class=\"X\" bounds=\"[0,0][10,10]\" clickable=\"true\"/>",
-            "<node text=\"B\" resource-id=\"com.x:id/btn2\" content-desc=\"\" class=\"X\" bounds=\"[10,10][20,20]\" clickable=\"true\"/>",
-            "</hierarchy>"
-        );
-        let hits = adb_match_elements(xml, "resource-id", "com.x:id/btn");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0]["text"].as_str(), Some("A"));
-    }
-
-    #[test]
-    fn parse_current_focus_handles_multi_user_shape() {
-        let dump = "  mCurrentFocus=Window{abcd u0 com.example.app/com.example.app.MainActivity}";
-        assert_eq!(
-            parse_current_focus_activity(dump).as_deref(),
-            Some("com.example.app/com.example.app.MainActivity")
-        );
-    }
-
-    #[test]
-    fn parse_current_focus_handles_single_user_shape() {
-        // Some images omit `u0 `; pick the trailing `/`-bearing token.
-        let dump = "  mCurrentFocus=Window{abcd com.example.app/com.example.app.MainActivity}";
-        assert_eq!(
-            parse_current_focus_activity(dump).as_deref(),
-            Some("com.example.app/com.example.app.MainActivity")
-        );
-    }
-
-    #[test]
-    fn parse_current_focus_returns_none_when_null() {
-        let dump = "  mCurrentFocus=null";
-        assert_eq!(parse_current_focus_activity(dump), None);
-    }
-
-    #[test]
-    fn parse_resumed_activity_typical_shape() {
-        let dump = concat!(
-            "ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)\n",
-            "  mResumedActivity: ActivityRecord{1234 u0 com.example.foo/.MainActivity t42}\n",
-        );
-        assert_eq!(
-            parse_resumed_activity(dump).as_deref(),
-            Some("com.example.foo/.MainActivity")
-        );
-    }
-
-    #[test]
-    fn parse_resumed_activity_no_m_prefix_shape() {
-        // Some AOSP forks drop the Hungarian-notation `m` prefix.
-        let dump = concat!(
-            "ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)\n",
-            "  ResumedActivity: ActivityRecord{1234 u0 com.example.foo/.MainActivity t42}\n",
-        );
-        assert_eq!(
-            parse_resumed_activity(dump).as_deref(),
-            Some("com.example.foo/.MainActivity")
-        );
-    }
-
-    #[test]
-    fn parse_resumed_activity_top_resumed_shape() {
-        let dump = concat!(
-            "ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)\n",
-            "  topResumedActivity: ActivityRecord{1234 u0 com.example.foo/.MainActivity t42}\n",
-        );
-        assert_eq!(
-            parse_resumed_activity(dump).as_deref(),
-            Some("com.example.foo/.MainActivity")
-        );
-    }
-
-    #[test]
-    fn parse_activity_top_typical_shape() {
-        let dump = concat!(
-            "TASK com.example.foo id=42\n",
-            "  ACTIVITY com.example.foo/.MainActivity 7a1b2c3 pid=1234\n",
-            "    Local Activity 7a1b2c3 State:\n",
-        );
-        assert_eq!(
-            parse_activity_top(dump).as_deref(),
-            Some("com.example.foo/.MainActivity")
-        );
-    }
-
-    #[test]
-    fn parse_activity_top_returns_none_without_slash() {
-        let dump = "ACTIVITY MANAGER RUNNING PROCESSES\n  something else\n";
-        assert_eq!(parse_activity_top(dump), None);
-    }
-
-    #[test]
-    fn parse_wm_size_physical_only() {
-        let out = "Physical size: 1080x2340\n";
-        assert_eq!(parse_wm_size(out), Some((1080, 2340)));
-    }
-
-    #[test]
-    fn parse_wm_size_prefers_override() {
-        let out = "Physical size: 1080x2340\nOverride size: 720x1560\n";
-        assert_eq!(parse_wm_size(out), Some((720, 1560)));
-    }
-
-    #[test]
-    fn parse_wm_size_returns_none_on_garbage() {
-        assert_eq!(parse_wm_size("nonsense\n"), None);
-        assert_eq!(parse_wm_size(""), None);
-    }
-
-    #[test]
-    fn adb_input_refused_includes_newlines() {
-        // Regression guard: the refusal list MUST include \n/\r/\0 so a
-        // malicious text payload can't smuggle a second command past
-        // `adb shell input text`.
-        for c in ['\n', '\r', '\0', ';', '&', '|', '`', '$'] {
-            assert!(
-                ADB_INPUT_REFUSED_CHARS.contains(&c),
-                "expected '{}' (\\u{{{:x}}}) to be refused for adb input text",
-                c.escape_debug(),
-                c as u32
-            );
-        }
     }
 }

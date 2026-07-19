@@ -1,8 +1,8 @@
 use anyhow::Result;
-
-use super::style::{banner, bold, dim, green, red, yellow};
 use rsclaw_cli::DoctorArgs;
 use rsclaw_config as config;
+
+use super::style::{banner, bold, dim, green, red, yellow};
 
 const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") {
     Some(v) => v,

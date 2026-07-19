@@ -1,12 +1,12 @@
 use anyhow::Result;
+use rsclaw_cli::ChannelsCommand;
+use rsclaw_config as config;
 
 use super::{
     config_json::{load_config_json, remove_nested_value, set_nested_value},
     gateway_http,
     style::*,
 };
-use rsclaw_cli::ChannelsCommand;
-use rsclaw_config as config;
 
 pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
     let config = config::load()?;
@@ -222,20 +222,25 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                             "dingtalk not configured -- add channels.dingtalk section to config"
                         )
                     })?;
-                    let accts = dt.accounts.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("channels.dingtalk.accounts not set")
-                    })?;
+                    let accts = dt
+                        .accounts
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.accounts not set"))?;
                     let default_acct = accts.get("default").ok_or_else(|| {
                         anyhow::anyhow!("channels.dingtalk.accounts.default not set")
                     })?;
                     let app_key = default_acct
                         .get("appKey")
                         .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.accounts.default.appKey not set"))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("channels.dingtalk.accounts.default.appKey not set")
+                        })?;
                     let app_secret = default_acct
                         .get("appSecret")
                         .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.accounts.default.appSecret not set"))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("channels.dingtalk.accounts.default.appSecret not set")
+                        })?;
                     let client = reqwest::Client::new();
                     rsclaw_channel::auth::dingtalk_auth::login(&client, app_key, app_secret, None)
                         .await?;
@@ -244,7 +249,9 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                     "action",
                     &format!(
                         "set {} in your config",
-                        cyan("channels.telegram.accounts.default.botToken = \"${TELEGRAM_BOT_TOKEN}\"")
+                        cyan(
+                            "channels.telegram.accounts.default.botToken = \"${TELEGRAM_BOT_TOKEN}\""
+                        )
                     ),
                 ),
                 "discord" => kv(

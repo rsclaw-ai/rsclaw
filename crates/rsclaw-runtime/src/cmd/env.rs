@@ -6,7 +6,6 @@
 //! restarting.
 
 use anyhow::Result;
-
 use rsclaw_cli::{EnvCommand, EnvSyncArgs};
 use rsclaw_config::{env_file, env_resolution, loader};
 

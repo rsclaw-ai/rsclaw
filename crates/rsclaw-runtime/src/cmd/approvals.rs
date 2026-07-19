@@ -1,8 +1,8 @@
 use anyhow::Result;
-
-use super::config_json::{load_config_json, set_nested_value};
 use rsclaw_cli::approvals::{AllowlistCommand, ApprovalsCommand};
 use rsclaw_config as config;
+
+use super::config_json::{load_config_json, set_nested_value};
 
 pub async fn cmd_approvals(sub: ApprovalsCommand) -> Result<()> {
     match sub {

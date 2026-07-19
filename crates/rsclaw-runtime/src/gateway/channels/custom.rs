@@ -1,5 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, DmPolicyEnforcer, OutboundMessage, PolicyResult};
+use rsclaw_config::runtime::RuntimeConfig;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -8,9 +11,6 @@ use super::{
     default_dm_scope,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, DmPolicyEnforcer, OutboundMessage, PolicyResult};
-use rsclaw_config::runtime::RuntimeConfig;
 
 // ---------------------------------------------------------------------------
 // Custom channels (webhook + websocket)
@@ -106,8 +106,7 @@ fn start_custom_webhook(
         .unwrap_or(rsclaw_config::schema::DmPolicy::Pairing);
     let allow_from: Vec<String> = ch_cfg.base.allow_from.clone().unwrap_or_default();
     let enforcer = Arc::new(
-        DmPolicyEnforcer::new(dm_policy, allow_from)
-            .with_persistence(&ch_name, redb_store),
+        DmPolicyEnforcer::new(dm_policy, allow_from).with_persistence(&ch_name, redb_store),
     );
 
     let reg = Arc::clone(&registry);
@@ -136,7 +135,11 @@ fn start_custom_webhook(
             let ch_name = ch_name_cb.clone();
             let enforcer = Arc::clone(&enforcer);
             // Where agent replies go: groups → group chat, DMs → speaker.
-            let reply_target = if is_group { chat_id.clone() } else { sender.clone() };
+            let reply_target = if is_group {
+                chat_id.clone()
+            } else {
+                sender.clone()
+            };
             tokio::spawn(async move {
                 // DM policy check (skip for groups — group_allow_from would
                 // belong here once the schema exposes it for custom channels).
@@ -207,13 +210,9 @@ fn start_custom_webhook(
                             Ok(h) => h,
                             Err(_) => return,
                         };
-                        if let Some(reply_text) = btw_direct_call(
-                            &question,
-                            &handle.live_status,
-                            &handle.providers,
-                            &cfg,
-                        )
-                        .await
+                        if let Some(reply_text) =
+                            btw_direct_call(&question, &handle.live_status, &handle.providers, &cfg)
+                                .await
                         {
                             if let Err(e) = tx
                                 .send(OutboundMessage {
@@ -371,9 +370,7 @@ fn start_custom_webhook(
                 if handle.tx.send(msg).await.is_err() {
                     return;
                 }
-                if let Ok(Ok(r)) =
-                    tokio::time::timeout(Duration::from_secs(120), reply_rx).await
-                {
+                if let Ok(Ok(r)) = tokio::time::timeout(Duration::from_secs(120), reply_rx).await {
                     let pending = r.pending_analysis;
                     if !r.is_empty {
                         if let Err(e) = tx
@@ -476,8 +473,7 @@ fn start_custom_websocket(
         .unwrap_or(rsclaw_config::schema::DmPolicy::Pairing);
     let allow_from: Vec<String> = ch_cfg.base.allow_from.clone().unwrap_or_default();
     let enforcer = Arc::new(
-        DmPolicyEnforcer::new(dm_policy, allow_from)
-            .with_persistence(&ch_name, redb_store),
+        DmPolicyEnforcer::new(dm_policy, allow_from).with_persistence(&ch_name, redb_store),
     );
 
     let reg = Arc::clone(&registry);
@@ -505,7 +501,11 @@ fn start_custom_websocket(
             let tx = out_tx.clone();
             let ch_name = ch_name_cb.clone();
             let enforcer = Arc::clone(&enforcer);
-            let reply_target = if is_group { chat_id.clone() } else { sender.clone() };
+            let reply_target = if is_group {
+                chat_id.clone()
+            } else {
+                sender.clone()
+            };
             tokio::spawn(async move {
                 if !is_group {
                     match enforcer.check(&sender).await {
@@ -574,13 +574,9 @@ fn start_custom_websocket(
                             Ok(h) => h,
                             Err(_) => return,
                         };
-                        if let Some(reply_text) = btw_direct_call(
-                            &question,
-                            &handle.live_status,
-                            &handle.providers,
-                            &cfg,
-                        )
-                        .await
+                        if let Some(reply_text) =
+                            btw_direct_call(&question, &handle.live_status, &handle.providers, &cfg)
+                                .await
                         {
                             if let Err(e) = tx
                                 .send(OutboundMessage {
@@ -738,9 +734,7 @@ fn start_custom_websocket(
                 if handle.tx.send(msg).await.is_err() {
                     return;
                 }
-                if let Ok(Ok(r)) =
-                    tokio::time::timeout(Duration::from_secs(120), reply_rx).await
-                {
+                if let Ok(Ok(r)) = tokio::time::timeout(Duration::from_secs(120), reply_rx).await {
                     let pending = r.pending_analysis;
                     if !r.is_empty {
                         if let Err(e) = tx

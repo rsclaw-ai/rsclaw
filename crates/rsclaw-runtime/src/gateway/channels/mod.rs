@@ -21,6 +21,9 @@ mod zalo;
 use std::sync::Arc;
 
 pub(crate) use custom::start_custom_channels;
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, OutboundMessage, cli::CliChannel, telegram::TelegramChannel};
+use rsclaw_config::{runtime::RuntimeConfig, schema::DmScope};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -37,9 +40,6 @@ use super::{
     startup::handle_pending_analysis,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, OutboundMessage, cli::CliChannel, telegram::TelegramChannel};
-use rsclaw_config::{runtime::RuntimeConfig, schema::DmScope};
 
 pub(crate) fn default_dm_scope(config: &RuntimeConfig) -> DmScope {
     config

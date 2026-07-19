@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, OutboundMessage};
+use rsclaw_config::runtime::RuntimeConfig;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -8,9 +11,6 @@ use super::{
     default_dm_scope,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, OutboundMessage};
-use rsclaw_config::runtime::RuntimeConfig;
 
 pub(crate) fn start_zalo_if_configured(
     config: &RuntimeConfig,
@@ -191,7 +191,10 @@ pub(crate) fn start_zalo_if_configured(
                                 while let Some((text, sender_id, images)) = urx.recv().await {
                                     // No debounce — task queue merge_into_pending
                                     // handles rapid consecutive messages automatically.
-                                    let handle = match w_reg.route_account("zalo", Some(&w_acct)).or_else(|_| w_reg.route_account("zalo", None)) {
+                                    let handle = match w_reg
+                                        .route_account("zalo", Some(&w_acct))
+                                        .or_else(|_| w_reg.route_account("zalo", None))
+                                    {
                                         Ok(h) => h,
                                         Err(e) => {
                                             error!("zalo route: {e:#}");
@@ -201,7 +204,9 @@ pub(crate) fn start_zalo_if_configured(
                                     let dm_scope = default_dm_scope(&w_cfg);
                                     let session_key = derive_session_key(&SessionKeyParams {
                                         agent_id: handle.id.clone(),
-                                        kind: MessageKind::DirectMessage { account_id: Some(w_acct.clone()) },
+                                        kind: MessageKind::DirectMessage {
+                                            account_id: Some(w_acct.clone()),
+                                        },
                                         channel: "zalo".to_string(),
                                         peer_id: sender_id.clone(),
                                         dm_scope,
@@ -242,7 +247,10 @@ pub(crate) fn start_zalo_if_configured(
                         let sender_id = sender_id.clone();
                         let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route_account("zalo", Some(&w_acct_btw)).or_else(|_| reg.route_account("zalo", None)) {
+                            let handle = match reg
+                                .route_account("zalo", Some(&w_acct_btw))
+                                .or_else(|_| reg.route_account("zalo", None))
+                            {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -282,14 +290,19 @@ pub(crate) fn start_zalo_if_configured(
                         let sender_id = sender_id.clone();
                         let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route_account("zalo", Some(&w_acct_pp)).or_else(|_| reg.route_account("zalo", None)) {
+                            let handle = match reg
+                                .route_account("zalo", Some(&w_acct_pp))
+                                .or_else(|_| reg.route_account("zalo", None))
+                            {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
                             let dm_scope = default_dm_scope(&cfg);
                             let session_key = derive_session_key(&SessionKeyParams {
                                 agent_id: handle.id.clone(),
-                                kind: MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) },
+                                kind: MessageKind::DirectMessage {
+                                    account_id: Some(w_acct_pp.clone()),
+                                },
                                 channel: "zalo".to_string(),
                                 peer_id: sender_id.clone(),
                                 dm_scope,
