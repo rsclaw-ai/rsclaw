@@ -15,6 +15,7 @@
 //!   - `load_all_plugins()` — unified loader that dispatches by runtime
 
 mod android_uiauto;
+mod android_vlm;
 pub mod host_methods;
 pub mod js_runtime;
 pub mod manifest;

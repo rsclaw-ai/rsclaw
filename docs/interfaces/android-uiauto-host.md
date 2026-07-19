@@ -78,6 +78,14 @@ Examples:
 {"command":"launch","args":{"package":"com.tencent.mm"}}
 ```
 
+The screenshot response also carries an additive `contactBadge` object derived
+from the same decoded PNG. It reports the Contacts-tab red-badge pixel probe
+(`badge`, boolean `count`, red/cluster diagnostics, and Contacts/WeChat
+active-tab pixel evidence), so
+a plugin can submit that one image to OCR without taking a second screenshot
+merely to inspect friend-request state. Consumers must treat it as presence
+evidence, not OCR of the badge numeral.
+
 ### `android-uiauto-raw`
 
 Allowed methods are `GET` and `POST`. Raw paths are capability-allowlisted for

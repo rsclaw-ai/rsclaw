@@ -24,13 +24,20 @@ const MAX_STRING_ARG_BYTES: usize = 4096;
 const MAX_SELECTOR_BYTES: usize = 64 * 1024;
 const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
 const CONTACT_BADGE_COMMAND: &str = "contact-badge";
+const KEYBOARD_VISIBLE_COMMAND: &str = "keyboard-visible";
+const SEND_BUTTON_COMMAND: &str = "send-button";
 const INPUT_TEXT_COMMAND: &str = "input-text";
 const PASTE_KEYCODE: u16 = 279;
-const CLIPBOARD_LABEL: &str = "rsclaw-input";
+const CLIPBOARD_LABEL: &str = "rsclaw";
 const WAKEUP_KEYCODE: u16 = 224;
-const WAKEUP_SCREEN_DELAY: Duration = Duration::from_millis(500);
+const WAKEUP_SCREEN_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_millis(750),
+    Duration::from_millis(1000),
+];
 const BLACK_PIXEL_THRESHOLD: u8 = 8;
 const MAX_VISIBLE_NEAR_BLACK_FRAME_PERCENT: u64 = 5;
+const BLACK_FRAME_SAMPLE_AXIS: u32 = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
@@ -146,6 +153,14 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         validate_no_args(command, args_json)?;
         return detect_contact_badge(&config).await;
     }
+    if command == KEYBOARD_VISIBLE_COMMAND {
+        validate_no_args(command, args_json)?;
+        return detect_keyboard_visible(&config).await;
+    }
+    if command == SEND_BUTTON_COMMAND {
+        validate_no_args(command, args_json)?;
+        return detect_send_button(&config).await;
+    }
     if command == INPUT_TEXT_COMMAND {
         return input_text(args_json).await;
     }
@@ -246,9 +261,14 @@ async fn detect_contact_badge(config: &Config) -> Result<String, String> {
     let probe = contact_badge_probe(image.width(), image.height(), |x, y| {
         image.get_pixel(x, y).0
     });
+    let active = contact_tab_active_probe(image.width(), image.height(), |x, y| {
+        image.get_pixel(x, y).0
+    });
     serde_json::to_string(&serde_json::json!({
         "badge": probe.badge,
         "count": u8::from(probe.badge),
+        "contactActive": active.active,
+        "contactGreenPixels": active.green_pixels,
         "source": "pixel",
         "redPixels": probe.red_pixels,
         "largestClusterPixels": probe.largest_cluster_pixels,
@@ -256,11 +276,351 @@ async fn detect_contact_badge(config: &Config) -> Result<String, String> {
     .map_err(|error| format!("android uiauto: encode badge result: {error}"))
 }
 
+async fn detect_send_button(config: &Config) -> Result<String, String> {
+    let response = screenshot_with_wakeup(config).await?;
+    let png = screenshot_png(&response)?;
+    let image = rsclaw_platform::capture::png_to_rgba(&png)
+        .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
+    let probe = send_button_probe(image.width(), image.height(), |x, y| {
+        image.get_pixel(x, y).0
+    });
+    serde_json::to_string(&serde_json::json!({
+        "found": probe.found,
+        "x": probe.x,
+        "y": probe.y,
+        "left": probe.left,
+        "top": probe.top,
+        "right": probe.right,
+        "bottom": probe.bottom,
+        "greenPixels": probe.green_pixels,
+        "source": "pixel",
+    }))
+    .map_err(|error| format!("android uiauto: encode send-button result: {error}"))
+}
+
+async fn detect_keyboard_visible(config: &Config) -> Result<String, String> {
+    let response = screenshot_with_wakeup(config).await?;
+    let png = screenshot_png(&response)?;
+    let image = rsclaw_platform::capture::png_to_rgba(&png)
+        .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
+    let probe = keyboard_visible_probe(image.width(), image.height(), |x, y| {
+        image.get_pixel(x, y).0
+    });
+    serde_json::to_string(&serde_json::json!({
+        "visible": probe.visible,
+        "rowGroups": probe.row_groups,
+        "qualifyingRows": probe.qualifying_rows,
+        "maxKeyRuns": probe.max_key_runs,
+        "source": "pixel-grid",
+    }))
+    .map_err(|error| format!("android uiauto: encode keyboard result: {error}"))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct KeyboardVisibleProbe {
+    visible: bool,
+    row_groups: u32,
+    qualifying_rows: u32,
+    max_key_runs: u32,
+}
+
+fn keyboard_visible_probe(
+    width: u32,
+    height: u32,
+    mut pixel_at: impl FnMut(u32, u32) -> [u8; 4],
+) -> KeyboardVisibleProbe {
+    if width < 100 || height < 200 {
+        return KeyboardVisibleProbe::default();
+    }
+    let top = height.saturating_mul(65) / 100;
+    let bottom = height.saturating_mul(94) / 100;
+    let edge_right = (width.saturating_mul(2) / 100).max(2);
+    let mut bins = vec![0_u32; 32 * 32 * 32];
+    for y in top..bottom {
+        for x in 0..edge_right {
+            let [red, green, blue, alpha] = pixel_at(x, y);
+            if alpha < 200 {
+                continue;
+            }
+            let index = usize::from(red / 8) * 32 * 32
+                + usize::from(green / 8) * 32
+                + usize::from(blue / 8);
+            bins[index] += 1;
+        }
+    }
+    let background_index = bins
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, count)| *count)
+        .map(|(index, _)| index)
+        .unwrap_or_default();
+    let background = [
+        ((background_index / (32 * 32)) as u8) * 8 + 4,
+        (((background_index / 32) % 32) as u8) * 8 + 4,
+        ((background_index % 32) as u8) * 8 + 4,
+    ];
+    let min_run = width.saturating_mul(5) / 100;
+    let max_run = width.saturating_mul(16) / 100;
+    let step = (height / 400).max(4);
+    let group_gap = (height / 200).max(step + 1);
+    let min_rows_per_group = 5_u32;
+    let mut qualifying_rows = 0_u32;
+    let mut row_groups = 0_u32;
+    let mut current_group_rows = 0_u32;
+    let mut previous_qualifying_y = None;
+    let mut max_key_runs = 0_u32;
+    let mut y = top;
+    while y < bottom {
+        let mut key_runs = 0_u32;
+        let mut run_start = None;
+        for x in 0..=width {
+            let differs = if x == width {
+                false
+            } else {
+                let [red, green, blue, alpha] = pixel_at(x, y);
+                alpha >= 200
+                    && red
+                        .abs_diff(background[0])
+                        .max(green.abs_diff(background[1]))
+                        .max(blue.abs_diff(background[2]))
+                        > 14
+            };
+            match (run_start, differs) {
+                (None, true) => run_start = Some(x),
+                (Some(start), false) => {
+                    let run_width = x.saturating_sub(start);
+                    if run_width >= min_run && run_width <= max_run {
+                        key_runs += 1;
+                    }
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        max_key_runs = max_key_runs.max(key_runs);
+        if key_runs >= 7 {
+            qualifying_rows += 1;
+            if previous_qualifying_y.is_some_and(|previous| y.saturating_sub(previous) <= group_gap)
+            {
+                current_group_rows += 1;
+            } else {
+                if current_group_rows >= min_rows_per_group {
+                    row_groups += 1;
+                }
+                current_group_rows = 1;
+            }
+            previous_qualifying_y = Some(y);
+        }
+        y = y.saturating_add(step);
+    }
+    if current_group_rows >= min_rows_per_group {
+        row_groups += 1;
+    }
+    KeyboardVisibleProbe {
+        visible: row_groups >= 3,
+        row_groups,
+        qualifying_rows,
+        max_key_runs,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SendButtonProbe {
+    found: bool,
+    x: u32,
+    y: u32,
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+    green_pixels: u32,
+}
+
+fn send_button_probe(
+    width: u32,
+    height: u32,
+    mut pixel_at: impl FnMut(u32, u32) -> [u8; 4],
+) -> SendButtonProbe {
+    if width == 0 || height == 0 {
+        return SendButtonProbe::default();
+    }
+    let left = width.saturating_mul(65) / 100;
+    let right = width.saturating_mul(99) / 100;
+    let top = height.saturating_mul(30) / 100;
+    let bottom = height.saturating_mul(92) / 100;
+    let roi_width = right.saturating_sub(left).max(1);
+    let roi_height = bottom.saturating_sub(top).max(1);
+    let mask_len = usize::try_from(roi_width)
+        .ok()
+        .and_then(|value| {
+            usize::try_from(roi_height)
+                .ok()
+                .and_then(|height| value.checked_mul(height))
+        })
+        .unwrap_or(0);
+    if mask_len == 0 {
+        return SendButtonProbe::default();
+    }
+    let mut mask = vec![false; mask_len];
+    for y in top..bottom {
+        for x in left..right {
+            let [red, green, blue, alpha] = pixel_at(x, y);
+            let is_wechat_green = alpha >= 200
+                && green >= 120
+                && red <= 160
+                && blue <= 180
+                && green.saturating_sub(red) >= 35
+                && green.saturating_sub(blue) >= 15;
+            if is_wechat_green {
+                mask[((y - top) * roi_width + (x - left)) as usize] = true;
+            }
+        }
+    }
+
+    let mut visited = vec![false; mask_len];
+    let mut best = SendButtonProbe::default();
+    for index in 0..mask_len {
+        if !mask[index] || visited[index] {
+            continue;
+        }
+        visited[index] = true;
+        let mut queue = VecDeque::from([index]);
+        let mut pixels = 0_u32;
+        let mut min_x = roi_width;
+        let mut min_y = roi_height;
+        let mut max_x = 0_u32;
+        let mut max_y = 0_u32;
+        while let Some(current) = queue.pop_front() {
+            pixels += 1;
+            let x = (current % roi_width as usize) as u32;
+            let y = (current / roi_width as usize) as u32;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            for (next_x, next_y) in [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ] {
+                if next_x >= roi_width || next_y >= roi_height {
+                    continue;
+                }
+                let next = (next_y * roi_width + next_x) as usize;
+                if mask[next] && !visited[next] {
+                    visited[next] = true;
+                    queue.push_back(next);
+                }
+            }
+        }
+        let component_width = max_x.saturating_sub(min_x) + 1;
+        let component_height = max_y.saturating_sub(min_y) + 1;
+        let area = u64::from(component_width) * u64::from(component_height);
+        let compact_control = component_width >= width.saturating_mul(6) / 100
+            && component_width <= width.saturating_mul(32) / 100
+            && component_height >= height.saturating_mul(2) / 100
+            && component_height <= height.saturating_mul(15) / 100
+            && u64::from(pixels) * 100 >= area.saturating_mul(30);
+        if !compact_control {
+            continue;
+        }
+        let absolute_left = left + min_x;
+        let absolute_top = top + min_y;
+        let absolute_right = left + max_x + 1;
+        let absolute_bottom = top + max_y + 1;
+        if !best.found
+            || absolute_bottom > best.bottom
+            || (absolute_bottom == best.bottom && pixels > best.green_pixels)
+        {
+            best = SendButtonProbe {
+                found: true,
+                x: (absolute_left + absolute_right) / 2,
+                y: (absolute_top + absolute_bottom) / 2,
+                left: absolute_left,
+                top: absolute_top,
+                right: absolute_right,
+                bottom: absolute_bottom,
+                green_pixels: pixels,
+            };
+        }
+    }
+    best
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContactTabActiveProbe {
+    active: bool,
+    green_pixels: u32,
+}
+
+fn contact_tab_active_probe(
+    width: u32,
+    height: u32,
+    pixel_at: impl FnMut(u32, u32) -> [u8; 4],
+) -> ContactTabActiveProbe {
+    bottom_tab_active_probe(width, height, 25, 50, pixel_at)
+}
+
+fn wechat_tab_active_probe(
+    width: u32,
+    height: u32,
+    pixel_at: impl FnMut(u32, u32) -> [u8; 4],
+) -> ContactTabActiveProbe {
+    bottom_tab_active_probe(width, height, 0, 25, pixel_at)
+}
+
+fn bottom_tab_active_probe(
+    width: u32,
+    height: u32,
+    left_percent: u32,
+    right_percent: u32,
+    mut pixel_at: impl FnMut(u32, u32) -> [u8; 4],
+) -> ContactTabActiveProbe {
+    if width == 0 || height == 0 {
+        return ContactTabActiveProbe {
+            active: false,
+            green_pixels: 0,
+        };
+    }
+
+    // WeChat's Contacts tab is the second of four equal bottom-navigation
+    // columns. Its active icon and label use a saturated green while inactive
+    // tabs are gray/white. Ratios keep this independent of resolution and DPI.
+    let left = width.saturating_mul(left_percent) / 100;
+    let right = width.saturating_mul(right_percent) / 100;
+    // Restrict the probe to the fixed navigation bar. A tall outgoing green
+    // chat bubble can extend below 82% of the frame and must not look like an
+    // active WeChat tab.
+    let top = height.saturating_mul(88) / 100;
+    let bottom = height.saturating_mul(97) / 100;
+    let mut green_pixels = 0_u32;
+    for y in top..bottom {
+        for x in left..right {
+            let [red, green, blue, alpha] = pixel_at(x, y);
+            if alpha >= 200
+                && green >= 125
+                && red <= 110
+                && blue <= 175
+                && green.saturating_sub(red) >= 55
+                && green.saturating_sub(blue) >= 20
+            {
+                green_pixels += 1;
+            }
+        }
+    }
+    let min_green_pixels = (u64::from(width) * u64::from(height) / 10_000).max(80) as u32;
+    ContactTabActiveProbe {
+        active: green_pixels >= min_green_pixels,
+        green_pixels,
+    }
+}
+
 async fn screenshot_with_wakeup(config: &Config) -> Result<String, String> {
     let args = uiauto_base_args(config, "screenshot");
     let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
     if !screenshot_is_black(&response)? {
-        return Ok(response);
+        return annotate_screenshot(response);
     }
 
     tracing::info!(
@@ -271,17 +631,61 @@ async fn screenshot_with_wakeup(config: &Config) -> Result<String, String> {
     wake_args.push("--keycode".to_string());
     wake_args.push(WAKEUP_KEYCODE.to_string());
     run_cls(&config.cls_bin, &wake_args, deadline_for("key")).await?;
-    tokio::time::sleep(WAKEUP_SCREEN_DELAY).await;
 
-    let retry = uiauto_base_args(config, "screenshot");
-    let response = run_cls(&config.cls_bin, &retry, deadline_for("screenshot")).await?;
-    if screenshot_is_black(&response)? {
-        return Err(
-            "android uiauto: screenshot remains black after UIAutomator2 wakeup; device may be locked or its display unavailable"
-                .to_string(),
+    for (index, delay) in WAKEUP_SCREEN_RETRY_DELAYS.iter().enumerate() {
+        tokio::time::sleep(*delay).await;
+        let retry = uiauto_base_args(config, "screenshot");
+        let response = run_cls(&config.cls_bin, &retry, deadline_for("screenshot")).await?;
+        if !screenshot_is_black(&response)? {
+            return annotate_screenshot(response);
+        }
+        tracing::debug!(
+            node = %config.node,
+            attempt = index + 1,
+            "Android screenshot remains black after wakeup"
         );
     }
-    Ok(response)
+
+    Err(
+        "android uiauto: screenshot remains black after UIAutomator2 wakeup retries; device may be locked or its display unavailable"
+            .to_string(),
+    )
+}
+
+fn annotate_screenshot(response: String) -> Result<String, String> {
+    let png = screenshot_png(&response)?;
+    let image = rsclaw_platform::capture::png_to_rgba(&png)
+        .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
+    let probe = contact_badge_probe(image.width(), image.height(), |x, y| {
+        image.get_pixel(x, y).0
+    });
+    let active = contact_tab_active_probe(image.width(), image.height(), |x, y| {
+        image.get_pixel(x, y).0
+    });
+    let wechat_active = wechat_tab_active_probe(image.width(), image.height(), |x, y| {
+        image.get_pixel(x, y).0
+    });
+    let mut value: Value = serde_json::from_str(&response)
+        .map_err(|error| format!("android uiauto: invalid screenshot response: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "android uiauto: screenshot response must be an object".to_string())?;
+    object.insert(
+        "contactBadge".to_string(),
+        serde_json::json!({
+            "badge": probe.badge,
+            "count": u8::from(probe.badge),
+            "contactActive": active.active,
+            "contactGreenPixels": active.green_pixels,
+            "wechatActive": wechat_active.active,
+            "wechatGreenPixels": wechat_active.green_pixels,
+            "source": "pixel",
+            "redPixels": probe.red_pixels,
+            "largestClusterPixels": probe.largest_cluster_pixels,
+        }),
+    );
+    serde_json::to_string(&value)
+        .map_err(|error| format!("android uiauto: encode screenshot result: {error}"))
 }
 
 fn screenshot_png(response: &str) -> Result<Vec<u8>, String> {
@@ -311,13 +715,20 @@ fn is_black_frame(width: u32, height: u32, mut pixel_at: impl FnMut(u32, u32) ->
     if total_pixels == 0 {
         return false;
     }
+    let x_step = (width / BLACK_FRAME_SAMPLE_AXIS).max(1);
+    let y_step = (height / BLACK_FRAME_SAMPLE_AXIS).max(1);
+    let sampled_width = width.div_ceil(x_step);
+    let sampled_height = height.div_ceil(y_step);
+    let sampled_pixels = u64::from(sampled_width) * u64::from(sampled_height);
     // Android's always-on display renders a clock and status icons over an
     // otherwise black frame. Treat it as asleep so a screenshot request can
-    // wake the device instead of feeding an unusable image to a plugin.
-    let visible_limit = (total_pixels * MAX_VISIBLE_NEAR_BLACK_FRAME_PERCENT / 100).max(1);
+    // wake the device instead of feeding an unusable image to a plugin. A
+    // regular grid is enough for this coarse classification and caps a normal
+    // phone screenshot at roughly 16k samples instead of scanning every pixel.
+    let visible_limit = (sampled_pixels * MAX_VISIBLE_NEAR_BLACK_FRAME_PERCENT / 100).max(1);
     let mut visible_pixels = 0_u64;
-    for y in 0..height {
-        for x in 0..width {
+    for y in (0..height).step_by(y_step as usize) {
+        for x in (0..width).step_by(x_step as usize) {
             let [red, green, blue, alpha] = pixel_at(x, y);
             if alpha > 0
                 && (red > BLACK_PIXEL_THRESHOLD
@@ -1347,6 +1758,90 @@ mod tests {
     }
 
     #[test]
+    fn send_button_probe_prefers_lowest_compact_green_control() {
+        let probe = send_button_probe(1_000, 2_000, |x, y| {
+            let outgoing_bubble = (680..900).contains(&x) && (600..800).contains(&y);
+            let send_button = (820..960).contains(&x) && (1_300..1_380).contains(&y);
+            if outgoing_bubble || send_button {
+                [20, 190, 95, 255]
+            } else {
+                [25, 25, 25, 255]
+            }
+        });
+        assert!(probe.found);
+        assert_eq!((probe.left, probe.top), (820, 1_300));
+        assert_eq!((probe.right, probe.bottom), (960, 1_380));
+        assert_eq!((probe.x, probe.y), (890, 1_340));
+    }
+
+    #[test]
+    fn keyboard_probe_requires_three_repeated_key_rows() {
+        let keyboard = keyboard_visible_probe(1_000, 2_000, |x, y| {
+            let key =
+                [(1_400, 1_480), (1_520, 1_600), (1_640, 1_720)]
+                    .iter()
+                    .any(|(top, bottom)| {
+                        (*top..*bottom).contains(&y)
+                            && (0..9).any(|column| {
+                                let left = 50 + column * 100;
+                                (left..left + 80).contains(&x)
+                            })
+                    });
+            if key {
+                [55, 55, 60, 255]
+            } else {
+                [25, 25, 30, 255]
+            }
+        });
+        assert!(keyboard.visible);
+        assert_eq!(keyboard.row_groups, 3);
+        assert!(keyboard.max_key_runs >= 9);
+
+        let composer_only = keyboard_visible_probe(1_000, 2_000, |x, y| {
+            if (100..900).contains(&x) && (1_650..1_760).contains(&y) {
+                [55, 55, 60, 255]
+            } else {
+                [25, 25, 30, 255]
+            }
+        });
+        assert!(!composer_only.visible);
+    }
+
+    #[test]
+    fn contact_tab_active_probe_requires_saturated_green_in_second_column() {
+        let mut pixels = vec![[35, 35, 35, 255]; 1_000 * 2_000];
+        for y in 1_800..1_860 {
+            for x in 330..390 {
+                pixels[y * 1_000 + x] = [20, 190, 95, 255];
+            }
+        }
+        let active =
+            contact_tab_active_probe(1_000, 2_000, |x, y| pixels[y as usize * 1_000 + x as usize]);
+        assert!(active.active);
+        assert_eq!(active.green_pixels, 3_600);
+
+        let outside = contact_tab_active_probe(1_000, 2_000, |x, y| {
+            if (80..140).contains(&x) && (1_800..1_860).contains(&y) {
+                [20, 190, 95, 255]
+            } else {
+                [35, 35, 35, 255]
+            }
+        });
+        assert!(!outside.active);
+        assert_eq!(outside.green_pixels, 0);
+
+        let wechat = wechat_tab_active_probe(1_000, 2_000, |x, y| {
+            if (80..140).contains(&x) && (1_800..1_860).contains(&y) {
+                [20, 190, 95, 255]
+            } else {
+                [35, 35, 35, 255]
+            }
+        });
+        assert!(wechat.active);
+        assert_eq!(wechat.green_pixels, 3_600);
+    }
+
+    #[test]
     fn black_frame_detection_tolerates_a_tiny_status_indicator_only() {
         assert!(is_black_frame(100, 100, |_, _| [0, 0, 0, 255]));
         assert!(is_black_frame(100, 100, |x, y| {
@@ -1363,6 +1858,16 @@ mod tests {
                 [0, 0, 0, 255]
             }
         }));
+    }
+
+    #[test]
+    fn black_frame_detection_samples_large_frames() {
+        let mut sampled = 0_u32;
+        assert!(is_black_frame(1080, 2408, |_, _| {
+            sampled += 1;
+            [0, 0, 0, 255]
+        }));
+        assert!(sampled < 20_000);
     }
 
     fn config() -> Config {

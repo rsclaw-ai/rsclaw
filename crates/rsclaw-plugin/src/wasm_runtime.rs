@@ -2210,28 +2210,28 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             recall: None,
         };
 
-        // A one-minute monitor cannot afford a single visual read holding the
-        // device UI for minutes. Thirty seconds leaves room for recovery and
-        // the next cron tick; callers retry on an explicit error.
+        // Bound both connection setup and streaming so one visual read cannot
+        // consume more than roughly half of a one-minute monitor interval.
+        // Callers retry on a later tick instead of holding the device UI.
         let mut stream =
-            match tokio::time::timeout(Duration::from_secs(30), provider.stream(req)).await {
+            match tokio::time::timeout(Duration::from_secs(15), provider.stream(req)).await {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(e)) => return Ok(Err(format!("vlm_parse provider error: {e}"))),
                 Err(_) => {
                     return Ok(Err(
-                        "vlm_parse provider setup timed out after 30s".to_string()
+                        "vlm_parse provider setup timed out after 15s".to_string()
                     ));
                 }
             };
         {
             let mut text = String::new();
             let mut reasoning = String::new();
+            let stream_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             use futures::StreamExt;
             loop {
-                let event = match tokio::time::timeout(Duration::from_secs(30), stream.next()).await
-                {
+                let event = match tokio::time::timeout_at(stream_deadline, stream.next()).await {
                     Ok(event) => event,
-                    Err(_) => return Ok(Err("vlm_parse stream timed out after 30s".to_string())),
+                    Err(_) => return Ok(Err("vlm_parse stream timed out after 15s".to_string())),
                 };
                 let Some(event) = event else { break };
                 match event {
@@ -2305,6 +2305,96 @@ impl rsclaw::plugin::host_android::Host for HostState {
         json_body: Option<String>,
     ) -> HostTrapResult<Result<String, String>> {
         Ok(crate::android_uiauto::raw(&method, &path, json_body.as_deref()).await)
+    }
+
+    async fn android_vlm_drive(
+        &mut self,
+        instruction: String,
+        max_steps: u32,
+    ) -> HostTrapResult<Result<String, String>> {
+        use std::sync::atomic::AtomicBool;
+
+        use rsclaw_computer::{
+            CoordSpace, DriverOutcome, VlmDriver,
+            app_rules::AppRuleSet,
+            parser::CoordFormat,
+            permission::{CheckFut, PermissionDecision, PermissionStore, RecordFut},
+        };
+
+        struct PluginPermission;
+        impl PermissionStore for PluginPermission {
+            fn check<'a>(&'a self, _agent_id: &'a str, _app: &'a str) -> CheckFut<'a> {
+                Box::pin(async { Ok(Some(PermissionDecision::AllowOnce)) })
+            }
+            fn record<'a>(
+                &'a self,
+                _agent_id: &'a str,
+                _app: &'a str,
+                _decision: PermissionDecision,
+            ) -> RecordFut<'a> {
+                Box::pin(async { Ok(()) })
+            }
+            fn revoke<'a>(&'a self, _agent_id: &'a str, _app: &'a str) -> RecordFut<'a> {
+                Box::pin(async { Ok(()) })
+            }
+            fn bypass_all(&self) -> bool {
+                true
+            }
+        }
+
+        let Some(registry) = self.providers.clone() else {
+            return Ok(Err(
+                "android-vlm-drive: provider registry unavailable".to_string()
+            ));
+        };
+        let Some(model_name) = self.vision_model.clone() else {
+            return Ok(Err(
+                "android-vlm-drive: vision model unavailable".to_string()
+            ));
+        };
+        let (provider_name, _) = registry.resolve_model(&model_name);
+        let provider = match registry.get(provider_name) {
+            Ok(provider) => provider,
+            Err(error) => return Ok(Err(format!("android-vlm-drive: {error}"))),
+        };
+        let operator = crate::android_vlm::AndroidUiautoOperator;
+        let rules = AppRuleSet::default();
+        let driver = VlmDriver {
+            operator: &operator,
+            provider,
+            model_name: model_name.clone(),
+            coord_format: CoordFormat::Auto,
+            coord_space: CoordSpace::for_model(&model_name),
+            max_loop: max_steps.clamp(1, 30) as usize,
+            abort: Arc::new(AtomicBool::new(false)),
+            app_rules: &rules,
+            permission: Arc::new(PluginPermission),
+            agent_id: format!("plugin:{}", self.plugin_name),
+            app: "WeChat Android".to_string(),
+            permission_emit: None,
+            headless_auto_allow: true,
+            status_emit: None,
+            run_id: format!("android-vlm-drive-{}", uuid::Uuid::new_v4().simple()),
+        };
+        let outcome = match driver.run(&instruction).await {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(Err(format!("android-vlm-drive: {error:#}"))),
+        };
+        let value = match outcome {
+            DriverOutcome::Finished { content, steps } => {
+                json!({"kind":"finished","content":content,"steps":steps})
+            }
+            DriverOutcome::CallUser { reason, steps } => {
+                json!({"kind":"call_user","reason":reason,"steps":steps})
+            }
+            DriverOutcome::MaxLoop { steps } => json!({"kind":"max_loop","steps":steps}),
+            DriverOutcome::UserAbort { steps } => json!({"kind":"user_abort","steps":steps}),
+            DriverOutcome::PermissionDenied => json!({"kind":"permission_denied"}),
+            DriverOutcome::OperatorError { message, steps } => {
+                json!({"kind":"operator_error","message":message,"steps":steps})
+            }
+        };
+        Ok(Ok(value.to_string()))
     }
 }
 

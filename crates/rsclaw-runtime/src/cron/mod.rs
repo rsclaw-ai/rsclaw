@@ -1441,7 +1441,27 @@ fn tick_has_work(tick: &str) -> Result<bool> {
         .get("contactBadge")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    Ok(active || changed || contact_badge)
+    let prepared_followup = value
+        .get("preparedFollowup")
+        .is_some_and(|followup| !followup.is_null());
+    Ok(active || changed || contact_badge || prepared_followup)
+}
+
+#[cfg(test)]
+mod monitor_preflight_tests {
+    use super::tick_has_work;
+
+    #[test]
+    fn due_followup_wakes_monitor_agent() {
+        let tick = r#"{"activeChat":{"needsReply":false},"changedChats":[],"contactBadge":false,"preparedFollowup":{"ticket":"followup-1","name":"客户"}}"#;
+        assert!(tick_has_work(tick).expect("valid monitor result"));
+    }
+
+    #[test]
+    fn empty_monitor_result_skips_agent() {
+        let tick = r#"{"activeChat":{"needsReply":false},"changedChats":[],"contactBadge":false,"preparedFollowup":null}"#;
+        assert!(!tick_has_work(tick).expect("valid monitor result"));
+    }
 }
 
 async fn run_cron_job(
