@@ -2160,13 +2160,10 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             }
         };
 
-        // Downscale the screenshot before sending. Full-res window captures
-        // (~1834px) encode to ~2744 vision tokens and ship a multi-MB PNG over
-        // the Mac→cloud→GPU hop, which dominates per-call latency (~71s observed).
-        // Cap the long edge at 1280 and re-encode JPEG q85 — cuts both wire bytes
-        // and image tokens. Safe for navigation: the plugin maps VLM boxes in
-        // 0-1000 normalized space, independent of pixel dimensions. Any
-        // parse/decode/resize failure falls back to the original URI.
+        // Android plugins act on absolute screenshot pixels. Resizing changes
+        // the visual geometry the model sees and can make a grounded tap miss.
+        // Keep that geometry intact; only re-encode unusually large payloads
+        // as JPEG to bound wire size. Any parse/decode failure keeps the original.
         let image_data_uri = {
             let downscaled = image_data_uri
                 .split_once(";base64,")
@@ -2179,8 +2176,8 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
                     let (new_bytes, new_mime) = rsclaw_util::downscale_image_for_vision(
                         &bytes,
                         &mime,
-                        256 * 1024,
-                        1280,
+                        1 * 1024 * 1024,
+                        u32::MAX,
                         85,
                     )
                     .ok()?;
