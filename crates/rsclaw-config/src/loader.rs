@@ -482,8 +482,8 @@ pub fn merge_remote_defaults(remote_raw: &str) -> Result<bool> {
     }
 
     let path = base_dir().join("defaults.toml");
-    let local = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| embedded_defaults_toml().to_owned());
+    let local =
+        std::fs::read_to_string(&path).unwrap_or_else(|_| embedded_defaults_toml().to_owned());
 
     let Some(merged) = merge_defaults_toml(&local, remote_raw) else {
         return Ok(false);
@@ -737,27 +737,47 @@ fn migrate_channel_legacy_fields(root: &mut serde_json::Value) {
         ("matrix", &["homeserver", "accessToken", "userId"]),
     ];
 
-    let Some(channels) = root.get_mut("channels") else { return };
-    let Some(channels_map) = channels.as_object_mut() else { return };
+    let Some(channels) = root.get_mut("channels") else {
+        return;
+    };
+    let Some(channels_map) = channels.as_object_mut() else {
+        return;
+    };
 
     for &(ch_name, fields) in LEGACY_FIELDS {
-        let Some(ch) = channels_map.get_mut(ch_name) else { continue };
-        let Some(ch_obj) = ch.as_object_mut() else { continue };
+        let Some(ch) = channels_map.get_mut(ch_name) else {
+            continue;
+        };
+        let Some(ch_obj) = ch.as_object_mut() else {
+            continue;
+        };
 
         // Does this channel have any legacy top-level credential fields set?
         let has_legacy = fields.iter().any(|f| {
-            ch_obj.get(*f).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+            ch_obj
+                .get(*f)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
         });
         if !has_legacy {
             continue;
         }
 
         // Does it already have `accounts` with at least one non-empty entry?
-        let has_accounts = ch_obj.get("accounts").and_then(|a| a.as_object()).is_some_and(|m| {
-            m.values().any(|v| v.as_object().is_some_and(|o| {
-                fields.iter().any(|f| o.get(*f).and_then(|s| s.as_str()).is_some_and(|s| !s.is_empty()))
-            }))
-        });
+        let has_accounts = ch_obj
+            .get("accounts")
+            .and_then(|a| a.as_object())
+            .is_some_and(|m| {
+                m.values().any(|v| {
+                    v.as_object().is_some_and(|o| {
+                        fields.iter().any(|f| {
+                            o.get(*f)
+                                .and_then(|s| s.as_str())
+                                .is_some_and(|s| !s.is_empty())
+                        })
+                    })
+                })
+            });
         if has_accounts {
             // Accounts already configured — remove top-level fields to avoid
             // confusion (the accounts path is canonical).
@@ -829,7 +849,10 @@ fn migrate_channel_env_fallback(root: &mut serde_json::Value) {
                 ("WHATSAPP_ACCESS_TOKEN", "accessToken"),
             ],
         ),
-        ("line", &[("LINE_CHANNEL_ACCESS_TOKEN", "channelAccessToken")]),
+        (
+            "line",
+            &[("LINE_CHANNEL_ACCESS_TOKEN", "channelAccessToken")],
+        ),
         ("zalo", &[("ZALO_ACCESS_TOKEN", "accessToken")]),
     ];
 
@@ -840,21 +863,29 @@ fn migrate_channel_env_fallback(root: &mut serde_json::Value) {
     for &(ch_name, env_fields) in ENV_FIELDS {
         // Only configured (present) channels — a channel with no block was
         // never started, env vars or not.
-        let Some(ch_obj) = channels_map.get_mut(ch_name).and_then(|c| c.as_object_mut()) else {
+        let Some(ch_obj) = channels_map
+            .get_mut(ch_name)
+            .and_then(|c| c.as_object_mut())
+        else {
             continue;
         };
 
         // Already has a non-empty accounts value for any of these fields?
         // Then config is authoritative; leave it alone.
-        let has_accounts_cred = ch_obj.get("accounts").and_then(|a| a.as_object()).is_some_and(|m| {
-            m.values().any(|v| {
-                v.as_object().is_some_and(|o| {
-                    env_fields
-                        .iter()
-                        .any(|(_, f)| o.get(*f).and_then(|s| s.as_str()).is_some_and(|s| !s.is_empty()))
+        let has_accounts_cred = ch_obj
+            .get("accounts")
+            .and_then(|a| a.as_object())
+            .is_some_and(|m| {
+                m.values().any(|v| {
+                    v.as_object().is_some_and(|o| {
+                        env_fields.iter().any(|(_, f)| {
+                            o.get(*f)
+                                .and_then(|s| s.as_str())
+                                .is_some_and(|s| !s.is_empty())
+                        })
+                    })
                 })
-            })
-        });
+            });
         if has_accounts_cred {
             continue;
         }

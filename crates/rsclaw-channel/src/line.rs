@@ -66,18 +66,14 @@ pub struct LineChannel {
     api_data_base: String,
     client: Client,
     #[allow(clippy::type_complexity)]
-    on_message: Arc<
-        dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
-    >,
+    on_message: Arc<dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
 }
 
 impl LineChannel {
     pub fn new(
         channel_access_token: impl Into<String>,
         on_message: Arc<
-            dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>)
-                + Send
-                + Sync,
+            dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
         >,
     ) -> Self {
         Self::with_api_base(channel_access_token, None, on_message)
@@ -87,9 +83,7 @@ impl LineChannel {
         channel_access_token: impl Into<String>,
         api_base: Option<String>,
         on_message: Arc<
-            dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>)
-                + Send
-                + Sync,
+            dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
         >,
     ) -> Self {
         let base = api_base.unwrap_or_else(|| LINE_API_BASE.to_owned());
@@ -149,18 +143,17 @@ impl LineChannel {
                     Ok(bytes) => {
                         use base64::Engine;
                         let orig_len = bytes.len();
-                        let (final_bytes, final_mime) =
-                            rsclaw_util::downscale_image_for_vision(
-                                &bytes,
-                                "image/jpeg",
-                                1 * 1024 * 1024,
-                                1920,
-                                85,
-                            )
-                            .unwrap_or_else(|e| {
-                                warn!(error = %e, "LINE: downscale failed");
-                                (bytes, "image/jpeg".to_owned())
-                            });
+                        let (final_bytes, final_mime) = rsclaw_util::downscale_image_for_vision(
+                            &bytes,
+                            "image/jpeg",
+                            1 * 1024 * 1024,
+                            1920,
+                            85,
+                        )
+                        .unwrap_or_else(|e| {
+                            warn!(error = %e, "LINE: downscale failed");
+                            (bytes, "image/jpeg".to_owned())
+                        });
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
                         images.push(rsclaw_types::ImageAttachment {
                             data: format!("data:{final_mime};base64,{b64}"),
@@ -168,7 +161,11 @@ impl LineChannel {
                             source_path: None,
                         });
                         text = String::new();
-                        info!(from = orig_len, to = final_bytes.len(), "LINE: image downloaded");
+                        info!(
+                            from = orig_len,
+                            to = final_bytes.len(),
+                            "LINE: image downloaded"
+                        );
                     }
                     Err(e) => {
                         warn!("LINE: image download failed: {e:#}");
@@ -485,13 +482,8 @@ async fn line_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::transcription::transcribe_audio(
-        client,
-        &audio_bytes,
-        "video_audio.ogg",
-        "audio/ogg",
-    )
-    .await
+    crate::transcription::transcribe_audio(client, &audio_bytes, "video_audio.ogg", "audio/ogg")
+        .await
 }
 
 // ---------------------------------------------------------------------------

@@ -13,7 +13,6 @@
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-
 use std::{sync::Arc, time::Duration};
 
 use aes::cipher::{BlockEncrypt, KeyInit};
@@ -712,12 +711,11 @@ impl WeChatPersonalChannel {
                                                 .encode(&final_bytes);
                                             let data_url =
                                                 format!("data:{final_mime};base64,{b64}");
-                                            let images =
-                                                vec![rsclaw_types::ImageAttachment {
-                                                    data: data_url,
-                                                    mime_type: final_mime,
-                                                    source_path: None,
-                                                }];
+                                            let images = vec![rsclaw_types::ImageAttachment {
+                                                data: data_url,
+                                                mime_type: final_mime,
+                                                source_path: None,
+                                            }];
                                             info!(
                                                 from = orig_len,
                                                 to = final_bytes.len(),
@@ -843,7 +841,10 @@ impl WeChatPersonalChannel {
                             "wechat getupdates failing repeatedly: {e:#}"
                         );
                     } else {
-                        debug!(consecutive = consecutive_errs, "wechat getupdates error: {e:#}");
+                        debug!(
+                            consecutive = consecutive_errs,
+                            "wechat getupdates error: {e:#}"
+                        );
                     }
                     sleep(Duration::from_secs(5)).await;
                 }
@@ -1003,9 +1004,7 @@ impl WeChatPersonalChannel {
     /// Download from either a URL or CDN media source.
     async fn download_media_source(&self, src: &MediaSource) -> Result<Vec<u8>> {
         match src {
-            MediaSource::Url(url) => {
-                crate::transcription::download_file(&self.client, url).await
-            }
+            MediaSource::Url(url) => crate::transcription::download_file(&self.client, url).await,
             MediaSource::Cdn {
                 encrypt_query_param,
                 aes_key,
@@ -1426,8 +1425,7 @@ impl WeChatPersonalChannel {
         std::fs::write(&tmp_src, audio_bytes)?;
 
         // ffmpeg: decode to raw PCM s16le mono 24kHz
-        let ffmpeg_bin =
-            rsclaw_platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+        let ffmpeg_bin = rsclaw_platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
         let mut cmd = std::process::Command::new(&ffmpeg_bin);
         cmd.args([
             "-i",

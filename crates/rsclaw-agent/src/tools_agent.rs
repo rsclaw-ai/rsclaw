@@ -311,16 +311,20 @@ impl AgentRuntime {
         let task_timeout = timeout_secs.min(300); // up to 5 min for background tasks
 
         tokio::spawn(async move {
-            let result_text =
-                match tokio::time::timeout(Duration::from_secs(task_timeout), reply_rx).await {
-                    Ok(Ok(reply)) => reply.text,
-                    Ok(Err(_)) => format!(
-                        "[task {task_id} failed: sub-agent exited without replying (likely crashed mid-run); no result was produced. Retry with agent action=temp, or do the work yourself and tell the user the sub-task failed.]"
-                    ),
-                    Err(_) => format!(
-                        "[task {task_id} timed out after {task_timeout}s — no result. Split it into smaller tasks, or ask the user to raise agents.defaults.timeout_seconds.]"
-                    ),
-                };
+            let result_text = match tokio::time::timeout(
+                Duration::from_secs(task_timeout),
+                reply_rx,
+            )
+            .await
+            {
+                Ok(Ok(reply)) => reply.text,
+                Ok(Err(_)) => format!(
+                    "[task {task_id} failed: sub-agent exited without replying (likely crashed mid-run); no result was produced. Retry with agent action=temp, or do the work yourself and tell the user the sub-task failed.]"
+                ),
+                Err(_) => format!(
+                    "[task {task_id} timed out after {task_timeout}s — no result. Split it into smaller tasks, or ask the user to raise agents.defaults.timeout_seconds.]"
+                ),
+            };
 
             // Store result for main agent to pick up when run_turn fires.
             if let Ok(mut guard) = pending.lock() {
@@ -478,16 +482,20 @@ impl AgentRuntime {
         let target_id_bg = target_id.clone();
 
         tokio::spawn(async move {
-            let result_text =
-                match tokio::time::timeout(Duration::from_secs(send_timeout), reply_rx).await {
-                    Ok(Ok(reply)) => reply.text,
-                    Ok(Err(_)) => format!(
-                        "[agent {target_id_bg} exited before replying — the message may not have been processed. Run agent action=list to check if it is still alive; respawn and resend if needed.]"
-                    ),
-                    Err(_) => format!(
-                        "[agent {target_id_bg} timed out after {send_timeout}s — no result. Split the request into smaller messages, or ask the user to raise agents.defaults.timeout_seconds.]"
-                    ),
-                };
+            let result_text = match tokio::time::timeout(
+                Duration::from_secs(send_timeout),
+                reply_rx,
+            )
+            .await
+            {
+                Ok(Ok(reply)) => reply.text,
+                Ok(Err(_)) => format!(
+                    "[agent {target_id_bg} exited before replying — the message may not have been processed. Run agent action=list to check if it is still alive; respawn and resend if needed.]"
+                ),
+                Err(_) => format!(
+                    "[agent {target_id_bg} timed out after {send_timeout}s — no result. Split the request into smaller messages, or ask the user to raise agents.defaults.timeout_seconds.]"
+                ),
+            };
             if let Ok(mut guard) = pending.lock() {
                 guard.push((send_id_bg.clone(), session_key.clone(), result_text));
             }
@@ -615,7 +623,9 @@ impl AgentRuntime {
                     "note": "agent termination not yet implemented; agent will stop on next idle timeout"
                 }))
             }
-            _ => bail!("agent: unknown action '{action}' (spawn, dispatch, send, list, update, kill)"),
+            _ => bail!(
+                "agent: unknown action '{action}' (spawn, dispatch, send, list, update, kill)"
+            ),
         }
     }
 }

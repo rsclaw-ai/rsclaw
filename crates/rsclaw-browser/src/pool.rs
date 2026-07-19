@@ -20,13 +20,12 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use rsclaw_platform::detect_chrome;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
-
 use super::{CdpClient, ChromeProcess, can_launch_chrome};
-use rsclaw_platform::detect_chrome;
 
 /// Maximum concurrent tabs per Chrome instance.
 const MAX_TABS_PER_INSTANCE: usize = 8;
@@ -211,11 +210,10 @@ impl BrowserPool {
 
     /// Browser-level CDP ws_url for a debug port (GET /json/version).
     async fn ws_url_for_port(&self, port: u16) -> Result<String> {
-        let version_info: Value =
-            reqwest::get(format!("http://127.0.0.1:{port}/json/version"))
-                .await?
-                .json()
-                .await?;
+        let version_info: Value = reqwest::get(format!("http://127.0.0.1:{port}/json/version"))
+            .await?
+            .json()
+            .await?;
         version_info["webSocketDebuggerUrl"]
             .as_str()
             .map(String::from)
@@ -259,9 +257,7 @@ impl BrowserPool {
             if let Some(ref mut pooled) = *guard {
                 let alive = match pooled.process {
                     None => true, // external — caller vouches for it
-                    Some(ref mut proc) => {
-                        !proc.child.try_wait().is_ok_and(|s| s.is_some())
-                    }
+                    Some(ref mut proc) => !proc.child.try_wait().is_ok_and(|s| s.is_some()),
                 };
                 if alive {
                     let p = pooled.port;
@@ -295,8 +291,8 @@ impl BrowserPool {
     /// All subsequent `acquire_tab()` calls create tabs in this Chrome.
     /// The pool does NOT own the process (no liveness checks, no restart).
     pub async fn set_chrome_ws_url(&self, ws_url: &str) -> Result<()> {
-        let parsed = url::Url::parse(ws_url)
-            .map_err(|e| anyhow!("pool: invalid ws_url {ws_url}: {e}"))?;
+        let parsed =
+            url::Url::parse(ws_url).map_err(|e| anyhow!("pool: invalid ws_url {ws_url}: {e}"))?;
         let port = parsed
             .port()
             .ok_or_else(|| anyhow!("pool: ws_url {ws_url} has no port"))?;

@@ -37,6 +37,9 @@ use std::{
 use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures::StreamExt;
+use rsclaw_provider::{
+    AgentEndpoint, ContentPart, LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
+};
 use tracing::{debug, info, warn};
 
 use super::{
@@ -47,9 +50,6 @@ use super::{
     permission::{PermissionDecision, PermissionRequest, PermissionStore},
     prompt::{PromptInputs, build_system_prompt},
     status::ComputerUseStatus,
-};
-use rsclaw_provider::{
-    AgentEndpoint, ContentPart, LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -306,7 +306,7 @@ impl VlmDriver<'_> {
             }];
 
             let req = LlmRequest {
-            fallback_models: Vec::new(),
+                fallback_models: Vec::new(),
                 model: self.model_name.clone(),
                 messages,
                 tools: Vec::new(),
@@ -936,7 +936,10 @@ fn downscale_for_vision(png_bytes: &[u8], w: u32, h: u32) -> (std::borrow::Cow<'
                 // Use the actual emitted width for the scale so integer
                 // rounding stays exact; aspect is preserved so the height
                 // factor is within a pixel of this.
-                return (std::borrow::Cow::Owned(buf.into_inner()), nw as f32 / w as f32);
+                return (
+                    std::borrow::Cow::Owned(buf.into_inner()),
+                    nw as f32 / w as f32,
+                );
             }
             (std::borrow::Cow::Borrowed(png_bytes), 1.0)
         }
@@ -973,18 +976,20 @@ fn parsed_to_action(
 ) -> Option<Action> {
     // Coord pipeline depends on what the model emits:
     //   - Normalized (0-1000 grid, the prompt's documented convention and
-    //     ui-tars-desktop's defaultNormalizeCoords): rescale
-    //     `x/1000 * screen_w` to physical pixels. Resize-invariant, so
-    //     `vision_scale` does not apply.
-    //   - Pixels (rsclaw-vision-v1's actual behaviour): the model emits
-    //     absolute pixels of the image it was sent. We pre-downscale that
-    //     image by `vision_scale` (<=1.0) to stay under the encoder's
-    //     budget, so the model's pixels are in the downscaled space →
-    //     physical = model / vision_scale. With no downscale
-    //     (vision_scale == 1.0) this is identity.
+    //     ui-tars-desktop's defaultNormalizeCoords): rescale `x/1000 * screen_w` to
+    //     physical pixels. Resize-invariant, so `vision_scale` does not apply.
+    //   - Pixels (rsclaw-vision-v1's actual behaviour): the model emits absolute
+    //     pixels of the image it was sent. We pre-downscale that image by
+    //     `vision_scale` (<=1.0) to stay under the encoder's budget, so the model's
+    //     pixels are in the downscaled space → physical = model / vision_scale.
+    //     With no downscale (vision_scale == 1.0) this is identity.
     // In both cases the result is physical pixels; the native operator
     // divides by scale_factor for macOS Retina before driving enigo.
-    let inv = if vision_scale > 0.0 { 1.0 / vision_scale } else { 1.0 };
+    let inv = if vision_scale > 0.0 {
+        1.0 / vision_scale
+    } else {
+        1.0
+    };
     let scale = |c: (f32, f32)| -> (i32, i32) {
         let (x, y) = c;
         match coord_space {
@@ -1282,7 +1287,10 @@ mod tests {
         );
         // Everything else stays on the 0-1000 prompt convention.
         assert_eq!(CoordSpace::for_model("ui-tars-1.5"), CoordSpace::Normalized);
-        assert_eq!(CoordSpace::for_model("doubao-vision"), CoordSpace::Normalized);
+        assert_eq!(
+            CoordSpace::for_model("doubao-vision"),
+            CoordSpace::Normalized
+        );
         assert_eq!(CoordSpace::for_model(""), CoordSpace::Normalized);
     }
 

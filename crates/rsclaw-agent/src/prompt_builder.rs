@@ -4,9 +4,10 @@
 
 use std::sync::LazyLock;
 
-use super::workspace::WorkspaceContext;
 use rsclaw_plugin::{PluginRegistry, wasm_runtime::WasmPlugin};
 use rsclaw_skill::SkillRegistry;
+
+use super::workspace::WorkspaceContext;
 
 /// Cached output of [`build_shared_system_prefix`]. The shared prefix is
 /// byte-stable across the gateway lifetime (no dynamic inputs — only
@@ -372,7 +373,10 @@ pub(crate) fn build_date_context() -> String {
     // unreliably; timezone (`%Z`) disambiguates the wall-clock. Relative dates
     // (yesterday, last Friday) are dropped — the model derives those from the
     // date fine, and per-turn brevity matters.
-    format!("Now: {}", chrono::Local::now().format("%Y-%m-%d %H:%M %a %Z"))
+    format!(
+        "Now: {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M %a %Z")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -931,10 +935,7 @@ pub fn build_user_system(
             these versions take precedence over any system install. `npm install` / \
             `pip install` work as normal for project deps. If a runtime you need \
             isn't listed, install it with `rsclaw tools install <node|python|bun|...>`.";
-        parts.push(format!(
-            "## Installed Tools\n\n{}{usage}",
-            lines.join("\n")
-        ));
+        parts.push(format!("## Installed Tools\n\n{}{usage}", lines.join("\n")));
     }
 
     // ws_segment last — its memory_today / memory_yesterday blocks roll
@@ -986,7 +987,8 @@ pub(crate) fn build_system_prompt(
 /// Coding-profile guidance block. Appended to user_system when the agent's
 /// `model.toolset` is `"code"`. Borrows the well-trodden directives from
 /// pi/coding-agent (proven over 76 versions) and harmonizes them with rsclaw
-/// conventions (edit_file existence, read_artifact backstop, cap-rs escalation).
+/// conventions (edit_file existence, read_artifact backstop, cap-rs
+/// escalation).
 fn build_coding_mode_block() -> String {
     [
         "## Coding profile (toolset=code)",

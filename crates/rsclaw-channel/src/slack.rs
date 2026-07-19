@@ -9,7 +9,6 @@
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
@@ -370,8 +369,7 @@ impl SlackChannel {
                         // files go into `file_attachments` for the same
                         // reason. Audio/video still get inline-transcribed.
                         let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
-                        let mut file_attachments: Vec<rsclaw_types::FileAttachment> =
-                            Vec::new();
+                        let mut file_attachments: Vec<rsclaw_types::FileAttachment> = Vec::new();
                         if let Some(files) = event["files"].as_array() {
                             for file in files {
                                 let url = file["url_private_download"].as_str().unwrap_or("");
@@ -455,17 +453,15 @@ impl SlackChannel {
                                         info!(from = orig_len, to = final_bytes.len(), %filename, "Slack: image forwarded for vision");
                                     } else {
                                         let processed = slack_process_file(filename, &bytes);
-                                        file_attachments.push(
-                                            rsclaw_types::FileAttachment {
-                                                filename: filename.to_owned(),
-                                                data: bytes.clone(),
-                                                mime_type: if mimetype.is_empty() {
-                                                    "application/octet-stream".to_owned()
-                                                } else {
-                                                    mimetype.to_owned()
-                                                },
+                                        file_attachments.push(rsclaw_types::FileAttachment {
+                                            filename: filename.to_owned(),
+                                            data: bytes.clone(),
+                                            mime_type: if mimetype.is_empty() {
+                                                "application/octet-stream".to_owned()
+                                            } else {
+                                                mimetype.to_owned()
                                             },
-                                        );
+                                        });
                                         if !text.is_empty() {
                                             text.push('\n');
                                         }

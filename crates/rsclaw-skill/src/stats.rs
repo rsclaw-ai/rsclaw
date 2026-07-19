@@ -16,7 +16,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-
 use rsclaw_store::redb_store::RedbStore;
 
 /// Disuse window: an auto-skill not activated for this many days (and old
@@ -131,7 +130,11 @@ mod tests {
 
     fn store() -> (RedbStore, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        let db = RedbStore::open(&tmp.path().join("kv.redb"), rsclaw_platform::MemoryTier::High).unwrap();
+        let db = RedbStore::open(
+            &tmp.path().join("kv.redb"),
+            rsclaw_platform::MemoryTier::High,
+        )
+        .unwrap();
         (db, tmp)
     }
 
@@ -166,8 +169,11 @@ mod tests {
         let future = now_ms() + (RETIRE_AFTER_DAYS + 1) * 24 * 3600 * 1000;
         db.kv_set(
             "skillstat:auto-recently-used",
-            &serde_json::to_string(&SkillStat { uses: 3, last_used_ms: future - 3_600_000 })
-                .unwrap(),
+            &serde_json::to_string(&SkillStat {
+                uses: 3,
+                last_used_ms: future - 3_600_000,
+            })
+            .unwrap(),
         )
         .unwrap();
 

@@ -4,13 +4,15 @@
 //! the first request to an origin pays the redirect, after which the target
 //! origin is cached (per `Cache-Control: max-age`, or [`DEFAULT_REDIRECT_TTL`])
 //! so subsequent requests route DIRECT until the entry expires. 307 (temporary)
-//! is followed but never cached. This is the SINGLE implementation shared by the
-//! rsclaw provider AND the fleet capability clients (OCR / embed / rerank) so
-//! they all amortise the LB cost instead of re-paying the redirect per call.
+//! is followed but never cached. This is the SINGLE implementation shared by
+//! the rsclaw provider AND the fleet capability clients (OCR / embed / rerank)
+//! so they all amortise the LB cost instead of re-paying the redirect per call.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use reqwest::StatusCode;
@@ -217,9 +219,10 @@ impl FleetHttp {
     }
 
     /// POST `body` to `url`, transparently following 307/308 and caching 308
-    /// targets by origin (`Cache-Control: max-age` or [`DEFAULT_REDIRECT_TTL`]).
-    /// Non-redirect statuses (incl. errors) are returned as-is for the caller
-    /// to interpret. `builder_timeout` is a per-hop deadline (NOT cumulative).
+    /// targets by origin (`Cache-Control: max-age` or
+    /// [`DEFAULT_REDIRECT_TTL`]). Non-redirect statuses (incl. errors) are
+    /// returned as-is for the caller to interpret. `builder_timeout` is a
+    /// per-hop deadline (NOT cumulative).
     pub async fn post_following_redirects<B: Serialize>(
         &self,
         url: &str,
@@ -252,12 +255,15 @@ impl FleetHttp {
                     // Transport failure against a redirected target → drop the
                     // cache entry so the next attempt goes back through the LB.
                     self.invalidate_redirect_for(&current_url);
-                    return Err(anyhow::Error::from(e).context(format!("rsclaw POST {current_url}")));
+                    return Err(
+                        anyhow::Error::from(e).context(format!("rsclaw POST {current_url}"))
+                    );
                 }
             };
 
             let status = resp.status();
-            if status != StatusCode::TEMPORARY_REDIRECT && status != StatusCode::PERMANENT_REDIRECT {
+            if status != StatusCode::TEMPORARY_REDIRECT && status != StatusCode::PERMANENT_REDIRECT
+            {
                 return Ok(resp);
             }
 
@@ -273,7 +279,9 @@ impl FleetHttp {
                 .map(str::to_owned);
 
             let Some(loc) = location else {
-                anyhow::bail!("rsclaw: {status} redirect from {current_url} omitted Location header");
+                anyhow::bail!(
+                    "rsclaw: {status} redirect from {current_url} omitted Location header"
+                );
             };
             let Some(next_url) = resolve_location(&current_url, &loc) else {
                 anyhow::bail!(
@@ -327,11 +335,11 @@ mod tests {
 
     #[test]
     fn origin_extracts_scheme_host_port() {
-        assert_eq!(origin_of("https://api.rsclaw.ai/v1/x"), Some("https://api.rsclaw.ai"));
         assert_eq!(
-            origin_of("https://h:8443/p?q=1"),
-            Some("https://h:8443")
+            origin_of("https://api.rsclaw.ai/v1/x"),
+            Some("https://api.rsclaw.ai")
         );
+        assert_eq!(origin_of("https://h:8443/p?q=1"), Some("https://h:8443"));
         assert_eq!(origin_of("not-a-url"), None);
     }
 
@@ -359,8 +367,14 @@ mod tests {
 
     #[test]
     fn max_age_parsing() {
-        assert_eq!(parse_max_age(Some("max-age=3600")), Some(Duration::from_secs(3600)));
-        assert_eq!(parse_max_age(Some("public, max-age=60")), Some(Duration::from_secs(60)));
+        assert_eq!(
+            parse_max_age(Some("max-age=3600")),
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(
+            parse_max_age(Some("public, max-age=60")),
+            Some(Duration::from_secs(60))
+        );
         assert_eq!(parse_max_age(Some("no-store, max-age=60")), None);
         assert_eq!(parse_max_age(Some("no-cache")), None);
         assert_eq!(parse_max_age(None), None);
@@ -369,7 +383,11 @@ mod tests {
     #[test]
     fn cache_store_lookup_invalidate() {
         let mut c = RedirectCache::default();
-        c.store("https://a".into(), "https://b".into(), Duration::from_secs(60));
+        c.store(
+            "https://a".into(),
+            "https://b".into(),
+            Duration::from_secs(60),
+        );
         assert_eq!(c.lookup("https://a"), Some("https://b".to_owned()));
         c.invalidate("https://a");
         assert_eq!(c.lookup("https://a"), None);
@@ -378,7 +396,11 @@ mod tests {
     #[test]
     fn cache_evicts_expired() {
         let mut c = RedirectCache::default();
-        c.store("https://a".into(), "https://b".into(), Duration::from_millis(0));
+        c.store(
+            "https://a".into(),
+            "https://b".into(),
+            Duration::from_millis(0),
+        );
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(c.lookup("https://a"), None);
     }

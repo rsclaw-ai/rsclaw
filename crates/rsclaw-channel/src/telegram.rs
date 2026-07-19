@@ -517,13 +517,8 @@ impl TelegramChannel {
         let audio_bytes = self.download_file(file_id).await?;
 
         // 3. Transcribe via shared multi-provider module.
-        crate::transcription::transcribe_audio(
-            &self.client,
-            &audio_bytes,
-            "voice.ogg",
-            "audio/ogg",
-        )
-        .await
+        crate::transcription::transcribe_audio(&self.client, &audio_bytes, "voice.ogg", "audio/ogg")
+            .await
     }
 
     /// Register bot commands with Telegram so they appear in the command menu.
@@ -689,37 +684,34 @@ impl Channel for TelegramChannel {
 
                 // Audio files: convert to ogg/opus and send as voice message (pure Rust).
                 let is_audio = mime.starts_with("audio/");
-                let (send_bytes, send_filename, send_mime) = if is_audio
-                    && !filename.ends_with(".ogg")
-                    && !filename.ends_with(".opus")
-                {
-                    let ext = filename.rsplit('.').next().unwrap_or("mp3");
-                    match crate::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext))
-                    {
-                        Ok(opus_bytes) => {
-                            let ogg_name = filename
-                                .rsplit_once('.')
-                                .map(|(n, _)| format!("{n}.ogg"))
-                                .unwrap_or_else(|| format!("{filename}.ogg"));
-                            info!(
-                                idx,
-                                src_len = bytes.len(),
-                                opus_len = opus_bytes.len(),
-                                "telegram: converted audio to ogg-opus"
-                            );
-                            (opus_bytes, ogg_name, "audio/ogg".to_owned())
+                let (send_bytes, send_filename, send_mime) =
+                    if is_audio && !filename.ends_with(".ogg") && !filename.ends_with(".opus") {
+                        let ext = filename.rsplit('.').next().unwrap_or("mp3");
+                        match crate::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext)) {
+                            Ok(opus_bytes) => {
+                                let ogg_name = filename
+                                    .rsplit_once('.')
+                                    .map(|(n, _)| format!("{n}.ogg"))
+                                    .unwrap_or_else(|| format!("{filename}.ogg"));
+                                info!(
+                                    idx,
+                                    src_len = bytes.len(),
+                                    opus_len = opus_bytes.len(),
+                                    "telegram: converted audio to ogg-opus"
+                                );
+                                (opus_bytes, ogg_name, "audio/ogg".to_owned())
+                            }
+                            Err(e) => {
+                                warn!(
+                                    idx,
+                                    "telegram: ogg-opus conversion failed, sending as-is: {e:#}"
+                                );
+                                (bytes, filename.clone(), mime.clone())
+                            }
                         }
-                        Err(e) => {
-                            warn!(
-                                idx,
-                                "telegram: ogg-opus conversion failed, sending as-is: {e:#}"
-                            );
-                            (bytes, filename.clone(), mime.clone())
-                        }
-                    }
-                } else {
-                    (bytes, filename.clone(), mime.clone())
-                };
+                    } else {
+                        (bytes, filename.clone(), mime.clone())
+                    };
 
                 let part = match reqwest::multipart::Part::bytes(send_bytes)
                     .file_name(send_filename.clone())
@@ -771,9 +763,8 @@ impl Channel for TelegramChannel {
                             offset = update.update_id + 1;
 
                             if let Some(msg) = &update.message {
-                                let mut tg_file_attachments: Vec<
-                                    rsclaw_types::FileAttachment,
-                                > = Vec::new();
+                                let mut tg_file_attachments: Vec<rsclaw_types::FileAttachment> =
+                                    Vec::new();
                                 // Try text first, then voice/audio transcription, then caption.
                                 let text = if let Some(t) =
                                     msg.text.clone().filter(|s| !s.is_empty())
@@ -895,13 +886,11 @@ impl Channel for TelegramChannel {
                                                             .encode(&final_bytes);
                                                     let data_url =
                                                         format!("data:{final_mime};base64,{b64}");
-                                                    images.push(
-                                                        rsclaw_types::ImageAttachment {
-                                                            data: data_url,
-                                                            mime_type: final_mime,
-                                                            source_path: None,
-                                                        },
-                                                    );
+                                                    images.push(rsclaw_types::ImageAttachment {
+                                                        data: data_url,
+                                                        mime_type: final_mime,
+                                                        source_path: None,
+                                                    });
                                                     info!(
                                                         from = orig_len,
                                                         to = final_bytes.len(),

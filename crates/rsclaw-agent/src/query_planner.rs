@@ -25,11 +25,10 @@
 
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
-
 use rsclaw_provider::{
     AgentEndpoint, LlmRequest, Message, MessageContent, Role, registry::ProviderRegistry,
 };
+use serde::{Deserialize, Serialize};
 
 /// A single planned sub-query with its recognized intent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,7 +399,7 @@ async fn try_plan(
     }];
 
     let req = LlmRequest {
-            fallback_models: Vec::new(),
+        fallback_models: Vec::new(),
         model: model_id.to_owned(),
         messages,
         tools: vec![],

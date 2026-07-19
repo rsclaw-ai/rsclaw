@@ -10,8 +10,7 @@ use futures::future::BoxFuture;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::debug;
 
-use super::attachments::parse_data_url;
-use super::{Channel, OutboundMessage};
+use super::{Channel, OutboundMessage, attachments::parse_data_url};
 
 pub const CLI_CHANNEL_NAME: &str = "cli";
 /// Synthetic peer ID for CLI usage.
@@ -65,9 +64,7 @@ impl Channel for CliChannel {
                             debug!(?e, "cli: failed to save image {}", i);
                         } else {
                             stdout
-                                .write_all(
-                                    format!("[image: {}]\n", path.display()).as_bytes(),
-                                )
+                                .write_all(format!("[image: {}]\n", path.display()).as_bytes())
                                 .await?;
                         }
                     }
@@ -79,7 +76,10 @@ impl Channel for CliChannel {
             stdout.flush().await?;
 
             if !msg.files.is_empty() {
-                debug!("cli: files not rendered on CLI: {:?}", msg.files.iter().map(|f| &f.0).collect::<Vec<_>>());
+                debug!(
+                    "cli: files not rendered on CLI: {:?}",
+                    msg.files.iter().map(|f| &f.0).collect::<Vec<_>>()
+                );
             }
             Ok(())
         })

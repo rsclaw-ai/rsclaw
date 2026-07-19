@@ -11,13 +11,13 @@
 //!   stays declarative (`primary: "doubao/x"` or `primary: [a, b]`) and the
 //!   user sees what they wrote.
 //! - **A runtime failure never permanently disables a model.** Every failure
-//!   produces a time-bounded `Cooling`; disabling-class errors (auth /
-//!   balance / model-missing) escalate to the `MAX_COOLDOWN` ceiling so a
+//!   produces a time-bounded `Cooling`; disabling-class errors (auth / balance
+//!   / model-missing) escalate to the `MAX_COOLDOWN` ceiling so a
 //!   genuinely-broken config is re-probed at most hourly rather than being
 //!   locked out until manual reset. `Disabled` is reserved for explicit
 //!   operator/config disable, never reached from call results.
-//! - Restart resets all state (no on-disk persistence). Simple and avoids
-//!   the redb dance for what's essentially short-term volatile data.
+//! - Restart resets all state (no on-disk persistence). Simple and avoids the
+//!   redb dance for what's essentially short-term volatile data.
 
 use std::{
     sync::{Arc, RwLock},
@@ -568,7 +568,8 @@ mod tests {
 
     #[test]
     fn classify_auth_401() {
-        let body = r#"OpenAI API error 401 Unauthorized: {"error":{"message":"Incorrect API key"}}"#;
+        let body =
+            r#"OpenAI API error 401 Unauthorized: {"error":{"message":"Incorrect API key"}}"#;
         assert_eq!(classify_str(body), ErrorKind::Auth);
     }
 
@@ -586,13 +587,15 @@ mod tests {
 
     #[test]
     fn classify_model_missing() {
-        let body = r#"{"error":{"code":"model_not_found","message":"The model gpt-5 does not exist"}}"#;
+        let body =
+            r#"{"error":{"code":"model_not_found","message":"The model gpt-5 does not exist"}}"#;
         assert_eq!(classify_str(body), ErrorKind::ModelMissing);
     }
 
     #[test]
     fn classify_model_missing_volcengine() {
-        let body = r#"{"error":{"code":"EndpointIsNotEnabled","message":"endpoint is not enabled"}}"#;
+        let body =
+            r#"{"error":{"code":"EndpointIsNotEnabled","message":"endpoint is not enabled"}}"#;
         assert_eq!(classify_str(body), ErrorKind::ModelMissing);
     }
 
@@ -604,7 +607,10 @@ mod tests {
 
     #[test]
     fn classify_transient_timeout() {
-        assert_eq!(classify_str("connection failed: timed out"), ErrorKind::Transient);
+        assert_eq!(
+            classify_str("connection failed: timed out"),
+            ErrorKind::Transient
+        );
     }
 
     #[test]
@@ -645,11 +651,7 @@ mod tests {
     fn health_transitions_healthy_to_cooling() {
         let mut h = ModelHealth::new("doubao/x");
         assert!(h.is_callable());
-        h.record_failure(
-            ErrorKind::Transient,
-            "503".into(),
-            Instant::now(),
-        );
+        h.record_failure(ErrorKind::Transient, "503".into(), Instant::now());
         assert!(matches!(h.status, ModelStatus::Cooling { .. }));
         assert!(!h.is_callable());
         assert_eq!(h.consecutive_failures, 1);
@@ -733,7 +735,13 @@ mod tests {
 
     #[test]
     fn cooling_backoff_starts_at_base() {
-        assert_eq!(cooling_backoff(1, ErrorKind::RateLimit), Duration::from_secs(30));
-        assert_eq!(cooling_backoff(1, ErrorKind::Transient), Duration::from_secs(10));
+        assert_eq!(
+            cooling_backoff(1, ErrorKind::RateLimit),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            cooling_backoff(1, ErrorKind::Transient),
+            Duration::from_secs(10)
+        );
     }
 }

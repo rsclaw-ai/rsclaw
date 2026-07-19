@@ -20,6 +20,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use rsclaw_config::schema::McpServerConfig;
+use rsclaw_provider::ToolDef;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
@@ -29,9 +31,6 @@ use tokio::{
     time,
 };
 use tracing::{debug, info};
-
-use rsclaw_config::schema::McpServerConfig;
-use rsclaw_provider::ToolDef;
 
 const MCP_CALL_TIMEOUT_SECS: u64 = 60;
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";

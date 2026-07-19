@@ -11,9 +11,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-
-use rsclaw_types::turn_metrics::TurnMetrics;
 use rsclaw_provider::registry::ProviderRegistry;
+use rsclaw_types::turn_metrics::TurnMetrics;
 
 /// Build the LLM prompt for workflow distillation. Receives the raw turn
 /// transcript so the model can extract the steps, errors, and recovery
@@ -223,8 +222,9 @@ pub async fn crystallize_workflow(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rsclaw_types::turn_metrics::TurnMetrics;
+
+    use super::*;
 
     #[test]
     fn prompt_includes_tool_log() {

@@ -216,7 +216,11 @@ impl HnswCache {
 
     /// Number of vectors currently in the cache. Test/debug helper.
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap_or_else(|p| p.into_inner()).id_to_chunk.len()
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .id_to_chunk
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {

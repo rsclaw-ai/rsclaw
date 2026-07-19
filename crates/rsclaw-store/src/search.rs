@@ -13,6 +13,7 @@
 use std::{path::Path, sync::Mutex};
 
 use anyhow::{Context, Result};
+use rsclaw_platform::MemoryTier;
 use tantivy::{
     Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument,
     collector::TopDocs,
@@ -21,8 +22,6 @@ use tantivy::{
     schema::{STORED, STRING, Schema, SchemaBuilder, TEXT, document::Value as _},
 };
 use tracing::debug;
-
-use rsclaw_platform::MemoryTier;
 
 // ---------------------------------------------------------------------------
 // Schema field names

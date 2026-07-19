@@ -90,7 +90,8 @@ pub const OUTBOUND_BATCH_PREFIX: &str = "\u{1}batch:";
 
 /// Names of all built-in agent tools. Lifted from agent/prompt_builder.rs
 /// (crate-split) so rsclaw-provider can reference it without depending on the
-/// runtime knot. Re-exported at crate::agent::prompt_builder::BUILTIN_TOOL_NAMES.
+/// runtime knot. Re-exported at
+/// crate::agent::prompt_builder::BUILTIN_TOOL_NAMES.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "memory",
     "todo",
@@ -171,9 +172,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
 // external_jobs}.rs so rsclaw-store can depend on them without depending on the
 // gateway runtime. Re-exported at their original paths.
 // ============================================================================
-use serde::{Serialize, Deserialize};
-use md5::Md5;
-use md5::Digest as _;
+use md5::{Digest as _, Md5};
+use serde::{Deserialize, Serialize};
 
 /// Task priority. Lower numeric value = higher priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -325,7 +325,8 @@ pub fn default_max_turns() -> u32 {
 pub fn compute_hash(text: &str) -> String {
     let hash = Md5::digest(text.as_bytes());
     hex::encode(hash)
-}/// What kind of artifact the job will produce when it finishes. Used by the
+}
+/// What kind of artifact the job will produce when it finishes. Used by the
 /// worker's delivery step to pick the right channel formatting (e.g. video
 /// vs image attachment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,7 +531,9 @@ impl ExternalJob {
 // ============================================================================
 use futures::future::BoxFuture as _NotifBoxFuture;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationPriority {
     Low = 0,
@@ -557,8 +560,8 @@ pub trait NotificationSink: Send + Sync {
 pub mod turn_metrics;
 
 // ============================================================================
-// BriefingSink (crate-split): trait inversion so trusted runtime integrations can
-// submit to the gateway task queue + push outbound WITHOUT depending on the
+// BriefingSink (crate-split): trait inversion so trusted runtime integrations
+// can submit to the gateway task queue + push outbound WITHOUT depending on the
 // gateway runtime.
 // ============================================================================
 pub trait BriefingSink: Send + Sync {
@@ -692,8 +695,9 @@ pub enum Recommend {
 // Pending-outcome staging map (crate-split: lifted from gateway/task_queue.rs
 // so rsclaw-a2a can drain staged outcomes without depending on the gateway).
 use std::collections::HashMap as _PoHashMap;
-static PENDING_OUTCOMES: std::sync::OnceLock<std::sync::Mutex<_PoHashMap<String, StructuredOutcome>>> =
-    std::sync::OnceLock::new();
+static PENDING_OUTCOMES: std::sync::OnceLock<
+    std::sync::Mutex<_PoHashMap<String, StructuredOutcome>>,
+> = std::sync::OnceLock::new();
 
 fn pending_outcomes_map() -> &'static std::sync::Mutex<_PoHashMap<String, StructuredOutcome>> {
     PENDING_OUTCOMES.get_or_init(|| std::sync::Mutex::new(_PoHashMap::new()))
@@ -720,7 +724,8 @@ pub struct SkipEntry {
     /// Why it was skipped.
     pub why: String,
 }
-/// Default max turns for /task mode (crate-split: lifted from gateway/task_queue.rs).
+/// Default max turns for /task mode (crate-split: lifted from
+/// gateway/task_queue.rs).
 pub const TASK_DEFAULT_MAX_TURNS: u32 = 10;
 /// Default TTL for /task mode (1 hour).
 pub const TASK_DEFAULT_TTL_SECS: u64 = 3600;
@@ -731,7 +736,8 @@ pub const TASK_DEFAULT_TTL_SECS: u64 = 3600;
 // Root's gateway implements this and injects it at startup.
 // ============================================================================
 pub trait TaskQueueHost: Send + Sync {
-    /// Submit a background task to the queue. Returns (task_id, merged_into_existing).
+    /// Submit a background task to the queue. Returns (task_id,
+    /// merged_into_existing).
     fn submit_task(
         &self,
         session_key: &str,

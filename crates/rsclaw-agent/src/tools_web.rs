@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
+use rsclaw_config::loader::{applicable_site_rules, applicable_site_rules_body};
+use rsclaw_provider::{AgentEndpoint, Message, MessageContent, Role, StreamEvent};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -21,8 +23,6 @@ use super::{
     },
 };
 use crate::query_planner::{Intent, QueryPlan};
-use rsclaw_config::loader::{applicable_site_rules, applicable_site_rules_body};
-use rsclaw_provider::{AgentEndpoint, Message, MessageContent, Role, StreamEvent};
 
 /// Attach a pre-written raw-markdown artifact id to a `tool_web_fetch`
 /// JSON result so the runtime's "truncated → call read_artifact"
@@ -161,13 +161,12 @@ impl AgentRuntime {
         // cross-encoder rerank → return the most relevant chunks). It calls
         // back into plain search (with `_planned`, and no `deep`) for URLs, so
         // this branch does not recurse.
-        if args
-            .get("deep")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+        if args.get("deep").and_then(|v| v.as_bool()).unwrap_or(false) {
             let q = query.trim().to_owned();
-            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
             return self.deep_web_search(&q, limit).await;
         }
 
@@ -187,8 +186,7 @@ impl AgentRuntime {
             // the planner. Fall back to the tool's `query` arg if unavailable.
             let planner_input = args["_user_query"].as_str().unwrap_or(query);
             let flash = self.resolve_flash_model_name();
-            let plan =
-                crate::query_planner::plan(planner_input, &flash, &self.providers).await;
+            let plan = crate::query_planner::plan(planner_input, &flash, &self.providers).await;
 
             // Count structured (non-general) intents. If we have any, dispatch
             // them through the planner path and return structured results.
@@ -687,8 +685,8 @@ impl AgentRuntime {
     pub(crate) async fn deep_web_search(&self, query: &str, limit: Option<usize>) -> Result<Value> {
         let fetch_n = limit.unwrap_or(DEEP_FETCH_TOP_N).clamp(1, 10);
 
-        // 1. Plain search for URLs. `_planned` bypasses the query planner;
-        //    `deep` is absent so this does not recurse.
+        // 1. Plain search for URLs. `_planned` bypasses the query planner; `deep` is
+        //    absent so this does not recurse.
         // Box::pin breaks the async-fn recursion cycle (tool_web_search →
         // deep_web_search → tool_web_search); the `_planned`/no-`deep` args
         // ensure it runs the plain snippet path exactly once.
@@ -718,8 +716,8 @@ impl AgentRuntime {
             return Ok(raw);
         }
 
-        // 2. Fetch page bodies concurrently with a strict per-fetch timeout
-        //    (reqwest's own timeout); reuse the HTML→text dehydrator.
+        // 2. Fetch page bodies concurrently with a strict per-fetch timeout (reqwest's
+        //    own timeout); reuse the HTML→text dehydrator.
         let client = match reqwest::Client::builder()
             .user_agent(DEEP_FETCH_UA)
             .timeout(Duration::from_millis(DEEP_PER_FETCH_TIMEOUT_MS))
@@ -731,8 +729,8 @@ impl AgentRuntime {
                 return Ok(raw);
             }
         };
-        let mut pages: Vec<(usize, String, String, String)> = futures::stream::iter(
-            hits.into_iter().enumerate().map(|(idx, (title, url))| {
+        let mut pages: Vec<(usize, String, String, String)> =
+            futures::stream::iter(hits.into_iter().enumerate().map(|(idx, (title, url))| {
                 let client = client.clone();
                 async move {
                     let body = client.get(&url).send().await.ok()?.text().await.ok()?;
@@ -742,12 +740,11 @@ impl AgentRuntime {
                     }
                     Some((idx, title, url, text))
                 }
-            }),
-        )
-        .buffer_unordered(DEEP_FETCH_CONCURRENCY)
-        .filter_map(|x| async move { x })
-        .collect()
-        .await;
+            }))
+            .buffer_unordered(DEEP_FETCH_CONCURRENCY)
+            .filter_map(|x| async move { x })
+            .collect()
+            .await;
         if pages.is_empty() {
             return Ok(raw);
         }
@@ -776,13 +773,12 @@ impl AgentRuntime {
             return Ok(raw);
         }
 
-        // 4. Embed query + chunks OFF the async worker. The local candle
-        //    embedder is synchronous + CPU-bound and the remote one drives
-        //    blocking reqwest; on the single-worker runtime an inline call
-        //    head-of-line-blocks every other session, so wrap it in
-        //    spawn_blocking (mirrors tools_artifact.rs). Resolve the embedder
-        //    inside the closure so a first-time local-model load also stays
-        //    off the worker.
+        // 4. Embed query + chunks OFF the async worker. The local candle embedder is
+        //    synchronous + CPU-bound and the remote one drives blocking reqwest; on the
+        //    single-worker runtime an inline call head-of-line-blocks every other
+        //    session, so wrap it in spawn_blocking (mirrors tools_artifact.rs). Resolve
+        //    the embedder inside the closure so a first-time local-model load also
+        //    stays off the worker.
         let n = chunk_text.len();
         let mut batch: Vec<String> = Vec::with_capacity(n + 1);
         batch.push(query.to_owned());
@@ -823,10 +819,10 @@ impl AgentRuntime {
         }
         order.truncate(DEEP_COSINE_TOPK.min(n));
 
-        // 5. Optional cross-encoder rerank (also off-worker). The reranker
-        //    ranks independently of the embeddings, so it still works when
-        //    they failed. But with neither usable embeddings NOR a reranker,
-        //    a random chunk order is worse than snippets — fall back.
+        // 5. Optional cross-encoder rerank (also off-worker). The reranker ranks
+        //    independently of the embeddings, so it still works when they failed. But
+        //    with neither usable embeddings NOR a reranker, a random chunk order is
+        //    worse than snippets — fall back.
         let reranker = self.resolve_web_reranker();
         if !embed_ok && reranker.is_none() {
             return Ok(raw);
@@ -2257,9 +2253,8 @@ impl AgentRuntime {
                         .and_then(|b| b.remote_debug_ports.as_ref())
                         .unwrap_or(&default_ports);
 
-                    // 1. User's Chrome with CDP already open? Use it. The user
-                    //    owns this process, so register it as *external* (pool
-                    //    won't try to kill/restart it).
+                    // 1. User's Chrome with CDP already open? Use it. The user owns this process,
+                    //    so register it as *external* (pool won't try to kill/restart it).
                     if let Some(ws_url) = rsclaw_browser::detect_existing_chrome(ports).await {
                         info!("connecting to user Chrome (remote debugging, headed)");
                         let _ = rsclaw_browser::pool::BrowserPool::global()
@@ -2278,8 +2273,7 @@ impl AgentRuntime {
                         let pool_pid = rsclaw_browser::pool::BrowserPool::global()
                             .owned_chrome_pid()
                             .await;
-                        let mut chrome_blocking =
-                            rsclaw_browser::default_profile_blocked(pool_pid);
+                        let mut chrome_blocking = rsclaw_browser::default_profile_blocked(pool_pid);
                         if chrome_blocking {
                             info!("Chrome running without CDP; asking user to quit (60s window)");
                             if let Some(ref tx) = self.notification_tx {
@@ -2300,8 +2294,8 @@ impl AgentRuntime {
                             // Cancellable poll: wait for the user to quit Chrome.
                             // Respects chat.abort via turn_ctx so a user who
                             // changes their mind isn't stuck waiting 60s.
-                            let deadline = std::time::Instant::now()
-                                + std::time::Duration::from_secs(60);
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(60);
                             while std::time::Instant::now() < deadline {
                                 if ctx.turn_ctx.is_cancelled() {
                                     return Err(anyhow!("turn aborted"));
@@ -2309,7 +2303,9 @@ impl AgentRuntime {
                                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                 if !rsclaw_browser::default_profile_blocked(pool_pid) {
                                     chrome_blocking = false;
-                                    info!("default profile freed; relaunching with default profile + CDP");
+                                    info!(
+                                        "default profile freed; relaunching with default profile + CDP"
+                                    );
                                     break;
                                 }
                             }
@@ -2320,10 +2316,15 @@ impl AgentRuntime {
                         // profile (no cookies) as a last resort. Either way the
                         // Chrome is launched *pool-owned* so it outlives this
                         // turn and is shared by web_fetch / sub-agents.
-                        let launch_profile: Option<&str> =
-                            if chrome_blocking { None } else { Some("default") };
+                        let launch_profile: Option<&str> = if chrome_blocking {
+                            None
+                        } else {
+                            Some("default")
+                        };
                         if chrome_blocking {
-                            warn!("user kept Chrome open; using temporary profile (no login state)");
+                            warn!(
+                                "user kept Chrome open; using temporary profile (no login state)"
+                            );
                             if let Some(ref tx) = self.notification_tx {
                                 let _ = tx.send(rsclaw_channel::OutboundMessage {
                                     target_id: ctx.peer_id.clone(),

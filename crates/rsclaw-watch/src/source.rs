@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-
 use tracing::warn;
 
 use crate::parser::SourceKind;

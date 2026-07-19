@@ -9,40 +9,44 @@
 //! both retain conversation memory across `Prompt` frames).
 //!
 //! Designed for two callers:
-//!   - **Orchestration mode (LLM):** the agent calls a `cap_live` tool
-//!     with `(agent, task, session_id?)`. First call returns a fresh
-//!     session_id; subsequent calls pass it back to continue the same
-//!     subagent. Typical pattern: codex designs → claude implements →
-//!     opencode reviews, all in one IM turn, with the main LLM acting
-//!     as conductor.
-//!   - **Direct mode (IM `/cap` command, CLI, UI panel):** later phases
-//!     bind an IM session sticky to a live session_id so user messages
-//!     bypass the main LLM and flow straight to the driver.
+//!   - **Orchestration mode (LLM):** the agent calls a `cap_live` tool with
+//!     `(agent, task, session_id?)`. First call returns a fresh session_id;
+//!     subsequent calls pass it back to continue the same subagent. Typical
+//!     pattern: codex designs → claude implements → opencode reviews, all in
+//!     one IM turn, with the main LLM acting as conductor.
+//!   - **Direct mode (IM `/cap` command, CLI, UI panel):** later phases bind an
+//!     IM session sticky to a live session_id so user messages bypass the main
+//!     LLM and flow straight to the driver.
 //!
 //! Resource governance:
-//!   - Global cap (`max_sessions`, default 8) — over-spawn returns an
-//!     error so a runaway LLM can't drown the host in driver processes.
-//!   - Per-session idle GC (`idle_timeout`, default 10 min) — sessions
-//!     that haven't received a prompt are torn down on the next
-//!     allocation attempt.
+//!   - Global cap (`max_sessions`, default 8) — over-spawn returns an error so
+//!     a runaway LLM can't drown the host in driver processes.
+//!   - Per-session idle GC (`idle_timeout`, default 10 min) — sessions that
+//!     haven't received a prompt are torn down on the next allocation attempt.
 //!
 //! Lifecycle: `dispatch_sync(.., session_id=None)` spawns + returns
 //! id; `dispatch_sync(.., session_id=Some)` reuses; `end_session(id)`
 //! force-closes; idle GC closes silently.
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
+};
+
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use cap_rs::{
+    core::{ClientFrame, Content},
+    driver::Driver,
+};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 
-use cap_rs::core::{ClientFrame, Content};
-use cap_rs::driver::Driver;
-
-use super::AgentKind;
-use super::runtime::{
-    NotifTarget, run_turn, spawn_driver, spawn_driver_acp, spawn_driver_continue_last,
-    spawn_driver_resume,
+use super::{
+    AgentKind,
+    runtime::{
+        NotifTarget, run_turn, spawn_driver, spawn_driver_acp, spawn_driver_continue_last,
+        spawn_driver_resume,
+    },
 };
 
 const DEFAULT_MAX_SESSIONS: usize = 8;
@@ -91,8 +95,7 @@ pub struct CapLiveManager {
     /// initial bind reply (e.g. surface the agent's native session_id
     /// once `AgentEvent::Ready` lands in the actor). `None` in test /
     /// embedded contexts that don't have a channel layer.
-    notification_tx:
-        Option<broadcast::Sender<rsclaw_types::OutboundMessage>>,
+    notification_tx: Option<broadcast::Sender<rsclaw_types::OutboundMessage>>,
     max_sessions: usize,
     idle_timeout: Duration,
 }
@@ -165,18 +168,13 @@ impl CapLiveManager {
 
     /// Late-set the outbound notification channel. Called once from
     /// `gateway::startup` after the broadcast channel is created.
-    pub fn set_notification_tx(
-        &mut self,
-        tx: broadcast::Sender<rsclaw_types::OutboundMessage>,
-    ) {
+    pub fn set_notification_tx(&mut self, tx: broadcast::Sender<rsclaw_types::OutboundMessage>) {
         self.notification_tx = Some(tx);
     }
 
     /// Cheap clone of the outbound notification sender, for preparse-
     /// side follow-up dispatches (e.g. resume-id hint after /cap).
-    pub fn notification_tx(
-        &self,
-    ) -> Option<broadcast::Sender<rsclaw_types::OutboundMessage>> {
+    pub fn notification_tx(&self) -> Option<broadcast::Sender<rsclaw_types::OutboundMessage>> {
         self.notification_tx.clone()
     }
 
@@ -229,13 +227,10 @@ impl CapLiveManager {
     /// Used by the IM `/cap <agent>` slash command which wants to open
     /// a session and bind it sticky before any user message arrives.
     /// Returns the freshly minted `session_id`.
-    pub async fn open_session(
-        &self,
-        kind: AgentKind,
-        cwd: std::path::PathBuf,
-    ) -> Result<String> {
+    pub async fn open_session(&self, kind: AgentKind, cwd: std::path::PathBuf) -> Result<String> {
         let sid = uuid::Uuid::new_v4().simple().to_string();
-        self.spawn_session(&sid, kind, &cwd, ResumeMode::None).await?;
+        self.spawn_session(&sid, kind, &cwd, ResumeMode::None)
+            .await?;
         Ok(sid)
     }
 
@@ -346,10 +341,7 @@ impl CapLiveManager {
 
     /// Remove a sticky binding. Returns the previously bound
     /// `(live_session_id, kind)` if there was one.
-    pub async fn unbind_sticky(
-        &self,
-        im_session_key: &str,
-    ) -> Option<(String, AgentKind)> {
+    pub async fn unbind_sticky(&self, im_session_key: &str) -> Option<(String, AgentKind)> {
         let mut g = self.sticky.write().await;
         g.remove(im_session_key)
     }
@@ -357,10 +349,7 @@ impl CapLiveManager {
     /// Look up the live session bound to this IM key. Returns
     /// `None` if the binding doesn't exist OR if the underlying live
     /// session is gone (in which case the stale entry is also evicted).
-    pub async fn resolve_sticky(
-        &self,
-        im_session_key: &str,
-    ) -> Option<(String, AgentKind)> {
+    pub async fn resolve_sticky(&self, im_session_key: &str) -> Option<(String, AgentKind)> {
         let entry = {
             let g = self.sticky.read().await;
             g.get(im_session_key).cloned()
@@ -614,7 +603,8 @@ impl CapLiveManager {
     /// the id immediately after spawn.
     pub async fn get_agent_session_id(&self, sid: &str) -> Option<String> {
         let g = self.sessions.read().await;
-        g.get(sid).and_then(|h| h.agent_session_id.lock().ok().and_then(|s| s.clone()))
+        g.get(sid)
+            .and_then(|h| h.agent_session_id.lock().ok().and_then(|s| s.clone()))
     }
 
     /// Same as `get_agent_session_id` but polls for up to `timeout`
@@ -775,8 +765,7 @@ async fn respawn_driver(
             {
                 use cap_rs::core::AgentEvent;
                 let mut captured: Option<String> = None;
-                let recapture_deadline =
-                    tokio::time::sleep(std::time::Duration::from_secs(8));
+                let recapture_deadline = tokio::time::sleep(std::time::Duration::from_secs(8));
                 tokio::pin!(recapture_deadline);
                 loop {
                     tokio::select! {
@@ -950,16 +939,15 @@ async fn actor_loop(
                 // agents just respawn same-kind.
                 let retry_acp = kind == AgentKind::Opencode;
                 // Two INDEPENDENT budgets:
-                //  - `respawned`: a DEAD driver (send fail / mid-turn exit) gets
-                //    one respawn — opencode via ACP, the resilient path.
-                //  - `empty_resends`: an ALIVE-but-empty turn is the opencode
-                //    cold-start "produced nothing" flake. RE-SEND to the SAME,
-                //    now-warm driver — respawning there just cold-starts again
-                //    and re-emits nothing. (Observed: the death-respawn burned
-                //    the single old retry, so the empty post-respawn turn slipped
-                //    through as "(no output)" while the user's very next message
-                //    worked on the warm driver.) An empty turn ran no tools, so
-                //    replaying the prompt is safe.
+                //  - `respawned`: a DEAD driver (send fail / mid-turn exit) gets one respawn —
+                //    opencode via ACP, the resilient path.
+                //  - `empty_resends`: an ALIVE-but-empty turn is the opencode cold-start
+                //    "produced nothing" flake. RE-SEND to the SAME, now-warm driver —
+                //    respawning there just cold-starts again and re-emits nothing. (Observed:
+                //    the death-respawn burned the single old retry, so the empty post-respawn
+                //    turn slipped through as "(no output)" while the user's very next message
+                //    worked on the warm driver.) An empty turn ran no tools, so replaying the
+                //    prompt is safe.
                 let mut respawned = false;
                 let mut empty_resends = 0u8;
                 let outcome = loop {
@@ -970,7 +958,16 @@ async fn actor_loop(
                         .await;
                     if let Err(e) = send_res {
                         if !respawned
-                            && respawn_driver(&kind, &cwd, &mut driver, &sid, "send failed", &agent_sid_slot, retry_acp).await
+                            && respawn_driver(
+                                &kind,
+                                &cwd,
+                                &mut driver,
+                                &sid,
+                                "send failed",
+                                &agent_sid_slot,
+                                retry_acp,
+                            )
+                            .await
                         {
                             respawned = true;
                             continue;

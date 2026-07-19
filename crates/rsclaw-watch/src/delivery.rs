@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-
 use rsclaw_channel::{ChannelManager, OutboundMessage};
 
 /// Push `body` to (channel, account, peer) using the same ChannelManager

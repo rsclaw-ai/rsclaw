@@ -45,7 +45,8 @@ pub fn process_alive(pid: u32) -> bool {
             use std::os::windows::process::CommandExt;
             taskl.creation_flags(0x08000000);
         }
-        taskl.output()
+        taskl
+            .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
             .unwrap_or(false)
     }
@@ -254,8 +255,8 @@ pub fn detect_chrome() -> Option<String> {
         }
     }
 
-    // 2. Fall back to ~/.rsclaw/tools/chrome (Chrome for Testing we manage).
-    //    On macOS this is already tried above (before Edge/Brave); this covers
+    // 2. Fall back to ~/.rsclaw/tools/chrome (Chrome for Testing we manage). On
+    //    macOS this is already tried above (before Edge/Brave); this covers
     //    Windows/Linux and macOS machines with no system browser at all.
     if let Some(m) = managed_chrome() {
         return Some(m);
@@ -264,8 +265,9 @@ pub fn detect_chrome() -> Option<String> {
     None
 }
 
-/// Path to the rsclaw-managed Chrome for Testing under `~/.rsclaw/tools/chrome`,
-/// if a usable binary is present. Returns `None` when the dir is absent.
+/// Path to the rsclaw-managed Chrome for Testing under
+/// `~/.rsclaw/tools/chrome`, if a usable binary is present. Returns `None` when
+/// the dir is absent.
 fn managed_chrome() -> Option<String> {
     let tools_dir = rsclaw_config::loader::base_dir().join("tools/chrome");
     if !tools_dir.exists() {

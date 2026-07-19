@@ -4,19 +4,18 @@
 use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::{Result, anyhow};
-use tokio::sync::{broadcast, mpsc};
-use tracing::info;
-
-use rsclaw_config::live_config::LiveConfig;
-use crate::{
-    AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, AgentRuntime, MemoryStore,
-};
-use rsclaw_config::{runtime::RuntimeConfig, schema::AgentEntry};
+use rsclaw_config::{live_config::LiveConfig, runtime::RuntimeConfig, schema::AgentEntry};
 use rsclaw_events::AgentEvent;
 use rsclaw_plugin::PluginRegistry;
 use rsclaw_provider::registry::ProviderRegistry;
 use rsclaw_skill::SkillRegistry;
 use rsclaw_store::Store;
+use tokio::sync::{broadcast, mpsc};
+use tracing::info;
+
+use crate::{
+    AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, AgentRuntime, MemoryStore,
+};
 
 pub struct AgentSpawner {
     pub registry: Arc<AgentRegistry>,

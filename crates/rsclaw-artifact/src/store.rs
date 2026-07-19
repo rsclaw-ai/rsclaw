@@ -157,7 +157,9 @@ impl ArtifactStore {
     /// an optional optimization).
     pub fn read_summary(&self, session_key: &str, id: &ArtifactId) -> Option<String> {
         let path = self.summary_path_for(session_key, id);
-        fs::read_to_string(path).ok().filter(|s| !s.trim().is_empty())
+        fs::read_to_string(path)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
     }
 
     /// Cache a flash-generated summary next to its artifact. Best-effort:

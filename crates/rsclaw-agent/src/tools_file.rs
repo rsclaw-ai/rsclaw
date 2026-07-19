@@ -267,9 +267,9 @@ mod shell_sanitize_tests {
 //
 // Replaces `glob::glob` for tool-side traversal. The story:
 //   - `glob` follows symlinks, has no gitignore awareness, and runs
-//     synchronously without yielding. A `glob::glob("/Users/$HOME/**/*")`
-//     on a tree with one `node_modules` hoist symlink loop loops forever,
-//     pinning a tokio worker thread.
+//     synchronously without yielding. A `glob::glob("/Users/$HOME/**/*")` on a
+//     tree with one `node_modules` hoist symlink loop loops forever, pinning a
+//     tokio worker thread.
 //   - `tokio::time::timeout` does NOT save us — the future never reaches an
 //     await point, so the timeout's drop-on-elapsed never fires.
 //
@@ -328,15 +328,15 @@ struct WalkOutcome {
 /// Walk a directory tree safely.
 ///
 /// - `root` — absolute path of the directory to walk. Must exist.
-/// - `name_filter` — optional `globset` glob (matches against BASENAME).
-///   `None` = include every entry. Pattern like `*.rs`, `Cargo.toml`,
-///   `opencode` (literal-name match), etc.
+/// - `name_filter` — optional `globset` glob (matches against BASENAME). `None`
+///   = include every entry. Pattern like `*.rs`, `Cargo.toml`, `opencode`
+///   (literal-name match), etc.
 /// - `recursive` — descend into subdirs. When false, only `root`'s direct
 ///   children are visited.
-/// - `max_results` — cap on returned `entries`. Walk continues internally
-///   only until this is hit (or one of the other limits).
-/// - `max_scanned` — cap on directory entries the walker is allowed to
-///   visit. Catches "result is rare but tree is enormous" scenarios.
+/// - `max_results` — cap on returned `entries`. Walk continues internally only
+///   until this is hit (or one of the other limits).
+/// - `max_scanned` — cap on directory entries the walker is allowed to visit.
+///   Catches "result is rare but tree is enormous" scenarios.
 /// - `deadline` — wall-clock cap. Walker exits cleanly when exceeded.
 ///
 /// All blocking work happens inside `spawn_blocking`, so the caller's
@@ -494,7 +494,11 @@ impl super::runtime::AgentRuntime {
         let pattern_raw = args["pattern"].as_str().unwrap_or("*");
         // "*" means "no filter"; safe_walk treats None as "any entry"
         // which is faster (no globset compile + no per-entry match).
-        let pattern = if pattern_raw == "*" { None } else { Some(pattern_raw.to_owned()) };
+        let pattern = if pattern_raw == "*" {
+            None
+        } else {
+            Some(pattern_raw.to_owned())
+        };
 
         if !path.exists() {
             return Ok(json!({"error": format!("path not found: {}", path.display())}));
@@ -680,9 +684,7 @@ impl super::runtime::AgentRuntime {
             if let Some(inc) = include {
                 cmd.arg("--include").arg(inc);
             }
-            cmd.arg("--")
-                .arg(pattern)
-                .arg(root_path.as_os_str());
+            cmd.arg("--").arg(pattern).arg(root_path.as_os_str());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::null());
             tokio::time::timeout(Duration::from_secs(15), cmd.output())
@@ -860,7 +862,10 @@ impl super::runtime::AgentRuntime {
                 path
             );
         }
-        let limit = limit_raw.map(|n| n as usize).unwrap_or(DEFAULT_LIMIT).max(1);
+        let limit = limit_raw
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_LIMIT)
+            .max(1);
         let end = (start + limit).min(total_lines);
         let slice = lines[start..end].join("\n");
 
@@ -1096,7 +1101,9 @@ impl super::runtime::AgentRuntime {
                     bail!("[blocked] {reason}");
                 }
                 crate::preparse::SafetyCheck::Confirm(reason) => {
-                    bail!("[needs confirmation] {reason}. Command: {command}. Do not retry on your own — ask the user to explicitly approve this command, and re-run it only after they confirm.");
+                    bail!(
+                        "[needs confirmation] {reason}. Command: {command}. Do not retry on your own — ask the user to explicitly approve this command, and re-run it only after they confirm."
+                    );
                 }
             }
         }
@@ -1111,7 +1118,10 @@ impl super::runtime::AgentRuntime {
             // ("running scripts is disabled on this system"). Bypass applies
             // ONLY to this child process — it never changes the machine's
             // persistent policy. Without it `npm install` etc. just fails.
-            ("powershell", vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
+            (
+                "powershell",
+                vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"],
+            )
         } else {
             ("sh", vec!["-c"])
         };
@@ -1455,7 +1465,8 @@ impl super::runtime::AgentRuntime {
                      Your old_string appears to contain non-ASCII variants: {}. \
                      Re-read the file and copy the literal characters from disk, \
                      not from a chat / markdown rendering.",
-                    path, diffs
+                    path,
+                    diffs
                 );
             }
             bail!(
@@ -1509,11 +1520,7 @@ async fn has_ripgrep() -> bool {
         use std::os::windows::process::CommandExt;
         rg_cmd.creation_flags(0x08000000);
     }
-    rg_cmd
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+    rg_cmd.status().await.map(|s| s.success()).unwrap_or(false)
 }
 
 /// Run a ripgrep search with full support for `output_mode` and `multiline`.

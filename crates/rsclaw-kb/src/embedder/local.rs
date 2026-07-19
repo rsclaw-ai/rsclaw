@@ -13,9 +13,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rsclaw_embed::{Embedder, EmbedderBackend, LocalBgeEmbedder, OpenAiEmbedder};
 
 use super::KbEmbedder;
-use rsclaw_embed::{Embedder, EmbedderBackend, LocalBgeEmbedder, OpenAiEmbedder};
 
 pub struct LocalKbEmbedder {
     backend: EmbedderBackend,

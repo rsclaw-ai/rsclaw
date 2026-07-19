@@ -3,13 +3,13 @@
 //! Extracted from `runtime.rs` to reduce file size.
 //! All public items are re-exported by `runtime.rs` so callers are unaffected.
 
-use serde_json::{Value, json};
-
-use super::registry::AgentRegistry;
 use rsclaw_config::schema::A2aPeerConfig;
 use rsclaw_plugin::{PluginRegistry, WasmPlugin};
 use rsclaw_provider::ToolDef;
 use rsclaw_skill::SkillRegistry;
+use serde_json::{Value, json};
+
+use super::registry::AgentRegistry;
 
 pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
     vec![
@@ -84,7 +84,11 @@ fn plugin_tool_list(
     // reach them via plugin_invoke. The catalog is the discovery surface for
     // the long tail that has NO ToolDef — so drop the headlines here.
     let is_headline = |n: &str| headlines.contains(&n);
-    let visible: Vec<(&str, &str)> = tools.iter().copied().filter(|(n, _)| !is_headline(n)).collect();
+    let visible: Vec<(&str, &str)> = tools
+        .iter()
+        .copied()
+        .filter(|(n, _)| !is_headline(n))
+        .collect();
     if visible.is_empty() {
         return "  (all common tools are exposed as direct `<plugin>__<tool>` calls; \
                 plugin_search for more)"
@@ -122,9 +126,7 @@ fn plugin_tool_list(
     if total > cap {
         let n = total - cap;
         let noun = if n == 1 { "tool" } else { "tools" };
-        lines.push(format!(
-            "- …{n} more {noun} — plugin_search to find them"
-        ));
+        lines.push(format!("- …{n} more {noun} — plugin_search to find them"));
     }
     lines.join("\n")
 }
@@ -383,7 +385,7 @@ pub fn toolset_allowed_names(
         "shell",
         "read_file",
         "write_file",
-        "edit_file",         // exact-string replace; cheaper than rewriting whole files
+        "edit_file", // exact-string replace; cheaper than rewriting whole files
         "list_dir",
         "search_file",
         "search_content",
@@ -2289,10 +2291,11 @@ pub(crate) fn windows_shell_guidance() -> String {
 
 #[cfg(test)]
 mod plugin_catalog_tests {
-    use super::*;
-    use crate::registry::AgentRegistry;
     use rsclaw_config::schema::A2aPeerConfig;
     use rsclaw_skill::SkillRegistry;
+
+    use super::*;
+    use crate::registry::AgentRegistry;
 
     #[test]
     fn cold_tools_all_exist_and_stub_lists_them() {
@@ -2301,10 +2304,12 @@ mod plugin_catalog_tests {
         // that no longer exists) is exactly the drift this guards against.
         let skills = SkillRegistry::new();
         let all = build_tool_list(&skills, None, "main", &[]);
-        let names: std::collections::HashSet<&str> =
-            all.iter().map(|t| t.name.as_str()).collect();
+        let names: std::collections::HashSet<&str> = all.iter().map(|t| t.name.as_str()).collect();
         for cold in COLD_TOOLS {
-            assert!(names.contains(cold), "COLD_TOOLS entry `{cold}` is not a builtin tool");
+            assert!(
+                names.contains(cold),
+                "COLD_TOOLS entry `{cold}` is not a builtin tool"
+            );
         }
         let entries: Vec<(String, String)> = COLD_TOOLS
             .iter()
@@ -2366,16 +2371,22 @@ mod plugin_catalog_tests {
         assert_eq!(names.len(), 2, "must NOT include minimal base");
         assert!(names.contains("agent_spoke_aihub"));
         assert!(names.contains("memory"));
-        assert!(!names.contains("shell"), "shell from minimal must be excluded");
-        assert!(!names.contains("read_file"), "read_file from minimal must be excluded");
+        assert!(
+            !names.contains("shell"),
+            "shell from minimal must be excluded"
+        );
+        assert!(
+            !names.contains("read_file"),
+            "read_file from minimal must be excluded"
+        );
     }
 
     #[test]
     fn custom_tools_override_works_for_every_preset() {
         let custom = vec!["only_me".to_string()];
         for preset in ["minimal", "web", "code", "standard", "full"] {
-            let names = toolset_allowed_names(preset, Some(&custom))
-                .expect("override produces whitelist");
+            let names =
+                toolset_allowed_names(preset, Some(&custom)).expect("override produces whitelist");
             assert_eq!(names.len(), 1, "preset={preset}");
             assert!(names.contains("only_me"), "preset={preset}");
         }
@@ -2428,13 +2439,17 @@ mod plugin_catalog_tests {
         );
 
         // Empty.
-        assert_eq!(plugin_tool_list(&[], &none, &[], 5), "  (no declared tools)");
+        assert_eq!(
+            plugin_tool_list(&[], &none, &[], 5),
+            "  (no declared tools)"
+        );
     }
 
     #[test]
     fn catalog_block_is_skill_md_shaped() {
         let tools = vec![("publish", "Publish a video")];
-        let block = render_plugin_catalog_block("douyin", "0.1.0", "Douyin ops", &tools, &[], &[], 5);
+        let block =
+            render_plugin_catalog_block("douyin", "0.1.0", "Douyin ops", &tools, &[], &[], 5);
         assert!(block.contains("### douyin — Douyin ops"));
         assert!(block.contains("- publish: Publish a video"));
         assert!(block.contains("plugin_search"));

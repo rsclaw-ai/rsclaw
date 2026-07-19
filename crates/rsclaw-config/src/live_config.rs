@@ -673,9 +673,7 @@ mod tests {
                 password: None,
                 allow_tailscale: None,
                 allow_local: None,
-                token: Some(crate::schema::SecretOrString::Plain(
-                    "rotated".into(),
-                )),
+                token: Some(crate::schema::SecretOrString::Plain("rotated".into())),
             }),
             ..Default::default()
         });
