@@ -378,7 +378,9 @@ fn latest_message_bubble_probe(
     let x_start = width * 3 / 100;
     let x_end = width * 97 / 100;
     let y_start = height * 8 / 100;
-    let y_end = height * 80 / 100;
+    // WeChat's composer starts just below 90% on the tested 20:9 layout; the
+    // newest short reply may sit well below the preceding large bubble.
+    let y_end = height * 90 / 100;
     let mut classes = vec![0_u8; (width as usize).saturating_mul(height as usize)];
     for y in y_start..y_end {
         for x in x_start..x_end {
