@@ -885,8 +885,15 @@ impl CronRunner {
                         .unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
-                    let preflight_result = if let Some(plugin_name) = wechat_monitor_plugin(job.wake_mode.as_deref()) {
-                        match run_wechat_monitor_preflight(&job, wasm_plugins.as_deref(), plugin_name).await
+                    let preflight_result = if let Some(plugin_name) =
+                        wechat_monitor_plugin(job.wake_mode.as_deref())
+                    {
+                        match run_wechat_monitor_preflight(
+                            &job,
+                            wasm_plugins.as_deref(),
+                            plugin_name,
+                        )
+                        .await
                         {
                             Ok(tick) => match tick_has_work(&tick) {
                                 Ok(false) => Some(Ok("monitor tick: no changes".to_string())),
@@ -1351,7 +1358,11 @@ async fn run_wechat_monitor_preflight(
     // Android's preflight performs a bounded 35-second screenshot pass. A
     // short lease lets the next minute recover promptly after cancellation;
     // iOS retains its longer lease for WDA's slower friend-request path.
-    let ttl_secs = if plugin_name == "wechat-android" { 90 } else { 330 };
+    let ttl_secs = if plugin_name == "wechat-android" {
+        90
+    } else {
+        330
+    };
     let lock = plugin
         .call_tool(
             "acquire_ui_lock",
@@ -1370,7 +1381,11 @@ async fn run_wechat_monitor_preflight(
     // Bound the whole component invocation as a second line of defence; the
     // plugin-level request timeout cannot protect cron if the transport stalls
     // below reqwest's cancellation point.
-    let timeout_secs = if plugin_name == "wechat-android" { 55 } else { 35 };
+    let timeout_secs = if plugin_name == "wechat-android" {
+        55
+    } else {
+        35
+    };
     let tick = tokio::time::timeout(
         Duration::from_secs(timeout_secs),
         plugin.call_tool("monitor_tick", serde_json::json!({})),

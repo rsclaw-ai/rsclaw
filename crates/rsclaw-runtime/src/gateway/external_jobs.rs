@@ -23,10 +23,7 @@
 
 // Records lifted to rsclaw-types (crate-split); re-exported.
 // PollOutcome also lifted to rsclaw-types so rsclaw-jobs can return it.
-pub use rsclaw_types::{ExternalJobKind, ExternalJobOrigin, ExternalJobStatus, ExternalJobDelivery, ExternalJob, DEFAULT_TIMEOUT_SECS, PollOutcome};
-
-
-
-
-
-
+pub use rsclaw_types::{
+    DEFAULT_TIMEOUT_SECS, ExternalJob, ExternalJobDelivery, ExternalJobKind, ExternalJobOrigin,
+    ExternalJobStatus, PollOutcome,
+};

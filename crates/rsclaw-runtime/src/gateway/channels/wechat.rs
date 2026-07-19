@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, OutboundMessage};
+use rsclaw_config::runtime::RuntimeConfig;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -8,9 +11,6 @@ use super::{
     default_dm_scope,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, OutboundMessage};
-use rsclaw_config::runtime::RuntimeConfig;
 
 // ---------------------------------------------------------------------------
 // WeChat Personal (via ilink)
@@ -192,11 +192,12 @@ pub(crate) fn start_wechat_personal_if_configured(
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register channel sender for notification routing.
-        // - "wechat/{account}" is the canonical key — multi-account-aware callers use it.
+        // - "wechat/{account}" is the canonical key — multi-account-aware callers use
+        //   it.
         // - bare "wechat" is registered only by the first account so legacy callers
-        //   still find a sender. Without this guard each account overwrote the bare key,
-        //   leaving the last-registered account routing replies for messages received
-        //   via every other account.
+        //   still find a sender. Without this guard each account overwrote the bare
+        //   key, leaving the last-registered account routing replies for messages
+        //   received via every other account.
         {
             let mut senders = channel_senders
                 .write()
@@ -522,8 +523,7 @@ pub(crate) fn start_wechat_personal_if_configured(
             // sending, listening to drain so restart isn't blocked.
             let mut last_send: std::collections::HashMap<String, std::time::Instant> =
                 std::collections::HashMap::new();
-            const PER_TARGET_INTERVAL: std::time::Duration =
-                std::time::Duration::from_millis(3000);
+            const PER_TARGET_INTERVAL: std::time::Duration = std::time::Duration::from_millis(3000);
             loop {
                 tokio::select! {
                     () = shutdown_for_outbound.notified() => {

@@ -1,13 +1,15 @@
 use anyhow::Result;
-use serde::Deserialize;
-use serde_json::{Value, json};
-
-use super::gateway_http::{self, GatewayEndpoint};
-use super::style::*;
 use rsclaw_agent as agent;
 use rsclaw_cli::MemoryCommand;
 use rsclaw_config as config;
 use rsclaw_platform::detect_memory_tier;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use super::{
+    gateway_http::{self, GatewayEndpoint},
+    style::*,
+};
 
 /// `rsclaw memory ...` dispatcher.
 ///
@@ -202,13 +204,16 @@ async fn memory_save_http(args: rsclaw_cli::MemorySaveArgs) -> Result<()> {
     });
     let resp: AddResp = gateway_http::post_json("/api/v1/memory/docs", &body).await?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&Value::from(json!({
-            "id": resp.id,
-            "scope": resp.scope,
-            "kind": resp.kind,
-            "tier": resp.tier,
-            "deduped": resp.deduped,
-        })))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Value::from(json!({
+                "id": resp.id,
+                "scope": resp.scope,
+                "kind": resp.kind,
+                "tier": resp.tier,
+                "deduped": resp.deduped,
+            })))?
+        );
         return Ok(());
     }
     let prefix = if resp.deduped { "deduped" } else { "saved" };
@@ -311,7 +316,10 @@ async fn memory_search_local(query: &str, max: usize, json_out: bool) -> Result<
             );
         }
     }
-    println!("{}", dim("gateway is down — results may lag the live store"));
+    println!(
+        "{}",
+        dim("gateway is down — results may lag the live store")
+    );
     Ok(())
 }
 

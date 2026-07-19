@@ -1,5 +1,4 @@
 use anyhow::Result;
-
 use rsclaw_cli::anycli::AnycliCommand;
 
 /// Handle `rsclaw anycli` subcommands.

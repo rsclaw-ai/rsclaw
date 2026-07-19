@@ -1,5 +1,4 @@
 use anyhow::Result;
-
 use rsclaw_cli::WebhooksCommand;
 
 pub async fn cmd_webhooks(sub: WebhooksCommand) -> Result<()> {

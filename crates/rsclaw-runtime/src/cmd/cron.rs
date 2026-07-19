@@ -1,8 +1,8 @@
 use anyhow::Result;
-
-use super::style::*;
 use rsclaw_cli::CronCommand;
 use rsclaw_config as config;
+
+use super::style::*;
 
 pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
     match sub {
@@ -325,10 +325,7 @@ async fn notify_gateway_cron_reload() {
         Ok(c) => c,
         _ => return,
     };
-    let url = format!(
-        "http://127.0.0.1:{}/api/v1/cron/reload",
-        cfg.gateway.port
-    );
+    let url = format!("http://127.0.0.1:{}/api/v1/cron/reload", cfg.gateway.port);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build();

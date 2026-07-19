@@ -9,6 +9,8 @@
 //! routes by method name.
 
 use axum::{Json, extract::State, response::IntoResponse};
+use rsclaw_agent::{AgentMessage, AgentReply};
+use rsclaw_config::schema::BindMode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -26,8 +28,6 @@ use crate::{
     },
     server::AppState,
 };
-use rsclaw_agent::{AgentMessage, AgentReply};
-use rsclaw_config::schema::BindMode;
 
 pub const PROTOCOL_VERSION: &str = "1.0";
 
@@ -426,7 +426,8 @@ async fn handle_send_message(
     // tool names, InputRequired/AuthRequired, etc.). Streaming has the same
     // bridge; without it the sync path's bus only sees Submitted/Working/
     // Completed/Failed and push webhooks miss the per-tool progress.
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<rsclaw_a2a_types::event::AgentEvent>(64);
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel::<rsclaw_a2a_types::event::AgentEvent>(64);
     {
         let bus = state.task_event_bus.clone();
         tokio::spawn(async move {

@@ -1,7 +1,6 @@
 use anyhow::Result;
-use serde_json::json;
-
 use rsclaw_cli::browser::BrowserCommand;
+use serde_json::json;
 
 /// Handle `rsclaw browser` subcommands.
 pub async fn cmd_browser(sub: BrowserCommand) -> Result<()> {

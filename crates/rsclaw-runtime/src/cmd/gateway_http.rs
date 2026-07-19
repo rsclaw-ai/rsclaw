@@ -15,11 +15,11 @@
 //! human-friendly error. Callers branch on `is_gateway_up()` when they
 //! want a graceful fallback to a direct-open readonly path.
 
-use anyhow::{Context, Result, anyhow};
-use serde::{Serialize, de::DeserializeOwned};
 use std::time::Duration;
 
+use anyhow::{Context, Result, anyhow};
 use rsclaw_config as config;
+use serde::{Serialize, de::DeserializeOwned};
 
 const DEFAULT_PORT: u16 = 18888;
 
@@ -88,7 +88,10 @@ pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T> {
     if !resp.status().is_success() {
         let st = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("gateway returned {st}: {}", body.chars().take(400).collect::<String>()));
+        return Err(anyhow!(
+            "gateway returned {st}: {}",
+            body.chars().take(400).collect::<String>()
+        ));
     }
     resp.json::<T>()
         .await
@@ -108,7 +111,10 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(path: &str, body: &B) 
     if !resp.status().is_success() {
         let st = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("gateway returned {st}: {}", body.chars().take(400).collect::<String>()));
+        return Err(anyhow!(
+            "gateway returned {st}: {}",
+            body.chars().take(400).collect::<String>()
+        ));
     }
     resp.json::<T>()
         .await
@@ -127,7 +133,10 @@ pub async fn patch_json<B: Serialize, T: DeserializeOwned>(path: &str, body: &B)
     if !resp.status().is_success() {
         let st = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("gateway returned {st}: {}", body.chars().take(400).collect::<String>()));
+        return Err(anyhow!(
+            "gateway returned {st}: {}",
+            body.chars().take(400).collect::<String>()
+        ));
     }
     resp.json::<T>()
         .await
@@ -146,7 +155,10 @@ pub async fn delete_json<T: DeserializeOwned>(path: &str) -> Result<T> {
     if !resp.status().is_success() {
         let st = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("gateway returned {st}: {}", body.chars().take(400).collect::<String>()));
+        return Err(anyhow!(
+            "gateway returned {st}: {}",
+            body.chars().take(400).collect::<String>()
+        ));
     }
     resp.json::<T>()
         .await
@@ -166,7 +178,10 @@ pub async fn get_bytes(path: &str) -> Result<Vec<u8>> {
     if !resp.status().is_success() {
         let st = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("gateway returned {st}: {}", body.chars().take(400).collect::<String>()));
+        return Err(anyhow!(
+            "gateway returned {st}: {}",
+            body.chars().take(400).collect::<String>()
+        ));
     }
     Ok(resp.bytes().await?.to_vec())
 }

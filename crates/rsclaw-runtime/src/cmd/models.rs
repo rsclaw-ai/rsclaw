@@ -1,16 +1,16 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use rsclaw_cli::{
+    AliasesCommand, AuthOrderCommand, FallbacksCommand, HealthCommand, ModelsAuthCommand,
+    ModelsCommand,
+};
+use rsclaw_config as config;
 
 use super::{
     config_json::{load_config_json, remove_nested_value, set_nested_value},
     style::*,
 };
-use rsclaw_cli::{
-        AliasesCommand, AuthOrderCommand, FallbacksCommand, HealthCommand, ModelsAuthCommand,
-        ModelsCommand,
-    };
-use rsclaw_config as config;
 
 /// Resolve the gateway base URL from `rsclaw.json5` → `gateway.port`,
 /// falling back to 18888. Mirrors the helper in `cmd/sessions.rs`; kept
@@ -309,7 +309,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                 let resp = rb.send().await;
                 match resp {
                     Ok(r) if r.status().is_success() => {
-                        ok(&format!("reset '{}' — next chain iteration will retry it", cyan(&model)));
+                        ok(&format!(
+                            "reset '{}' — next chain iteration will retry it",
+                            cyan(&model)
+                        ));
                     }
                     Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
                         warn_msg(&format!(
@@ -468,14 +471,18 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         label: "Whisper-Tiny (STT lightweight, ~110MB)",
         dir: "whisper-tiny",
         url: "https://jp.gitfast.org/cache/releases/rsclaw/tools/models/sherpa-onnx-whisper-tiny.tar.bz2",
-        fallback_url: Some("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2"),
+        fallback_url: Some(
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2",
+        ),
     },
     ModelDef {
         names: &["whisper-turbo"],
         label: "Whisper-Turbo (STT Chinese recommended, ~537MB)",
         dir: "whisper-turbo",
         url: "https://jp.gitfast.org/cache/releases/rsclaw/tools/models/sherpa-onnx-whisper-turbo.tar.bz2",
-        fallback_url: Some("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-turbo.tar.bz2"),
+        fallback_url: Some(
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-turbo.tar.bz2",
+        ),
     },
     ModelDef {
         names: &["paraformer-zh", "paraformer", "paraformer-zh-int8"],
@@ -486,7 +493,9 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         // guess `sherpa-onnx-paraformer-zh-2023-09-14-int8.tar.bz2`
         // returns 404 from sherpa-onnx GitHub releases.
         url: "https://jp.gitfast.org/cache/releases/rsclaw/tools/models/sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2",
-        fallback_url: Some("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2"),
+        fallback_url: Some(
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2",
+        ),
     },
     ModelDef {
         names: &["paraformer-zh-full", "paraformer-full"],
@@ -494,7 +503,9 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         dir: "paraformer-zh-full",
         // Aligned with int8 release date (2025-10-07) for consistency.
         url: "https://jp.gitfast.org/cache/releases/rsclaw/tools/models/sherpa-onnx-paraformer-zh-2025-10-07.tar.bz2",
-        fallback_url: Some("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2025-10-07.tar.bz2"),
+        fallback_url: Some(
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2025-10-07.tar.bz2",
+        ),
     },
     ModelDef {
         names: &[

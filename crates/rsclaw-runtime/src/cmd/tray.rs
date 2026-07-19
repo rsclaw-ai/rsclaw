@@ -104,8 +104,7 @@ pub fn cmd_tray() -> Result<()> {
                     eprintln!("failed to stop gateway: {e}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                if let Err(e) = tray_cmd().args(["gateway", "start"]).spawn()
-                {
+                if let Err(e) = tray_cmd().args(["gateway", "start"]).spawn() {
                     eprintln!("failed to start gateway: {e}");
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));

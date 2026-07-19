@@ -1,14 +1,13 @@
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-
-use super::{config_json::load_config_json, style::*};
 use rsclaw_cli::PluginsCommand;
 use rsclaw_config::loader::base_dir;
 use rsclaw_plugin::manifest::{LEGACY_MANIFEST_FILE, MANIFEST_FILE, load_manifest, scan_plugins};
+
+use super::{config_json::load_config_json, style::*};
 
 fn plugins_dir() -> PathBuf {
     base_dir().join("plugins")
@@ -191,7 +190,12 @@ async fn plugins_install(spec: &str) -> Result<()> {
         }
         match rsclaw_skill::allowlist::snapshot().lookup_plugin(spec) {
             Some(entry) if !entry.url.is_empty() => {
-                println!("  {} {} {}", dim("resolving"), cyan(spec), dim("via hub allowlist"));
+                println!(
+                    "  {} {} {}",
+                    dim("resolving"),
+                    cyan(spec),
+                    dim("via hub allowlist")
+                );
                 install_from_url(&entry.url).await
             }
             Some(_) => bail!(
@@ -541,7 +545,9 @@ fn plugins_doctor() -> Result<()> {
                 {
                     cmd.creation_flags(0x08000000);
                 }
-                let version = cmd.output().ok()
+                let version = cmd
+                    .output()
+                    .ok()
                     .and_then(|o| String::from_utf8(o.stdout).ok())
                     .map(|s| s.trim().to_string())
                     .unwrap_or_else(|| "(unknown version)".to_string());

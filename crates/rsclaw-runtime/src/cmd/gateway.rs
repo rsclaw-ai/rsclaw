@@ -1,10 +1,10 @@
 use anyhow::Result;
-
-use super::style::{banner, dim, green, kv, red, yellow};
-use crate::gateway;
 use rsclaw_cli::GatewayCommand;
 use rsclaw_config as config;
 use rsclaw_platform::detect_memory_tier;
+
+use super::style::{banner, dim, green, kv, red, yellow};
+use crate::gateway;
 
 const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") {
     Some(v) => v,
@@ -401,8 +401,7 @@ fn find_gateway_pid() -> Option<u32> {
             use std::os::windows::process::CommandExt;
             ns.creation_flags(0x08000000);
         }
-        let output = ns.output()
-            .ok();
+        let output = ns.output().ok();
         if let Some(output) = output {
             let text = String::from_utf8_lossy(&output.stdout);
             let port_str = format!(":{port}");
@@ -746,8 +745,7 @@ fn service_installed() -> bool {
             use std::os::windows::process::CommandExt;
             sc_cmd.creation_flags(0x08000000);
         }
-        if let Ok(o) = sc_cmd.output()
-        {
+        if let Ok(o) = sc_cmd.output() {
             // If output contains "SERVICE_NAME" then the service exists.
             if String::from_utf8_lossy(&o.stdout).contains("SERVICE_NAME") {
                 return true;

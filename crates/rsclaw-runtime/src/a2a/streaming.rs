@@ -14,6 +14,7 @@ use axum::response::{
     sse::{Event, KeepAlive, Sse},
 };
 use futures::StreamExt;
+use rsclaw_agent::{AgentMessage, AgentReply};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
@@ -31,7 +32,6 @@ use crate::{
     },
     server::AppState,
 };
-use rsclaw_agent::{AgentMessage, AgentReply};
 
 /// Entry point. Called by the gateway dispatcher when the JSON-RPC method is
 /// `SendStreamingMessage` or `SubscribeToTask`.

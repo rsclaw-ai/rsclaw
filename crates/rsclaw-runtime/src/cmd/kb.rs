@@ -3,19 +3,19 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
-
-use crate::cmd::style::{banner, bold, cyan, dim, kv, ok};
 use rsclaw_cli::kb::KbCommand;
 use rsclaw_kb::{
-        KbEmbedder, KbIndex, KbPaths,
-        compactor::run_compactor_tick,
-        model::{CallerScope, KbStatus, KbVisibility},
-        search::SearchCtx,
-        store::{KbStore, docs},
-        sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason, UrlSyncer},
-        tools::{kb_fetch, kb_list_docs, kb_search},
-        worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool},
-    };
+    KbEmbedder, KbIndex, KbPaths,
+    compactor::run_compactor_tick,
+    model::{CallerScope, KbStatus, KbVisibility},
+    search::SearchCtx,
+    store::{KbStore, docs},
+    sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason, UrlSyncer},
+    tools::{kb_fetch, kb_list_docs, kb_search},
+    worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool},
+};
+
+use crate::cmd::style::{banner, bold, cyan, dim, kv, ok};
 
 pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
     // HTTP-first routing for the read/write ops a running gateway
@@ -152,25 +152,15 @@ async fn kb_search_http(query: &str, k: usize, json_out: bool) -> Result<()> {
     Ok(())
 }
 
-async fn kb_ls_http(
-    tags: &[String],
-    source_kind: Option<&str>,
-    limit: usize,
-) -> Result<()> {
+async fn kb_ls_http(tags: &[String], source_kind: Option<&str>, limit: usize) -> Result<()> {
     // Server takes a single optional `tag` query param; the CLI's
     // multi-tag UX is rare and not worth a multi-value endpoint.
     let mut path = format!("/api/v1/knowledge/docs?limit={limit}");
     if let Some(t) = tags.first().filter(|s| !s.is_empty()) {
-        path.push_str(&format!(
-            "&tag={}",
-            urlencoding::encode(t),
-        ));
+        path.push_str(&format!("&tag={}", urlencoding::encode(t),));
     }
     if let Some(sk) = source_kind.filter(|s| !s.is_empty()) {
-        path.push_str(&format!(
-            "&source_kind={}",
-            urlencoding::encode(sk),
-        ));
+        path.push_str(&format!("&source_kind={}", urlencoding::encode(sk),));
     }
     let resp: serde_json::Value = crate::cmd::gateway_http::get_json(&path).await?;
     let docs = resp.get("docs").and_then(|v| v.as_array());
@@ -205,11 +195,7 @@ async fn kb_ls_http(
     Ok(())
 }
 
-async fn kb_rm_http(
-    doc_id: Option<String>,
-    tag: Option<String>,
-    yes: bool,
-) -> Result<()> {
+async fn kb_rm_http(doc_id: Option<String>, tag: Option<String>, yes: bool) -> Result<()> {
     if !yes {
         eprintln!("Refusing to tombstone without --yes (this is a destructive operation).");
         return Ok(());
@@ -218,7 +204,10 @@ async fn kb_rm_http(
         (Some(id), None) => (id, String::new()),
         // Bulk-by-tag: the `_bulk` segment is a placeholder for the route's
         // {doc_id} slot; the server prefers the `tag` query param when set.
-        (None, Some(t)) => ("_bulk".to_owned(), format!("?tag={}", urlencoding::encode(&t))),
+        (None, Some(t)) => (
+            "_bulk".to_owned(),
+            format!("?tag={}", urlencoding::encode(&t)),
+        ),
         (Some(_), Some(_)) => anyhow::bail!("pass either doc_id or --tag, not both"),
         (None, None) => anyhow::bail!("pass either a doc_id or --tag <name>"),
     };
@@ -238,10 +227,24 @@ async fn kb_show_http(id: &str) -> Result<()> {
     let path = format!("/api/v1/knowledge/docs/{id}");
     match crate::cmd::gateway_http::get_json::<serde_json::Value>(&path).await {
         Ok(meta) => {
-            println!("doc_id:    {}", meta.get("docId").and_then(|v| v.as_str()).unwrap_or("?"));
-            println!("title:     {}", meta.get("title").and_then(|v| v.as_str()).unwrap_or(""));
-            println!("kind:      {}", meta.get("sourceKind").and_then(|v| v.as_str()).unwrap_or("?"));
-            println!("version:   {}", meta.get("version").and_then(|v| v.as_u64()).unwrap_or(0));
+            println!(
+                "doc_id:    {}",
+                meta.get("docId").and_then(|v| v.as_str()).unwrap_or("?")
+            );
+            println!(
+                "title:     {}",
+                meta.get("title").and_then(|v| v.as_str()).unwrap_or("")
+            );
+            println!(
+                "kind:      {}",
+                meta.get("sourceKind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+            );
+            println!(
+                "version:   {}",
+                meta.get("version").and_then(|v| v.as_u64()).unwrap_or(0)
+            );
             if let Some(cid) = meta.get("collectionId").and_then(|v| v.as_str()) {
                 println!("collection:{cid}");
             }
@@ -296,8 +299,7 @@ async fn kb_show_http(id: &str) -> Result<()> {
 async fn kb_visibility_http(doc_id: &str, visibility: &str) -> Result<()> {
     let path = format!("/api/v1/knowledge/docs/{doc_id}/visibility");
     let body = serde_json::json!({ "visibility": visibility });
-    let _: serde_json::Value =
-        crate::cmd::gateway_http::patch_json(&path, &body).await?;
+    let _: serde_json::Value = crate::cmd::gateway_http::patch_json(&path, &body).await?;
     println!("updated {doc_id} visibility → {visibility}");
     Ok(())
 }
@@ -306,7 +308,11 @@ async fn kb_export_http(doc_id: &str, to: &std::path::Path) -> Result<()> {
     let path = format!("/api/v1/knowledge/docs/{doc_id}/content");
     let bytes = crate::cmd::gateway_http::get_bytes(&path).await?;
     std::fs::write(to, &bytes).with_context(|| format!("write {}", to.display()))?;
-    println!("exported {doc_id} → {} ({} bytes)", to.display(), bytes.len());
+    println!(
+        "exported {doc_id} → {} ({} bytes)",
+        to.display(),
+        bytes.len()
+    );
     Ok(())
 }
 
@@ -318,7 +324,10 @@ async fn kb_sync_all_http(interval_min: u64, max: usize, dry_run: bool) -> Resul
     });
     let resp: serde_json::Value =
         crate::cmd::gateway_http::post_json("/api/v1/knowledge/sync-all", &body).await?;
-    println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&resp).unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -394,11 +403,7 @@ async fn kb_add_http(
         )
     };
     let resp: serde_json::Value = crate::cmd::gateway_http::post_json(&endpoint, &body).await?;
-    ok(&format!(
-        "queued ingest into {} → {}",
-        bold(&coll_id),
-        resp
-    ));
+    ok(&format!("queued ingest into {} → {}", bold(&coll_id), resp));
     Ok(())
 }
 
@@ -654,7 +659,6 @@ fn rm_by_id(h: &Handles, doc_id: String) -> Result<()> {
 
 fn rm_by_tag(h: &Handles, tag: &str) -> Result<()> {
     use redb::ReadableTable;
-
     use rsclaw_kb::store::codec::decode;
     let rtx = h.store.begin_read()?;
     let mut to_tombstone: Vec<rsclaw_kb::model::KbDoc> = Vec::new();
@@ -885,7 +889,6 @@ fn compact(kb_root: PathBuf) -> Result<()> {
 
 fn stats(kb_root: PathBuf) -> Result<()> {
     use redb::ReadableTable;
-
     use rsclaw_kb::store::codec::decode;
     let h = open_kb(&kb_root)?;
     let rtx = h.store.begin_read()?;
@@ -964,7 +967,6 @@ fn total_size(root: &PathBuf) -> u64 {
 /// lands users (or their cron job) can call this CLI directly.
 async fn sync_all(kb_root: PathBuf, interval_min: u64, max: usize, dry_run: bool) -> Result<()> {
     use redb::ReadableTable;
-
     use rsclaw_kb::{
         canonicalize::canonicalize_url,
         store::{codec::decode, schema::KB_DOCS, seen::get_sync_state},
@@ -1164,7 +1166,11 @@ async fn eval_golden(
         }
     }
 
-    let direct = if via_http { None } else { Some(open_kb(&kb_root)?) };
+    let direct = if via_http {
+        None
+    } else {
+        Some(open_kb(&kb_root)?)
+    };
     // Mirror the production query path: the gateway applies the configured
     // (or Qwen3-defaulted) query instruction; the direct path must too, or
     // the eval measures a pipeline nobody actually serves.
@@ -1331,8 +1337,7 @@ mod eval_tests {
 
     #[test]
     fn rank_by_doc_id_exact() {
-        let case: EvalCase =
-            serde_json::from_str(r#"{"query":"q","expectDocId":"abc"}"#).unwrap();
+        let case: EvalCase = serde_json::from_str(r#"{"query":"q","expectDocId":"abc"}"#).unwrap();
         let hits = vec![hit("xyz", "t", "x"), hit("abc", "t", "x")];
         assert_eq!(eval_case_rank(&case, &hits), Some(2));
     }

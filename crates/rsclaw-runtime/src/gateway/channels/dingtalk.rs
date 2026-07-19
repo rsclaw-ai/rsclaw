@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, OutboundMessage};
+use rsclaw_config::runtime::RuntimeConfig;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -8,9 +11,6 @@ use super::{
     default_dm_scope,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, OutboundMessage};
-use rsclaw_config::runtime::RuntimeConfig;
 
 // ---------------------------------------------------------------------------
 // DingTalk (钉钉)
@@ -253,7 +253,9 @@ pub(crate) fn start_dingtalk_if_configured(
                                     let handle = if let Some(ref agent_id) = bound {
                                         match w_reg.get(agent_id) {
                                             Ok(h) => h,
-                                            Err(_) => match w_reg.route_account("dingtalk", Some(&w_acct)) {
+                                            Err(_) => match w_reg
+                                                .route_account("dingtalk", Some(&w_acct))
+                                            {
                                                 Ok(h) => h,
                                                 Err(e) => {
                                                     error!("dingtalk route error: {e:#}");
@@ -279,7 +281,9 @@ pub(crate) fn start_dingtalk_if_configured(
                                                 thread_id: None,
                                             }
                                         } else {
-                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
+                                            MessageKind::DirectMessage {
+                                                account_id: Some(w_acct.clone()),
+                                            }
                                         },
                                         channel: "dingtalk".to_string(),
                                         peer_id: sender_id.clone(),
@@ -376,7 +380,8 @@ pub(crate) fn start_dingtalk_if_configured(
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
                                     Ok(h) => h,
-                                    Err(_) => match reg.route_account("dingtalk", Some(&w_acct_pp)) {
+                                    Err(_) => match reg.route_account("dingtalk", Some(&w_acct_pp))
+                                    {
                                         Ok(h) => h,
                                         Err(_) => return,
                                     },
@@ -396,7 +401,9 @@ pub(crate) fn start_dingtalk_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
+                                    MessageKind::DirectMessage {
+                                        account_id: Some(w_acct_pp.clone()),
+                                    }
                                 },
                                 channel: "dingtalk".to_string(),
                                 peer_id: sender_id.clone(),
@@ -493,7 +500,10 @@ pub(crate) fn start_dingtalk_if_configured(
             dt_cfg.oapi_base.clone(),
             on_message,
         ));
-        if let Err(e) = manager.register_with_name(format!("dingtalk/{}", acct_for_log), Arc::clone(&dt) as Arc<dyn rsclaw_channel::Channel>) {
+        if let Err(e) = manager.register_with_name(
+            format!("dingtalk/{}", acct_for_log),
+            Arc::clone(&dt) as Arc<dyn rsclaw_channel::Channel>,
+        ) {
             tracing::warn!("failed to register channel: {e}");
         }
         let dt_send = Arc::clone(&dt);

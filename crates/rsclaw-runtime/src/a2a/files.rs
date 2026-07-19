@@ -28,10 +28,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use tracing::warn;
-
 use rsclaw_a2a_types::types::A2aPart;
 use rsclaw_channel::{canonical_filename, category_for_kind, kind_for_mime};
+use tracing::warn;
 
 /// `<workspace>/a2a/<category>/` — created if it doesn't exist.
 pub fn a2a_dir(workspace: &Path, kind: char) -> PathBuf {

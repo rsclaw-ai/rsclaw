@@ -97,12 +97,27 @@ pub mod ws;
 // modules lived in the root crate (where the old `src/lib.rs` provided the same
 // aliases). Names are distinct from the 7 bundled modules above, so no clash.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Process entry point — dispatch logic relocated from the old src/main.rs.
+// ---------------------------------------------------------------------------
+use anyhow::Result;
+use clap::Parser;
+use cmd::{
+    cmd_agent_turn, cmd_agents, cmd_anycli, cmd_approvals, cmd_backup, cmd_browser, cmd_channels,
+    cmd_completion, cmd_config, cmd_configure, cmd_cron, cmd_daemon, cmd_dashboard, cmd_debug,
+    cmd_devices, cmd_directory, cmd_dns, cmd_docs, cmd_doctor, cmd_env, cmd_gateway, cmd_health,
+    cmd_hooks, cmd_kb, cmd_logs, cmd_memory, cmd_message, cmd_migrate, cmd_models, cmd_onboard,
+    cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox, cmd_secrets, cmd_security, cmd_sessions,
+    cmd_setup, cmd_skills, cmd_status, cmd_system, cmd_tools, cmd_tray, cmd_tui, cmd_uninstall,
+    cmd_update, cmd_watch, cmd_webhooks,
+};
 pub use rsclaw_agent as agent;
 pub use rsclaw_artifact as artifact;
 pub use rsclaw_browser as browser;
 pub use rsclaw_cap as cap;
 pub use rsclaw_channel as channel;
 pub use rsclaw_cli as cli;
+use rsclaw_cli::{Cli, Command};
 pub use rsclaw_computer as computer;
 pub use rsclaw_config as config;
 pub use rsclaw_desktop as desktop;
@@ -114,32 +129,13 @@ pub use rsclaw_kb as kb;
 pub use rsclaw_mcp as mcp;
 pub use rsclaw_migrate as migrate;
 pub use rsclaw_platform as sys;
+pub use rsclaw_platform::MemoryTier;
 pub use rsclaw_plugin as plugin;
 pub use rsclaw_provider as provider;
 pub use rsclaw_skill as skill;
 pub use rsclaw_store as store;
 pub use rsclaw_util as util;
-
-pub use rsclaw_platform::MemoryTier;
-
-// ---------------------------------------------------------------------------
-// Process entry point — dispatch logic relocated from the old src/main.rs.
-// ---------------------------------------------------------------------------
-
-use anyhow::Result;
-use clap::Parser;
-use rsclaw_cli::{Cli, Command};
 use tracing_subscriber::EnvFilter;
-
-use cmd::{
-    cmd_agent_turn, cmd_agents, cmd_anycli, cmd_approvals, cmd_backup, cmd_browser, cmd_channels,
-    cmd_completion, cmd_config, cmd_configure, cmd_cron, cmd_daemon, cmd_dashboard, cmd_debug,
-    cmd_devices, cmd_directory, cmd_dns, cmd_docs, cmd_doctor, cmd_env, cmd_gateway, cmd_health,
-    cmd_hooks, cmd_kb, cmd_logs, cmd_memory, cmd_message, cmd_migrate, cmd_models, cmd_onboard,
-    cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox, cmd_secrets, cmd_security, cmd_sessions,
-    cmd_setup, cmd_skills, cmd_status, cmd_system, cmd_tools, cmd_tray, cmd_tui, cmd_uninstall,
-    cmd_update, cmd_watch, cmd_webhooks,
-};
 
 /// Resolve the rsclaw base directory and port offset.
 ///
@@ -382,16 +378,15 @@ async fn cmd_pairing(sub: rsclaw_cli::PairingCommand) -> Result<()> {
             }
         }
         rsclaw_cli::PairingCommand::Revoke { channel, peer } => {
-            Box::pin(cmd::channels::cmd_channels(rsclaw_cli::ChannelsCommand::Unpair {
-                channel,
-                peer,
-            }))
+            Box::pin(cmd::channels::cmd_channels(
+                rsclaw_cli::ChannelsCommand::Unpair { channel, peer },
+            ))
             .await?;
         }
         rsclaw_cli::PairingCommand::List => {
-            Box::pin(cmd::channels::cmd_channels(rsclaw_cli::ChannelsCommand::Paired {
-                channel: None,
-            }))
+            Box::pin(cmd::channels::cmd_channels(
+                rsclaw_cli::ChannelsCommand::Paired { channel: None },
+            ))
             .await?;
         }
     }

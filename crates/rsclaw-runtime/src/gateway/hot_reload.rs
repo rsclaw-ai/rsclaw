@@ -21,6 +21,7 @@ use std::{
 };
 
 use anyhow::Result;
+use rsclaw_config::{self as config, runtime::RuntimeConfig};
 use tokio::{
     sync::broadcast,
     time::{MissedTickBehavior, interval},
@@ -28,7 +29,6 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::gateway::live_config::detect_restart_fields;
-use rsclaw_config::{self as config, runtime::RuntimeConfig};
 
 /// Poll interval for config file change detection.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);

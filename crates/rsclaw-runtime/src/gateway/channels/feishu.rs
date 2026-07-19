@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, OutboundMessage};
+use rsclaw_config::runtime::RuntimeConfig;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -8,9 +11,6 @@ use super::{
     default_dm_scope,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, OutboundMessage};
-use rsclaw_config::runtime::RuntimeConfig;
 
 // ---------------------------------------------------------------------------
 // Feishu (飞书)
@@ -380,13 +380,15 @@ pub(crate) fn start_feishu_if_configured(
                                     let handle = if let Some(ref agent_id) = bound {
                                         match w_reg.get(agent_id) {
                                             Ok(h) => h,
-                                            Err(_) => match w_reg.route_account("feishu", Some(&w_acct)) {
-                                                Ok(h) => h,
-                                                Err(e) => {
-                                                    error!("feishu route error: {e:#}");
-                                                    continue;
+                                            Err(_) => {
+                                                match w_reg.route_account("feishu", Some(&w_acct)) {
+                                                    Ok(h) => h,
+                                                    Err(e) => {
+                                                        error!("feishu route error: {e:#}");
+                                                        continue;
+                                                    }
                                                 }
-                                            },
+                                            }
                                         }
                                     } else {
                                         match w_reg.route_account("feishu", Some(&w_acct)) {
@@ -524,7 +526,9 @@ pub(crate) fn start_feishu_if_configured(
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
                                     Ok(h) => h,
-                                    Err(_) => match reg.route_account("feishu", Some(&w_acct_for_preparse)) {
+                                    Err(_) => match reg
+                                        .route_account("feishu", Some(&w_acct_for_preparse))
+                                    {
                                         Ok(h) => h,
                                         Err(_) => return,
                                     },

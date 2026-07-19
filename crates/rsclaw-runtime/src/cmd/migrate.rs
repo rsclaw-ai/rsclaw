@@ -5,13 +5,13 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-
-use super::style::{banner, bold, dim, err_msg, green, item, kv, ok, warn_msg};
 use rsclaw_cli::MigrateArgs;
 use rsclaw_migrate::{
-        MigrateMode, detect_openclaw_dir,
-        openclaw::{self, ImportStats},
-    };
+    MigrateMode, detect_openclaw_dir,
+    openclaw::{self, ImportStats},
+};
+
+use super::style::{banner, bold, dim, err_msg, green, item, kv, ok, warn_msg};
 
 const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") {
     Some(v) => v,
@@ -188,7 +188,10 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
     let redb_dir = rsclaw_dir.join("var/data/redb");
     std::fs::create_dir_all(&redb_dir)?;
 
-    let store = RedbStore::open(&redb_dir.join("data.redb"), rsclaw_platform::MemoryTier::Standard)?;
+    let store = RedbStore::open(
+        &redb_dir.join("data.redb"),
+        rsclaw_platform::MemoryTier::Standard,
+    )?;
 
     // Stage banners go through eprintln so they always appear, regardless
     // of the CLI's RUST_LOG default (`warn` for non-gateway commands).

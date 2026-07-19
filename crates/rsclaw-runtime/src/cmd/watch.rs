@@ -5,14 +5,14 @@
 //! source emits a fatal lifecycle event.
 
 use anyhow::{Result, anyhow};
+use rsclaw_cli::WatchArgs;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::gateway::watch::{
-        filter::Filter,
-        parser::{self, ParsedCommand, SourceKind},
-        source::EventRecord,
-    };
-use rsclaw_cli::WatchArgs;
+    filter::Filter,
+    parser::{self, ParsedCommand, SourceKind},
+    source::EventRecord,
+};
 
 pub async fn cmd_watch(args: WatchArgs) -> Result<()> {
     // The chat-side parser expects the body as a single string (e.g.

@@ -1,8 +1,9 @@
-use crate::ws::{
-        dispatch::{MethodCtx, MethodResult},
-        types::ErrorShape,
-    };
 use rsclaw_agent::AgentMessage;
+
+use crate::ws::{
+    dispatch::{MethodCtx, MethodResult},
+    types::ErrorShape,
+};
 
 pub async fn sessions_list(ctx: MethodCtx) -> MethodResult {
     let keys = ctx
