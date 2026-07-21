@@ -110,7 +110,8 @@ pub struct WasmPlugin {
     pub capabilities: Vec<String>,
     /// Slash command metadata from the manifest.
     pub slash_commands: Vec<crate::manifest::PluginSlashCommand>,
-    /// Trusted tool aliases from plugin tool name to first-class host tool name.
+    /// Trusted tool aliases from plugin tool name to first-class host tool
+    /// name.
     pub tool_aliases: HashMap<String, String>,
     /// Minimum gap between successive `call_tool` invocations on this plugin
     /// (host-enforced rate limit). 0 disables throttling.
@@ -688,7 +689,9 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         click_y: u32,
     ) -> HostTrapResult<Result<String, String>> {
         if filepaths.is_empty() {
-            return Ok(Err("browser_upload_via_chooser: filepaths is empty".to_string()));
+            return Ok(Err(
+                "browser_upload_via_chooser: filepaths is empty".to_string()
+            ));
         }
         // Canonicalize + sandbox-check every path (same policy as browser_upload).
         let mut canonical_files = Vec::with_capacity(filepaths.len());
@@ -1039,7 +1042,10 @@ fn validate_plugin_sql(sql: &str, kind: PluginSqlKind) -> std::result::Result<()
                 return Err("sql_query only allows SELECT statements".to_owned());
             }
             for token in &tokens {
-                if matches!(*token, "insert" | "update" | "delete" | "create" | "replace") {
+                if matches!(
+                    *token,
+                    "insert" | "update" | "delete" | "create" | "replace"
+                ) {
                     return Err(format!("sql_query cannot contain `{token}`"));
                 }
             }
@@ -1154,12 +1160,17 @@ impl rsclaw::plugin::host_http::Host for HostState {
         body: String,
         timeout_ms: u32,
     ) -> HostTrapResult<Result<String, String>> {
-        let headers: serde_json::Map<String, serde_json::Value> = if headers_json.trim().is_empty() {
+        let headers: serde_json::Map<String, serde_json::Value> = if headers_json.trim().is_empty()
+        {
             serde_json::Map::new()
         } else {
             match serde_json::from_str::<serde_json::Value>(&headers_json) {
                 Ok(serde_json::Value::Object(map)) => map,
-                Ok(_) => return Ok(Err("host_http.request: headers_json must be an object".to_owned())),
+                Ok(_) => {
+                    return Ok(Err(
+                        "host_http.request: headers_json must be an object".to_owned()
+                    ));
+                }
                 Err(e) => return Ok(Err(format!("host_http.request: invalid headers_json: {e}"))),
             }
         };
@@ -1183,7 +1194,9 @@ impl rsclaw::plugin::host_http::Host for HostState {
         let mut rb = client.request(method, url).timeout(timeout);
         for (k, v) in headers {
             let Some(s) = v.as_str() else {
-                return Ok(Err(format!("host_http.request: header `{k}` must be a string")));
+                return Ok(Err(format!(
+                    "host_http.request: header `{k}` must be a string"
+                )));
             };
             rb = rb.header(&k, s);
         }
@@ -1209,7 +1222,8 @@ impl rsclaw::plugin::host_http::Host for HostState {
             "status": status,
             "headers": out_headers,
             "body": body,
-        }).to_string()))
+        })
+        .to_string()))
     }
 }
 
@@ -1268,8 +1282,7 @@ async fn validate_host_http_url(raw: &str) -> std::result::Result<reqwest::Url, 
     let host = url
         .host_str()
         .ok_or_else(|| "URL host is required".to_owned())?;
-    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost")
-    {
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
         return Err("localhost is not allowed".to_owned());
     }
     let port = url
@@ -1356,7 +1369,11 @@ impl rsclaw::plugin::host_kv::Host for HostState {
         plugin_kv_get(&self.plugin_name, key).await
     }
 
-    async fn kv_set(&mut self, key: String, value: String) -> HostTrapResult<Result<String, String>> {
+    async fn kv_set(
+        &mut self,
+        key: String,
+        value: String,
+    ) -> HostTrapResult<Result<String, String>> {
         plugin_kv_set(&self.plugin_name, key, value).await
     }
 
@@ -1423,21 +1440,11 @@ impl rsclaw::plugin::host_background::Host for HostState {
     }
 
     async fn sse_status(&mut self, name: String) -> HostTrapResult<Result<String, String>> {
-        Ok(crate::sse_status(
-            self.plugin_name.clone(),
-            name,
-            self.invocation_context(),
-        )
-        .await)
+        Ok(crate::sse_status(self.plugin_name.clone(), name, self.invocation_context()).await)
     }
 
     async fn sse_unsubscribe(&mut self, name: String) -> HostTrapResult<Result<String, String>> {
-        Ok(crate::sse_unsubscribe(
-            self.plugin_name.clone(),
-            name,
-            self.invocation_context(),
-        )
-        .await)
+        Ok(crate::sse_unsubscribe(self.plugin_name.clone(), name, self.invocation_context()).await)
     }
 
     async fn push_outbound(
@@ -1446,13 +1453,7 @@ impl rsclaw::plugin::host_background::Host for HostState {
         peer_id: String,
         message_json: String,
     ) -> HostTrapResult<Result<String, String>> {
-        Ok(crate::push_outbound(
-            channel,
-            peer_id,
-            message_json,
-            self.invocation_context(),
-        )
-        .await)
+        Ok(crate::push_outbound(channel, peer_id, message_json, self.invocation_context()).await)
     }
 
     async fn submit_agent_turn(
@@ -1461,13 +1462,10 @@ impl rsclaw::plugin::host_background::Host for HostState {
         prompt: String,
         route_json: String,
     ) -> HostTrapResult<Result<String, String>> {
-        Ok(crate::submit_agent_turn(
-            session_key,
-            prompt,
-            route_json,
-            self.invocation_context(),
+        Ok(
+            crate::submit_agent_turn(session_key, prompt, route_json, self.invocation_context())
+                .await,
         )
-        .await)
     }
 }
 
@@ -1524,8 +1522,7 @@ async fn load_device_signing_key() -> Result<SigningKey, String> {
 fn write_device_key_restricted(path: &std::path::Path, encoded: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -1538,8 +1535,7 @@ fn write_device_key_restricted(path: &std::path::Path, encoded: &str) -> Result<
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, encoded)
-            .map_err(|e| format!("host_device: write key failed: {e}"))?;
+        std::fs::write(path, encoded).map_err(|e| format!("host_device: write key failed: {e}"))?;
     }
     // Belt-and-suspenders: if the file pre-existed (concurrent create) the
     // mode above is a no-op, so re-assert restrictive perms.
@@ -1644,7 +1640,10 @@ pub async fn plugin_kv_set_value(plugin_name: &str, key: &str, value: &str) -> R
     }
 }
 
-async fn plugin_kv_delete(plugin_name: &str, key: String) -> HostTrapResult<Result<String, String>> {
+async fn plugin_kv_delete(
+    plugin_name: &str,
+    key: String,
+) -> HostTrapResult<Result<String, String>> {
     let db_path = plugin_db_path(plugin_name);
     let result = tokio::task::spawn_blocking(move || {
         if let Some(parent) = db_path.parent() {
@@ -1673,16 +1672,14 @@ fn resolve_plugin_config(raw: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Object(map) => {
                 let source = map.get("source").and_then(|v| v.as_str());
                 let id = map.get("id").and_then(|v| v.as_str());
-                if source == Some("env") && let Some(id) = id {
+                if source == Some("env")
+                    && let Some(id) = id
+                {
                     return std::env::var(id)
                         .map(serde_json::Value::String)
                         .unwrap_or(serde_json::Value::Null);
                 }
-                serde_json::Value::Object(
-                    map.iter()
-                        .map(|(k, v)| (k.clone(), walk(v)))
-                        .collect(),
-                )
+                serde_json::Value::Object(map.iter().map(|(k, v)| (k.clone(), walk(v))).collect())
             }
             serde_json::Value::Array(arr) => {
                 serde_json::Value::Array(arr.iter().map(walk).collect())
@@ -1966,6 +1963,74 @@ async fn adb_run_bytes(serial: Option<&str>, sub: &[&str]) -> Result<Vec<u8>, St
     Ok(out.stdout)
 }
 
+/// Stage one approved local file under Android's app-picker-visible directory.
+async fn adb_stage_file(
+    serial: Option<&str>,
+    source: &std::path::Path,
+    media_kind: &str,
+) -> Result<String, String> {
+    if !matches!(media_kind, "image" | "file" | "audio") {
+        return Err(format!(
+            "android_stage_file: unsupported media kind '{media_kind}' (expected image, file, or audio)"
+        ));
+    }
+    let extension = source
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 16
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default();
+    let digest = Sha256::digest(source.to_string_lossy().as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let remote_dir = "/sdcard/Download/rsclaw";
+    let remote_path = format!("{remote_dir}/rsclaw_{suffix}{extension}");
+    adb_run_str(serial, &["shell", "mkdir", "-p", remote_dir]).await?;
+
+    let mut command = tokio::process::Command::new("adb");
+    if let Some(serial) = serial {
+        command.arg("-s").arg(serial);
+    }
+    let source = source.to_string_lossy();
+    let output = command
+        .args(["push", source.as_ref(), remote_path.as_str()])
+        .output()
+        .await
+        .map_err(|error| format!("android_stage_file: adb push spawn failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "android_stage_file: adb push {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if matches!(media_kind, "image" | "audio") {
+        let media_uri = format!("file://{remote_path}");
+        adb_run_str(
+            serial,
+            &[
+                "shell",
+                "am",
+                "broadcast",
+                "-a",
+                "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                "-d",
+                &media_uri,
+            ],
+        )
+        .await?;
+    }
+    Ok(remote_path)
+}
+
 /// Characters refused in any `input text` payload that ultimately runs
 /// through the device's shell via `adb shell`. The shell sees the whole
 /// trailing argv joined with spaces, so `\n`, `\r`, `\0` would let an
@@ -2058,7 +2123,9 @@ fn u2_local_port(serial: Option<&str>) -> u16 {
         None => 6790,
         Some(s) => {
             let mut h: u32 = 2166136261;
-            for b in s.bytes() { h = (h ^ b as u32).wrapping_mul(16777619); }
+            for b in s.bytes() {
+                h = (h ^ b as u32).wrapping_mul(16777619);
+            }
             6800 + (h % 600) as u16 // 6800..7400
         }
     }
@@ -2122,10 +2189,14 @@ async fn u2_ensure(serial: Option<&str>) -> Result<String, String> {
     // Already up (started by a previous run / cls / appium)? Reuse it.
     if u2_status_ok(&base).await {
         let session = u2_open_session(&base).await;
-        u2_conns()
-            .lock()
-            .await
-            .insert(key.clone(), U2Conn { base: base.clone(), session, _instr: None });
+        u2_conns().lock().await.insert(
+            key.clone(),
+            U2Conn {
+                base: base.clone(),
+                session,
+                _instr: None,
+            },
+        );
         return Ok(base);
     }
 
@@ -2133,30 +2204,47 @@ async fn u2_ensure(serial: Option<&str>) -> Result<String, String> {
     // kill_on_drop ensures the process is terminated when a stale U2Conn is
     // evicted from the cache, preventing orphaned instrumentation processes.
     let mut cmd = tokio::process::Command::new("adb");
-    if let Some(s) = serial { cmd.arg("-s").arg(s); }
+    if let Some(s) = serial {
+        cmd.arg("-s").arg(s);
+    }
     cmd.args([
-        "shell", "am", "instrument", "-w", "-e", "disableAnalytics", "true",
+        "shell",
+        "am",
+        "instrument",
+        "-w",
+        "-e",
+        "disableAnalytics",
+        "true",
         "io.appium.uiautomator2.server.test/androidx.test.runner.AndroidJUnitRunner",
     ]);
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let child = cmd.spawn().map_err(|e| format!("spawn u2 instrument: {e}"))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn u2 instrument: {e}"))?;
 
     // Poll /status up to ~30s.
     let mut ok = false;
     for _ in 0..60 {
-        if u2_status_ok(&base).await { ok = true; break; }
+        if u2_status_ok(&base).await {
+            ok = true;
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     if !ok {
         return Err("u2 server did not become ready within 30s".into());
     }
     let session = u2_open_session(&base).await;
-    u2_conns()
-        .lock()
-        .await
-        .insert(key, U2Conn { base: base.clone(), session, _instr: Some(child) });
+    u2_conns().lock().await.insert(
+        key,
+        U2Conn {
+            base: base.clone(),
+            session,
+            _instr: Some(child),
+        },
+    );
     Ok(base)
 }
 
@@ -2165,11 +2253,18 @@ async fn u2_ensure(serial: Option<&str>) -> Result<String, String> {
 async fn u2_open_session(base: &str) -> Option<String> {
     let client = host_http_client().ok()?;
     // Reuse.
-    if let Ok(resp) = client.get(format!("{base}/sessions"))
-        .timeout(std::time::Duration::from_secs(5)).send().await
+    if let Ok(resp) = client
+        .get(format!("{base}/sessions"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
         && let Ok(v) = resp.json::<Value>().await
-        && let Some(id) = v.get("value").and_then(|a| a.as_array()).and_then(|a| a.first())
-            .and_then(|s| s.get("sessionId").or_else(|| s.get("id"))).and_then(|x| x.as_str())
+        && let Some(id) = v
+            .get("value")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|s| s.get("sessionId").or_else(|| s.get("id")))
+            .and_then(|x| x.as_str())
         && !id.is_empty()
     {
         return Some(id.to_string());
@@ -2177,11 +2272,18 @@ async fn u2_open_session(base: &str) -> Option<String> {
     // Create.
     let caps = json!({"capabilities":{"alwaysMatch":{
         "platformName":"Android","appium:automationName":"UiAutomator2","appium:noReset":true}}});
-    let resp = client.post(format!("{base}/session")).json(&caps)
-        .timeout(std::time::Duration::from_secs(20)).send().await.ok()?;
+    let resp = client
+        .post(format!("{base}/session"))
+        .json(&caps)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .ok()?;
     let v: Value = resp.json().await.ok()?;
-    v.pointer("/value/sessionId").or_else(|| v.get("sessionId"))
-        .and_then(|x| x.as_str()).map(String::from)
+    v.pointer("/value/sessionId")
+        .or_else(|| v.get("sessionId"))
+        .and_then(|x| x.as_str())
+        .map(String::from)
 }
 
 /// ADBKeyboard (com.android.adbkeyboard) IME package — injects arbitrary
@@ -2200,28 +2302,36 @@ fn adbkb_ready() -> &'static Mutex<std::collections::HashSet<String>> {
 
 /// Ensure ADBKeyboard is installed and selected as the active IME for `serial`.
 /// Self-healing: verifies the ACTUAL current IME rather than trusting the cache
-/// alone — the device IME can be changed out from under us (manual switch, another
-/// app), which previously left the cache stale and made CJK input silently no-op.
+/// alone — the device IME can be changed out from under us (manual switch,
+/// another app), which previously left the cache stale and made CJK input
+/// silently no-op.
 async fn adbkb_ensure(serial: Option<&str>) -> Result<(), String> {
     let key = serial.unwrap_or("").to_string();
     // Fast path: cached AND the device confirms ADBKeyboard is still active.
     if adbkb_ready().lock().await.contains(&key)
-        && adb_run_str(serial, &["shell", "settings", "get", "secure", "default_input_method"])
-            .await
-            .map(|out| out.contains(ADBKB_IME))
-            .unwrap_or(false)
+        && adb_run_str(
+            serial,
+            &["shell", "settings", "get", "secure", "default_input_method"],
+        )
+        .await
+        .map(|out| out.contains(ADBKB_IME))
+        .unwrap_or(false)
     {
         return Ok(());
     }
     let pkgs = adb_run_str(serial, &["shell", "pm", "list", "packages"]).await?;
     if !pkgs.contains(ADBKB_PKG) {
-        return Err("ADBKeyboard not installed (needed for CJK on Flutter inputs); \
-                    sideload https://github.com/senzhk/ADBKeyBoard ADBKeyboard.apk".into());
+        return Err(
+            "ADBKeyboard not installed (needed for CJK on Flutter inputs); \
+                    sideload https://github.com/senzhk/ADBKeyBoard ADBKeyboard.apk"
+                .into(),
+        );
     }
     if let Err(e) = adb_run_str(serial, &["shell", "ime", "enable", ADBKB_IME]).await {
         tracing::warn!(serial = ?serial, error = %e, "best-effort ime enable ADBKeyboard");
     }
-    adb_run_str(serial, &["shell", "ime", "set", ADBKB_IME]).await
+    adb_run_str(serial, &["shell", "ime", "set", ADBKB_IME])
+        .await
         .map_err(|e| format!("ime set ADBKeyboard: {e}"))?;
     // Let the IME switch settle.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -2234,10 +2344,22 @@ async fn adbkb_type(serial: Option<&str>, text: &str) -> Result<(), String> {
     adbkb_ensure(serial).await?;
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    adb_run_str(serial, &["shell", "am", "broadcast", "-a", "ADB_INPUT_B64", "--es", "msg", &b64])
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("ADBKeyboard broadcast: {e}"))
+    adb_run_str(
+        serial,
+        &[
+            "shell",
+            "am",
+            "broadcast",
+            "-a",
+            "ADB_INPUT_B64",
+            "--es",
+            "msg",
+            &b64,
+        ],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("ADBKeyboard broadcast: {e}"))
 }
 
 /// Percent-encode a string for safe use in a URL path segment. u2 session and
@@ -2264,29 +2386,51 @@ async fn u2_type_focused(serial: Option<&str>, text: &str) -> Result<(), String>
     let base = u2_ensure(serial).await?;
     let sid = {
         let map = u2_conns().lock().await;
-        map.get(serial.unwrap_or("")).and_then(|c| c.session.clone())
+        map.get(serial.unwrap_or(""))
+            .and_then(|c| c.session.clone())
             .ok_or("u2 session unavailable")?
     };
     let client = host_http_client()?;
     // Focused element.
-    let resp = client.get(format!("{base}/session/{}/element/active", u2_url_encode(&sid)))
-        .timeout(std::time::Duration::from_secs(8)).send().await
+    let resp = client
+        .get(format!(
+            "{base}/session/{}/element/active",
+            u2_url_encode(&sid)
+        ))
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
         .map_err(|e| format!("u2 active element: {e}"))?;
-    let v: Value = resp.json().await.map_err(|e| format!("u2 active body: {e}"))?;
-    let aid = v.get("value").and_then(|x| x.get("ELEMENT").or_else(|| x.get("element-6066-11e4-a52e-4f735466cecf")))
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("u2 active body: {e}"))?;
+    let aid = v
+        .get("value")
+        .and_then(|x| {
+            x.get("ELEMENT")
+                .or_else(|| x.get("element-6066-11e4-a52e-4f735466cecf"))
+        })
         .and_then(|x| x.as_str())
         .ok_or("no focused element (tap the field first)")?
         .to_string();
     let body = json!({ "text": text, "value": [text] });
-    let resp = client.post(format!(
-        "{base}/session/{}/element/{}/value",
-        u2_url_encode(&sid),
-        u2_url_encode(&aid),
-    ))
-        .json(&body).timeout(std::time::Duration::from_secs(10)).send().await
+    let resp = client
+        .post(format!(
+            "{base}/session/{}/element/{}/value",
+            u2_url_encode(&sid),
+            u2_url_encode(&aid),
+        ))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
         .map_err(|e| format!("u2 setValue: {e}"))?;
-    if resp.status().is_success() { Ok(()) }
-    else { Err(format!("u2 setValue http {}", resp.status())) }
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("u2 setValue http {}", resp.status()))
+    }
 }
 
 /// Resolve `(base, session_id)` for a serial, bringing the u2 server up if
@@ -2296,7 +2440,8 @@ async fn u2_session(serial: Option<&str>) -> Result<(String, String), String> {
     let base = u2_ensure(serial).await?;
     let sid = {
         let map = u2_conns().lock().await;
-        map.get(serial.unwrap_or("")).and_then(|c| c.session.clone())
+        map.get(serial.unwrap_or(""))
+            .and_then(|c| c.session.clone())
     };
     match sid {
         Some(s) => Ok((base, s)),
@@ -2311,13 +2456,13 @@ async fn u2_tap(serial: Option<&str>, x: u32, y: u32) -> Result<(), String> {
     let (base, sid) = u2_session(serial).await?;
     let client = host_http_client()?;
     let body = json!({"actions":[{
-        "type":"pointer","id":"finger1","parameters":{"pointerType":"touch"},
-        "actions":[
-            {"type":"pointerMove","duration":0,"x":x,"y":y},
-            {"type":"pointerDown","button":0},
-            {"type":"pause","duration":60},
-            {"type":"pointerUp","button":0}
-        ]}]});
+    "type":"pointer","id":"finger1","parameters":{"pointerType":"touch"},
+    "actions":[
+        {"type":"pointerMove","duration":0,"x":x,"y":y},
+        {"type":"pointerDown","button":0},
+        {"type":"pause","duration":60},
+        {"type":"pointerUp","button":0}
+    ]}]});
     let resp = client
         .post(format!("{base}/session/{}/actions", u2_url_encode(&sid)))
         .json(&body)
@@ -2346,13 +2491,13 @@ async fn u2_swipe(
     let client = host_http_client()?;
     let dur = duration_ms.max(1);
     let body = json!({"actions":[{
-        "type":"pointer","id":"finger1","parameters":{"pointerType":"touch"},
-        "actions":[
-            {"type":"pointerMove","duration":0,"x":x1,"y":y1},
-            {"type":"pointerDown","button":0},
-            {"type":"pointerMove","duration":dur,"x":x2,"y":y2},
-            {"type":"pointerUp","button":0}
-        ]}]});
+    "type":"pointer","id":"finger1","parameters":{"pointerType":"touch"},
+    "actions":[
+        {"type":"pointerMove","duration":0,"x":x1,"y":y1},
+        {"type":"pointerDown","button":0},
+        {"type":"pointerMove","duration":dur,"x":x2,"y":y2},
+        {"type":"pointerUp","button":0}
+    ]}]});
     let resp = client
         .post(format!("{base}/session/{}/actions", u2_url_encode(&sid)))
         .json(&body)
@@ -2382,7 +2527,10 @@ async fn u2_screenshot_b64(serial: Option<&str>) -> Result<String, String> {
     if !resp.status().is_success() {
         return Err(format!("u2 screenshot http {}", resp.status()));
     }
-    let v: Value = resp.json().await.map_err(|e| format!("u2 screenshot body: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("u2 screenshot body: {e}"))?;
     v.get("value")
         .and_then(|x| x.as_str())
         .filter(|s| !s.is_empty())
@@ -2396,7 +2544,10 @@ async fn u2_screen_size(serial: Option<&str>) -> Result<(u32, u32), String> {
     let (base, sid) = u2_session(serial).await?;
     let client = host_http_client()?;
     let resp = client
-        .get(format!("{base}/session/{}/window/size", u2_url_encode(&sid)))
+        .get(format!(
+            "{base}/session/{}/window/size",
+            u2_url_encode(&sid)
+        ))
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
@@ -2404,7 +2555,10 @@ async fn u2_screen_size(serial: Option<&str>) -> Result<(u32, u32), String> {
     if !resp.status().is_success() {
         return Err(format!("u2 window size http {}", resp.status()));
     }
-    let v: Value = resp.json().await.map_err(|e| format!("u2 window size body: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("u2 window size body: {e}"))?;
     let value = v.get("value").unwrap_or(&v);
     let width = value.get("width").and_then(Value::as_u64);
     let height = value.get("height").and_then(Value::as_u64);
@@ -2415,7 +2569,9 @@ async fn u2_screen_size(serial: Option<&str>) -> Result<(u32, u32), String> {
 }
 
 async fn u2_status_ok(base: &str) -> bool {
-    let Ok(client) = host_http_client() else { return false };
+    let Ok(client) = host_http_client() else {
+        return false;
+    };
     match client
         .get(format!("{base}/status"))
         .timeout(std::time::Duration::from_secs(4))
@@ -2436,7 +2592,8 @@ async fn u2_ui_xml(serial: Option<&str>) -> Result<String, String> {
     // whose semantics tree only materializes within a session).
     let sid = {
         let map = u2_conns().lock().await;
-        map.get(serial.unwrap_or("")).and_then(|c| c.session.clone())
+        map.get(serial.unwrap_or(""))
+            .and_then(|c| c.session.clone())
     };
     let path = match &sid {
         Some(s) => format!("{base}/session/{}/source", u2_url_encode(s)),
@@ -2449,7 +2606,10 @@ async fn u2_ui_xml(serial: Option<&str>) -> Result<String, String> {
         .send()
         .await
         .map_err(|e| format!("u2 /source: {e}"))?;
-    let body = resp.text().await.map_err(|e| format!("u2 /source body: {e}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("u2 /source body: {e}"))?;
     // u2 returns {"value":"<xml>"} (or sometimes raw XML).
     let xml = serde_json::from_str::<Value>(&body)
         .ok()
@@ -2473,7 +2633,9 @@ fn u2_normalize_xml(xml: &str) -> String {
                     // Element open tag — consume the tag name, emit `node`.
                     let mut name = String::new();
                     while let Some(&(_, ch)) = chars.peek() {
-                        if ch.is_whitespace() || ch == '>' || ch == '/' { break; }
+                        if ch.is_whitespace() || ch == '>' || ch == '/' {
+                            break;
+                        }
                         name.push(ch);
                         chars.next();
                     }
@@ -2488,7 +2650,9 @@ fn u2_normalize_xml(xml: &str) -> String {
                     {
                         let mut name = String::new();
                         while let Some(&(_, ch)) = chars.peek() {
-                            if ch.is_whitespace() || ch == '>' { break; }
+                            if ch.is_whitespace() || ch == '>' {
+                                break;
+                            }
                             name.push(ch);
                             chars.next();
                         }
@@ -2604,15 +2768,17 @@ fn adb_match_elements(xml: &str, sel_type: &str, sel_val: &str) -> Vec<serde_jso
 
 impl HostState {
     fn invocation_context(&self) -> Option<crate::PluginInvocationContext> {
-        self.notify_ctx.as_ref().map(|ctx| crate::PluginInvocationContext {
-            target_id: ctx.target_id.clone(),
-            channel: ctx.channel.clone(),
-            agent_id: ctx.agent_id.clone(),
-            peer_id: ctx.peer_id.clone(),
-            chat_id: ctx.chat_id.clone(),
-            session_key: ctx.session_key.clone(),
-            is_group: ctx.is_group,
-        })
+        self.notify_ctx
+            .as_ref()
+            .map(|ctx| crate::PluginInvocationContext {
+                target_id: ctx.target_id.clone(),
+                channel: ctx.channel.clone(),
+                agent_id: ctx.agent_id.clone(),
+                peer_id: ctx.peer_id.clone(),
+                chat_id: ctx.chat_id.clone(),
+                session_key: ctx.session_key.clone(),
+                is_group: ctx.is_group,
+            })
     }
 
     /// Execute a browser action by locking the shared browser session.
@@ -2858,17 +3024,27 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
         // 0-1000 normalized space, independent of pixel dimensions. Any
         // parse/decode/resize failure falls back to the original URI.
         let image_data_uri = {
-            let downscaled = image_data_uri.split_once(";base64,").and_then(|(header, b64)| {
-                let mime = header.strip_prefix("data:").unwrap_or("image/png").to_string();
-                let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-                let (new_bytes, new_mime) =
-                    rsclaw_util::downscale_image_for_vision(&bytes, &mime, 256 * 1024, 1280, 85)
-                        .ok()?;
-                Some(format!(
-                    "data:{new_mime};base64,{}",
-                    base64::engine::general_purpose::STANDARD.encode(&new_bytes)
-                ))
-            });
+            let downscaled = image_data_uri
+                .split_once(";base64,")
+                .and_then(|(header, b64)| {
+                    let mime = header
+                        .strip_prefix("data:")
+                        .unwrap_or("image/png")
+                        .to_string();
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+                    let (new_bytes, new_mime) = rsclaw_util::downscale_image_for_vision(
+                        &bytes,
+                        &mime,
+                        256 * 1024,
+                        1280,
+                        85,
+                    )
+                    .ok()?;
+                    Some(format!(
+                        "data:{new_mime};base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(&new_bytes)
+                    ))
+                });
             downscaled.unwrap_or(image_data_uri)
         };
 
@@ -2901,12 +3077,24 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             recall: None,
         };
 
-        match provider.stream(req).await {
-            Ok(mut stream) => {
+        // A one-minute monitor cannot afford a single visual read holding the
+        // device UI for minutes. Thirty seconds leaves room for recovery and
+        // the next cron tick; callers retry on an explicit error.
+        let mut stream = match tokio::time::timeout(Duration::from_secs(30), provider.stream(req)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Ok(Err(format!("vlm_parse provider error: {e}"))),
+            Err(_) => return Ok(Err("vlm_parse provider setup timed out after 30s".to_string())),
+        };
+        {
                 let mut text = String::new();
                 let mut reasoning = String::new();
                 use futures::StreamExt;
-                while let Some(event) = stream.next().await {
+                loop {
+                    let event = match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+                        Ok(event) => event,
+                        Err(_) => return Ok(Err("vlm_parse stream timed out after 30s".to_string())),
+                    };
+                    let Some(event) = event else { break };
                     match event {
                         Ok(rsclaw_provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
                         Ok(rsclaw_provider::StreamEvent::ReasoningDelta(d)) => {
@@ -2928,8 +3116,6 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
                     text
                 };
                 Ok(Ok(result))
-            }
-            Err(e) => Ok(Err(format!("vlm_parse provider error: {e}"))),
         }
     }
 }
@@ -2992,7 +3178,10 @@ impl rsclaw::plugin::host_android::Host for HostState {
         duration_ms: u32,
     ) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
-        if u2_swipe(serial.as_deref(), x1, y1, x2, y2, duration_ms).await.is_ok() {
+        if u2_swipe(serial.as_deref(), x1, y1, x2, y2, duration_ms)
+            .await
+            .is_ok()
+        {
             return Ok(Ok("swiped".to_string()));
         }
         let (s1, s2, s3, s4, s5) = (
@@ -3086,6 +3275,19 @@ impl rsclaw::plugin::host_android::Host for HostState {
             ));
         }
         Ok(Ok("clipboard_set".to_string()))
+    }
+
+    async fn android_stage_file(
+        &mut self,
+        local_path: String,
+        media_kind: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let source = match canonicalize_browser_upload_path(&self.plugin_name, &local_path) {
+            Ok(path) => path,
+            Err(error) => return Ok(Err(error)),
+        };
+        let serial = self.android_serial.clone();
+        Ok(adb_stage_file(serial.as_deref(), &source, &media_kind).await)
     }
 
     async fn android_paste(&mut self) -> HostTrapResult<Result<String, String>> {
@@ -3201,12 +3403,10 @@ impl rsclaw::plugin::host_android::Host for HostState {
         match adb_run_str(serial.as_deref(), &["shell", "dumpsys", "activity", "top"]).await {
             Ok(out) => match parse_activity_top(&out) {
                 Some(activity) => Ok(Ok(activity)),
-                None => Ok(Err(
-                    "could not determine current activity (mCurrentFocus, \
+                None => Ok(Err("could not determine current activity (mCurrentFocus, \
                      mResumedActivity, and `dumpsys activity top` all failed \
                      to match on this device)"
-                        .to_string(),
-                )),
+                    .to_string())),
             },
             Err(e) => Ok(Err(format!("dumpsys activity top failed: {e}"))),
         }
@@ -3214,17 +3414,41 @@ impl rsclaw::plugin::host_android::Host for HostState {
 
     async fn android_launch_app(&mut self, pkg: String) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
-        Ok(adb_run_str(
+        // Monkey is accepted by most devices, but after an automation-service
+        // reconnect this Samsung can return to Home without foregrounding the
+        // package. Resolve the launcher activity and start it explicitly so
+        // callers can verify the requested app rather than a stale activity.
+        if let Ok(resolved) = adb_run_str(
             serial.as_deref(),
             &[
                 "shell",
-                "monkey",
-                "-p",
-                &pkg,
+                "cmd",
+                "package",
+                "resolve-activity",
+                "--brief",
+                "-a",
+                "android.intent.action.MAIN",
                 "-c",
                 "android.intent.category.LAUNCHER",
-                "1",
+                &pkg,
             ],
+        )
+        .await
+            && let Some(component) = resolved.lines().rev().find(|line| line.contains('/'))
+        {
+            return Ok(adb_run_str(
+                serial.as_deref(),
+                &["shell", "am", "start", "-n", component.trim()],
+            )
+            .await
+            .map(|_| format!("launched {pkg}")));
+        }
+        Ok(adb_run_str(
+            serial.as_deref(),
+            // Some OEM builds route the explicit launcher-category variant
+            // back to the automation companion instead of the requested app.
+            // The package-scoped Monkey launch is the device-verified path.
+            &["shell", "monkey", "-p", &pkg, "1"],
         )
         .await
         .map(|_| format!("launched {pkg}")))
@@ -3259,7 +3483,9 @@ impl rsclaw::plugin::host_android::Host for HostState {
         if let Ok(b64) = u2_screenshot_b64(serial.as_deref()).await {
             return Ok(Ok(format!("data:image/png;base64,{b64}")));
         }
-        Ok(Err("android_screenshot: both ADB screencap and u2 screenshot failed".to_string()))
+        Ok(Err(
+            "android_screenshot: both ADB screencap and u2 screenshot failed".to_string(),
+        ))
     }
 
     async fn android_screen_size(&mut self) -> HostTrapResult<Result<String, String>> {
@@ -3268,16 +3494,18 @@ impl rsclaw::plugin::host_android::Host for HostState {
         // connection, same rationale as android_screenshot's u2-first path).
         // Fall back to `adb shell wm size` when u2 isn't up.
         if let Ok((width, height)) = u2_screen_size(serial.as_deref()).await {
-            return Ok(Ok(serde_json::json!({"width": width, "height": height}).to_string()));
+            return Ok(Ok(
+                serde_json::json!({"width": width, "height": height}).to_string()
+            ));
         }
         let out = match adb_run_str(serial.as_deref(), &["shell", "wm", "size"]).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("wm size: {e}"))),
         };
         match parse_wm_size(&out) {
-            Some((width, height)) => {
-                Ok(Ok(serde_json::json!({"width": width, "height": height}).to_string()))
-            }
+            Some((width, height)) => Ok(Ok(
+                serde_json::json!({"width": width, "height": height}).to_string()
+            )),
             None => Ok(Err(format!(
                 "android_screen_size: could not parse `wm size` output: {out:?}"
             ))),
@@ -3498,9 +3726,8 @@ impl rsclaw::plugin::host_android::Host for HostState {
         if raw.len() < 16 {
             return Ok(Err("screencap: data too small".to_string()));
         }
-        let rd = |i: usize| {
-            u32::from_le_bytes([raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]) as usize
-        };
+        let rd =
+            |i: usize| u32::from_le_bytes([raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]) as usize;
         let (w, h) = (rd(0), rd(4));
         if w == 0 || h == 0 || w > 20000 || h > 20000 {
             return Ok(Err(format!("screencap: bad header {w}x{h}")));
@@ -3539,7 +3766,9 @@ impl rsclaw::plugin::host_android::Host for HostState {
             y += 2;
         }
         if n < 80 {
-            return Ok(Err("android_tap_yellow_button: no yellow button found".to_string()));
+            return Ok(Err(
+                "android_tap_yellow_button: no yellow button found".to_string()
+            ));
         }
         let (cx, cy) = ((sx / n) as u32, (sy / n) as u32);
         match adb_run_str(
@@ -3586,14 +3815,14 @@ impl rsclaw::plugin::host_ios::Host for HostState {
     ) -> HostTrapResult<Result<String, String>> {
         let base = std::env::var("RSCLAW_IOS_WDA_URL")
             .unwrap_or_else(|_| "http://localhost:8100".to_string());
-        
+
         // Reuse existing session if available
         if let Some(ref existing_url) = self.wda_url {
             if existing_url.starts_with(&base) {
                 return Ok(Ok(base));
             }
         }
-        
+
         let cli = match host_http_client() {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
@@ -3762,11 +3991,7 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         }
     }
 
-    async fn ios_tap(
-        &mut self,
-        x: f64,
-        y: f64,
-    ) -> HostTrapResult<Result<String, String>> {
+    async fn ios_tap(&mut self, x: f64, y: f64) -> HostTrapResult<Result<String, String>> {
         let (base, cli) = self.wda_base_and_client();
         // Use the sessionless `/wda/tap` with the coordinates in the JSON body —
         // the `/wda/tap/{x}/{y}` path form returns 404 on this WDA build.
@@ -3790,10 +4015,7 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         }
     }
 
-    async fn ios_type(
-        &mut self,
-        text: String,
-    ) -> HostTrapResult<Result<String, String>> {
+    async fn ios_type(&mut self, text: String) -> HostTrapResult<Result<String, String>> {
         let (base, cli) = self.wda_base_and_client();
         let payload = serde_json::json!({"value": [text]});
         let resp = match cli
@@ -3867,10 +4089,12 @@ impl rsclaw::plugin::host_ios::Host for HostState {
             }
             return Ok(Err(format!("WDA source returned {}", resp.status())));
         }
-        let body: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => return Ok(Err(format!("WDA source decode: {e}"))),
-        };
+        let body: serde_json::Value =
+            match tokio::time::timeout(Duration::from_secs(12), resp.json()).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return Ok(Err(format!("WDA source decode: {e}"))),
+                Err(_) => return Ok(Err("WDA source body timed out after 12s".to_string())),
+            };
         let xml = body
             .pointer("/value")
             .and_then(|v| v.as_str())
@@ -3880,17 +4104,25 @@ impl rsclaw::plugin::host_ios::Host for HostState {
 
     async fn ios_screenshot(&mut self) -> HostTrapResult<Result<String, String>> {
         let (base, cli) = self.wda_base_and_client();
-        let resp = match cli.get(format!("{base}/screenshot")).send().await {
-            Ok(r) => r,
-            Err(e) => return Ok(Err(format!("WDA screenshot: {e}"))),
+        let resp = match tokio::time::timeout(
+            Duration::from_secs(12),
+            cli.get(format!("{base}/screenshot")).send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Ok(Err(format!("WDA screenshot: {error}"))),
+            Err(_) => return Ok(Err("WDA screenshot timed out after 12s".to_string())),
         };
         if !resp.status().is_success() {
             return Ok(Err(format!("WDA screenshot returned {}", resp.status())));
         }
-        let body: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => return Ok(Err(format!("WDA screenshot decode: {e}"))),
-        };
+        let body: serde_json::Value =
+            match tokio::time::timeout(Duration::from_secs(12), resp.json()).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return Ok(Err(format!("WDA screenshot decode: {e}"))),
+                Err(_) => return Ok(Err("WDA screenshot body timed out after 12s".to_string())),
+            };
         let png_b64 = body
             .pointer("/value")
             .and_then(|v| v.as_str())
@@ -3911,13 +4143,14 @@ impl rsclaw::plugin::host_ios::Host for HostState {
             Ok(v) => v,
             Err(e) => return Ok(Err(format!("WDA size decode: {e}"))),
         };
-        Ok(Ok(body.pointer("/value").cloned().unwrap_or(body).to_string()))
+        Ok(Ok(body
+            .pointer("/value")
+            .cloned()
+            .unwrap_or(body)
+            .to_string()))
     }
 
-    async fn ios_press_button(
-        &mut self,
-        name: String,
-    ) -> HostTrapResult<Result<String, String>> {
+    async fn ios_press_button(&mut self, name: String) -> HostTrapResult<Result<String, String>> {
         let (base, cli) = self.wda_base_and_client();
         let payload = serde_json::json!({"name": name});
         let resp = match cli
@@ -3942,8 +4175,7 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         base64_content: String,
     ) -> HostTrapResult<Result<String, String>> {
         let (base, cli) = self.wda_base_and_client();
-        let payload =
-            serde_json::json!({"contentType": content_type, "content": base64_content});
+        let payload = serde_json::json!({"contentType": content_type, "content": base64_content});
         let resp = match cli
             .post(format!("{base}/wda/setPasteboard"))
             .json(&payload)
@@ -3964,11 +4196,7 @@ impl rsclaw::plugin::host_ios::Host for HostState {
 
     async fn ios_current_app(&mut self) -> HostTrapResult<Result<String, String>> {
         let (base, cli) = self.wda_base_and_client();
-        let resp = match cli
-            .get(format!("{base}/wda/activeAppInfo"))
-            .send()
-            .await
-        {
+        let resp = match cli.get(format!("{base}/wda/activeAppInfo")).send().await {
             Ok(r) => r,
             Err(e) => return Ok(Err(format!("WDA activeApp: {e}"))),
         };
@@ -4139,10 +4367,7 @@ fn parse_activity_top(dumpsys_output: &str) -> Option<String> {
             continue;
         }
         let rest = trimmed.strip_prefix("ACTIVITY ")?;
-        let tok = rest
-            .split_whitespace()
-            .next()
-            .filter(|s| s.contains('/'))?;
+        let tok = rest.split_whitespace().next().filter(|s| s.contains('/'))?;
         return Some(tok.to_string());
     }
     None
@@ -4210,15 +4435,15 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
         wasmtime::component::HasSelf<HostState>,
     >(&mut linker, |state: &mut HostState| state)
     .map_err(|e| anyhow::anyhow!("failed to add host-context linker interfaces: {e}"))?;
-    rsclaw::plugin::host_http::add_to_linker::<
-        HostState,
-        wasmtime::component::HasSelf<HostState>,
-    >(&mut linker, |state: &mut HostState| state)
+    rsclaw::plugin::host_http::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state: &mut HostState| state,
+    )
     .map_err(|e| anyhow::anyhow!("failed to add host-http linker interfaces: {e}"))?;
-    rsclaw::plugin::host_kv::add_to_linker::<
-        HostState,
-        wasmtime::component::HasSelf<HostState>,
-    >(&mut linker, |state: &mut HostState| state)
+    rsclaw::plugin::host_kv::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state: &mut HostState| state,
+    )
     .map_err(|e| anyhow::anyhow!("failed to add host-kv linker interfaces: {e}"))?;
     rsclaw::plugin::host_device::add_to_linker::<
         HostState,
@@ -4260,10 +4485,10 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
         wasmtime::component::HasSelf<HostState>,
     >(&mut linker, |state: &mut HostState| state)
     .map_err(|e| anyhow::anyhow!("failed to add host-android linker interfaces: {e}"))?;
-    rsclaw::plugin::host_ios::add_to_linker::<
-        HostState,
-        wasmtime::component::HasSelf<HostState>,
-    >(&mut linker, |state: &mut HostState| state)
+    rsclaw::plugin::host_ios::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state: &mut HostState| state,
+    )
     .map_err(|e| anyhow::anyhow!("failed to add host-ios linker interfaces: {e}"))?;
     Ok(linker)
 }
@@ -4506,18 +4731,63 @@ mod android_helper_tests {
 
     #[test]
     fn plugin_sql_policy_allows_basic_safe_shapes() {
-        assert!(validate_plugin_sql("select code, price from quotes where code = ?1", PluginSqlKind::Query).is_ok());
-        assert!(validate_plugin_sql("with ranked as (select code from quotes) select * from ranked", PluginSqlKind::Query).is_ok());
-        assert!(validate_plugin_sql("create table if not exists quotes (code text primary key, price real)", PluginSqlKind::Execute).is_ok());
-        assert!(validate_plugin_sql("insert into quotes (code, price) values (?1, ?2)", PluginSqlKind::Execute).is_ok());
-        assert!(validate_plugin_sql("update quotes set price = ?2 where code = ?1", PluginSqlKind::Execute).is_ok());
-        assert!(validate_plugin_sql("delete from quotes where code = ?1", PluginSqlKind::Execute).is_ok());
+        assert!(
+            validate_plugin_sql(
+                "select code, price from quotes where code = ?1",
+                PluginSqlKind::Query
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_sql(
+                "with ranked as (select code from quotes) select * from ranked",
+                PluginSqlKind::Query
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_sql(
+                "create table if not exists quotes (code text primary key, price real)",
+                PluginSqlKind::Execute
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_sql(
+                "insert into quotes (code, price) values (?1, ?2)",
+                PluginSqlKind::Execute
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_sql(
+                "update quotes set price = ?2 where code = ?1",
+                PluginSqlKind::Execute
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_sql("delete from quotes where code = ?1", PluginSqlKind::Execute)
+                .is_ok()
+        );
     }
 
     #[test]
     fn plugin_sql_policy_ignores_blocked_words_inside_literals() {
-        assert!(validate_plugin_sql("select 'drop table kv; attach database x' as text", PluginSqlKind::Query).is_ok());
-        assert!(validate_plugin_sql("insert into notes (body) values ('pragma kv attach')", PluginSqlKind::Execute).is_ok());
+        assert!(
+            validate_plugin_sql(
+                "select 'drop table kv; attach database x' as text",
+                PluginSqlKind::Query
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_sql(
+                "insert into notes (body) values ('pragma kv attach')",
+                PluginSqlKind::Execute
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -4530,7 +4800,10 @@ mod android_helper_tests {
             "select * from quotes; drop table quotes",
             "with x as (select 1) delete from quotes",
         ] {
-            assert!(validate_plugin_sql(sql, PluginSqlKind::Query).is_err(), "{sql}");
+            assert!(
+                validate_plugin_sql(sql, PluginSqlKind::Query).is_err(),
+                "{sql}"
+            );
         }
         for sql in [
             "delete from kv where key = ?1",
@@ -4538,14 +4811,21 @@ mod android_helper_tests {
             "alter table quotes add column x text",
             "vacuum",
         ] {
-            assert!(validate_plugin_sql(sql, PluginSqlKind::Execute).is_err(), "{sql}");
+            assert!(
+                validate_plugin_sql(sql, PluginSqlKind::Execute).is_err(),
+                "{sql}"
+            );
         }
     }
 
     #[tokio::test]
     async fn host_http_url_allows_public_http_ip_literals() {
         assert!(validate_host_http_url("https://8.8.8.8/path").await.is_ok());
-        assert!(validate_host_http_url("http://1.1.1.1:8080/path").await.is_ok());
+        assert!(
+            validate_host_http_url("http://1.1.1.1:8080/path")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

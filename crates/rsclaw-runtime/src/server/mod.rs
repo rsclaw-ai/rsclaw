@@ -1980,6 +1980,22 @@ async fn cron_save_and_reload(
     jobs: &[serde_json::Value],
     reload_tx: &broadcast::Sender<()>,
 ) -> Result<(), String> {
+    // redb is the authoritative cron store in a running gateway. Persist the
+    // same payload there before exporting cron.json5; otherwise the runner
+    // reloads the old redb copy and silently undoes an HTTP cron update.
+    if let Some(store) = crate::cron::cron_store() {
+        let entries: Vec<(String, String)> = jobs
+            .iter()
+            .filter_map(|job| {
+                let id = job.get("id").and_then(serde_json::Value::as_str)?.to_owned();
+                serde_json::to_string(job).ok().map(|json| (id, json))
+            })
+            .collect();
+        store
+            .cron_bulk_replace(&entries)
+            .map_err(|e| format!("redb cron_bulk_replace: {e}"))?;
+    }
+
     let path = cron_jobs_path();
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)

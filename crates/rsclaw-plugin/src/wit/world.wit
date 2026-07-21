@@ -200,6 +200,11 @@ interface host-android {
     /// Set Android primary clipboard text.
     android-clipboard-set: func(text: string) -> result<string, string>;
 
+    /// Copy one local media file into Android's controlled rsclaw directory
+    /// and return its absolute device path. `media-kind` is image, file, or
+    /// audio; images and audio are indexed for application media pickers.
+    android-stage-file: func(local-path: string, media-kind: string) -> result<string, string>;
+
     /// Paste Android primary clipboard text into the currently focused input.
     android-paste: func() -> result<string, string>;
 

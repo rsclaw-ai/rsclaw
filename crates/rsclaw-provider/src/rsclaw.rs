@@ -1378,10 +1378,11 @@ impl RsclawProvider {
         // Wrap it as a one-delta stream so the LlmStream interface is
         // unchanged for callers, while skipping the slow per-chunk SSE relay.
         if !use_stream {
-            let json: Value = resp
-                .json()
-                .await
-                .map_err(|e| anyhow::anyhow!("rsclaw {path}: decode non-stream body: {e}"))?;
+            let json: Value = match tokio::time::timeout(Duration::from_secs(30), resp.json()).await {
+                Ok(Ok(json)) => json,
+                Ok(Err(e)) => anyhow::bail!("rsclaw {path}: decode non-stream body: {e}"),
+                Err(_) => anyhow::bail!("rsclaw {path}: non-stream body timed out after 30s"),
+            };
             if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
                 return Ok(Box::pin(futures::stream::iter(vec![Ok(StreamEvent::Error(
                     err.to_owned(),
