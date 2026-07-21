@@ -52,6 +52,8 @@ impl super::runtime::AgentRuntime {
         };
 
         let lang = args["lang"].as_str().map(str::to_owned);
+        let prompt = args["prompt"].as_str().map(str::to_owned);
+        let max_tokens = args["max_tokens"].as_u64().map(|v| v as u32);
         // OCR transport is sync (block_in_place); run it off the async
         // worker so we don't stall the runtime thread on a slow page.
         let text = tokio::task::spawn_blocking(move || {
@@ -59,7 +61,7 @@ impl super::runtime::AgentRuntime {
             // per-call override would need a richer client API. Keep it
             // config-driven for now and note the requested lang.
             let _ = &lang;
-            client.ocr(&payload, None, None)
+            client.ocr(&payload, prompt.as_deref(), max_tokens)
         })
         .await
         .map_err(|e| anyhow!("ocr: task join failed: {e}"))?;

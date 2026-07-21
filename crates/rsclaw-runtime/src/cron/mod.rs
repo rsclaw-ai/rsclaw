@@ -72,7 +72,7 @@ const CANCEL_BY_RELOAD: &str = "cron: cancelled by reload";
 const PLUGIN_PREFLIGHT_WAKE_MODE_PREFIX: &str = "plugin-preflight:";
 
 /// Bound plugin preflights so an unavailable external UI cannot stall cron.
-const PLUGIN_PREFLIGHT_TIMEOUT_SECS: u64 = 75;
+const PLUGIN_PREFLIGHT_TIMEOUT_SECS: u64 = 180;
 
 // ---------------------------------------------------------------------------
 // CronRunner
@@ -559,7 +559,7 @@ impl CronRunner {
             }
 
             if reload_triggered {
-                // Reload jobs from file
+                // Reload jobs from redb.
                 let old_count = jobs.len();
                 let (new_jobs, parse_ok) = load_cron_jobs();
 
