@@ -536,8 +536,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // 9. Main dispatch loop.
     let mut rate_limiter = super::rate_limit::RateLimiter::default_write_limiter();
+    let shutdown_for_loop = state.shutdown.clone();
     loop {
-        match read_half.next().await {
+        let next_msg = tokio::select! {
+            msg = read_half.next() => msg,
+            () = shutdown_for_loop.notified() => {
+                info!(conn = %conn_id, "ws: drain signaled, closing connection");
+                break;
+            }
+        };
+        match next_msg {
             Some(Ok(Message::Text(text))) => {
                 let raw = text.to_string();
                 debug!(len = raw.len(), "ws recv");

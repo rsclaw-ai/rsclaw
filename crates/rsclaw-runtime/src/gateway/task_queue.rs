@@ -1091,6 +1091,10 @@ impl TaskQueueWorker {
         let mut last_send_ok = false;
 
         loop {
+            if self.shutdown.is_draining() {
+                info!(task_id = %task_id, turn, "task queue worker: drain signaled, aborting multi-turn loop");
+                break;
+            }
             turn += 1;
 
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();

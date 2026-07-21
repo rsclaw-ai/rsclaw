@@ -1312,16 +1312,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         });
     }
 
-    // Run serve with a hard-timeout safety net. Axum's
-    // `with_graceful_shutdown` waits for ALL existing connections to
-    // close after the drain signal — but long-lived WS connections
-    // (the Tauri UI keeps one open indefinitely) never close on
-    // their own, so without an outer timeout the process can hang
-    // forever after SIGTERM. We give the drain 60s (mirrors the
-    // existing inflight-drain timeout in the restart branch below);
-    // after that we log a warning and bail so the process actually
-    // exits and the restart path (or systemd / CI) can proceed.
-    const SHUTDOWN_HARD_TIMEOUT_SECS: u64 = 60;
+    // Run serve with a hard-timeout safety net. With the WS drain fix
+    // (handshake.rs closes connections immediately on drain), axum's
+    // graceful shutdown completes in under a second. The 10s timeout is
+    // a safety net for edge cases (e.g. a non-WS HTTP long-poll that
+    // somehow survives the cancel).
+    const SHUTDOWN_HARD_TIMEOUT_SECS: u64 = 10;
     let shutdown_for_timeout = shutdown.clone();
     let result = tokio::select! {
         r = serve(state, bind_addr) => r,
@@ -1349,39 +1345,28 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     //     `cmd_gateway` to see "port in use" and exit cleanly, leaving the gateway
     //     dead.
     if shutdown.is_restart_requested() {
-        // Channel-origin turns cannot deliver their result anymore — the
-        // outbound channel senders stopped when drain began — so waiting
-        // for them only delays the restart (observed: 81/108 historical
-        // restarts burned the full 60s on exactly this). Cancel their
-        // turns now; HTTP/API turns still hold an open connection that CAN
-        // answer, so they keep the full drain window. Explicit allowlist:
-        // only origins whose delivery path is provably dead.
-        const UNDELIVERABLE_ORIGINS: &[&str] = &[
-            "wechat", "feishu", "telegram", "discord", "qq", "dingtalk", "wecom", "slack",
-            "whatsapp", "line", "matrix", "signal", "cron",
-        ];
+        // Cancel ALL active turns. With the WS drain fix (handshake.rs closes
+        // connections immediately on drain), no turn — HTTP, WS, or channel-origin
+        // — can deliver its result anymore. Waiting for them only delays the
+        // restart (observed: 81/108 historical restarts burned the full 60s).
         let mut cancelled = 0usize;
         for handle in registry.all() {
             if let Ok(map) = handle.cancel_tokens.read() {
-                for (sk, tok) in map.iter() {
-                    // Channel session keys: "agent:<id>:<channel>:..."
-                    let channel = sk.split(':').nth(2).unwrap_or("");
-                    if UNDELIVERABLE_ORIGINS.contains(&channel) {
-                        tok.cancel();
-                        cancelled += 1;
-                    }
+                for (_sk, tok) in map.iter() {
+                    tok.cancel();
+                    cancelled += 1;
                 }
             }
         }
         if cancelled > 0 {
             info!(
                 cancelled,
-                "drain: cancelled channel-origin turns whose delivery path already stopped"
+                "drain: cancelled all active turns (delivery paths closed)"
             );
         }
 
-        info!("restart requested - waiting for inflight drain (max 60s)");
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        info!("restart requested - waiting for inflight drain (max 10s)");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let n = shutdown.inflight();
             if n == 0 {
@@ -1407,7 +1392,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 warn!(
                     inflight = n,
                     stuck = ?stuck,
-                    "graceful drain: 60s timeout reached, restarting anyway"
+                    "graceful drain: 10s timeout reached, restarting anyway"
                 );
                 break;
             }
