@@ -26,9 +26,8 @@
 
 use std::collections::HashMap;
 
-use uuid::Uuid;
-
 use rsclaw_config::schema::DmScope;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // MessageKind

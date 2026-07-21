@@ -10,7 +10,6 @@
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -157,7 +156,8 @@ pub struct FeishuChannel {
     /// tools.upload.downloadTimeoutSecs, default 600). Read-idle, not total:
     /// a progressing download is never killed, a stalled one fails after this.
     pub download_timeout_secs: u64,
-    /// Seconds to wait between WS reconnect attempts (config: feishu.reconnectDelaySecs).
+    /// Seconds to wait between WS reconnect attempts (config:
+    /// feishu.reconnectDelaySecs).
     pub ws_reconnect_delay_secs: u64,
     /// Callback: (sender_open_id, text, chat_id, is_group, images, files).
     #[allow(clippy::type_complexity)]
@@ -587,9 +587,9 @@ impl FeishuChannel {
     /// Bulk-send one message to many individual users in a single call via
     /// `im/v1/batch_messages` (feishu caps each call at 200 ids). `ids` must be
     /// individual user ids — open_id / union_id / user_id; group (oc_) ids are
-    /// not accepted by the batch API and are filtered out by the caller. Ids are
-    /// partitioned into the right request array by prefix. Returns the number of
-    /// recipients accepted by the batch call.
+    /// not accepted by the batch API and are filtered out by the caller. Ids
+    /// are partitioned into the right request array by prefix. Returns the
+    /// number of recipients accepted by the batch call.
     async fn send_batch_text(&self, ids: &[String], text: &str) -> Result<usize> {
         let token = self.get_token().await?;
         let card_payload = build_feishu_card(text, &self.brand);
@@ -1203,8 +1203,7 @@ impl FeishuChannel {
                                 Ok((final_bytes, final_mime)) => {
                                     let b64 = base64::engine::general_purpose::STANDARD
                                         .encode(&final_bytes);
-                                    let data_url =
-                                        format!("data:{final_mime};base64,{b64}");
+                                    let data_url = format!("data:{final_mime};base64,{b64}");
                                     images.push(rsclaw_types::ImageAttachment {
                                         data: data_url,
                                         mime_type: final_mime,
@@ -1243,7 +1242,11 @@ impl FeishuChannel {
                             // Log the full error chain ({e:#}) — without this the
                             // real reqwest cause (timeout vs reset vs decode) is
                             // invisible and the agent just hallucinates "no file".
-                            warn!(name = file_name, error = format!("{e:#}"), "feishu: file download failed");
+                            warn!(
+                                name = file_name,
+                                error = format!("{e:#}"),
+                                "feishu: file download failed"
+                            );
                             "__DIRECT_REPLY__File download failed (timeout or connection issue). Please retry, use a smaller file, or provide a public URL.".to_owned()
                         }
                     }
@@ -1705,8 +1708,7 @@ impl Channel for FeishuChannel {
                     && !filename.ends_with(".opus")
                 {
                     let ext = filename.rsplit('.').next().unwrap_or("mp3");
-                    match crate::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext))
-                    {
+                    match crate::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext)) {
                         Ok(opus_bytes) => {
                             let opus_name = filename
                                 .rsplit_once('.')
@@ -2078,7 +2080,9 @@ async fn extract_and_upload_cover(
     let ffmpeg_bin = match rsclaw_platform::detect_ffmpeg() {
         Some(p) => p,
         None => {
-            tracing::warn!("feishu: skipping video cover — ffmpeg not found (run: rsclaw tools install ffmpeg)");
+            tracing::warn!(
+                "feishu: skipping video cover — ffmpeg not found (run: rsclaw tools install ffmpeg)"
+            );
             return None;
         }
     };

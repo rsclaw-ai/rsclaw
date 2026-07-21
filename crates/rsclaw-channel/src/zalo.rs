@@ -64,16 +64,13 @@ pub struct ZaloChannel {
     api_base: String,
     client: Client,
     #[allow(clippy::type_complexity)]
-    on_message:
-        Arc<dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
+    on_message: Arc<dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
 }
 
 impl ZaloChannel {
     pub fn new(
         access_token: impl Into<String>,
-        on_message: Arc<
-            dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
-        >,
+        on_message: Arc<dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
     ) -> Self {
         Self::with_api_base(access_token, None, on_message)
     }
@@ -81,9 +78,7 @@ impl ZaloChannel {
     pub fn with_api_base(
         access_token: impl Into<String>,
         api_base: Option<String>,
-        on_message: Arc<
-            dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
-        >,
+        on_message: Arc<dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
     ) -> Self {
         Self {
             access_token: access_token.into(),
@@ -507,13 +502,8 @@ async fn zalo_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::transcription::transcribe_audio(
-        client,
-        &audio_bytes,
-        "video_audio.ogg",
-        "audio/ogg",
-    )
-    .await
+    crate::transcription::transcribe_audio(client, &audio_bytes, "video_audio.ogg", "audio/ogg")
+        .await
 }
 
 // ---------------------------------------------------------------------------

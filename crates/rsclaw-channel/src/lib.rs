@@ -24,8 +24,8 @@
 //!   - `matrix`   — Matrix Client-Server API (long-poll sync)
 //!   - `cli`      — CLI interactive channel
 
-// crate-split: root aliases so grouped `use crate::{config::.., provider::.., retry::..}`
-// imports resolve to the extracted crates.
+// crate-split: root aliases so grouped `use crate::{config::.., provider::..,
+// retry::..}` imports resolve to the extracted crates.
 use rsclaw_config as config;
 use rsclaw_provider as provider;
 
@@ -982,8 +982,7 @@ pub async fn extract_audio_text(bytes: &[u8], lower_filename: &str) -> Option<St
     tracing::info!(file = %lower_filename, bytes = bytes.len(), "extract_audio_text: starting");
 
     let client = reqwest::Client::new();
-    let result =
-        crate::transcription::transcribe_audio(&client, bytes, lower_filename, mime).await;
+    let result = crate::transcription::transcribe_audio(&client, bytes, lower_filename, mime).await;
 
     match result {
         Ok(text) if !text.trim().is_empty() => Some(format!(

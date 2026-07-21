@@ -396,9 +396,7 @@ fn decode_string_escapes(s: &str) -> String {
                     i += 2;
                 }
             }
-            'u' if i + 5 < cv.len()
-                && cv[i + 2..=i + 5].iter().all(char::is_ascii_hexdigit) =>
-            {
+            'u' if i + 5 < cv.len() && cv[i + 2..=i + 5].iter().all(char::is_ascii_hexdigit) => {
                 // `\uXXXX` — four hex digits. The VLM occasionally
                 // emits Unicode escapes for CJK input.
                 let v = (cv[i + 2].to_digit(16).unwrap() << 12)
@@ -640,8 +638,7 @@ fn activate_app_blocking_non_macos(app: &str) -> ActionOutput {
             use std::os::windows::process::CommandExt;
             ps_cmd.creation_flags(0x08000000);
         }
-        match ps_cmd.output()
-        {
+        match ps_cmd.output() {
             Ok(out) if out.status.success() => ActionOutput::ok(),
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr).into_owned();

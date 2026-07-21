@@ -1,8 +1,8 @@
 use anyhow::Result;
-
-use super::style::*;
 use rsclaw_cli::CronCommand;
 use rsclaw_config as config;
+
+use super::style::*;
 
 pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
     match sub {
@@ -64,8 +64,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 "session_key": format!("cron:{id}:manual"),
             });
             let client = reqwest::Client::new();
-            let resp = client
-                .post(&url)
+            let resp = with_gateway_auth(client.post(&url), config.gateway.auth_token.as_deref())
                 .json(&body)
                 .send()
                 .await
@@ -110,46 +109,34 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
         CronCommand::Add(args) => {
             validate_cron_schedule(&args.schedule)?;
 
-            let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
-            if !parse_ok {
-                anyhow::bail!("cron.json5 has syntax errors - fix the file before adding jobs");
+            let cfg = gateway_config()?;
+            let url = gateway_url(&cfg, "/api/v1/cron");
+            let client = reqwest::Client::new();
+            let body = serde_json::json!({
+                "agent_id": args.agent.as_deref().unwrap_or("main"),
+                "enabled": true,
+                "schedule": args.schedule,
+                "message": args.message,
+            });
+            let resp = with_gateway_auth(client.post(&url), cfg.gateway.auth_token.as_deref())
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("gateway unreachable at {url}: {e}"))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                let created: serde_json::Value =
+                    serde_json::from_str(&text).unwrap_or_default();
+                let id = created["id"].as_str().unwrap_or("?");
+                ok(&format!(
+                    "added cron job '{}' ({})",
+                    cyan(id),
+                    dim(&args.schedule)
+                ));
+            } else {
+                anyhow::bail!("gateway error {status}: {text}");
             }
-            let max_id = jobs
-                .iter()
-                .filter_map(|j| j.id.strip_prefix("job-"))
-                .filter_map(|s| s.parse::<usize>().ok())
-                .max()
-                .unwrap_or(0);
-            let id = format!("job-{}", max_id + 1);
-
-            let job = crate::cron::CronJob {
-                id: id.clone(),
-                name: None,
-                agent_id: args.agent.clone().unwrap_or_else(|| "main".to_string()),
-                session_key: None,
-                enabled: true,
-                schedule: crate::cron::CronSchedule::Flat(args.schedule.clone()),
-                payload: None,
-                message: Some(args.message.clone()),
-                delivery: None,
-                session_target: None,
-                wake_mode: None,
-                state: Some(crate::cron::CronJobState::default()),
-                iter: None,
-                created_at_ms: Some(chrono::Utc::now().timestamp_millis() as u64),
-                updated_at_ms: None,
-            };
-
-            jobs.push(job);
-            crate::cron::save_cron_jobs(&jobs)?;
-
-            notify_gateway_cron_reload().await;
-
-            ok(&format!(
-                "added cron job '{}' ({})",
-                cyan(&id),
-                dim(&args.schedule)
-            ));
         }
         CronCommand::Edit { id } => {
             let (jobs, _) = crate::cron::load_cron_jobs();
@@ -174,31 +161,69 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             }
             ok(&format!("edited cron jobs file"));
         }
-        CronCommand::Enable { id } => cron_set_enabled(&id, true).await?,
-        CronCommand::Disable { id } => cron_set_enabled(&id, false).await?,
+        CronCommand::Enable { id } => {
+            let cfg = gateway_config()?;
+            let url = gateway_url(&cfg, &format!("/api/v1/cron/{id}"));
+            let client = reqwest::Client::new();
+            let resp = with_gateway_auth(client.put(&url), cfg.gateway.auth_token.as_deref())
+                .json(&serde_json::json!({"enabled": true}))
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("gateway unreachable at {url}: {e}"))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                ok(&format!("cron job '{}' enabled", cyan(&id)));
+            } else {
+                anyhow::bail!("gateway error {status}: {text}");
+            }
+        }
+        CronCommand::Disable { id } => {
+            let cfg = gateway_config()?;
+            let url = gateway_url(&cfg, &format!("/api/v1/cron/{id}"));
+            let client = reqwest::Client::new();
+            let resp = with_gateway_auth(client.put(&url), cfg.gateway.auth_token.as_deref())
+                .json(&serde_json::json!({"enabled": false}))
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("gateway unreachable at {url}: {e}"))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                ok(&format!("cron job '{}' disabled", cyan(&id)));
+            } else {
+                anyhow::bail!("gateway error {status}: {text}");
+            }
+        }
         CronCommand::Rm { id } => {
-            let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
-            if !parse_ok {
-                anyhow::bail!("cron.json5 has syntax errors - fix the file before removing jobs");
+            let cfg = gateway_config()?;
+            let url = gateway_url(&cfg, &format!("/api/v1/cron/{id}"));
+            let client = reqwest::Client::new();
+            let resp = with_gateway_auth(client.delete(&url), cfg.gateway.auth_token.as_deref())
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("gateway unreachable at {url}: {e}"))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                ok(&format!("removed cron job '{}'", cyan(&id)));
+            } else {
+                anyhow::bail!("gateway error {status}: {text}");
             }
-            let before = jobs.len();
-            jobs.retain(|j| j.id != id);
-            if jobs.len() == before {
-                anyhow::bail!("cron job '{id}' not found");
-            }
-            crate::cron::save_cron_jobs(&jobs)?;
-
-            notify_gateway_cron_reload().await;
-
-            ok(&format!("removed cron job '{}'", cyan(&id)));
         }
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Cron expression validator
-// ---------------------------------------------------------------------------
+fn with_gateway_auth(
+    request: reqwest::RequestBuilder,
+    auth_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match auth_token {
+        Some(token) if !token.is_empty() => request.bearer_auth(token),
+        _ => request,
+    }
+}
 
 /// Validate a 5-field cron expression (minute hour day month weekday).
 fn validate_cron_schedule(schedule: &str) -> Result<()> {
@@ -281,64 +306,15 @@ fn validate_cron_part(part: &str, min: u32, max: u32) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Gateway helpers
+// ---------------------------------------------------------------------------
 
-/// Enable or disable a cron job by id and notify the gateway to reload.
-pub async fn cron_set_enabled(id: &str, enabled: bool) -> Result<()> {
-    let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
-    if !parse_ok {
-        anyhow::bail!("cron.json5 has syntax errors - fix the file before modifying jobs");
-    }
-    let mut found = false;
-    for job in &mut jobs {
-        if job.id == id {
-            job.enabled = enabled;
-            job.updated_at_ms = Some(chrono::Utc::now().timestamp_millis() as u64);
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        anyhow::bail!("cron job '{id}' not found");
-    }
-    crate::cron::save_cron_jobs(&jobs)?;
-
-    notify_gateway_cron_reload().await;
-
-    if enabled {
-        ok(&format!("cron job '{}' enabled", cyan(id)));
-    } else {
-        ok(&format!("cron job '{}' disabled", cyan(id)));
-    }
-    Ok(())
+fn gateway_config() -> Result<rsclaw_config::runtime::RuntimeConfig> {
+    rsclaw_config::load().map_err(|e| anyhow::anyhow!("failed to load config: {e}"))
 }
 
-// ---------------------------------------------------------------------------
-// Gateway notification helper
-// ---------------------------------------------------------------------------
-
-/// Best-effort POST to the running gateway's cron/reload endpoint so it
-/// picks up file-based cron changes without requiring a restart. Uses the
-/// async `reqwest::Client` (never `reqwest::blocking::Client`, which would
-/// panic inside a tokio runtime context).
-async fn notify_gateway_cron_reload() {
-    let cfg = match config::load() {
-        Ok(c) => c,
-        _ => return,
-    };
-    let url = format!(
-        "http://127.0.0.1:{}/api/v1/cron/reload",
-        cfg.gateway.port
-    );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build();
-    let client = match client {
-        Ok(c) => c,
-        _ => return,
-    };
-    if let Err(e) = client.post(&url).send().await {
-        tracing::warn!("failed to notify gateway of cron reload: {e}");
-    }
+fn gateway_url(cfg: &rsclaw_config::runtime::RuntimeConfig, path: &str) -> String {
+    format!("http://127.0.0.1:{}{path}", cfg.gateway.port)
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +323,34 @@ async fn notify_gateway_cron_reload() {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_cron_schedule;
+    use super::{validate_cron_schedule, with_gateway_auth};
+
+    #[test]
+    fn gateway_auth_helper_adds_bearer_token() {
+        let request = with_gateway_auth(
+            reqwest::Client::new().post("http://127.0.0.1:18888/api/v1/message"),
+            Some("secret-token"),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer secret-token"
+        );
+    }
+
+    #[test]
+    fn gateway_auth_helper_omits_empty_token() {
+        let request = with_gateway_auth(
+            reqwest::Client::new().post("http://127.0.0.1:18888/api/v1/message"),
+            Some(""),
+        )
+        .build()
+        .unwrap();
+
+        assert!(request.headers().get("authorization").is_none());
+    }
 
     #[test]
     fn valid_schedules() {

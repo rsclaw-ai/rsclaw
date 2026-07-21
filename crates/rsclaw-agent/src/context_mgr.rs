@@ -5,13 +5,11 @@
 use std::sync::Arc;
 
 use futures::StreamExt as _;
-
 use rsclaw_config::schema::ContextPruningConfig;
 use rsclaw_provider::{
-    AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
-    ToolDef, failover::FailoverManager, registry::ProviderRegistry,
+    AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent, ToolDef,
+    failover::FailoverManager, registry::ProviderRegistry,
 };
-
 // `estimate_tokens` lifted to rsclaw-util (crate-split); re-exported so
 // `crate::context_mgr::estimate_tokens` (and runtime's `pub use
 // super::context_mgr::estimate_tokens`) keep resolving.
@@ -577,8 +575,20 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
                 // a conversational filler — "记住：我住在..." otherwise gets
                 // "记住" captured as the recipient name (seen live).
                 const NOT_NAMES: &[&str] = &[
-                    "记住", "记一下", "记下", "保存", "请", "帮我", "我的",
-                    "这是", "新的", "现在", "改成", "更新", "对了", "另外",
+                    "记住",
+                    "记一下",
+                    "记下",
+                    "保存",
+                    "请",
+                    "帮我",
+                    "我的",
+                    "这是",
+                    "新的",
+                    "现在",
+                    "改成",
+                    "更新",
+                    "对了",
+                    "另外",
                 ];
                 let char_count = candidate.chars().count();
                 let has_marker = ADDR_MARKERS.iter().any(|m| candidate.contains(m));
@@ -592,15 +602,30 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
             // Strip leading narration glued to the address ("我住在上海市..."
             // → "上海市..."): conversational verbs are not part of the value.
             const ADDR_NARRATION: &[&str] = &[
-                "我住在", "我家在", "我搬到了", "我搬到", "我现在住在",
-                "现在住在", "我在", "家住", "住在", "搬到了", "搬到",
-                "记住", "记一下",
+                "我住在",
+                "我家在",
+                "我搬到了",
+                "我搬到",
+                "我现在住在",
+                "现在住在",
+                "我在",
+                "家住",
+                "住在",
+                "搬到了",
+                "搬到",
+                "记住",
+                "记一下",
                 // Workplace variants — "我的工位在B栋7楼706室" kept the
                 // whole phrase as the entity value (seen live 2026-06-12).
                 // Compounds listed explicitly: the stripper is prefix-based,
                 // so "工位在" alone never matches "我的工位在".
-                "我的工位在", "工位在", "我的办公室在", "办公室在",
-                "我的公司在", "公司在", "我的家在",
+                "我的工位在",
+                "工位在",
+                "我的办公室在",
+                "办公室在",
+                "我的公司在",
+                "公司在",
+                "我的家在",
             ];
             let addr_parts: Vec<String> = addr_parts
                 .into_iter()
@@ -786,7 +811,7 @@ pub(crate) async fn extract_entities_via_llm(
     );
 
     let req = LlmRequest {
-            fallback_models: Vec::new(),
+        fallback_models: Vec::new(),
         model: model.to_owned(),
         messages: vec![Message {
             role: Role::User,
@@ -934,7 +959,7 @@ pub(crate) async fn describe_image_via_llm(
     providers: &Arc<ProviderRegistry>,
 ) -> Option<String> {
     let req = LlmRequest {
-            fallback_models: Vec::new(),
+        fallback_models: Vec::new(),
         model: model.to_owned(),
         messages: vec![Message {
             role: Role::User,

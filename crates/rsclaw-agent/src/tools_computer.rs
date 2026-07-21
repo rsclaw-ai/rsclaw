@@ -57,7 +57,6 @@ impl Drop for VlmDriveRunGuard {
     }
 }
 
-use super::platform::{display_logical_scale, jpeg_dimensions, powershell_hidden};
 use rsclaw_computer::{
     Action, ExecCtx, MouseButton, ScrollDir,
     app_rules::AppRuleSet,
@@ -68,6 +67,8 @@ use rsclaw_computer::{
     permission::{PermissionRequest, PermissionStore, RedbPermissionStore},
     status::ComputerUseStatus,
 };
+
+use super::platform::{display_logical_scale, jpeg_dimensions, powershell_hidden};
 
 impl super::runtime::AgentRuntime {
     /// Top-level dispatcher for the `computer_use` tool. Routes by
@@ -454,10 +455,9 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             || args["background"].as_bool().unwrap_or(false);
 
         // 1. Resolve the vision chain. Single string config → 1-element chain
-        //    (back-compat). Multi-entry config → ordered candidates we'll
-        //    try on first failure (sync path only — async path uses head
-        //    for simplicity; see below). The head is also the "primary"
-        //    we kick the driver off with.
+        //    (back-compat). Multi-entry config → ordered candidates we'll try on first
+        //    failure (sync path only — async path uses head for simplicity; see below).
+        //    The head is also the "primary" we kick the driver off with.
         let vision_chain = self.resolve_vision_chain();
         let model_name = vision_chain
             .first()
@@ -675,8 +675,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 // LLM observes the task outcome on the next turn and
                 // replies to the user. Mirrors the pattern used by
                 // `tool_agent_task` in tools_agent.rs.
-                let (wake_tx, wake_rx) =
-                    tokio::sync::oneshot::channel::<crate::AgentReply>();
+                let (wake_tx, wake_rx) = tokio::sync::oneshot::channel::<crate::AgentReply>();
                 let wake_msg = crate::AgentMessage {
                     session_key: session_key.clone(),
                     text: result_text,
@@ -847,11 +846,8 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     let body = format!("{e:#}");
                     let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
                     self.model_health.ensure(&[attempt_model.clone()]);
-                    self.model_health.record_failure(
-                        attempt_model,
-                        kind.clone(),
-                        truncated,
-                    );
+                    self.model_health
+                        .record_failure(attempt_model, kind.clone(), truncated);
                     tracing::warn!(
                         model = %attempt_model,
                         kind = ?kind,

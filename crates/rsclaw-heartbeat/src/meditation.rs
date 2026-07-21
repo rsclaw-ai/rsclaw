@@ -10,7 +10,6 @@
 use std::{collections::HashSet, sync::Arc};
 
 use anyhow::Result;
-
 use rsclaw_memory::{MemDocTier, MemoryStore};
 use rsclaw_provider::registry::ProviderRegistry;
 
@@ -318,8 +317,9 @@ Follow them unless the user says otherwise.\n\n{}\n",
 
 #[cfg(test)]
 mod lessons_tests {
-    use super::*;
     use rsclaw_memory::{MemDocTier, MemoryDoc, MemoryStore};
+
+    use super::*;
     use crate::MemoryTier;
 
     fn lesson(id: &str, text: &str, importance: f32) -> MemoryDoc {
@@ -348,9 +348,18 @@ mod lessons_tests {
         let mut store = MemoryStore::open(&tmp.path().join("mem"), None, MemoryTier::High, None)
             .await
             .unwrap();
-        store.add(lesson("l1", "回答代码问题时不要加解释性注释", 0.85)).await.unwrap();
-        store.add(lesson("l2", "提交信息永远不要加 Co-Authored-By", 0.9)).await.unwrap();
-        store.add(lesson("l3", "低置信教训不该出现", 0.3)).await.unwrap();
+        store
+            .add(lesson("l1", "回答代码问题时不要加解释性注释", 0.85))
+            .await
+            .unwrap();
+        store
+            .add(lesson("l2", "提交信息永远不要加 Co-Authored-By", 0.9))
+            .await
+            .unwrap();
+        store
+            .add(lesson("l3", "低置信教训不该出现", 0.3))
+            .await
+            .unwrap();
 
         let n = lessons_phase(&store, "agent:t", &ws, 8).unwrap();
         assert_eq!(n, 2);

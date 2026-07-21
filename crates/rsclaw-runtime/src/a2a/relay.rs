@@ -20,6 +20,9 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use rsclaw_config::runtime::{
+    A2aRelayModeRuntime, A2aRelayNodeRuntime, A2aRelayRuntime, A2aRelayStrategyRuntime,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -34,9 +37,6 @@ use crate::{
     },
     server::{AppState, constant_time_eq},
 };
-use rsclaw_config::runtime::{
-        A2aRelayModeRuntime, A2aRelayNodeRuntime, A2aRelayRuntime, A2aRelayStrategyRuntime,
-    };
 
 const RELAY_PROTOCOL: &str = "rsclaw.a2a.relay.v1";
 const ROUTE_TTL_MS: u64 = 30_000;

@@ -304,8 +304,7 @@ fn apply_flags(spec: &mut WatchSpec, tail: &str) -> Result<()> {
                 // Compile-test now so the user gets the syntax error at
                 // parse time, before the watch task spawns and starts
                 // failing silently per-event.
-                crate::jq::CompiledJq::compile(&val)
-                    .map_err(|e| anyhow!("invalid jq: {e}"))?;
+                crate::jq::CompiledJq::compile(&val).map_err(|e| anyhow!("invalid jq: {e}"))?;
                 spec.jq = Some(val);
             }
             "--event" => {

@@ -1,10 +1,10 @@
 //! Skill-related built-in tools.
 
 use anyhow::{Result, anyhow};
+use rsclaw_skill::SkillManifest;
 use serde_json::{Value, json};
 
 use super::runtime::AgentRuntime;
-use rsclaw_skill::SkillManifest;
 
 pub(crate) fn paginate_skill_list<'a, I>(skills: I, args: &Value) -> Value
 where

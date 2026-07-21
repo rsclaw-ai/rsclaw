@@ -1,9 +1,9 @@
 use std::io::Write;
 
 use anyhow::{Result, bail};
+use rsclaw_cli::SessionsCommand;
 
 use super::style::*;
-use rsclaw_cli::SessionsCommand;
 
 /// Resolve the gateway base URL.
 fn gateway_url() -> String {

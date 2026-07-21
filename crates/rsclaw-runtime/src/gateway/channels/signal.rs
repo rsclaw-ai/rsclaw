@@ -2,6 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use futures::future::BoxFuture;
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, OutboundMessage, signal::SignalChannel};
+use rsclaw_config::runtime::RuntimeConfig;
 use tokio::sync::{Notify, OnceCell, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -10,9 +13,6 @@ use super::{
     default_dm_scope,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, OutboundMessage, signal::SignalChannel};
-use rsclaw_config::runtime::RuntimeConfig;
 
 /// How long the proxy will wait for the real `SignalChannel` to finish
 /// initializing before erroring out. Covers the signal-cli spawn cost on
@@ -144,9 +144,9 @@ pub(crate) fn start_signal_if_configured(
 
         // Register Signal channel sender for notification routing.
         // - "signal/{account}" is the canonical key for multi-account routing.
-        // - bare "signal" registered only by the first account so legacy callers
-        //   still find a sender. Without first-wins guarding, each account would
-        //   overwrite the bare key and replies route via the wrong principal.
+        // - bare "signal" registered only by the first account so legacy callers still
+        //   find a sender. Without first-wins guarding, each account would overwrite
+        //   the bare key and replies route via the wrong principal.
         {
             let mut senders = channel_senders
                 .write()
@@ -486,8 +486,8 @@ pub(crate) fn start_signal_if_configured(
             real: Arc::clone(&signal_slot),
             ready: Arc::clone(&signal_ready),
         });
-        if let Err(e) = manager
-            .register_with_name(proxy_name.clone(), Arc::clone(&proxy) as Arc<dyn Channel>)
+        if let Err(e) =
+            manager.register_with_name(proxy_name.clone(), Arc::clone(&proxy) as Arc<dyn Channel>)
         {
             warn!(account = %acct_for_log, "signal: failed to register proxy: {e:#}");
         }

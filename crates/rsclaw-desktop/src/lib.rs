@@ -37,7 +37,8 @@ pub trait DesktopSession: Send + Sync {
     /// Scan an absolute screen region for pixels near a target RGB colour
     /// (per-channel `tolerance`). Cross-platform (xcap capture + pure pixel
     /// math, no OCR/VLM) — used for red-badge presence detection. Returns JSON
-    /// `{"hit":bool,"count":N,"total":T,"ratio":f}`, `hit = count >= min_count`.
+    /// `{"hit":bool,"count":N,"total":T,"ratio":f}`, `hit = count >=
+    /// min_count`.
     #[allow(clippy::too_many_arguments)]
     async fn region_has_color(
         &self,
@@ -121,5 +122,5 @@ pub fn create_session() -> Box<dyn DesktopSession> {
     }
 }
 
-mod native;
 pub mod macos_perm;
+mod native;

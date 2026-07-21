@@ -75,12 +75,7 @@ pub fn build_client(user_agent: &str, timeout_secs: u64) -> Result<Client> {
 /// POST JSON with Bearer auth; follow 307/308 manually re-attaching
 /// the header on each hop. Returns the final non-redirect response
 /// for the caller to drain.
-pub async fn post_json(
-    client: &Client,
-    url: &str,
-    bearer: &str,
-    body: &Value,
-) -> Result<Response> {
+pub async fn post_json(client: &Client, url: &str, bearer: &str, body: &Value) -> Result<Response> {
     send_following(client, Method::POST, url, bearer, Some(body)).await
 }
 
@@ -99,8 +94,8 @@ pub async fn get(client: &Client, url: &str, bearer: &str) -> Result<Response> {
 ///
 /// Returns:
 /// - `Ok(Some(target_url))` — the 307 Location, fetchable without auth
-/// - `Ok(None)` — endpoint returned 2xx with bytes inline (dev/in-mem
-///   BlobStore path; caller can fall back to `get()` + bytes())
+/// - `Ok(None)` — endpoint returned 2xx with bytes inline (dev/in-mem BlobStore
+///   path; caller can fall back to `get()` + bytes())
 /// - `Err(_)` — non-redirect non-success status, or missing Location
 ///
 /// We deliberately do NOT auto-follow into the presigned target — the
@@ -142,9 +137,7 @@ async fn send_following(
 ) -> Result<Response> {
     let mut current = initial_url.to_owned();
     for _ in 0..=MAX_HOPS {
-        let mut builder = client
-            .request(method.clone(), &current)
-            .bearer_auth(bearer);
+        let mut builder = client.request(method.clone(), &current).bearer_auth(bearer);
         if let Some(b) = body {
             builder = builder.json(b);
         }
@@ -234,7 +227,11 @@ mod tests {
     #[test]
     fn resolve_location_absolute() {
         assert_eq!(
-            resolve_location("https://api.rsclaw.ai/v1/videos", "https://backend-a.rsclaw.ai/v1/videos").unwrap(),
+            resolve_location(
+                "https://api.rsclaw.ai/v1/videos",
+                "https://backend-a.rsclaw.ai/v1/videos"
+            )
+            .unwrap(),
             "https://backend-a.rsclaw.ai/v1/videos"
         );
     }
@@ -242,7 +239,11 @@ mod tests {
     #[test]
     fn resolve_location_relative_path() {
         assert_eq!(
-            resolve_location("https://api.rsclaw.ai/v1/videos/video_abc", "/backend/v1/videos/video_abc").unwrap(),
+            resolve_location(
+                "https://api.rsclaw.ai/v1/videos/video_abc",
+                "/backend/v1/videos/video_abc"
+            )
+            .unwrap(),
             "https://api.rsclaw.ai/backend/v1/videos/video_abc"
         );
     }

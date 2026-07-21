@@ -1,5 +1,4 @@
 use anyhow::Result;
-
 use rsclaw_cli::QrArgs;
 use rsclaw_config as config;
 

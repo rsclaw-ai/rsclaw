@@ -74,7 +74,10 @@ impl ExecPool {
             // Restricted policy blocks. Per-process only; doesn't touch the
             // machine policy. Keep these two shell selections in sync.
             let (shell, shell_args) = if cfg!(target_os = "windows") {
-                ("powershell", vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
+                (
+                    "powershell",
+                    vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"],
+                )
             } else {
                 ("sh", vec!["-c"])
             };

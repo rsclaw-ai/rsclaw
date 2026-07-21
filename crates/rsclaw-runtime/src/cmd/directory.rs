@@ -1,5 +1,4 @@
 use anyhow::Result;
-
 use rsclaw_cli::directory::{DirectoryCommand, GroupsCommand, PeersCommand};
 use rsclaw_config as config;
 

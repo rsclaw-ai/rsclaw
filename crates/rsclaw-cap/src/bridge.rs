@@ -1,14 +1,15 @@
 //! `cap_rs::AgentEvent` → rsclaw sinks dispatch.
 //!
 //! Three sink channels:
-//! - `notif`: live progress notifications to the user's IM channel
-//!   (used by the actor's async submission pattern).
-//! - `agent_event`: real-time WS/desktop event bus (used by the
-//!   originating rsclaw session subscriber to render deltas live).
-//! - `reply`: per-turn accumulator the actor reads at `Done` time for
-//!   the followup-inject summary.
+//! - `notif`: live progress notifications to the user's IM channel (used by the
+//!   actor's async submission pattern).
+//! - `agent_event`: real-time WS/desktop event bus (used by the originating
+//!   rsclaw session subscriber to render deltas live).
+//! - `reply`: per-turn accumulator the actor reads at `Done` time for the
+//!   followup-inject summary.
 
-// cap-rs doesn't re-export at the crate root; all protocol types live in cap_rs::core.
+// cap-rs doesn't re-export at the crate root; all protocol types live in
+// cap_rs::core.
 use cap_rs::core::{AgentEvent, TextChannel};
 use tokio::sync::broadcast;
 
@@ -31,19 +32,18 @@ pub struct Sinks<'a> {
 /// to resolve the pending oneshot.
 ///
 /// Notification policy (matches old `tool_acp*` behaviour):
-/// - `ToolCallStart` → push "🔧 {name}" to IM (low-volume, useful
-///   progress signal).
-/// - `TextChunk` Assistant → accumulate into `reply` + relay to
-///   `agent_event` bus (NOT pushed to IM directly — IM chunker
-///   subscribes to the bus and handles its own batching).
-/// - `TextChunk` Thought + `Thought {...}` events → relay to bus on
-///   a separate `channel: Thought` track so reasoning is visible to
-///   subscribers (desktop UI, IM chunker) without contaminating
-///   `reply_buf` (which is the final assistant text saved to history).
-///   This makes codex's reasoning streamable to feishu — pre-fix,
-///   thoughts were silently logged and dropped.
-/// - `Done` → returns `true`. Final summary push is the actor's job
-///   (it has the full `reply` text at that point).
+/// - `ToolCallStart` → push "🔧 {name}" to IM (low-volume, useful progress
+///   signal).
+/// - `TextChunk` Assistant → accumulate into `reply` + relay to `agent_event`
+///   bus (NOT pushed to IM directly — IM chunker subscribes to the bus and
+///   handles its own batching).
+/// - `TextChunk` Thought + `Thought {...}` events → relay to bus on a separate
+///   `channel: Thought` track so reasoning is visible to subscribers (desktop
+///   UI, IM chunker) without contaminating `reply_buf` (which is the final
+///   assistant text saved to history). This makes codex's reasoning streamable
+///   to feishu — pre-fix, thoughts were silently logged and dropped.
+/// - `Done` → returns `true`. Final summary push is the actor's job (it has the
+///   full `reply` text at that point).
 #[allow(dead_code)]
 pub fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
     match event {
@@ -127,17 +127,19 @@ pub fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     // cap-rs TextChannel has Assistant/Thought/System — not Final/Default.
     // All protocol types live in cap_rs::core, not the crate root.
     use cap_rs::core::{StopReason, TextChannel};
     use tokio::sync::broadcast;
 
+    use super::*;
+
     fn assistant_chunk(text: &str) -> AgentEvent {
         AgentEvent::TextChunk {
             msg_id: "m1".into(),
             text: text.into(),
-            // Adjusted: plan used TextChannel::Final which doesn't exist; real variant is Assistant.
+            // Adjusted: plan used TextChannel::Final which doesn't exist; real variant is
+            // Assistant.
             channel: TextChannel::Assistant,
         }
     }

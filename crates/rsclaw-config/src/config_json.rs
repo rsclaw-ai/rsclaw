@@ -1,7 +1,5 @@
 use anyhow::Result;
 
-
-
 /// Detect the active config file and parse it as a JSON value.
 /// Note: write-back via `serde_json::to_string_pretty` converts JSON5 to
 /// standard JSON (losing comments and trailing commas). Users should use

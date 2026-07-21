@@ -493,7 +493,11 @@ pub(crate) fn chrome_pids() -> Vec<u32> {
     };
     let mut pids = Vec::new();
     for &name in names {
-        if let Ok(output) = std::process::Command::new("pgrep").arg("-x").arg(name).output() {
+        if let Ok(output) = std::process::Command::new("pgrep")
+            .arg("-x")
+            .arg(name)
+            .output()
+        {
             if output.status.success() {
                 for line in String::from_utf8_lossy(&output.stdout).lines() {
                     if let Ok(pid) = line.trim().parse::<u32>() {
@@ -510,7 +514,9 @@ pub(crate) fn chrome_pids() -> Vec<u32> {
 /// [`default_profile_blocked`] (Chrome has no SingletonLock symlink there).
 #[cfg(not(unix))]
 pub(crate) fn is_external_chrome_running(exclude_pid: Option<u32>) -> bool {
-    chrome_pids().into_iter().any(|pid| Some(pid) != exclude_pid)
+    chrome_pids()
+        .into_iter()
+        .any(|pid| Some(pid) != exclude_pid)
 }
 
 /// The user's default Chrome user-data directory — where their real profile,
@@ -899,8 +905,8 @@ impl BrowserSession {
     ///    Chrome for Testing is available).
     ///
     /// Helper: launch chrome and connect CDP. Factored out so `start`
-    /// can attempt path-3 (user profile) with a path-5 (rsclaw isolated profile)
-    /// fallback without duplicating the launch sequence.
+    /// can attempt path-3 (user profile) with a path-5 (rsclaw isolated
+    /// profile) fallback without duplicating the launch sequence.
     async fn try_launch(
         chrome_path: &str,
         headed: bool,
@@ -930,13 +936,12 @@ impl BrowserSession {
             }
         }
 
-        // 3. System Chrome: launch it against rsclaw's persistent "default"
-        //    profile (resolved to ~/.rsclaw/browser-profiles/default by
-        //    ChromeProcess::launch). That dir is debuggable under Chrome 136+
-        //    (which blocks debugging on the browser's own default profile) AND
-        //    lives in its own user-data-dir, so it coexists with the user's
-        //    daily Chrome — no need to refuse or ask them to quit. Login state
-        //    is entered once and persists across restarts.
+        // 3. System Chrome: launch it against rsclaw's persistent "default" profile
+        //    (resolved to ~/.rsclaw/browser-profiles/default by ChromeProcess::launch).
+        //    That dir is debuggable under Chrome 136+ (which blocks debugging on the
+        //    browser's own default profile) AND lives in its own user-data-dir, so it
+        //    coexists with the user's daily Chrome — no need to refuse or ask them to
+        //    quit. Login state is entered once and persists across restarts.
         let mut chosen_profile = profile;
         if is_system_chrome(chrome_path) {
             info!(
@@ -1516,7 +1521,8 @@ impl BrowserSession {
                     });
                     if !skills.is_empty() {
                         result["applicable_site_rules"] = json!(skills);
-                        if let Some(body) = rsclaw_config::loader::applicable_site_rules_body(&url) {
+                        if let Some(body) = rsclaw_config::loader::applicable_site_rules_body(&url)
+                        {
                             result["site_rule"] = json!(body);
                         }
                         result["site_rules_hint"] = json!(
@@ -1541,7 +1547,10 @@ impl BrowserSession {
             if let Ok(targets) = resp.json::<Vec<Value>>().await {
                 if let Some(existing) = targets.iter().find(|t| {
                     t["type"].as_str() == Some("page")
-                        && t["url"].as_str().map(|u| same_origin(u, url)).unwrap_or(false)
+                        && t["url"]
+                            .as_str()
+                            .map(|u| same_origin(u, url))
+                            .unwrap_or(false)
                 }) {
                     if let (Some(target_id), Some(ws_url)) = (
                         existing["id"].as_str(),
@@ -3751,8 +3760,9 @@ impl BrowserSession {
     /// (e.g. a button whose handler creates a transient/cross-origin-iframe
     /// `<input type=file>` and calls `.click()`/`.showPicker()`). We intercept
     /// the chooser at the CDP level — which works regardless of which frame or
-    /// origin the input lives in — click the trigger, await `fileChooserOpened`,
-    /// then set the files by the global `backendNodeId` from the event.
+    /// origin the input lives in — click the trigger, await
+    /// `fileChooserOpened`, then set the files by the global
+    /// `backendNodeId` from the event.
     async fn cmd_upload_via_chooser(&self, args: &Value) -> Result<Value> {
         let files: Vec<String> = args
             .get("files")

@@ -19,9 +19,8 @@ use axum::{
     routing::{get, post},
 };
 use futures::{Stream, StreamExt as _};
-use serde::{Deserialize, Serialize};
-
 use rsclaw_kb::{KnowledgeError, KnowledgeService, model::KbCollection, service::DocInfo};
+use serde::{Deserialize, Serialize};
 
 /// Routes nested under `/api/v1/knowledge`. State is the `KnowledgeService`
 /// alone (not the full `AppState`), so the handlers are testable in isolation.
@@ -62,7 +61,10 @@ pub fn routes(max_doc_bytes: usize) -> Router<Arc<KnowledgeService>> {
         )
         .route("/docs/{doc_id}/content", get(get_doc_content_by_id))
         .route("/docs/{doc_id}/chunks", get(get_doc_chunks))
-        .route("/docs/{doc_id}/visibility", axum::routing::patch(patch_doc_visibility))
+        .route(
+            "/docs/{doc_id}/visibility",
+            axum::routing::patch(patch_doc_visibility),
+        )
         .route("/embedders", get(embedders))
         .route("/events", get(events))
         // Allow large document uploads (default axum limit is 2MB).

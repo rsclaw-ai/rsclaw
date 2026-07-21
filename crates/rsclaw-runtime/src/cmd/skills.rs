@@ -1,9 +1,9 @@
 use anyhow::Result;
-
-use super::style::*;
 use rsclaw_cli::SkillsCommand;
 use rsclaw_config as config;
 use rsclaw_skill as skill;
+
+use super::style::*;
 
 pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
     let config = config::load_quiet()?;
@@ -97,7 +97,9 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                 Ok(body) => {
                     println!("# Skill: {skill}");
                     println!("# Directory: {}", dir.display());
-                    println!("# Follow the playbook below; scripts/references are under the directory above.");
+                    println!(
+                        "# Follow the playbook below; scripts/references are under the directory above."
+                    );
                     println!();
                     println!("{body}");
                 }
@@ -164,7 +166,10 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                     name.clone()
                 }
             };
-            let locked = match client.install_with_fallback(&install_spec, &global_dir).await {
+            let locked = match client
+                .install_with_fallback(&install_spec, &global_dir)
+                .await
+            {
                 Ok(l) => l,
                 Err(e) => {
                     // A failed install can leave an empty skill dir behind

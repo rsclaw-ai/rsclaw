@@ -21,10 +21,13 @@
 //! resolution (e.g. 2× on Retina); use [`primary_scale_factor`] when a caller
 //! needs to map back to logical pixels.
 
-use anyhow::{anyhow, Result};
-use std::path::PathBuf;
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    path::PathBuf,
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use anyhow::{Result, anyhow};
 
 /// An on-screen window. `id` is the OS-native window identifier (CGWindowID on
 /// macOS, HWND on Windows, X11 window id on Linux). Bounds are logical points.
@@ -90,10 +93,7 @@ mod imp {
 
     pub fn capture_region_png(x: i32, y: i32, w: u32, h: u32) -> Result<Vec<u8>> {
         let out = tmp_png("region");
-        run_screencapture(
-            &["-x".into(), format!("-R{x},{y},{w},{h}")],
-            &out,
-        )
+        run_screencapture(&["-x".into(), format!("-R{x},{y},{w},{h}")], &out)
     }
 
     pub fn capture_full_png() -> Result<Vec<u8>> {
@@ -111,10 +111,11 @@ mod imp {
     // CoreGraphics FFI
     // ---------------------------------------------------------------
 
-    use core_foundation::base::CFType;
-    use core_foundation::base::TCFType;
-    use core_foundation::number::CFNumber;
-    use core_foundation::string::CFString;
+    use core_foundation::{
+        base::{CFType, TCFType},
+        number::CFNumber,
+        string::CFString,
+    };
 
     /// `CGRect` as returned by `CGDisplayBounds` (all `f64` / `CGFloat`).
     #[repr(C)]
@@ -179,8 +180,7 @@ mod imp {
         key: &str,
     ) -> Option<CFType> {
         let cf_key = CFString::new(key);
-        let val =
-            unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
+        let val = unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
         if val.is_null() {
             None
         } else {
@@ -217,8 +217,7 @@ mod imp {
         key: &str,
     ) -> Option<core_foundation::dictionary::CFDictionaryRef> {
         let cf_key = CFString::new(key);
-        let val =
-            unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
+        let val = unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
         if val.is_null() {
             None
         } else {
@@ -247,8 +246,7 @@ mod imp {
     pub fn list_windows() -> Result<Vec<WindowInfo>> {
         let cf_array_ref = unsafe {
             CGWindowListCopyWindowInfo(
-                K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY
-                    | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+                K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
                 K_CG_NULL_WINDOW_ID,
             )
         };
@@ -311,8 +309,9 @@ mod imp {
         }
     }
 
-    /// macOS apps don't destroy their window on close the way WeChat 4.x does on
-    /// Windows; the activate path (`open -b`) already handles bringing them up.
+    /// macOS apps don't destroy their window on close the way WeChat 4.x does
+    /// on Windows; the activate path (`open -b`) already handles bringing
+    /// them up.
     pub fn restore_app_window(_app_name: &str) -> Result<bool> {
         Ok(false)
     }
@@ -488,10 +487,11 @@ Add-Type $sig
         1.0
     }
 
-    /// Restore an app's hidden/tray main window. WeChat 4.x closes to the tray by
-    /// destroying its top-level window, so we enumerate ALL top-level windows of
-    /// the matching process (including invisible ones) whose title looks like the
-    /// main window and SW_RESTORE + foreground them. Returns true if ≥1 restored.
+    /// Restore an app's hidden/tray main window. WeChat 4.x closes to the tray
+    /// by destroying its top-level window, so we enumerate ALL top-level
+    /// windows of the matching process (including invisible ones) whose
+    /// title looks like the main window and SW_RESTORE + foreground them.
+    /// Returns true if ≥1 restored.
     pub fn restore_app_window(app_name: &str) -> Result<bool> {
         use std::os::windows::process::CommandExt;
         let needle = app_name.to_lowercase();
@@ -629,7 +629,10 @@ mod imp {
             }
         }
         if have("import") {
-            let st = Command::new("import").args(["-window", "root"]).arg(&out).status();
+            let st = Command::new("import")
+                .args(["-window", "root"])
+                .arg(&out)
+                .status();
             if matches!(st, Ok(s) if s.success()) {
                 return read_consume(&out);
             }
@@ -746,19 +749,20 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
     imp::list_windows()
 }
 
-/// Primary-display scale factor (2.0 on macOS Retina, 1.0 elsewhere by default).
+/// Primary-display scale factor (2.0 on macOS Retina, 1.0 elsewhere by
+/// default).
 pub fn primary_scale_factor() -> f32 {
     imp::primary_scale_factor()
 }
 
-/// Restore an app's main window from the system tray / hidden state so it can be
-/// captured. `app_name` is matched case-insensitively against the process name
-/// (e.g. "WeChat"/"Weixin"). Returns `Ok(true)` if at least one window was
+/// Restore an app's main window from the system tray / hidden state so it can
+/// be captured. `app_name` is matched case-insensitively against the process
+/// name (e.g. "WeChat"/"Weixin"). Returns `Ok(true)` if at least one window was
 /// restored. No-op (returns `Ok(false)`) on platforms where it isn't needed.
 ///
 /// Motivation: WeChat 4.x closes to the tray by destroying its top-level window
-/// (MainWindowHandle becomes 0), so window enumeration finds nothing and OCR has
-/// no surface. This brings the hidden main window back before capture.
+/// (MainWindowHandle becomes 0), so window enumeration finds nothing and OCR
+/// has no surface. This brings the hidden main window back before capture.
 pub fn restore_app_window(app_name: &str) -> Result<bool> {
     imp::restore_app_window(app_name)
 }

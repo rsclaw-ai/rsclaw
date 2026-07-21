@@ -6,11 +6,20 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
+use rsclaw_agent::{
+    AgentMessage, AgentRegistry, AgentReply, AgentRuntime, AgentSpawner, MemoryStore,
+    PendingAnalysis,
+};
+use rsclaw_channel::OutboundMessage;
+use rsclaw_config::{self as config, runtime::RuntimeConfig, schema::BindMode};
+use rsclaw_plugin::{MemoryStoreSlot, PluginRegistry, load_all_plugins};
+use rsclaw_provider::{build::build_providers, registry::ProviderRegistry};
+use rsclaw_skill::{SkillRegistry, load_skills};
+use rsclaw_store::Store;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use super::channels::{start_channels, start_custom_channels};
-use rsclaw_provider::build::build_providers;
 use crate::{
     MemoryTier,
     cron::CronRunner,
@@ -20,16 +29,6 @@ use crate::{
     },
     server::{AppState, serve},
 };
-use rsclaw_agent::{
-        AgentMessage, AgentRegistry, AgentReply, AgentRuntime, AgentSpawner, MemoryStore,
-        PendingAnalysis,
-    };
-use rsclaw_channel::OutboundMessage;
-use rsclaw_config::{self as config, runtime::RuntimeConfig, schema::BindMode};
-use rsclaw_plugin::{MemoryStoreSlot, PluginRegistry, load_all_plugins};
-use rsclaw_provider::registry::ProviderRegistry;
-use rsclaw_skill::{SkillRegistry, load_skills};
-use rsclaw_store::Store;
 
 // ---------------------------------------------------------------------------
 // Sync-only channel allow-list
@@ -96,7 +95,12 @@ fn enrich_process_path() {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
-                    push_if(p.join("node_modules").join(".bin").to_string_lossy().to_string());
+                    push_if(
+                        p.join("node_modules")
+                            .join(".bin")
+                            .to_string_lossy()
+                            .to_string(),
+                    );
                     push_if(p.join("bin").to_string_lossy().to_string());
                     push_if(p.to_string_lossy().to_string());
                 }
@@ -168,24 +172,22 @@ fn enrich_process_path() {
 }
 
 pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Result<()> {
-    // 0. (Restart safety net.) When this process was spawned as a
-    //    replacement during a `gateway restart`, the parent sets
-    //    `RSCLAW_PARENT_PID=<self>` on the child's env before spawn.
-    //    On macOS the native-respawn path uses `execv` so the parent's
-    //    fds (including redb's exclusive file lock) close atomically
-    //    when the new image takes over — no race. But on platforms
-    //    where exec isn't available, OR when the user starts a fresh
-    //    `rsclaw gateway start` while a previous gateway is still
-    //    holding the lock during graceful drain, opening redb here
-    //    would fail with "Database locked by another gateway
-    //    instance". Wait up to 5s for the parent to actually exit
-    //    before letting MemoryStore / KB / a2a tasks open their redbs.
+    // 0. (Restart safety net.) When this process was spawned as a replacement
+    //    during a `gateway restart`, the parent sets `RSCLAW_PARENT_PID=<self>` on
+    //    the child's env before spawn. On macOS the native-respawn path uses
+    //    `execv` so the parent's fds (including redb's exclusive file lock) close
+    //    atomically when the new image takes over — no race. But on platforms where
+    //    exec isn't available, OR when the user starts a fresh `rsclaw gateway
+    //    start` while a previous gateway is still holding the lock during graceful
+    //    drain, opening redb here would fail with "Database locked by another
+    //    gateway instance". Wait up to 5s for the parent to actually exit before
+    //    letting MemoryStore / KB / a2a tasks open their redbs.
     wait_for_parent_release();
     // 0. Refresh the tools/bin shim dir, then enrich the process PATH before
-    //    anything spawns a subprocess. Desktop/launchd-started gateways inherit
-    //    a stripped PATH; the shim dir + PATH prepend let cap-rs coding-agent
-    //    drivers and shell tools resolve every binary by bare name from one
-    //    place. Sync first so the shims exist before PATH points at them.
+    //    anything spawns a subprocess. Desktop/launchd-started gateways inherit a
+    //    stripped PATH; the shim dir + PATH prepend let cap-rs coding-agent drivers
+    //    and shell tools resolve every binary by bare name from one place. Sync
+    //    first so the shims exist before PATH points at them.
     crate::cmd::tools::sync_tool_shims();
     enrich_process_path();
 
@@ -415,8 +417,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 .and_then(|m| m.primary_head())
                 .map(|p| p.trim().starts_with("rsclaw/"))
                 .unwrap_or(true);
-            primary_is_rsclaw
-                .then(|| rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_string())
+            primary_is_rsclaw.then(|| rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_string())
         });
 
     let mut plugin_registry = load_all_plugins(
@@ -741,15 +742,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 shutdown: Some(shutdown.clone()),
                 defaults: config.agents.defaults.clone(),
             });
-        let runner = rsclaw_heartbeat::HeartbeatRunner::new(
-            hb_host,
-            &data_dir,
-            heartbeat_memory,
-        )
-        .with_meditation_deps(rsclaw_heartbeat::MeditationDeps {
-            config: Arc::clone(&config),
-            db: Arc::clone(&store.db),
-        });
+        let runner = rsclaw_heartbeat::HeartbeatRunner::new(hb_host, &data_dir, heartbeat_memory)
+            .with_meditation_deps(rsclaw_heartbeat::MeditationDeps {
+                config: Arc::clone(&config),
+                db: Arc::clone(&store.db),
+            });
         let runner = std::sync::Arc::new(runner);
         runner.run();
         info!("heartbeat runner started");
@@ -859,9 +856,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // Register desktop channel — routes cron delivery to connected WS clients.
     {
-        let desktop_ch = Arc::new(crate::gateway::desktop_channel::DesktopChannel::new(Arc::clone(
-            &ws_conns,
-        )));
+        let desktop_ch = Arc::new(crate::gateway::desktop_channel::DesktopChannel::new(
+            Arc::clone(&ws_conns),
+        ));
         // Bridge the notification_tx → DesktopChannel path so AgentRuntime
         // (which only has notification_tx, not ChannelManager) can route
         // short-delay reminders through the same broadcast path cron uses.
@@ -1249,15 +1246,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 }
                 match String::from_utf8(buf) {
                     Ok(body) => match rsclaw_config::loader::merge_remote_defaults(&body) {
-                        Ok(true) => info!(
-                            "remote defaults.toml updated; takes effect on next restart"
-                        ),
+                        Ok(true) => {
+                            info!("remote defaults.toml updated; takes effect on next restart")
+                        }
                         Ok(false) => debug!("remote defaults.toml not newer than local"),
                         Err(e) => {
                             debug!(error = %e, "remote defaults.toml invalid; keeping local")
                         }
                     },
-                    Err(e) => debug!(error = %e, "remote defaults.toml not valid UTF-8; keeping local"),
+                    Err(e) => {
+                        debug!(error = %e, "remote defaults.toml not valid UTF-8; keeping local")
+                    }
                 }
             }
             Ok(resp) => debug!(status = %resp.status(), "remote defaults.toml fetch non-200"),
@@ -1358,8 +1357,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         // answer, so they keep the full drain window. Explicit allowlist:
         // only origins whose delivery path is provably dead.
         const UNDELIVERABLE_ORIGINS: &[&str] = &[
-            "wechat", "feishu", "telegram", "discord", "qq", "dingtalk",
-            "wecom", "slack", "whatsapp", "line", "matrix", "signal", "cron",
+            "wechat", "feishu", "telegram", "discord", "qq", "dingtalk", "wecom", "slack",
+            "whatsapp", "line", "matrix", "signal", "cron",
         ];
         let mut cancelled = 0usize;
         for handle in registry.all() {
@@ -1397,9 +1396,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 let stuck: Vec<String> = registry
                     .all()
                     .iter()
-                    .filter_map(|h| h.cancel_tokens.read().ok().map(|m| {
-                        m.keys().cloned().collect::<Vec<_>>()
-                    }))
+                    .filter_map(|h| {
+                        h.cancel_tokens
+                            .read()
+                            .ok()
+                            .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                    })
                     .flatten()
                     .collect();
                 warn!(
@@ -1509,13 +1511,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
         // Unix: use `exec()` instead of `spawn() + exit(0)`. The race
         // we kept hitting on every `gateway restart`:
-        //   1. parent spawns child (clone semantics: child inherits
-        //      our open fds, but the redb file LOCK is process-scoped
-        //      and NOT inherited — both processes are now contending)
-        //   2. parent calls exit(0), eventually closes redb and
-        //      releases the lock — but not before
-        //   3. child reaches MemoryStore::open and fails with
-        //      "Database locked by another gateway instance"
+        //   1. parent spawns child (clone semantics: child inherits our open fds, but
+        //      the redb file LOCK is process-scoped and NOT inherited — both processes
+        //      are now contending)
+        //   2. parent calls exit(0), eventually closes redb and releases the lock — but
+        //      not before
+        //   3. child reaches MemoryStore::open and fails with "Database locked by
+        //      another gateway instance"
         // `exec` replaces the current process image in place: all
         // file descriptors (and therefore the redb lock) close
         // atomically before the new image runs `main`. Zero overlap
@@ -1566,14 +1568,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 /// belt-and-suspenders (exec replaces the process image in place, so
 /// fds + the redb file lock close atomically before `main` runs).
 /// But it also covers the cases exec doesn't:
-///   * Windows native respawn — still uses spawn+exit, so a window
-///     where parent + child both contend the redb lock is real.
-///   * `rsclaw gateway start` invoked by a human while a previous
-///     gateway is still in the middle of graceful drain (60s
-///     window): the new process inherits no env from the old one,
-///     `RSCLAW_PARENT_PID` is unset, and we just proceed; if it
-///     genuinely conflicts the existing PID-file check + redb's
-///     own error surface that condition cleanly.
+///   * Windows native respawn — still uses spawn+exit, so a window where parent
+///     + child both contend the redb lock is real.
+///   * `rsclaw gateway start` invoked by a human while a previous gateway is
+///     still in the middle of graceful drain (60s window): the new process
+///     inherits no env from the old one, `RSCLAW_PARENT_PID` is unset, and we
+///     just proceed; if it genuinely conflicts the existing PID-file check +
+///     redb's own error surface that condition cleanly.
 ///   * Future codepaths that bypass exec for whatever reason.
 ///
 /// Polls `kill(pid, 0)` every 50ms for up to 5s. Returns immediately
@@ -1659,13 +1660,7 @@ fn parent_alive(pid: i32) -> bool {
         // window each iteration.
         use std::os::windows::process::CommandExt;
         match std::process::Command::new("tasklist")
-            .args([
-                "/FI",
-                &format!("PID eq {pid}"),
-                "/NH",
-                "/FO",
-                "CSV",
-            ])
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .creation_flags(0x08000000)
             .output()
         {
@@ -2029,14 +2024,13 @@ fn spawn_agent_tasks(
                     progress: Some(progress.clone()),
                 };
                 // Stuck-turn watchdog. Two modes:
-                //  - Normal turns: flat 20-min wall-clock cap (a single turn
-                //    should complete; if not, something's wedged).
-                //  - Daemon agents (agent_wechat monitor): they loop FOREVER, so
-                //    a wall-clock cap can't apply. Instead watch PROGRESS — the
-                //    loop bumps a counter every iteration; if it stops advancing
-                //    for STALL_LIMIT, a tool is genuinely wedged (e.g. enter_chat
-                //    spinning), so cancel and let the cron backstop restart. A
-                //    healthy forever-loop bumps every few seconds → never killed.
+                //  - Normal turns: flat 20-min wall-clock cap (a single turn should complete;
+                //    if not, something's wedged).
+                //  - Daemon agents (agent_wechat monitor): they loop FOREVER, so a wall-clock
+                //    cap can't apply. Instead watch PROGRESS — the loop bumps a counter every
+                //    iteration; if it stops advancing for STALL_LIMIT, a tool is genuinely
+                //    wedged (e.g. enter_chat spinning), so cancel and let the cron backstop
+                //    restart. A healthy forever-loop bumps every few seconds → never killed.
                 let watchdog_token = turn_token.clone();
                 let watchdog_agent = handle.id.clone();
                 let watchdog_session = session_key.clone();
@@ -2218,9 +2212,8 @@ fn spawn_agent_tasks(
                 // /goal — completion-driven turn loop. See
                 // `src/agent/goal.rs`. After every turn, if the
                 // session has an active goal we either:
-                //   * append a terminal status (✅/❌/⚠) to the reply
-                //     text so the user sees it in the same chat
-                //     bubble, AND clear the goal state, OR
+                //   * append a terminal status (✅/❌/⚠) to the reply text so the user sees it
+                //     in the same chat bubble, AND clear the goal state, OR
                 //   * schedule the next iteration via the task queue.
                 //
                 // Mutating `reply.text` is safe because nothing on the
@@ -2257,23 +2250,19 @@ fn spawn_agent_tasks(
                             // accidentally-leaked GOAL_* marker
                             // (parse_terminal said Continue, so there
                             // can't be one — but defensive).
-                            if let Some(tq) =
-                                crate::gateway::task_queue::get_task_queue()
-                            {
+                            if let Some(tq) = crate::gateway::task_queue::get_task_queue() {
                                 let delivery_channel: &str =
                                     if channel == "ws" { "desktop" } else { &channel };
-                                if let Err(e) =
-                                    crate::gateway::task_queue::submit_to_queue(
-                                        &tq,
-                                        &session_key,
-                                        &next_prompt,
-                                        delivery_channel,
-                                        &peer_id,
-                                        &peer_id,
-                                        false,
-                                        crate::gateway::task_queue::Priority::Cron,
-                                    )
-                                {
+                                if let Err(e) = crate::gateway::task_queue::submit_to_queue(
+                                    &tq,
+                                    &session_key,
+                                    &next_prompt,
+                                    delivery_channel,
+                                    &peer_id,
+                                    &peer_id,
+                                    false,
+                                    crate::gateway::task_queue::Priority::Cron,
+                                ) {
                                     warn!(
                                         session = %session_key,
                                         error = %e,

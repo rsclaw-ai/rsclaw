@@ -1,7 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Result, bail};
-
 use rsclaw_cli::ToolsCommand;
 
 // ---------------------------------------------------------------------------
@@ -499,7 +498,15 @@ fn sync_tool_shims_unix() {
 /// Command names cap-rs spawns for the coding agents. `claude` is the
 /// Claudecode driver's default bin; the rest match their drivers.
 #[cfg(unix)]
-const CODING_AGENT_NAMES: &[&str] = &["opencode", "claude", "openclaude", "codex", "aider", "qodercli", "qoder"];
+const CODING_AGENT_NAMES: &[&str] = &[
+    "opencode",
+    "claude",
+    "openclaude",
+    "codex",
+    "aider",
+    "qodercli",
+    "qoder",
+];
 
 /// Subpackage tag for `@anthropic-ai/claude-code-<tag>` matching this host.
 /// Empty string on unsupported platforms (probe falls back to generic paths).
@@ -537,7 +544,13 @@ fn resolve_command(name: &str, shim_dir: &std::path::Path) -> Option<PathBuf> {
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
     if let Some(home) = dirs_next::home_dir() {
-        for rel in [".opencode/bin", ".local/bin", ".bun/bin", ".cargo/bin", "bin"] {
+        for rel in [
+            ".opencode/bin",
+            ".local/bin",
+            ".bun/bin",
+            ".cargo/bin",
+            "bin",
+        ] {
             dirs.push(home.join(rel));
         }
     }

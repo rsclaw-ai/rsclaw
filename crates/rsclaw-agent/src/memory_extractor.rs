@@ -13,11 +13,11 @@
 
 use std::sync::Arc;
 
+use rsclaw_provider::registry::ProviderRegistry;
+use rsclaw_skill::crystallizer::{acquire_distill_permit, distill_with_llm};
 use tokio::sync::Mutex;
 
 use crate::memory::{MemDocTier, MemoryDoc, MemoryStore, add_off_lock};
-use rsclaw_provider::registry::ProviderRegistry;
-use rsclaw_skill::crystallizer::{acquire_distill_permit, distill_with_llm};
 
 /// Max L1 items written per turn — guards against a runaway model dumping
 /// dozens of "facts" from a single message.

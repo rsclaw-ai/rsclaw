@@ -17,10 +17,10 @@ use std::{
 };
 
 use anyhow::Result;
+use rsclaw_channel::ChannelManager;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 
-use rsclaw_channel::ChannelManager;
 use crate::{
     dedup::{DedupKey, dedup_key},
     filter::Filter,
@@ -98,7 +98,8 @@ impl WatchRegistry {
             channels,
         });
         // GLOBAL is a OnceLock<Arc<WatchRegistry>>; set() returns Err if already set.
-        // This is idempotent initialization — warn on re-init which suggests double-call.
+        // This is idempotent initialization — warn on re-init which suggests
+        // double-call.
         if let Err(_prev) = GLOBAL.set(registry) {
             tracing::warn!("WatchRegistry GLOBAL was already set; ignoring duplicate init");
         }
@@ -458,12 +459,14 @@ impl WatchRegistry {
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) => warn!(channel = %channel, peer = %peer, "watch delivery failed: {e}"),
-            Err(_) => warn!(channel = %channel, peer = %peer, "watch delivery timed out (15s); dropped"),
+            Err(_) => {
+                warn!(channel = %channel, peer = %peer, "watch delivery timed out (15s); dropped")
+            }
         }
     }
 
-    /// Stop a single watch task identified by its id within a channel+peer scope.
-    /// Returns `true` if a task was found and stopped.
+    /// Stop a single watch task identified by its id within a channel+peer
+    /// scope. Returns `true` if a task was found and stopped.
     pub async fn stop_one(&self, channel: &str, peer: &str, id: &str) -> bool {
         let mut inner = self.inner.lock().await;
         let key_to_remove = inner

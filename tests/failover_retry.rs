@@ -159,7 +159,12 @@ async fn test_failover_on_429() {
     // Fallback model points to the "fallback" provider.
     let fallbacks = vec!["fallback/gpt-4o-mini".to_owned()];
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
+    let mut mgr = FailoverManager::new(
+        order,
+        api_keys,
+        fallbacks,
+        rsclaw::provider::health::ProviderHealthRegistry::new(),
+    );
 
     let req = simple_request("primary/claude-3-sonnet");
     let result = mgr.call(req, &registry).await;
@@ -233,7 +238,12 @@ async fn test_cooldown_respected() {
     // No fallbacks — all providers exhaust immediately.
     let fallbacks = vec![];
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
+    let mut mgr = FailoverManager::new(
+        order,
+        api_keys,
+        fallbacks,
+        rsclaw::provider::health::ProviderHealthRegistry::new(),
+    );
 
     // First call: should fail (rate-limited) and put "prof-a" into cooldown.
     let req1 = simple_request("only/model-x");
@@ -273,7 +283,12 @@ async fn test_all_providers_exhausted() {
     let api_keys: HashMap<String, String> = HashMap::new();
     let fallbacks = vec!["p2/gpt-fallback".to_owned()];
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
+    let mut mgr = FailoverManager::new(
+        order,
+        api_keys,
+        fallbacks,
+        rsclaw::provider::health::ProviderHealthRegistry::new(),
+    );
 
     let req = simple_request("p1/claude");
     let err = mgr
@@ -333,7 +348,12 @@ async fn test_transient_error_advances_chain() {
     let api_keys: HashMap<String, String> = HashMap::new();
     let fallbacks = vec!["fallback/model".to_owned()];
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
+    let mut mgr = FailoverManager::new(
+        order,
+        api_keys,
+        fallbacks,
+        rsclaw::provider::health::ProviderHealthRegistry::new(),
+    );
 
     let req = simple_request("primary/model");
     let result = mgr.call(req, &registry).await;
@@ -371,7 +391,12 @@ async fn test_multiple_profiles_tried_in_order() {
     let api_keys: HashMap<String, String> = HashMap::new();
     let fallbacks = vec![];
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
+    let mut mgr = FailoverManager::new(
+        order,
+        api_keys,
+        fallbacks,
+        rsclaw::provider::health::ProviderHealthRegistry::new(),
+    );
 
     let req = simple_request("multi/model");
     let result = mgr.call(req, &registry).await;
@@ -467,7 +492,12 @@ async fn test_error_classification_rate_limit_variants() {
 
         let api_keys: HashMap<String, String> = HashMap::new();
         let fallbacks = vec!["fallback/m".to_owned()];
-        let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
+        let mut mgr = FailoverManager::new(
+            order,
+            api_keys,
+            fallbacks,
+            rsclaw::provider::health::ProviderHealthRegistry::new(),
+        );
 
         let req = simple_request(&format!("{provider_name}/model"));
         let result = mgr.call(req, &registry).await;
@@ -518,7 +548,12 @@ async fn test_error_classification_auth_variants() {
 
         let api_keys: HashMap<String, String> = HashMap::new();
         let fallbacks = vec!["fallback/m".to_owned()];
-        let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
+        let mut mgr = FailoverManager::new(
+            order,
+            api_keys,
+            fallbacks,
+            rsclaw::provider::health::ProviderHealthRegistry::new(),
+        );
 
         let req = simple_request(&format!("{provider_name}/model"));
         let result = mgr.call(req, &registry).await;
@@ -549,7 +584,12 @@ async fn test_empty_fallback_list() {
     let api_keys: HashMap<String, String> = HashMap::new();
     let fallbacks = vec![]; // no fallbacks
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
+    let mut mgr = FailoverManager::new(
+        order,
+        api_keys,
+        fallbacks,
+        rsclaw::provider::health::ProviderHealthRegistry::new(),
+    );
 
     let req = simple_request("primary/model");
     let result = mgr.call(req, &registry).await;

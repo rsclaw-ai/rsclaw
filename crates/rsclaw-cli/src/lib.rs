@@ -20,6 +20,7 @@ pub mod doctor;
 pub mod env;
 pub mod gateway;
 pub mod hooks;
+pub mod image;
 pub mod kb;
 pub mod memory;
 pub mod message;
@@ -56,6 +57,7 @@ pub use doctor::DoctorArgs;
 pub use env::{EnvCommand, EnvSyncArgs};
 pub use gateway::{GatewayCommand, GatewayRunArgs};
 pub use hooks::HooksCommand;
+pub use image::ImageCommand;
 pub use kb::KbCommand;
 pub use memory::{
     MemoryCommand, MemoryIndexArgs, MemorySaveArgs, MemorySearchArgs, MemoryStatusArgs,
@@ -197,6 +199,10 @@ pub enum Command {
     /// Knowledge-base management.
     #[command(subcommand)]
     Kb(KbCommand),
+
+    /// Image vision / OCR.
+    #[command(subcommand)]
+    Image(ImageCommand),
 
     /// Memory management.
     #[command(subcommand)]

@@ -12,13 +12,13 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use rsclaw_cli::{HealthArgs, LogsArgs, StatusArgs, TuiArgs};
+use rsclaw_config as config;
 
 use super::{
     gateway::gateway_pid_file,
     style::{banner, dim, green, kv, red},
 };
-use rsclaw_cli::{HealthArgs, LogsArgs, StatusArgs, TuiArgs};
-use rsclaw_config as config;
 
 // ---------------------------------------------------------------------------
 // cmd_logs / cmd_status / cmd_health

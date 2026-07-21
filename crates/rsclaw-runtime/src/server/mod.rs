@@ -32,9 +32,15 @@
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-
-use std::{collections::HashMap, net::IpAddr, time::Instant};
-use std::{convert::Infallible, path::PathBuf, process::Command, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    net::IpAddr,
+    path::PathBuf,
+    process::Command,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use axum::{
@@ -53,7 +59,7 @@ use rsclaw_agent::{AgentMessage, AgentRegistry};
 use rsclaw_config::runtime::RuntimeConfig;
 use rsclaw_store::Store;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
@@ -64,7 +70,8 @@ mod knowledge;
 const MAX_LOCAL_MEDIA_BYTES: u64 = 10 * 1024 * 1024;
 
 // H1: simple in-memory per-IP rate limiter with a sliding window.
-// Default: 100 req / 60s per IP. Bypassed when no limit is configured (rate_rps = 0).
+// Default: 100 req / 60s per IP. Bypassed when no limit is configured (rate_rps
+// = 0).
 #[derive(Clone)]
 pub struct RateLimiter {
     inner: Arc<RwLock<HashMap<IpAddr, Vec<Instant>>>>,
@@ -592,7 +599,11 @@ async fn rate_limit_middleware(
     let ip = addr.ip();
     const DEFAULT_MAX_REQ: u32 = 100;
     const WINDOW_SECS: u64 = 60;
-    if state.rate_limiter.check(ip, DEFAULT_MAX_REQ, WINDOW_SECS).await {
+    if state
+        .rate_limiter
+        .check(ip, DEFAULT_MAX_REQ, WINDOW_SECS)
+        .await
+    {
         warn!(%ip, DEFAULT_MAX_REQ, "rate limit exceeded");
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -1987,7 +1998,10 @@ async fn cron_save_and_reload(
         let entries: Vec<(String, String)> = jobs
             .iter()
             .filter_map(|job| {
-                let id = job.get("id").and_then(serde_json::Value::as_str)?.to_owned();
+                let id = job
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)?
+                    .to_owned();
                 serde_json::to_string(job).ok().map(|json| (id, json))
             })
             .collect();
@@ -2238,6 +2252,7 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
 
     let message = job["message"]
         .as_str()
+        .or_else(|| job["payload"]["message"].as_str())
         .or_else(|| job["payload"]["text"].as_str())
         .unwrap_or("")
         .to_owned();
@@ -2524,7 +2539,11 @@ async fn computer_use_permission_response(
     };
 
     if let (Some(agent_id), Some(app)) = (body.agent_id.as_deref(), body.app.as_deref()) {
-        if let Err(e) = state.computer_permission.record(agent_id, app, decision).await {
+        if let Err(e) = state
+            .computer_permission
+            .record(agent_id, app, decision)
+            .await
+        {
             warn!(error = %e, "computer_permission.record failed");
         }
     }
@@ -2575,9 +2594,7 @@ fn run_cmd(dir: &std::path::Path, program: &str, args: &[&str]) -> Result<String
     {
         cmd.creation_flags(0x08000000);
     }
-    let output = cmd
-        .output()
-        .map_err(|e| format!("{program}: {e}"))?;
+    let output = cmd.output().map_err(|e| format!("{program}: {e}"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
@@ -2711,7 +2728,11 @@ async fn git_commit(Json(body): Json<GitCommitRequest>) -> Response {
 
 async fn git_prs(Query(q): Query<GitQuery>) -> Response {
     let dir = git_workdir(q.repo.as_deref().or(q.path.as_deref()));
-    match run_cmd(&dir, "gh", &["pr", "list", "--json", "number,title,state,author,url"]) {
+    match run_cmd(
+        &dir,
+        "gh",
+        &["pr", "list", "--json", "number,title,state,author,url"],
+    ) {
         Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(value) => Json(value).into_response(),
             Err(e) => (
@@ -2730,7 +2751,13 @@ async fn git_pr_get(Path(number): Path<u64>, Query(q): Query<GitQuery>) -> Respo
     match run_cmd(
         &dir,
         "gh",
-        &["pr", "view", &number_s, "--json", "number,title,state,author,url,body"],
+        &[
+            "pr",
+            "view",
+            &number_s,
+            "--json",
+            "number,title,state,author,url,body",
+        ],
     ) {
         Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(value) => Json(value).into_response(),
@@ -3121,7 +3148,10 @@ async fn openai_chat_completions(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.split(',').next())
                 .and_then(|s| s.trim().parse::<IpAddr>().ok())
-                .map(|ip| ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+                .map(|ip| {
+                    ip == IpAddr::V4(Ipv4Addr::LOCALHOST)
+                        || ip == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                })
                 .unwrap_or(false);
             if !is_local {
                 info!("open gateway: rejecting spoofed x- headers from non-loopback");
@@ -4256,7 +4286,8 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
     });
     // C2: redact common secret patterns (Bearer tokens, API keys, etc.)
     static SECRET_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)(?:bearer |api[_-]?key[=:]\s*|sk-|token[=:]\s*)[a-zA-Z0-9_-]{16,}").expect("secret redaction regex")
+        regex::Regex::new(r"(?i)(?:bearer |api[_-]?key[=:]\s*|sk-|token[=:]\s*)[a-zA-Z0-9_-]{16,}")
+            .expect("secret redaction regex")
     });
 
     let lines: Vec<&str> = content.lines().rev().take(limit).collect();

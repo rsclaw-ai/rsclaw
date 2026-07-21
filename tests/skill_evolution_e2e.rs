@@ -9,11 +9,14 @@
 //! Ignored by default (hits a paid LLM + network). Run explicitly:
 //!   cargo test --test skill_evolution_e2e -- --ignored --nocapture
 //! Override the distill model (default: rsclaw/rsclaw-agent-v1):
-//!   DISTILL_MODEL=doubao/doubao-... cargo test --test skill_evolution_e2e -- --ignored --nocapture
+//!   DISTILL_MODEL=doubao/doubao-... cargo test --test skill_evolution_e2e --
+//! --ignored --nocapture
 
 use std::sync::Arc;
 
-use rsclaw::{config, provider::build::build_providers, skill::workflow_distill::crystallize_workflow};
+use rsclaw::{
+    config, provider::build::build_providers, skill::workflow_distill::crystallize_workflow,
+};
 use rsclaw_types::turn_metrics::TurnMetrics;
 
 #[tokio::test]
@@ -89,7 +92,10 @@ async fn evolution_generates_skill_from_hard_turn() {
 
     assert!(body.starts_with("---"), "must start with YAML frontmatter");
     assert!(body.contains("name:"), "frontmatter must have name:");
-    assert!(body.contains("description:"), "frontmatter must have description:");
+    assert!(
+        body.contains("description:"),
+        "frontmatter must have description:"
+    );
     assert!(
         path.file_name().unwrap().to_string_lossy() == "SKILL.md",
         "file must be named SKILL.md"

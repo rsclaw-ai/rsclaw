@@ -1,13 +1,13 @@
 use anyhow::Result;
 use dialoguer::{Input, Password, Select};
+use rsclaw_agent as agent;
+use rsclaw_cli::{ConfigureArgs, OnboardArgs, SetupArgs};
 use serde_json::json;
 use tracing::info;
 
 use super::config_json::{
     get_nested_value, load_config_json, remove_nested_value, set_nested_value,
 };
-use rsclaw_agent as agent;
-use rsclaw_cli::{ConfigureArgs, OnboardArgs, SetupArgs};
 
 /// Generate a 64-character hex auth token.
 pub(crate) fn generate_auth_token() -> String {
@@ -2469,11 +2469,7 @@ fn account_names(val: &serde_json::Value, ch_name: &str) -> Vec<String> {
 /// Prefers an id-like field (feishu `appId`, wechat `botId`) so the account
 /// name is recognizable; falls back to "account". Guarantees the result does
 /// not collide with any `existing` name by appending `-2`, `-3`, … .
-fn derive_account_name(
-    ch_name: &str,
-    fields: &[(String, String)],
-    existing: &[String],
-) -> String {
+fn derive_account_name(ch_name: &str, fields: &[(String, String)], existing: &[String]) -> String {
     let base = fields
         .iter()
         .find(|(k, _)| k == "appId" || k == "botId")
@@ -2659,12 +2655,13 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
         get_nested_value(val, &path)
             .and_then(|v| v.as_str())
             .is_some_and(|s| !s.is_empty())
-    }) || ch.multi_account && ch.fields.iter().any(|f| {
-        let path = format!("channels.{}.accounts.default.{}", ch.name, f.key);
-        get_nested_value(val, &path)
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.is_empty())
-    });
+    }) || ch.multi_account
+        && ch.fields.iter().any(|f| {
+            let path = format!("channels.{}.accounts.default.{}", ch.name, f.key);
+            get_nested_value(val, &path)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+        });
 
     let lang = rsclaw_i18n::default_lang();
 
@@ -2714,23 +2711,15 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
                         } else {
                             derive_account_name(&ch.name, &fields, &existing)
                         };
-                        ensure_json_path(
-                            val,
-                            &["channels", &ch.name, "accounts", &acct_name],
-                        );
+                        ensure_json_path(val, &["channels", &ch.name, "accounts", &acct_name]);
                         for (k, v) in &fields {
-                            let path =
-                                format!("channels.{}.accounts.{}.{}", ch.name, acct_name, k);
+                            let path = format!("channels.{}.accounts.{}.{}", ch.name, acct_name, k);
                             let _ = set_nested_value(val, &path, serde_json::json!(v));
                         }
                         toggle_channel_enabled(val, &ch.name, true);
                         println!(
                             "  {}",
-                            rsclaw_i18n::t_fmt(
-                                "cli_account_added",
-                                lang,
-                                &[("name", &acct_name)],
-                            )
+                            rsclaw_i18n::t_fmt("cli_account_added", lang, &[("name", &acct_name)],)
                         );
                         // Go straight to the policy step (pairing / group). The
                         // old code re-entered the account list here, forcing the
@@ -2794,9 +2783,8 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
                 // app's open_id is rejected as cross-app (Feishu 99992361,
                 // WeChat ret=-2). Strip cleanly:
                 //   - no accounts.* yet → migrate top into accounts.default
-                //   - accounts.* exists → drop top (accounts is canonical;
-                //     never overwrite a configured accounts.default with
-                //     a stale top value).
+                //   - accounts.* exists → drop top (accounts is canonical; never overwrite a
+                //     configured accounts.default with a stale top value).
                 if has_accounts {
                     strip_top_fields(val, &ch.name, &ch.fields);
                 } else {
@@ -3036,23 +3024,15 @@ async fn edit_channel_multi_account(
             if use_scan {
                 match run_channel_login(&ch.name).await {
                     Ok(fields) => {
-                        ensure_json_path(
-                            val,
-                            &["channels", &ch.name, "accounts", &new_name],
-                        );
+                        ensure_json_path(val, &["channels", &ch.name, "accounts", &new_name]);
                         for (k, v) in &fields {
-                            let path =
-                                format!("channels.{}.accounts.{}.{}", ch.name, new_name, k);
+                            let path = format!("channels.{}.accounts.{}.{}", ch.name, new_name, k);
                             let _ = set_nested_value(val, &path, serde_json::json!(v));
                         }
                         toggle_channel_enabled(val, &ch.name, true);
                         println!(
                             "  {}",
-                            rsclaw_i18n::t_fmt(
-                                "cli_account_added",
-                                lang,
-                                &[("name", &new_name)],
-                            )
+                            rsclaw_i18n::t_fmt("cli_account_added", lang, &[("name", &new_name)],)
                         );
                         changed = true;
                     }

@@ -16,10 +16,9 @@ use std::{path::Path, sync::Arc};
 use anyhow::{Context, Result, anyhow};
 use hnsw_rs::{hnsw::Hnsw, prelude::DistCosine};
 use redb::ReadableDatabase;
-use tracing::{debug, info, warn};
-
-use rsclaw_platform::MemoryTier;
 use rsclaw_config::schema::MemorySearchConfig;
+use rsclaw_platform::MemoryTier;
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -75,7 +74,8 @@ pub fn global_store() -> Option<Arc<tokio::sync::Mutex<MemoryStore>>> {
 // ---------------------------------------------------------------------------
 
 /// Memory document tier for decay and priority control.
-/// Named `MemDocTier` to avoid conflict with `rsclaw_platform::MemoryTier` (system RAM).
+/// Named `MemDocTier` to avoid conflict with `rsclaw_platform::MemoryTier`
+/// (system RAM).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum MemDocTier {
     /// Identity-level facts, decay floor = 0.9
@@ -799,10 +799,7 @@ impl MemoryStore {
 
         // Remove from BM25 too so deleted docs don't leak into keyword search.
         if let Some(ref search) = self.search {
-            if let Err(e) = search
-                .delete_document(id)
-                .and_then(|_| search.commit())
-            {
+            if let Err(e) = search.delete_document(id).and_then(|_| search.commit()) {
                 warn!(id, "BM25 delete failed: {e:#}");
             }
         }
@@ -868,15 +865,13 @@ impl MemoryStore {
         scope: Option<&str>,
         top_k: usize,
     ) -> Result<Vec<MemoryDoc>> {
-        let vec_docs = self.search(query, scope, top_k.saturating_mul(3).max(top_k)).await?;
+        let vec_docs = self
+            .search(query, scope, top_k.saturating_mul(3).max(top_k))
+            .await?;
         let Some(ref search) = self.search else {
             return Ok(vec_docs.into_iter().take(top_k).collect());
         };
-        let bm25_hits = match search.search(
-            query,
-            scope,
-            top_k.saturating_mul(4).max(16),
-        ) {
+        let bm25_hits = match search.search(query, scope, top_k.saturating_mul(4).max(16)) {
             Ok(hits) => hits,
             Err(e) => {
                 debug!(query, "BM25 search skipped: {e:#}");
@@ -1956,7 +1951,10 @@ mod swap_tests {
         let (mut store, tmp) = open_temp_store().await;
         // Insert docs BEFORE wiring BM25 — simulates upgrade from a binary
         // that only wrote to redb+HNSW.
-        store.add(doc("legacy", "ancient sentinel token")).await.unwrap();
+        store
+            .add(doc("legacy", "ancient sentinel token"))
+            .await
+            .unwrap();
 
         let search = Arc::new(
             rsclaw_store::SearchIndex::open(&tmp.path().join("bm25"), MemoryTier::Low)
@@ -2092,7 +2090,10 @@ mod dedup_supersede_tests {
         assert_eq!(n, 1);
         let d = store.docs.iter().find(|d| d.id == "a1").unwrap();
         assert!(!d.pinned);
-        assert!(!d.tags.iter().any(|t| t == "pinned"), "stale pinned tag survived");
+        assert!(
+            !d.tags.iter().any(|t| t == "pinned"),
+            "stale pinned tag survived"
+        );
         assert_eq!(d.tier, MemDocTier::Working);
         assert!(d.importance <= 0.3);
         assert!(d.tags.iter().any(|t| t == "superseded"));

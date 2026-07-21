@@ -14,13 +14,15 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use cap_rs::core::{AgentEvent, ClientFrame, Content};
-use cap_rs::driver::Driver;
+use cap_rs::{
+    core::{AgentEvent, ClientFrame, Content},
+    driver::Driver,
+};
+use rsclaw_i18n as i18n;
+use rsclaw_types::OutboundMessage;
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 
 use super::{bridge, permission};
-use rsclaw_types::OutboundMessage;
-use rsclaw_i18n as i18n;
 
 /// Per-turn timeout for a coding-agent driver run. A hung CLI can't tie
 /// up the actor indefinitely. Used by both task-mode (`actor_loop`) and
@@ -72,7 +74,8 @@ impl AgentKind {
 }
 
 /// IM channel routing for live progress + completion notifications.
-/// `lang` is a static i18n key (e.g. "en", "zh") — see `rsclaw_i18n::resolve_lang`.
+/// `lang` is a static i18n key (e.g. "en", "zh") — see
+/// `rsclaw_i18n::resolve_lang`.
 #[derive(Clone)]
 pub struct NotifTarget {
     pub tx: broadcast::Sender<OutboundMessage>,
@@ -166,7 +169,9 @@ impl CapAgentManager {
         })
         .await
         .map_err(|_| anyhow!("cap actor for {} closed", kind.as_str()))?;
-        reply_rx.await.map_err(|_| anyhow!("cap actor dropped reply"))?
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("cap actor dropped reply"))?
     }
 
     async fn ensure_actor(
@@ -195,10 +200,7 @@ impl CapAgentManager {
     }
 }
 
-pub async fn spawn_driver(
-    kind: AgentKind,
-    cwd: &std::path::Path,
-) -> Result<Box<dyn Driver>> {
+pub async fn spawn_driver(kind: AgentKind, cwd: &std::path::Path) -> Result<Box<dyn Driver>> {
     spawn_driver_inner(kind, cwd, ResumeMode::None).await
 }
 
@@ -239,10 +241,7 @@ pub async fn spawn_driver_continue_last(
 /// flaky under cap_live's cold-start capture — ACP is the resilient fallback).
 /// Only opencode has a distinct ACP driver; other kinds fall back to their
 /// normal spawn (a no-op difference for them).
-pub async fn spawn_driver_acp(
-    kind: AgentKind,
-    cwd: &std::path::Path,
-) -> Result<Box<dyn Driver>> {
+pub async fn spawn_driver_acp(kind: AgentKind, cwd: &std::path::Path) -> Result<Box<dyn Driver>> {
     match kind {
         AgentKind::Opencode => Ok(Box::new(
             cap_rs::driver::acp::AcpDriver::opencode(&cwd)
@@ -357,7 +356,9 @@ async fn spawn_driver_inner(
                     Box::new(
                         cap_rs::driver::acp::AcpDriver::opencode(&cwd)
                             .await
-                            .map_err(|e2| anyhow!("cap opencode spawn (stream-json: {e}, ACP: {e2})"))?,
+                            .map_err(|e2| {
+                                anyhow!("cap opencode spawn (stream-json: {e}, ACP: {e2})")
+                            })?,
                     )
                 }
             }
@@ -374,8 +375,7 @@ async fn spawn_driver_inner(
             // the MCP driver (`codex mcp-server`, supported by mainline)
             // when the stream-json flags are absent.
             if codex_supports_stream_json().await {
-                let mut b =
-                    ClaudeCodeDriver::codex_builder(cwd).dangerously_skip_permissions(true);
+                let mut b = ClaudeCodeDriver::codex_builder(cwd).dangerously_skip_permissions(true);
                 b = apply_resume_mode(b, resume_mode);
                 match b.spawn().await {
                     Ok(d) => Box::new(d),
@@ -502,8 +502,8 @@ async fn actor_loop(
                 // dispatched in one turn; completion notifications still go
                 // through below.
 
-                // 2. Tell the LLM the prompt is queued. From here on the
-                //    LLM is free; the result is delivered async.
+                // 2. Tell the LLM the prompt is queued. From here on the LLM is free; the
+                //    result is delivered async.
                 let _ = reply.send(Ok(Submitted {
                     session_id: session_id.clone(),
                 }));
@@ -648,10 +648,11 @@ async fn actor_loop(
 
 // `inject_followup` (cap → agent inbox re-injection) was dead code
 // (#[allow(dead_code)], "intentionally NOT called" — see actor_loop). Removed
-// during crate-split: it was the only constructor of agent::registry::AgentMessage
-// in cap, and dropping it lets cap become a lower crate (agent depends on cap,
-// not vice versa). If follow-up re-injection is revived, do it via a trait
-// injected from the runtime (FollowupSink), not a direct AgentMessage build.
+// during crate-split: it was the only constructor of
+// agent::registry::AgentMessage in cap, and dropping it lets cap become a lower
+// crate (agent depends on cap, not vice versa). If follow-up re-injection is
+// revived, do it via a trait injected from the runtime (FollowupSink), not a
+// direct AgentMessage build.
 
 pub async fn run_turn(
     driver: &mut dyn Driver,
@@ -704,18 +705,28 @@ pub async fn run_turn(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use cap_rs::core::{RiskLevel, StopReason, TextChannel, Usage};
-    use cap_rs::driver::DriverError;
     use std::collections::VecDeque;
+
+    use async_trait::async_trait;
+    use cap_rs::{
+        core::{RiskLevel, StopReason, TextChannel, Usage},
+        driver::DriverError,
+    };
+
+    use super::*;
 
     #[test]
     fn agent_kind_aliases() {
         assert_eq!(AgentKind::from_str("claude"), Some(AgentKind::Claudecode));
-        assert_eq!(AgentKind::from_str("claudecode"), Some(AgentKind::Claudecode));
+        assert_eq!(
+            AgentKind::from_str("claudecode"),
+            Some(AgentKind::Claudecode)
+        );
         assert_eq!(AgentKind::from_str("code"), None);
-        assert_eq!(AgentKind::from_str("openclaude"), Some(AgentKind::Openclaude));
+        assert_eq!(
+            AgentKind::from_str("openclaude"),
+            Some(AgentKind::Openclaude)
+        );
         assert_eq!(AgentKind::from_str("opencode"), Some(AgentKind::Opencode));
         assert_eq!(AgentKind::from_str("codex"), Some(AgentKind::Codex));
         assert_eq!(AgentKind::from_str("qoder"), Some(AgentKind::Qoder));
@@ -801,7 +812,8 @@ mod tests {
     /// works on this machine instead of only being wired. Ignored by
     /// default; run explicitly:
     ///
-    ///   cargo test -p rsclaw-cap opencode_acp_fallback -- --ignored --nocapture
+    ///   cargo test -p rsclaw-cap opencode_acp_fallback -- --ignored
+    /// --nocapture
     #[tokio::test]
     #[ignore = "spawns real opencode ACP server; run manually"]
     async fn opencode_acp_fallback() {
@@ -978,10 +990,6 @@ mod tests {
         // Bridge should have pushed at least one OutboundMessage for the
         // ToolCallStart.
         let m = notif_rx.try_recv().expect("expected tool-call notif");
-        assert!(
-            m.text.contains("read_file"),
-            "got notif: {:?}",
-            m.text
-        );
+        assert!(m.text.contains("read_file"), "got notif: {:?}", m.text);
     }
 }

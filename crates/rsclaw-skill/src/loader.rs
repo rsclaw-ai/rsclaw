@@ -13,10 +13,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use rsclaw_config::schema::SkillsConfig;
 use tracing::{debug, warn};
 
 use super::manifest::{SkillManifest, parse_skill_md};
-use rsclaw_config::schema::SkillsConfig;
 
 // ---------------------------------------------------------------------------
 // SkillRegistry

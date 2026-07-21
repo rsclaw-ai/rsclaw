@@ -2,11 +2,11 @@
 //!
 //! Semantically different from /loop:
 //!
-//!   * /loop is **schedule-driven** — fires on a wallclock cron tick
-//!     whether or not the previous turn completed. Cron is a timer.
-//!   * /goal is **completion-driven** — waits for the previous turn
-//!     to fully finish, then evaluates whether the goal has been
-//!     reached. If not, fires the next turn back-to-back. No interval.
+//!   * /loop is **schedule-driven** — fires on a wallclock cron tick whether or
+//!     not the previous turn completed. Cron is a timer.
+//!   * /goal is **completion-driven** — waits for the previous turn to fully
+//!     finish, then evaluates whether the goal has been reached. If not, fires
+//!     the next turn back-to-back. No interval.
 //!
 //! How a goal terminates
 //!
@@ -31,12 +31,11 @@
 //!   * `kind`           = "active_goal"
 //!   * `scope`          = session key (e.g. "agent:main:feishu:direct:ou_…")
 //!   * `text`           = the human-language goal text
-//!   * `abstract_text`  = JSON `{"iter": N, "max": M}` — current
-//!                        iteration count and cap. (We could store this
-//!                        in tags, but keeping it in a structured field
-//!                        makes the redb inspection / debugging easier.)
+//!   * `abstract_text`  = JSON `{"iter": N, "max": M}` — current iteration
+//!     count and cap. (We could store this in tags, but keeping it in a
+//!     structured field makes the redb inspection / debugging easier.)
 //!   * `pinned`         = true (no decay; goal stays alive across the
-//!                        crystallizer's lifecycle gates)
+//!     crystallizer's lifecycle gates)
 //!
 //! Survives gateway restart, because the memory store is on disk.
 //! Survives `/clear` only if `/clear` doesn't wipe memory docs — which
@@ -48,14 +47,14 @@
 //! `gateway/startup.rs` calls `check_after_turn` once after every
 //! agent reply lands. Three things can happen:
 //!
-//!   1. **No active goal for this session** — returns `None`, the turn
-//!      loop continues as normal.
+//!   1. **No active goal for this session** — returns `None`, the turn loop
+//!      continues as normal.
 //!   2. **Active goal + terminal marker found** — returns
-//!      `Reaction::Done(message)`. The hook caller appends `message` to
-//!      the reply text so the user sees ✅/❌/⚠ in the same chat bubble.
-//!   3. **Active goal + still working** — returns
-//!      `Reaction::Continue(prompt)`. The hook caller submits `prompt`
-//!      back to the task queue, producing a fresh turn back-to-back.
+//!      `Reaction::Done(message)`. The hook caller appends `message` to the
+//!      reply text so the user sees ✅/❌/⚠ in the same chat bubble.
+//!   3. **Active goal + still working** — returns `Reaction::Continue(prompt)`.
+//!      The hook caller submits `prompt` back to the task queue, producing a
+//!      fresh turn back-to-back.
 //!
 //! Idempotency: the hook only reads + (conditionally) mutates the goal
 //! doc; it doesn't write a new doc on a no-op. Re-entry is safe.
@@ -149,10 +148,7 @@ pub fn parse_terminal(reply_text: &str) -> TerminalSignal {
 // ---------------------------------------------------------------------------
 
 /// Read the active goal for a session, if any.
-pub async fn read(
-    mem: &Arc<Mutex<MemoryStore>>,
-    session_key: &str,
-) -> Option<ActiveGoal> {
+pub async fn read(mem: &Arc<Mutex<MemoryStore>>, session_key: &str) -> Option<ActiveGoal> {
     let store = mem.lock().await;
     let docs = store.list_active();
     drop(store);
@@ -204,10 +200,7 @@ pub async fn set(
 }
 
 /// Clear all goal docs in a session (idempotent — no-op if none).
-pub async fn clear(
-    mem: &Arc<Mutex<MemoryStore>>,
-    session_key: &str,
-) -> Result<()> {
+pub async fn clear(mem: &Arc<Mutex<MemoryStore>>, session_key: &str) -> Result<()> {
     let store = mem.lock().await;
     let to_delete: Vec<String> = store
         .list_active()
@@ -323,11 +316,10 @@ pub async fn check_after_turn(session_key: &str, reply_text: &str) -> Option<Rea
 
 /// The prompt sent back through the task queue for the next iteration.
 /// The instructions block is repeated each turn for two reasons:
-///   * Stateless re-priming — the LLM might not have seen the initial
-///     /goal turn in its context window after compaction.
-///   * Anti-drift — the GOAL_ACHIEVED / GOAL_FAILED format must stay
-///     fresh; without re-priming, the model tends to forget the exact
-///     marker spelling.
+///   * Stateless re-priming — the LLM might not have seen the initial /goal
+///     turn in its context window after compaction.
+///   * Anti-drift — the GOAL_ACHIEVED / GOAL_FAILED format must stay fresh;
+///     without re-priming, the model tends to forget the exact marker spelling.
 fn build_continuation_prompt(g: &ActiveGoal) -> String {
     format!(
         "目标: {} (iter {}/{})\n\n\
@@ -427,6 +419,9 @@ mod tests {
         assert_eq!(parse_iter_meta(""), (1, DEFAULT_MAX_ITER));
         assert_eq!(parse_iter_meta("garbage"), (1, DEFAULT_MAX_ITER));
         // Hard cap is enforced even when parsing back from disk.
-        assert_eq!(parse_iter_meta(r#"{"iter":1,"max":99999}"#).1, HARD_MAX_ITER);
+        assert_eq!(
+            parse_iter_meta(r#"{"iter":1,"max":99999}"#).1,
+            HARD_MAX_ITER
+        );
     }
 }

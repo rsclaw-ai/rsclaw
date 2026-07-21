@@ -1,8 +1,8 @@
 use anyhow::Result;
-
-use super::style::*;
 use rsclaw_cli::SecurityCommand;
 use rsclaw_config as config;
+
+use super::style::*;
 
 pub async fn cmd_security(sub: SecurityCommand) -> Result<()> {
     match sub {

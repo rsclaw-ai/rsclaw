@@ -7542,6 +7542,7 @@ dependencies = [
  "reqwest",
  "rsclaw-browser",
  "rsclaw-channel",
+ "rsclaw-computer",
  "rsclaw-config",
  "rsclaw-desktop",
  "rsclaw-events",

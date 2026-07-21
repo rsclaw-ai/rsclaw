@@ -15,8 +15,7 @@
 //! so existing `EmbedderBackend (agent crate)` paths keep
 //! working.
 
-use std::path::Path;
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use tracing::warn;
@@ -592,10 +591,7 @@ pub const QWEN3_DEFAULT_QUERY_INSTRUCTION: &str =
 ///
 /// Doc-side embeddings are NEVER prefixed, so existing indexes stay valid;
 /// flipping this on is purely a query-time change.
-pub fn resolve_query_instruction(
-    explicit: Option<String>,
-    model: Option<&str>,
-) -> Option<String> {
+pub fn resolve_query_instruction(explicit: Option<String>, model: Option<&str>) -> Option<String> {
     explicit.or_else(|| {
         model
             .filter(|m| m.to_lowercase().contains("qwen3"))

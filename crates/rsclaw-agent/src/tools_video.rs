@@ -49,9 +49,7 @@ impl super::runtime::AgentRuntime {
         };
         let mut images: Vec<String> = Vec::with_capacity(raw_images.len());
         for img in raw_images {
-            if img.starts_with("http://")
-                || img.starts_with("https://")
-                || img.starts_with("data:")
+            if img.starts_with("http://") || img.starts_with("https://") || img.starts_with("data:")
             {
                 images.push(img);
                 continue;
@@ -204,15 +202,13 @@ impl super::runtime::AgentRuntime {
         // For each model in `attempt_models`:
         //   1. Skip if the shared health table has marked it Disabled or
         //      Cooling-not-expired (e.g. a previous tool_video call hit
-        //      "AccountOverdueError" on doubao — don't burn another submit
-        //      attempt until the operator resets).
-        //   2. POST the submit request. On success → record_success +
-        //      break (provider has billed; polling stays on this provider
-        //      to avoid double-billing the user, even on poll-side
-        //      hiccups).
-        //   3. On submit failure → classify + record_failure in the
-        //      shared health table (Balance / Auth / etc. transitions),
-        //      advance to next model.
+        //      "AccountOverdueError" on doubao — don't burn another submit attempt
+        //      until the operator resets).
+        //   2. POST the submit request. On success → record_success + break (provider
+        //      has billed; polling stays on this provider to avoid double-billing the
+        //      user, even on poll-side hiccups).
+        //   3. On submit failure → classify + record_failure in the shared health table
+        //      (Balance / Auth / etc. transitions), advance to next model.
         let mut last_error: Option<anyhow::Error> = None;
         let mut chosen: Option<(&'static str, String, String)> = None;
         for model_id in &attempt_models {
@@ -336,7 +332,8 @@ impl super::runtime::AgentRuntime {
                     let body = format!("{e:#}");
                     let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
                     self.model_health.ensure(&[model_id.clone()]);
-                    self.model_health.record_failure(model_id, kind.clone(), truncated);
+                    self.model_health
+                        .record_failure(model_id, kind.clone(), truncated);
                     tracing::warn!(
                         model = %model_id,
                         provider,
@@ -417,7 +414,9 @@ impl super::runtime::AgentRuntime {
         let images = normalize_gen_assets(&args["image"]).await;
         let audio = normalize_gen_assets(&args["audio"]).await;
         let Some(image_url) = images.first() else {
-            return Ok(json!({ "error": "avatar_gen: a character `image` is required (local path, https URL, or data URI)" }));
+            return Ok(
+                json!({ "error": "avatar_gen: a character `image` is required (local path, https URL, or data URI)" }),
+            );
         };
         // Driving video (animate lane) — local path / data-URI / http URL all
         // accepted (normalised to a data-URI for local files, same as image/
@@ -425,7 +424,9 @@ impl super::runtime::AgentRuntime {
         let drive = normalize_gen_assets(&args["video"]).await;
         let drive_video = drive.first();
         if audio.first().is_none() && drive_video.is_none() {
-            return Ok(json!({ "error": "avatar_gen: provide a driving signal — either `audio` (speech → lip-sync) or `video` (a driving video → motion transfer)" }));
+            return Ok(
+                json!({ "error": "avatar_gen: provide a driving signal — either `audio` (speech → lip-sync) or `video` (a driving video → motion transfer)" }),
+            );
         }
         let mut body = json!({
             "input_reference": { "image_url": image_url },
@@ -458,7 +459,9 @@ impl super::runtime::AgentRuntime {
     ) -> Result<Value> {
         let images = normalize_gen_assets(&args["image"]).await;
         let Some(image_url) = images.first() else {
-            return Ok(json!({ "error": "mv_gen: a character `image` is required (local path, https URL, or data URI)" }));
+            return Ok(
+                json!({ "error": "mv_gen: a character `image` is required (local path, https URL, or data URI)" }),
+            );
         };
         let Some(lyrics) = args["lyrics"].as_str().filter(|s| !s.is_empty()) else {
             return Ok(json!({ "error": "mv_gen: `lyrics` is required (the song words to sing)" }));
@@ -685,7 +688,13 @@ async fn submit_rsclaw_video(
         // base `rsclaw-video-v1` model with a driving video in
         // `input_references`. Older prompt baselines advertised the bogus id;
         // remap it so requests work even before the prefix is re-ingested.
-        .map(|m| if m == "rsclaw-video-ref-v1" { "rsclaw-video-v1" } else { m })
+        .map(|m| {
+            if m == "rsclaw-video-ref-v1" {
+                "rsclaw-video-v1"
+            } else {
+                m
+            }
+        })
         .unwrap_or(default_model);
     // gen-api.md §2: `seconds` is a STRING, `size` is WxH, and image-to-video
     // uses `input_reference.image_url` (first frame) + optional
@@ -730,8 +739,8 @@ async fn submit_rsclaw_video(
     );
     let redirect_client =
         rsclaw_provider::rsclaw_http::build_client(rsclaw_provider::DEFAULT_USER_AGENT, 30)?;
-    let resp = rsclaw_provider::rsclaw_http::post_json(&redirect_client, &url, api_key, &body)
-        .await?;
+    let resp =
+        rsclaw_provider::rsclaw_http::post_json(&redirect_client, &url, api_key, &body).await?;
     let status = resp.status();
     let bytes = resp
         .bytes()

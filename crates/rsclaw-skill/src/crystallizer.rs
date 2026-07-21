@@ -17,13 +17,11 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt as _;
-use tokio::sync::Semaphore;
-
 use rsclaw_memory::{MemDocTier, MemoryDoc, MemoryStore};
 use rsclaw_provider::{
-    LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
-    registry::ProviderRegistry,
+    LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent, registry::ProviderRegistry,
 };
+use tokio::sync::Semaphore;
 
 // ---------------------------------------------------------------------------
 // Process-wide concurrency control
@@ -345,7 +343,7 @@ async fn distill_once(
     model: String,
 ) -> Result<String> {
     let req = LlmRequest {
-            fallback_models: Vec::new(),
+        fallback_models: Vec::new(),
         model,
         messages: vec![Message {
             role: Role::User,
@@ -491,10 +489,10 @@ pub(crate) fn validate_skill_md_and_body(content: &str) -> Result<()> {
 /// near-misses parse instead of throwing them out:
 ///
 /// 1. Strip wrapping markdown code fences (```yaml / ```markdown / ```).
-/// 2. If frontmatter opens with `---` but never closes, insert `---` at
-///    the first blank line after the opening fence.
-/// 3. Fold an unquoted multi-line `description:` value into a single
-///    quoted line so YAML stops treating the continuation as new keys.
+/// 2. If frontmatter opens with `---` but never closes, insert `---` at the
+///    first blank line after the opening fence.
+/// 3. Fold an unquoted multi-line `description:` value into a single quoted
+///    line so YAML stops treating the continuation as new keys.
 ///
 /// Returns the repaired content. Idempotent — applying it to already-valid
 /// SKILL.md content is a no-op.
@@ -589,8 +587,10 @@ fn fold_unquoted_description(content: &str) -> String {
     };
     let desc_line = lines[desc_idx];
     let after_colon = desc_line.splitn(2, ':').nth(1).unwrap_or("").trim();
-    if matches!(after_colon.chars().next(), Some('>') | Some('|') | Some('"') | Some('\''))
-    {
+    if matches!(
+        after_colon.chars().next(),
+        Some('>') | Some('|') | Some('"') | Some('\'')
+    ) {
         return content.to_owned();
     }
     // Collect continuation lines: everything until the next top-level
@@ -711,15 +711,14 @@ pub async fn crystallize_one(
             return Ok(None);
         }
     };
-    let skill_md = match distill_with_llm(&prompt, Arc::clone(&provider_arc), model_id.to_owned())
-        .await
-    {
-        Ok(md) => md,
-        Err(e) => {
-            tracing::warn!("crystallization: LLM distillation failed: {e:#}");
-            return Ok(None);
-        }
-    };
+    let skill_md =
+        match distill_with_llm(&prompt, Arc::clone(&provider_arc), model_id.to_owned()).await {
+            Ok(md) => md,
+            Err(e) => {
+                tracing::warn!("crystallization: LLM distillation failed: {e:#}");
+                return Ok(None);
+            }
+        };
 
     // 6. Validate before writing. Auto-repair common LLM frontmatter
     // mistakes (wrapping ``` fences, missing closing `---`, unquoted
@@ -745,8 +744,12 @@ pub async fn crystallize_one(
                  (5) the output contains no prompt instructions, only the skill content.\n\n\
                  Original task:\n{prompt}"
             );
-            match distill_with_llm(&fixup_prompt, Arc::clone(&provider_arc), model_id.to_owned())
-                .await
+            match distill_with_llm(
+                &fixup_prompt,
+                Arc::clone(&provider_arc),
+                model_id.to_owned(),
+            )
+            .await
             {
                 Ok(second_md) => {
                     let second_repaired = repair_skill_md(&second_md);

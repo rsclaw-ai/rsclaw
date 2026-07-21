@@ -4,20 +4,19 @@
 //! without going through the LLM agent loop.
 
 use futures::StreamExt as _;
+use rsclaw_agent::{
+    LiveStatus,
+    runtime::{AgentRuntime, PluginOverride},
+};
+use rsclaw_channel::OutboundMessage;
+use rsclaw_config::{runtime::RuntimeConfig, schema::DmScope};
+use rsclaw_provider::{
+    AgentEndpoint, LlmRequest, Message, MessageContent, Role, StreamEvent,
+    failover::FailoverManager, registry::ProviderRegistry,
+};
 use tracing::warn;
 
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{
-        LiveStatus,
-        runtime::{AgentRuntime, PluginOverride},
-    };
-use rsclaw_channel::OutboundMessage;
-use rsclaw_config::runtime::RuntimeConfig;
-use rsclaw_config::schema::DmScope;
-use rsclaw_provider::{
-        AgentEndpoint, LlmRequest, Message, MessageContent, Role, StreamEvent,
-        failover::FailoverManager, registry::ProviderRegistry,
-    };
 
 /// Where a `/...` command text came from. `/watch` uses this to suppress
 /// dedup-hit replies fired by /loop's cron-replayed text.
@@ -35,7 +34,10 @@ pub(crate) enum PluginCommand {
     /// `/plugin <name>` — show one plugin's current override.
     Info { plugin: String },
     /// `/plugin <name> off|on|all|<comma-tools>` — set session override.
-    SetState { plugin: String, action: PluginAction },
+    SetState {
+        plugin: String,
+        action: PluginAction,
+    },
     /// `/plugin reset` — clear every override for this session.
     Reset,
     /// `/plugin pin <plugin>__<tool>` (or legacy `<plugin>.<tool>`) —
@@ -72,8 +74,8 @@ pub(crate) enum PluginAction {
 /// Recognized aliases (so muscle memory works):
 /// - `/plugin`, `/plugin list`, `/plugin ls` → Status (list overrides)
 /// - `/plugin info <name>`, `/plugin show <name>`, `/plugin <name>` → Info
-/// - `/plugin info` (no name), `/plugin help`, `/plugin -h`, `/plugin --help`
-///   → None (caller shows help)
+/// - `/plugin info` (no name), `/plugin help`, `/plugin -h`, `/plugin --help` →
+///   None (caller shows help)
 ///
 /// Tradeoff: this reserves the words `list`/`ls`/`info`/`show`/`help`/`reset`
 /// as command keywords, so a plugin literally named one of those can't be
@@ -242,7 +244,9 @@ fn preparse_session_key(
         agent_id: handle.id.clone(),
         channel: channel.to_owned(),
         peer_id: peer_id.to_owned(),
-        kind: MessageKind::DirectMessage { account_id: account.map(str::to_owned) },
+        kind: MessageKind::DirectMessage {
+            account_id: account.map(str::to_owned),
+        },
         dm_scope: DmScope::PerChannelPeer,
     })
 }
@@ -511,8 +515,7 @@ pub(crate) async fn try_preparse_locally_with_account(
             names.dedup();
             names
         };
-        let _ =
-            rsclaw_cap::identity::write_identity_files(&cwd, &cap_plugins, &cap_skills).await;
+        let _ = rsclaw_cap::identity::write_identity_files(&cwd, &cap_plugins, &cap_skills).await;
         match manager.open_session(kind, cwd).await {
             Ok(sid) => {
                 manager
@@ -606,7 +609,9 @@ pub(crate) async fn try_preparse_locally_with_account(
         let spawn_result = if session_id.is_empty() {
             manager.open_session_continue_last(kind, cwd).await
         } else {
-            manager.open_session_resume(kind, cwd, session_id.to_owned()).await
+            manager
+                .open_session_resume(kind, cwd, session_id.to_owned())
+                .await
         };
         match spawn_result {
             Ok(sid) => {
@@ -1382,9 +1387,10 @@ $g.Dispose();$b.Dispose()"#
         if rest.eq_ignore_ascii_case("status") {
             return Some(txt(goal_status_handler(handle, channel, peer_id).await));
         }
-        return Some(txt(
-            goal_set_handler(handle, channel, peer_id, account, rest).await,
-        ));
+        return Some(txt(goal_set_handler(
+            handle, channel, peer_id, account, rest,
+        )
+        .await));
     }
     None
 }
@@ -1416,9 +1422,7 @@ async fn goal_set_handler(
         return "_memory 未启用,/goal 无法持久化_".to_owned();
     };
     let session_key = preparse_session_key(handle, channel, peer_id, account);
-    if let Err(e) =
-        rsclaw_agent::goal::set(&mem, &session_key, &condition, max_iter).await
-    {
+    if let Err(e) = rsclaw_agent::goal::set(&mem, &session_key, &condition, max_iter).await {
         return format!("/goal: 写入失败: {e:#}");
     }
     // Kick off the first turn via the task queue (same path the channel
@@ -1656,10 +1660,15 @@ async fn try_plugin_slash(
                 is_group: false,
                 account: account.map(str::to_owned),
             });
-            return Some(match plugin.call_tool_with_ctx(&command.handler, args, notify_ctx).await {
-                Ok(value) => plugin_slash_outbound(value),
-                Err(e) => plugin_slash_error(format!("plugin slash `{prefix}` failed: {e:#}")),
-            });
+            return Some(
+                match plugin
+                    .call_tool_with_ctx(&command.handler, args, notify_ctx)
+                    .await
+                {
+                    Ok(value) => plugin_slash_outbound(value),
+                    Err(e) => plugin_slash_error(format!("plugin slash `{prefix}` failed: {e:#}")),
+                },
+            );
         }
     }
     None
@@ -1692,7 +1701,9 @@ fn plugin_slash_outbound(value: serde_json::Value) -> OutboundMessage {
         .get("text")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
-        .unwrap_or_else(|| serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()));
+        .unwrap_or_else(|| {
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+        });
     let values_to_strings = |key: &str| -> Vec<String> {
         value
             .get(key)
@@ -1731,10 +1742,17 @@ fn plugin_file_tuple(value: &serde_json::Value) -> Option<(String, String, Strin
             .and_then(|s| s.to_str())
             .unwrap_or("plugin-file")
             .to_owned();
-        (path.to_owned(), filename, "application/octet-stream".to_owned())
+        (
+            path.to_owned(),
+            filename,
+            "application/octet-stream".to_owned(),
+        )
     } else {
         let obj = value.as_object()?;
-        let path = obj.get("path").and_then(serde_json::Value::as_str)?.to_owned();
+        let path = obj
+            .get("path")
+            .and_then(serde_json::Value::as_str)?
+            .to_owned();
         let filename = obj
             .get("filename")
             .and_then(serde_json::Value::as_str)
@@ -1803,18 +1821,15 @@ fn resolve_cap_workspace(
     } else {
         std::path::PathBuf::from(input)
     };
-    let canon = std::fs::canonicalize(&expanded)
-        .map_err(|e| format!("path not accessible ({e})"))?;
+    let canon =
+        std::fs::canonicalize(&expanded).map_err(|e| format!("path not accessible ({e})"))?;
     if !canon.is_dir() {
         return Err("not a directory".to_string());
     }
     let home = dirs_next::home_dir().ok_or_else(|| "HOME not available".to_string())?;
     let home_canon = std::fs::canonicalize(&home).unwrap_or(home);
     if !canon.starts_with(&home_canon) {
-        return Err(format!(
-            "path must be under {}",
-            home_canon.display()
-        ));
+        return Err(format!("path must be under {}", home_canon.display()));
     }
     Ok(canon)
 }
@@ -2165,7 +2180,7 @@ pub(crate) async fn btw_direct_call(
     );
 
     let req = LlmRequest {
-            fallback_models: Vec::new(),
+        fallback_models: Vec::new(),
         model: model.to_owned(),
         messages: vec![Message {
             role: Role::User,
@@ -2317,7 +2332,10 @@ mod tests {
     #[test]
     fn parse_plugin_command_status_bare() {
         assert_eq!(parse_plugin_command("/plugin"), Some(PluginCommand::Status));
-        assert_eq!(parse_plugin_command("/plugin "), Some(PluginCommand::Status));
+        assert_eq!(
+            parse_plugin_command("/plugin "),
+            Some(PluginCommand::Status)
+        );
     }
 
     #[test]
@@ -2368,17 +2386,17 @@ mod tests {
             parse_plugin_command("/plugin douyin publish_video,check_comments"),
             Some(PluginCommand::SetState {
                 plugin: "douyin".to_owned(),
-                action: PluginAction::Inject(vec![
-                    "publish_video".into(),
-                    "check_comments".into()
-                ]),
+                action: PluginAction::Inject(vec!["publish_video".into(), "check_comments".into()]),
             })
         );
     }
 
     #[test]
     fn parse_plugin_command_reset() {
-        assert_eq!(parse_plugin_command("/plugin reset"), Some(PluginCommand::Reset));
+        assert_eq!(
+            parse_plugin_command("/plugin reset"),
+            Some(PluginCommand::Reset)
+        );
     }
 
     #[test]
@@ -2389,8 +2407,14 @@ mod tests {
 
     #[test]
     fn parse_plugin_command_list_aliases() {
-        assert_eq!(parse_plugin_command("/plugin list"), Some(PluginCommand::Status));
-        assert_eq!(parse_plugin_command("/plugin ls"), Some(PluginCommand::Status));
+        assert_eq!(
+            parse_plugin_command("/plugin list"),
+            Some(PluginCommand::Status)
+        );
+        assert_eq!(
+            parse_plugin_command("/plugin ls"),
+            Some(PluginCommand::Status)
+        );
     }
 
     #[test]

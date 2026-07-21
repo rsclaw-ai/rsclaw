@@ -149,7 +149,10 @@ fn tool_name_roundtrip() {
     assert_eq!(sanitize_tool_name("ns:tool"), "rc_ns_x3A_tool");
     // A real tool literally named with the rc_ prefix must round-trip without
     // colliding with the escape scheme.
-    assert_eq!(restore_tool_name(&sanitize_tool_name("rc_weird")), "rc_weird");
+    assert_eq!(
+        restore_tool_name(&sanitize_tool_name("rc_weird")),
+        "rc_weird"
+    );
 }
 
 #[cfg(test)]
@@ -2368,7 +2371,7 @@ mod tests {
         #[test]
         fn request_uses_input_not_messages() {
             let req = LlmRequest {
-            fallback_models: Vec::new(),
+                fallback_models: Vec::new(),
                 messages: vec![Message {
                     role: Role::User,
                     content: MessageContent::Text("hello".to_owned()),
@@ -2387,7 +2390,7 @@ mod tests {
         #[test]
         fn system_goes_to_instructions() {
             let req = LlmRequest {
-            fallback_models: Vec::new(),
+                fallback_models: Vec::new(),
                 system: Some("be helpful".to_owned()),
                 ..make_responses_request()
             };
@@ -2398,7 +2401,7 @@ mod tests {
         #[test]
         fn content_parts_use_input_text() {
             let req = LlmRequest {
-            fallback_models: Vec::new(),
+                fallback_models: Vec::new(),
                 messages: vec![Message {
                     role: Role::User,
                     content: MessageContent::Text("hello".to_owned()),
@@ -2415,7 +2418,7 @@ mod tests {
         #[test]
         fn image_uses_input_image() {
             let req = LlmRequest {
-            fallback_models: Vec::new(),
+                fallback_models: Vec::new(),
                 messages: vec![Message {
                     role: Role::User,
                     content: MessageContent::Parts(vec![ContentPart::Image {

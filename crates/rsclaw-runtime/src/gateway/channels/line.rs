@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, OutboundMessage};
+use rsclaw_config::runtime::RuntimeConfig;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -8,9 +11,6 @@ use super::{
     default_dm_scope,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, OutboundMessage};
-use rsclaw_config::runtime::RuntimeConfig;
 
 pub(crate) fn start_line_if_configured(
     config: &RuntimeConfig,
@@ -224,7 +224,10 @@ pub(crate) fn start_line_if_configured(
                                 {
                                     // No debounce — task queue merge_into_pending
                                     // handles rapid consecutive messages automatically.
-                                    let handle = match w_reg.route_account("line", Some(&w_acct)).or_else(|_| w_reg.route_account("line", None)) {
+                                    let handle = match w_reg
+                                        .route_account("line", Some(&w_acct))
+                                        .or_else(|_| w_reg.route_account("line", None))
+                                    {
                                         Ok(h) => h,
                                         Err(e) => {
                                             error!("line route: {e:#}");
@@ -284,7 +287,10 @@ pub(crate) fn start_line_if_configured(
                         let user_id = user_id.clone();
                         let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route_account("line", Some(&w_acct_btw)).or_else(|_| reg.route_account("line", None)) {
+                            let handle = match reg
+                                .route_account("line", Some(&w_acct_btw))
+                                .or_else(|_| reg.route_account("line", None))
+                            {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -324,7 +330,10 @@ pub(crate) fn start_line_if_configured(
                         let user_id = user_id.clone();
                         let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route_account("line", Some(&w_acct_pp)).or_else(|_| reg.route_account("line", None)) {
+                            let handle = match reg
+                                .route_account("line", Some(&w_acct_pp))
+                                .or_else(|_| reg.route_account("line", None))
+                            {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -337,7 +346,9 @@ pub(crate) fn start_line_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
+                                    MessageKind::DirectMessage {
+                                        account_id: Some(w_acct_pp.clone()),
+                                    }
                                 },
                                 channel: "line".to_string(),
                                 peer_id: user_id.clone(),

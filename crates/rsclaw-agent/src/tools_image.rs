@@ -133,7 +133,9 @@ pub(crate) async fn normalize_image_inputs(v: &Value) -> Vec<String> {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 out.push(format!("data:{mime};base64,{b64}"));
             }
-            Err(e) => tracing::warn!(path = %img, error = %e, "image_gen: input image not readable, skipping"),
+            Err(e) => {
+                tracing::warn!(path = %img, error = %e, "image_gen: input image not readable, skipping")
+            }
         }
     }
     out
@@ -192,7 +194,11 @@ impl super::runtime::AgentRuntime {
         // strings in args["image"].
         if !args["image"].is_null() {
             let imgs = normalize_image_inputs(&args["image"]).await;
-            args["image"] = if imgs.is_empty() { Value::Null } else { json!(imgs) };
+            args["image"] = if imgs.is_empty() {
+                Value::Null
+            } else {
+                json!(imgs)
+            };
         }
         let prompt = args["prompt"]
             .as_str()
@@ -232,7 +238,10 @@ impl super::runtime::AgentRuntime {
         // The primary provider's key is already configured, so this stays
         // within the user's chosen vendor — no surprise cross-billing.
         if image_chain.is_empty()
-            && let Some(def) = self.primary_provider().as_deref().and_then(default_image_model)
+            && let Some(def) = self
+                .primary_provider()
+                .as_deref()
+                .and_then(default_image_model)
         {
             image_chain.push(def.to_owned());
         }
@@ -288,8 +297,10 @@ impl super::runtime::AgentRuntime {
                     // provider "rsclaw_image") for delivery instead of blocking
                     // the turn ~280s.
                     if v.get("_async_image_job").and_then(|b| b.as_bool()) == Some(true) {
-                        let poll_url =
-                            v.get("poll_url").and_then(|u| u.as_str()).unwrap_or_default();
+                        let poll_url = v
+                            .get("poll_url")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or_default();
                         return self.enqueue_rsclaw_image_job(poll_url, prompt, ctx).await;
                     }
                     return Ok(v);
@@ -316,7 +327,8 @@ impl super::runtime::AgentRuntime {
                     let kind = rsclaw_provider::health::classify_error(&e);
                     let body = format!("{e:#}");
                     let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
-                    self.model_health.record_failure(chain_model, kind.clone(), truncated);
+                    self.model_health
+                        .record_failure(chain_model, kind.clone(), truncated);
                     tracing::warn!(
                         model = %chain_model,
                         kind = ?kind,
@@ -570,16 +582,16 @@ impl super::runtime::AgentRuntime {
         ) -> Result<Value, anyhow::Error> {
             if status.is_success() {
                 serde_json::from_slice::<Value>(bytes).map_err(|e| {
-                    let preview: String = String::from_utf8_lossy(bytes).chars().take(200).collect();
+                    let preview: String =
+                        String::from_utf8_lossy(bytes).chars().take(200).collect();
                     post_billing(format!("parse error: {e} (body preview: {preview})"))
                 })
             } else {
                 // Non-2xx with a non-JSON body (HTML error page, plain
                 // text from a proxy, …): keep the raw text so the error
                 // site can show a preview instead of "unknown error".
-                Ok(serde_json::from_slice::<Value>(bytes).unwrap_or_else(|_| {
-                    Value::String(String::from_utf8_lossy(bytes).into_owned())
-                }))
+                Ok(serde_json::from_slice::<Value>(bytes)
+                    .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(bytes).into_owned())))
             }
         }
         let (resp_status, resp_body) = if is_qwen {
@@ -694,11 +706,10 @@ impl super::runtime::AgentRuntime {
         } else if is_agnes {
             // Agnes Image 2.0/2.1 Flash: OAI-shaped /v1/images/generations,
             // but with two quirks from the official docs:
-            //   1. `response_format` MUST live under `extra_body` — placing
-            //      it at the top level returns a 400.
-            //   2. image-to-image input goes in `extra_body.image` (array of
-            //      public URLs or `data:image/...;base64,...` Data URIs); no
-            //      `tags: ["img2img"]` needed.
+            //   1. `response_format` MUST live under `extra_body` — placing it at the top
+            //      level returns a 400.
+            //   2. image-to-image input goes in `extra_body.image` (array of public URLs or
+            //      `data:image/...;base64,...` Data URIs); no `tags: ["img2img"]` needed.
             // Output URL is at data[0].url (same parser as the OAI block).
             let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
             let mut extra = json!({ "response_format": "url" });
@@ -787,9 +798,13 @@ impl super::runtime::AgentRuntime {
                 // side's `send_following_redirects`.
                 let redirect_client = rsclaw_provider::rsclaw_http::build_client(img_ua, 120)
                     .map_err(|e| anyhow!("image: rsclaw client: {e}"))?;
-                let resp =
-                    rsclaw_provider::rsclaw_http::post_json(&redirect_client, &url, &api_key, &body)
-                        .await?;
+                let resp = rsclaw_provider::rsclaw_http::post_json(
+                    &redirect_client,
+                    &url,
+                    &api_key,
+                    &body,
+                )
+                .await?;
                 let st = resp.status();
                 let body_bytes = resp
                     .bytes()
@@ -823,7 +838,11 @@ impl super::runtime::AgentRuntime {
                 // Non-JSON bodies are preserved as Value::String by
                 // parse_response_body; fall back to a raw preview so
                 // 401/429/400 are distinguishable.
-                .or_else(|| resp_body.as_str().map(|s| rsclaw_util::truncate_str(s, 200)))
+                .or_else(|| {
+                    resp_body
+                        .as_str()
+                        .map(|s| rsclaw_util::truncate_str(s, 200))
+                })
                 .unwrap_or_else(|| rsclaw_util::truncate_str(&raw, 200));
             return Err(anyhow!("image: API error (HTTP {resp_status}): {err_msg}"));
         }
@@ -890,7 +909,10 @@ impl super::runtime::AgentRuntime {
                 })
                 .unwrap_or("unknown");
             let refusal_text = parts
-                .and_then(|ps| ps.iter().find_map(|p| p.get("text").and_then(|v| v.as_str())))
+                .and_then(|ps| {
+                    ps.iter()
+                        .find_map(|p| p.get("text").and_then(|v| v.as_str()))
+                })
                 .unwrap_or("");
             return Err(post_billing(format!(
                 "no image data in Gemini response (finishReason: {finish_reason}, text: {}) — likely safety-filtered; rephrase the prompt to avoid policy-sensitive content",

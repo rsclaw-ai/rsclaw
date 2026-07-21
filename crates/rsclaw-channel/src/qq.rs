@@ -1084,13 +1084,8 @@ async fn extract_audio_and_transcribe(client: &Client, video_bytes: &[u8]) -> Re
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::transcription::transcribe_audio(
-        client,
-        &audio_bytes,
-        "video_audio.ogg",
-        "audio/ogg",
-    )
-    .await
+    crate::transcription::transcribe_audio(client, &audio_bytes, "video_audio.ogg", "audio/ogg")
+        .await
 }
 
 // ---------------------------------------------------------------------------

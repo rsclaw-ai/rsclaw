@@ -1,8 +1,8 @@
 use anyhow::Result;
-
-use super::style::*;
 use rsclaw_cli::ResetArgs;
 use rsclaw_config as config;
+
+use super::style::*;
 
 pub async fn cmd_reset(args: ResetArgs) -> Result<()> {
     let base_dir = config::loader::base_dir();

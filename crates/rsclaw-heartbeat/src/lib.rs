@@ -11,10 +11,9 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use chrono::NaiveTime;
 use chrono_tz::Tz;
+use rsclaw_config::loader::base_dir;
 use state::{HeartbeatState, HeartbeatStore};
 use tracing::{info, warn};
-
-use rsclaw_config::loader::base_dir;
 
 /// Host abstraction (crate-split trait inversion): lets heartbeat reach the
 /// agent registry + graceful-shutdown coordinator WITHOUT depending on the
@@ -27,11 +26,19 @@ pub trait HeartbeatHost: Send + Sync {
     /// with the configured default fallback applied root-side).
     fn agent_flash_model(&self, agent_id: &str) -> Option<String>;
     /// Provider registry for an agent (crystallize-phase LLM calls).
-    fn agent_providers(&self, agent_id: &str) -> Option<std::sync::Arc<rsclaw_provider::registry::ProviderRegistry>>;
+    fn agent_providers(
+        &self,
+        agent_id: &str,
+    ) -> Option<std::sync::Arc<rsclaw_provider::registry::ProviderRegistry>>;
     /// Agent workspace dir (lessons-phase target).
     fn agent_workspace(&self, agent_id: &str) -> Option<String>;
     /// Send a heartbeat message to the agent and await its reply (or timeout).
-    async fn send_heartbeat(&self, agent_id: &str, session_key: &str, text: &str) -> anyhow::Result<()>;
+    async fn send_heartbeat(
+        &self,
+        agent_id: &str,
+        session_key: &str,
+        text: &str,
+    ) -> anyhow::Result<()>;
     /// Whether the runtime is draining (graceful shutdown in progress).
     fn is_draining(&self) -> bool;
     /// Register an in-flight unit of work; the returned opaque guard
@@ -256,8 +263,8 @@ impl HeartbeatRunner {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 if runner.host.is_draining() {
-                        info!("heartbeat rescan: drain signaled, stopping");
-                        break;
+                    info!("heartbeat rescan: drain signaled, stopping");
+                    break;
                 }
                 runner.scan_and_spawn();
             }
@@ -527,7 +534,9 @@ impl HeartbeatRunner {
     /// preserved (first-segment match for is_internal_session routing).
     async fn send_heartbeat(&self, agent_id: &str, state_key: &str, content: &str) -> Result<()> {
         let session_key = format!("heartbeat:{state_key}");
-        self.host.send_heartbeat(agent_id, &session_key, content).await
+        self.host
+            .send_heartbeat(agent_id, &session_key, content)
+            .await
     }
 }
 

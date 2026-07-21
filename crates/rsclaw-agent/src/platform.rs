@@ -93,7 +93,8 @@ fn detect_display_logical_scale() -> f64 {
     1.0
 }
 
-// detect_chrome/detect_ffmpeg lifted to rsclaw-platform (crate-split); re-exported.
+// detect_chrome/detect_ffmpeg lifted to rsclaw-platform (crate-split);
+// re-exported.
 pub use rsclaw_platform::{detect_chrome, detect_ffmpeg};
 
 /// Like `detect_chrome` but auto-installs Chrome for Testing on miss.
@@ -110,7 +111,6 @@ pub async fn ensure_chrome() -> Result<String> {
         anyhow::anyhow!("Chrome auto-install completed but binary still not detected")
     })
 }
-
 
 /// Like `detect_ffmpeg` but auto-installs ffmpeg on miss (downloads ~80MB).
 pub(crate) async fn ensure_ffmpeg() -> Result<String> {
