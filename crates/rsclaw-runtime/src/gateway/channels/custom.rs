@@ -19,7 +19,7 @@ use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key}
 pub(crate) fn start_custom_channels(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     custom_webhooks: Arc<
         std::sync::RwLock<
             std::collections::HashMap<String, Arc<rsclaw_channel::custom::CustomWebhookChannel>>,
@@ -82,7 +82,7 @@ fn start_custom_webhook(
     config: &RuntimeConfig,
     ch_cfg: rsclaw_config::schema::CustomChannelConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     custom_webhooks: Arc<
         std::sync::RwLock<
             std::collections::HashMap<String, Arc<rsclaw_channel::custom::CustomWebhookChannel>>,
@@ -454,7 +454,7 @@ fn start_custom_websocket(
     config: &RuntimeConfig,
     ch_cfg: rsclaw_config::schema::CustomChannelConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,

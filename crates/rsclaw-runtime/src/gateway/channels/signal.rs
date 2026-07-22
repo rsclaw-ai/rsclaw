@@ -76,7 +76,7 @@ impl Channel for SignalProxy {
 pub(crate) fn start_signal_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<rsclaw_channel::DmPolicyEnforcer>>>,
     >,

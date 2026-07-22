@@ -204,6 +204,8 @@ pub struct AppState {
         Arc<std::sync::RwLock<std::collections::HashMap<String, tokio::sync::mpsc::Sender<rsclaw_channel::OutboundMessage>>>>,
     /// Agent spawner — needed for hot-adding agents via `/api/v1/reload`.
     pub agent_spawner: Arc<rsclaw_agent::AgentSpawner>,
+    /// Task queue manager — needed for channel hot-add via `/api/v1/reload`.
+    pub task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
     /// Broadcast channel for restart-required events
     /// (config changed, model downloaded, etc.). Multi-source, single sink.
     pub restart_request_tx: broadcast::Sender<rsclaw_events::RestartRequest>,
@@ -1953,7 +1955,7 @@ async fn http_reload(
         );
     }
 
-    // --- Channels: remove deconfigured channels, report new ones ---
+    // --- Channels: remove deconfigured channels, hot-add new ones ---
     let reload_channels = scope.contains("all") || scope.contains("channel");
     if reload_channels {
         let configured_channels = fresh_config
@@ -1981,7 +1983,7 @@ async fn http_reload(
 
         let running = state.channel_manager.names();
         let mut removed = Vec::new();
-        let mut needs_restart = Vec::new();
+        let mut added = Vec::new();
 
         // Remove channels that are running but no longer configured.
         for name in &running {
@@ -1998,25 +2000,83 @@ async fn http_reload(
             }
         }
 
-        // Detect new channels that need a restart to wire up.
-        for name in &configured_channels {
-            let is_running = running.iter().any(|r| {
-                r == name || r.starts_with(&format!("{name}/"))
-            });
-            if !is_running {
-                needs_restart.push(name.clone());
+        // Hot-add channels that are configured but not yet running.
+        let is_running = |name: &str| -> bool {
+            running.iter().any(|r| r == name || r.starts_with(&format!("{name}/")))
+                || state.channel_manager.contains(name)
+        };
+        {
+            use crate::gateway::channels::*;
+            let cfg = &fresh_config;
+            let reg = Arc::clone(&state.agents);
+            let mgr = &state.channel_manager;
+            let dme = Arc::clone(&state.dm_enforcers);
+            let db = Arc::clone(&state.store.db);
+            let cs = Arc::clone(&state.channel_senders);
+            let tq = Arc::clone(&state.task_queue);
+            let sd = state.shutdown.clone();
+
+            if !is_running("discord") {
+                start_discord_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("discord");
+            }
+            if !is_running("slack") {
+                start_slack_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("slack");
+            }
+            if !is_running("whatsapp") {
+                start_whatsapp_if_configured(cfg, reg.clone(), mgr, Arc::clone(&state.whatsapp), Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("whatsapp");
+            }
+            if !is_running("signal") {
+                start_signal_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("signal");
+            }
+            if !is_running("feishu") {
+                start_feishu_if_configured(cfg, reg.clone(), mgr, Arc::clone(&state.feishu), Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("feishu");
+            }
+            if !is_running("dingtalk") {
+                start_dingtalk_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("dingtalk");
+            }
+            if !is_running("wecom") {
+                start_wecom_if_configured(cfg, reg.clone(), mgr, Arc::clone(&state.wecom), Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("wecom");
+            }
+            if !is_running("wechat") {
+                start_wechat_personal_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("wechat");
+            }
+            if !is_running("qq") {
+                start_qq_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("qq");
+            }
+            if !is_running("line") {
+                start_line_if_configured(cfg, reg.clone(), mgr, Arc::clone(&state.line), Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("line");
+            }
+            if !is_running("zalo") {
+                start_zalo_if_configured(cfg, reg.clone(), mgr, Arc::clone(&state.zalo), Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("zalo");
+            }
+            if !is_running("matrix") {
+                start_matrix_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("matrix");
             }
         }
+        // Filter out channels that were "added" but weren't actually configured.
+        added.retain(|name| configured_channels.iter().any(|c| c == name));
 
-        if !removed.is_empty() {
-            tracing::info!(removed = ?removed, "hot-reload: channels removed");
+        if !removed.is_empty() || !added.is_empty() {
+            tracing::info!(removed = ?removed, added = ?added, "hot-reload: channels updated");
         }
         details.insert(
             "channels".to_owned(),
             serde_json::json!({
                 "reloaded": true,
                 "removed": removed,
-                "needs_restart": needs_restart,
+                "added": added,
             }),
         );
     }

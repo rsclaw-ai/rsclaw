@@ -622,7 +622,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     start_channels(
         &config,
         Arc::clone(&registry),
-        &mut channel_manager,
+        &channel_manager,
         Arc::clone(&feishu_slot),
         Arc::clone(&wecom_slot),
         Arc::clone(&whatsapp_slot),
@@ -847,7 +847,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     start_custom_channels(
         &config,
         Arc::clone(&registry),
-        &mut channel_manager,
+        &channel_manager,
         Arc::clone(&custom_webhooks),
         Arc::clone(&channel_senders),
         Arc::clone(&store.db),
@@ -1032,6 +1032,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         channel_manager: Arc::clone(&channel_manager),
         channel_senders: Arc::clone(&channel_senders),
         agent_spawner: Arc::clone(&spawner),
+        task_queue: Arc::clone(&task_queue_mgr),
         restart_request_tx: restart_request_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),

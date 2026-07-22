@@ -27,7 +27,7 @@ use rsclaw_config::{runtime::RuntimeConfig, schema::DmScope};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use self::{
+pub(crate) use self::{
     dingtalk::start_dingtalk_if_configured, discord::start_discord_if_configured,
     feishu::start_feishu_if_configured, line::start_line_if_configured,
     matrix::start_matrix_if_configured, qq::start_qq_if_configured,
@@ -53,7 +53,7 @@ pub(crate) fn default_dm_scope(config: &RuntimeConfig) -> DmScope {
 pub(crate) fn start_channels(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     feishu_slot: Arc<tokio::sync::OnceCell<Arc<rsclaw_channel::feishu::FeishuChannel>>>,
     wecom_slot: Arc<tokio::sync::OnceCell<Arc<rsclaw_channel::wecom::WeComChannel>>>,
     whatsapp_slot: Arc<tokio::sync::OnceCell<Arc<rsclaw_channel::whatsapp::WhatsAppChannel>>>,

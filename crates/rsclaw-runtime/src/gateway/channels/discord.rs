@@ -15,7 +15,7 @@ use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key}
 pub(crate) fn start_discord_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<rsclaw_channel::DmPolicyEnforcer>>>,
     >,

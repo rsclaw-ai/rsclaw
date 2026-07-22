@@ -718,6 +718,11 @@ impl ChannelManager {
     pub fn names(&self) -> Vec<String> {
         self.channels.read().expect("ChannelManager lock poisoned").keys().cloned().collect()
     }
+
+    /// Whether a channel with the given name is registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.channels.read().expect("ChannelManager lock poisoned").contains_key(name)
+    }
 }
 
 // ---------------------------------------------------------------------------

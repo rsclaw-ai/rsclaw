@@ -15,7 +15,7 @@ use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key}
 pub(crate) fn start_line_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     line_slot: Arc<tokio::sync::OnceCell<Arc<rsclaw_channel::line::LineChannel>>>,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<rsclaw_channel::DmPolicyEnforcer>>>,

@@ -40,7 +40,7 @@ fn outbound_addr_for(is_group: bool, chat_id: &str, sender_id: &str) -> String {
 pub(crate) fn start_feishu_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     feishu_slot: Arc<tokio::sync::OnceCell<Arc<rsclaw_channel::feishu::FeishuChannel>>>,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<rsclaw_channel::DmPolicyEnforcer>>>,

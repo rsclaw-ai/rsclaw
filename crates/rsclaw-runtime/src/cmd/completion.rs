@@ -79,7 +79,7 @@ _rsclaw() {
         'dashboard:Open Control UI'
         'daemon:Legacy gateway alias'
         'docs:Search live documentation'
-        'qr:Generate iOS pairing QR'
+        'qr:Generate app pairing QR'
         'uninstall:Uninstall service and data'
         'webhooks:Webhook helpers'
     )
@@ -125,7 +125,7 @@ complete -c rsclaw -n __fish_use_subcommand -a completion -d 'Generate shell com
 complete -c rsclaw -n __fish_use_subcommand -a dashboard -d 'Open Control UI'
 complete -c rsclaw -n __fish_use_subcommand -a daemon -d 'Legacy gateway alias'
 complete -c rsclaw -n __fish_use_subcommand -a docs -d 'Search live documentation'
-complete -c rsclaw -n __fish_use_subcommand -a qr -d 'Generate iOS pairing QR'
+complete -c rsclaw -n __fish_use_subcommand -a qr -d 'Generate app pairing QR'
 complete -c rsclaw -n __fish_use_subcommand -a uninstall -d 'Uninstall service and data'
 complete -c rsclaw -n __fish_use_subcommand -a webhooks -d 'Webhook helpers'
 "#

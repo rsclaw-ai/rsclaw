@@ -331,7 +331,7 @@ pub enum Command {
         query: Vec<String>,
     },
 
-    /// Generate iOS pairing QR code.
+    /// Generate app pairing QR code.
     Qr(QrArgs),
 
     /// Migrate data from OpenClaw to rsclaw.
