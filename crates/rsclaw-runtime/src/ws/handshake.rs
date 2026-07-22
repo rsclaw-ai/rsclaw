@@ -607,7 +607,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state.ws_conns.unregister(&conn_id).await;
     info!("ws: connection {conn_id} disconnected");
     drop(outbound_tx);
-    let _ = write_task.await; // task cleanup, result irrelevant
+    // Abort (not await) the write task. On drain the socket is still open
+    // (client connected), so awaiting would hang forever — the spawned relay
+    // tasks keep feeding outbound_rx and never exit on their own. Aborting
+    // drops write_half (closing the socket) and outbound_rx (closing the
+    // channel, which makes the relay tasks' sends fail so they exit). This
+    // lets the axum connection close promptly during graceful shutdown.
+    write_task.abort();
 }
 
 // ---------------------------------------------------------------------------

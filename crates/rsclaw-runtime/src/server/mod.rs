@@ -2913,9 +2913,11 @@ async fn computer_use_stream_sse(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut permission_rx = state.computer_permission_tx.subscribe();
     let mut status_rx = state.computer_status_tx.subscribe();
+    let shutdown_for_stream = state.shutdown.clone();
     let stream = async_stream::stream! {
         loop {
             tokio::select! {
+                () = shutdown_for_stream.notified() => break,
                 result = permission_rx.recv() => {
                     match result {
                         Ok(req) => {
@@ -4115,21 +4117,24 @@ async fn stream_sse(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.event_bus.subscribe();
     let session_filter = params.session_id;
+    let shutdown_for_stream = state.shutdown.clone();
 
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |msg| {
-        let session_filter = session_filter.clone();
-        async move {
-            let event = msg.ok()?;
-            if session_filter
-                .as_ref()
-                .is_some_and(|id| &event.session_id != id)
-            {
-                return None;
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
+        .filter_map(move |msg| {
+            let session_filter = session_filter.clone();
+            async move {
+                let event = msg.ok()?;
+                if session_filter
+                    .as_ref()
+                    .is_some_and(|id| &event.session_id != id)
+                {
+                    return None;
+                }
+                let data = serde_json::to_string(&event).ok()?;
+                Some(Ok(Event::default().data(data)))
             }
-            let data = serde_json::to_string(&event).ok()?;
-            Some(Ok(Event::default().data(data)))
-        }
-    });
+        })
+        .take_until(Box::pin(async move { shutdown_for_stream.notified().await }));
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()
