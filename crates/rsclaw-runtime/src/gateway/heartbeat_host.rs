@@ -32,7 +32,7 @@ impl rsclaw_heartbeat::HeartbeatHost for RuntimeHeartbeatHost {
         agent_id: &str,
     ) -> Option<Arc<rsclaw_provider::registry::ProviderRegistry>> {
         let h = self.registry.get(agent_id).ok()?;
-        Some(h.providers.clone())
+        Some(h.providers_snapshot())
     }
 
     fn agent_workspace(&self, agent_id: &str) -> Option<String> {

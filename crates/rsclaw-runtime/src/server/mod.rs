@@ -248,8 +248,8 @@ pub struct AppState {
     /// written by every `FailoverManager` in the gateway. See
     /// `provider::health::ProviderHealthRegistry`.
     pub model_health: rsclaw_provider::health::ProviderHealthRegistry,
-    /// Provider registry — needed by `/api/v1/reload` to re-load plugins.
-    pub providers: Arc<rsclaw_provider::registry::ProviderRegistry>,
+    /// Provider registry — swappable via `/api/v1/reload --scope providers`.
+    pub providers: Arc<tokio::sync::RwLock<Arc<rsclaw_provider::registry::ProviderRegistry>>>,
     /// Shared WASM browser session — needed by `/api/v1/reload` for plugin host functions.
     pub wasm_browser: Arc<tokio::sync::Mutex<Option<rsclaw_browser::BrowserSession>>>,
     /// H1: per-IP rate limiter for inbound HTTP requests.
@@ -1784,7 +1784,7 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
     let (providers_active, providers_disabled): (Vec<String>, Vec<serde_json::Value>) =
         match state.agents.all().first() {
             Some(agent) => {
-                let regs = &agent.providers;
+                let regs = agent.providers_snapshot();
                 let active: Vec<String> = regs.names().into_iter().map(str::to_owned).collect();
                 let disabled: Vec<serde_json::Value> = regs
                     .disabled_list()
@@ -1838,6 +1838,7 @@ async fn http_reload(
         .unwrap_or_else(|| "all".to_owned());
     let reload_skills = scope.contains("all") || scope.contains("skill");
     let reload_plugins = scope.contains("all") || scope.contains("plugin");
+    let reload_providers = scope.contains("all") || scope.contains("provider");
     let reload_mcp = scope.contains("all") || scope.contains("mcp");
 
     // Re-load config from disk to pick up any changes.
@@ -1883,12 +1884,13 @@ async fn http_reload(
     if reload_plugins {
         let base_dir = rsclaw_config::loader::base_dir();
         let plugins_dir = base_dir.join("plugins");
+        let providers_snapshot = state.providers.read().await.clone();
         match rsclaw_plugin::load_all_plugins(
             &plugins_dir,
             fresh_config.ext.plugins.as_ref(),
             Arc::clone(&state.wasm_browser),
             Some(state.notification_tx.clone()),
-            Some(Arc::clone(&state.providers)),
+            Some(providers_snapshot),
             None,
         )
         .await
@@ -1935,6 +1937,24 @@ async fn http_reload(
                 tracing::warn!(error = %e, "hot-reload: plugin reload failed");
             }
         }
+    }
+
+    // --- Providers: rebuild registry from config and swap into all handles ---
+    if reload_providers {
+        let new_registry = Arc::new(rsclaw_provider::build::build_providers(&fresh_config));
+        let provider_count = new_registry.names().len();
+        {
+            let mut guard = state.providers.write().await;
+            *guard = Arc::clone(&new_registry);
+        }
+        for handle in state.agents.all() {
+            handle.set_providers(Arc::clone(&new_registry));
+        }
+        details.insert(
+            "providers".to_owned(),
+            serde_json::json!({"reloaded": true, "count": provider_count}),
+        );
+        tracing::info!(provider_count, "hot-reload: providers rebuilt");
     }
 
     // --- MCP: kill all existing servers and re-spawn from config ---

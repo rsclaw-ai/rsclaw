@@ -1045,7 +1045,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         knowledge: knowledge_svc,
         memory: memory.clone(),
         model_health: model_health.clone(),
-        providers: Arc::clone(&providers),
+        providers: Arc::new(tokio::sync::RwLock::new(Arc::clone(&providers))),
         wasm_browser: Arc::clone(&wasm_browser),
         rate_limiter: Arc::new(crate::server::RateLimiter::new()),
     };

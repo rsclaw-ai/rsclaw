@@ -2304,6 +2304,9 @@ impl AgentRuntime {
         // Refresh WASM plugins from the handle's shared slot so hot-reload
         // (rsclaw gateway reload --scope plugins) takes effect next turn.
         self.wasm_plugins = self.handle.wasm_plugins_snapshot();
+        // Refresh providers from the handle's shared slot so hot-reload
+        // (rsclaw gateway reload --scope providers) takes effect next turn.
+        self.providers = self.handle.providers_snapshot();
 
         // Resolve @file references (e.g. @up_i_202604271325ab.png → full path
         // under workspace/uploads/, @dl_v_... → ~/Downloads/rsclaw/videos/).

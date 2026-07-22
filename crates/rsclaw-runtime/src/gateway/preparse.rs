@@ -3,6 +3,8 @@
 //! Functions here handle commands like `/ls`, `/status`, `/version`, `/btw`
 //! without going through the LLM agent loop.
 
+use std::sync::Arc;
+
 use futures::StreamExt as _;
 use rsclaw_agent::{
     LiveStatus,
@@ -2140,9 +2142,14 @@ fn task_help_text(lang: &str) -> String {
 pub(crate) async fn btw_direct_call(
     question: &str,
     live_status: &tokio::sync::RwLock<LiveStatus>,
-    providers: &ProviderRegistry,
+    providers: &Arc<std::sync::RwLock<Arc<ProviderRegistry>>>,
     config: &RuntimeConfig,
 ) -> Option<String> {
+    // Snapshot the provider registry (hot-swappable via rsclaw reload).
+    let providers: Arc<ProviderRegistry> = providers
+        .read()
+        .map(|g| Arc::clone(&g))
+        .unwrap_or_else(|_| Arc::new(ProviderRegistry::new()));
     // 1. Read live status.
     let status_block = {
         let status = live_status.read().await;
@@ -2218,7 +2225,7 @@ pub(crate) async fn btw_direct_call(
         rsclaw_provider::health::ProviderHealthRegistry::new(),
     );
 
-    let mut stream = match failover.call(req, providers).await {
+    let mut stream = match failover.call(req, &providers).await {
         Ok(s) => s,
         Err(e) => {
             warn!("/btw direct LLM call failed: {e:#}");

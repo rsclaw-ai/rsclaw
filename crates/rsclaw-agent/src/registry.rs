@@ -47,7 +47,9 @@ pub struct AgentHandle {
     /// Shared live status for /btw parallel queries.
     pub live_status: Arc<RwLock<crate::runtime::LiveStatus>>,
     /// Provider registry for direct LLM calls (used by /btw bypass).
-    pub providers: Arc<rsclaw_provider::registry::ProviderRegistry>,
+    /// Swappable shared slot so `rsclaw reload --scope providers` can hot-swap
+    /// the registry; all handles share the same slot.
+    pub providers: Arc<std::sync::RwLock<Arc<rsclaw_provider::registry::ProviderRegistry>>>,
     /// Per-session abort flags: session_key -> atomic abort flag.
     /// Uses std::sync::RwLock (not tokio) so it can be accessed in Drop impls.
     ///
@@ -151,6 +153,21 @@ impl AgentHandle {
             .read()
             .map(|g| Arc::clone(&g))
             .unwrap_or_else(|_| Arc::new(Vec::new()))
+    }
+
+    /// Replace the provider registry visible to this handle (hot-reload).
+    pub fn set_providers(&self, providers: Arc<rsclaw_provider::registry::ProviderRegistry>) {
+        if let Ok(mut g) = self.providers.write() {
+            *g = providers;
+        }
+    }
+
+    /// Return the current provider registry snapshot.
+    pub fn providers_snapshot(&self) -> Arc<rsclaw_provider::registry::ProviderRegistry> {
+        self.providers
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_else(|_| Arc::new(rsclaw_provider::registry::ProviderRegistry::new()))
     }
 
     /// Set the outbound notification sender visible to slash handlers.
@@ -351,7 +368,7 @@ impl AgentHandle {
         let mut lines = vec![format!("Current model: {}", self.effective_model)];
         lines.push(String::new());
         lines.push("Registered providers:".to_owned());
-        for name in self.providers.names() {
+        for name in self.providers_snapshot().names() {
             lines.push(format!("  {name}"));
         }
         lines.join("\n")
@@ -813,7 +830,7 @@ impl AgentRegistry {
                     tx,
                     concurrency: Arc::new(tokio::sync::Semaphore::new(permits)),
                     live_status: Arc::new(RwLock::new(crate::runtime::LiveStatus::default())),
-                    providers: Arc::clone(&providers),
+                    providers: Arc::new(std::sync::RwLock::new(Arc::clone(&providers))),
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     cancel_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     plugin_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
