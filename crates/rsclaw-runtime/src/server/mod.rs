@@ -2016,6 +2016,10 @@ async fn http_reload(
             let tq = Arc::clone(&state.task_queue);
             let sd = state.shutdown.clone();
 
+            if !is_running("telegram") {
+                start_telegram_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                added.push("telegram");
+            }
             if !is_running("discord") {
                 start_discord_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
                 added.push("discord");
@@ -2081,21 +2085,21 @@ async fn http_reload(
         );
     }
 
-    // --- Agents: diff config vs registry, spawn new / remove old ---
+    // --- Agents: diff config vs registry, spawn new / remove old / restart changed ---
     let reload_agents = scope.contains("all") || scope.contains("agent");
     if reload_agents {
-        let config_agents = fresh_config
+        let config_entries = fresh_config
             .raw
             .agents
             .as_ref()
             .and_then(|a| a.list.as_ref())
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|e| e.id.clone())
-                    .collect::<std::collections::HashSet<_>>()
-            })
+            .cloned()
             .unwrap_or_default();
+
+        let config_agents: std::collections::HashSet<String> = config_entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
 
         let running_agents: std::collections::HashSet<String> = state
             .agents
@@ -2106,17 +2110,36 @@ async fn http_reload(
 
         let mut spawned_ids = Vec::new();
         let mut removed_ids = Vec::new();
+        let mut restarted_ids = Vec::new();
+
+        // Detect agents whose model or system prompt changed → remove + re-spawn.
+        for entry in &config_entries {
+            if running_agents.contains(&entry.id) {
+                if let Ok(handle) = state.agents.get(&entry.id) {
+                    let model_changed = serde_json::to_value(&handle.config.model).unwrap_or_default()
+                        != serde_json::to_value(&entry.model).unwrap_or_default();
+                    let system_changed = handle.config.system != entry.system;
+                    if model_changed || system_changed {
+                        // Cancel in-flight turns.
+                        if let Ok(tokens) = handle.cancel_tokens.read() {
+                            for (_sk, tok) in tokens.iter() {
+                                tok.cancel();
+                            }
+                        }
+                        state.agents.remove_handle(&entry.id);
+                        match state.agent_spawner.spawn_agent(entry.clone()) {
+                            Ok(id) => restarted_ids.push(id),
+                            Err(e) => {
+                                tracing::warn!(agent = %entry.id, error = %e, "hot-reload: agent re-spawn failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Spawn new agents that are in config but not running.
-        for entry in fresh_config
-            .raw
-            .agents
-            .as_ref()
-            .and_then(|a| a.list.as_ref())
-            .map(|e| e.iter())
-            .into_iter()
-            .flatten()
-        {
+        for entry in &config_entries {
             if !running_agents.contains(&entry.id) {
                 match state.agent_spawner.spawn_agent(entry.clone()) {
                     Ok(id) => {
@@ -2132,7 +2155,6 @@ async fn http_reload(
         // Remove agents that are running but no longer in config.
         for id in &running_agents {
             if !config_agents.contains(id) {
-                // Cancel in-flight turns for this agent.
                 if let Ok(handle) = state.agents.get(id) {
                     if let Ok(tokens) = handle.cancel_tokens.read() {
                         for (_sk, tok) in tokens.iter() {
@@ -2145,10 +2167,11 @@ async fn http_reload(
             }
         }
 
-        if !spawned_ids.is_empty() || !removed_ids.is_empty() {
+        if !spawned_ids.is_empty() || !removed_ids.is_empty() || !restarted_ids.is_empty() {
             tracing::info!(
                 spawned = ?spawned_ids,
                 removed = ?removed_ids,
+                restarted = ?restarted_ids,
                 "hot-reload: agents updated"
             );
         }
@@ -2158,6 +2181,7 @@ async fn http_reload(
                 "reloaded": true,
                 "spawned": spawned_ids,
                 "removed": removed_ids,
+                "restarted": restarted_ids,
             }),
         );
     }

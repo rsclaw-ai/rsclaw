@@ -257,10 +257,12 @@ fn strip_live_fields(v: &mut serde_json::Value) {
         if let Some(list) = agents.get_mut("list").and_then(|l| l.as_array_mut()) {
             for entry in list {
                 if let Some(obj) = entry.as_object_mut() {
-                    // Per-agent overrides — only `temperature` exists on
-                    // AgentEntry, the other defaults aren't overridable
-                    // per-agent.
-                    obj.remove("temperature");
+                    // Per-agent overrides — hot-reloadable via
+                    // `rsclaw reload --scope agents` (remove + re-spawn).
+                    // KV-cache invalidates on model change anyway.
+                    for key in ["temperature", "model", "flashModel", "system"] {
+                        obj.remove(key);
+                    }
                 }
             }
         }
