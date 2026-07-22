@@ -176,6 +176,14 @@ pub enum Command {
     #[command(hide = true)]
     Restart,
 
+    /// Alias for `gateway reload`.
+    #[command(hide = true)]
+    Reload {
+        /// What to reload: plugins, skills, mcp, channels, agents (default: all).
+        #[arg(long, value_delimiter = ',')]
+        scope: Option<Vec<String>>,
+    },
+
     /// Channel management sub-commands.
     #[command(subcommand)]
     Channels(ChannelsCommand),

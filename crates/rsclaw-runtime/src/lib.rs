@@ -286,6 +286,9 @@ pub async fn run() -> Result<()> {
         Command::Start => cmd_gateway(rsclaw_cli::GatewayCommand::Start).await,
         Command::Stop => cmd_gateway(rsclaw_cli::GatewayCommand::Stop).await,
         Command::Restart => cmd_gateway(rsclaw_cli::GatewayCommand::Restart).await,
+        Command::Reload { scope } => {
+            cmd_gateway(rsclaw_cli::GatewayCommand::Reload { scope }).await
+        }
         Command::Channels(sub) => cmd_channels(sub).await,
         Command::Agents(sub) => cmd_agents(sub).await,
         Command::Models(sub) => cmd_models(sub).await,
