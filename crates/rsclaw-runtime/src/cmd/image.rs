@@ -15,13 +15,13 @@ pub async fn cmd_image(sub: ImageCommand) -> Result<()> {
     match sub {
         ImageCommand::Vision(args) => {
             let data_uri = image_to_data_uri(&args.path)?;
-            let model = args.model.as_deref().unwrap_or("rsclaw-vision-v1");
+            let model = resolve_vision_model(args.model.as_deref())?;
             let prompt = args
                 .prompt
                 .as_deref()
                 .unwrap_or("Describe this image in detail.");
 
-            let result = vision_describe(&data_uri, model, prompt, args.max_tokens).await?;
+            let result = vision_describe(&data_uri, &model, prompt, args.max_tokens).await?;
             println!("{result}");
         }
         ImageCommand::Ocr(args) => {
@@ -103,6 +103,28 @@ async fn vision_describe(
         .or_else(|| resp.pointer("/choices/0/message/content").and_then(|v| v.as_str()))
         .context("vision response missing `content`")?;
     Ok(content.to_owned())
+}
+
+/// Resolve the vision model: --model flag, then agents.defaults.model.vision,
+/// then the rsclaw fleet default.
+fn resolve_vision_model(cli_model: Option<&str>) -> Result<String> {
+    if let Some(m) = cli_model {
+        return Ok(m.to_owned());
+    }
+    // Try config: agents.defaults.model.vision
+    if let Ok(cfg) = rsclaw_config::load() {
+        if let Some(head) = cfg
+            .raw
+            .agents
+            .as_ref()
+            .and_then(|a| a.defaults.as_ref())
+            .and_then(|d| d.model.as_ref())
+            .and_then(|m| m.vision_head())
+        {
+            return Ok(head.to_owned());
+        }
+    }
+    Ok(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned())
 }
 
 /// Resolve fleet base URL for vision, mirroring OcrClient's logic.
