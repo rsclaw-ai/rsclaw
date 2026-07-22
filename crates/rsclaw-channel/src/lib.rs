@@ -643,6 +643,10 @@ use rsclaw_platform::MemoryTier;
 
 pub struct ChannelManager {
     channels: std::sync::RwLock<HashMap<String, Arc<dyn Channel>>>,
+    /// Per-channel cancellation tokens keyed by registration name. A channel's
+    /// run/outbound tasks select on their token; firing it (via `unregister`
+    /// or `cancel_channel`) stops them gracefully during hot-reload removal.
+    cancel_tokens: std::sync::RwLock<HashMap<String, tokio_util::sync::CancellationToken>>,
     tier: MemoryTier,
 }
 
@@ -650,7 +654,33 @@ impl ChannelManager {
     pub fn new(tier: MemoryTier) -> Self {
         Self {
             channels: std::sync::RwLock::new(HashMap::new()),
+            cancel_tokens: std::sync::RwLock::new(HashMap::new()),
             tier,
+        }
+    }
+
+    /// Mint and register a cancellation token for a channel registration name.
+    /// The channel's run/outbound tasks should select on the returned token so
+    /// they stop gracefully when the channel is unregistered.
+    pub fn register_cancel_token(&self, name: &str) -> tokio_util::sync::CancellationToken {
+        let tok = tokio_util::sync::CancellationToken::new();
+        self.cancel_tokens
+            .write()
+            .expect("ChannelManager cancel_tokens lock poisoned")
+            .insert(name.to_owned(), tok.clone());
+        tok
+    }
+
+    /// Fire (and drop) the cancellation token for a channel name, stopping its
+    /// run/outbound tasks. No-op if no token is registered.
+    pub fn cancel_channel(&self, name: &str) {
+        if let Some(tok) = self
+            .cancel_tokens
+            .write()
+            .expect("ChannelManager cancel_tokens lock poisoned")
+            .remove(name)
+        {
+            tok.cancel();
         }
     }
 
@@ -710,7 +740,10 @@ impl ChannelManager {
     }
 
     /// Remove a channel by name. Returns the removed channel if it existed.
+    /// Also fires the channel's cancellation token so its run/outbound tasks
+    /// stop gracefully (not just the routing entry).
     pub fn unregister(&self, name: &str) -> Option<Arc<dyn Channel>> {
+        self.cancel_channel(name);
         self.channels.write().expect("ChannelManager lock poisoned").remove(name)
     }
 

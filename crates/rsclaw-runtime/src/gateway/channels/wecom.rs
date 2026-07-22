@@ -418,8 +418,11 @@ pub(crate) fn start_wecom_if_configured(
 
         let wecom = Arc::new(WeComChannel::new(bot_id, secret, ws_url, on_message));
 
+        let chan_name = format!("wecom/{}", acct_for_log);
+        let cancel_token = manager.register_cancel_token(&chan_name);
+        let cancel_for_out = cancel_token.clone();
         if let Err(e) = manager.register_with_name(
-            format!("wecom/{}", acct_for_log),
+            chan_name,
             Arc::clone(&wecom) as Arc<dyn rsclaw_channel::Channel>,
         ) {
             tracing::warn!("failed to register channel: {e}");
@@ -431,6 +434,10 @@ pub(crate) fn start_wecom_if_configured(
                 tokio::select! {
                     () = shutdown_for_out.notified() => {
                         info!("wecom: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    () = cancel_for_out.cancelled() => {
+                        info!("wecom: channel cancelled, stopping outbound sender");
                         break;
                     }
                     msg = out_rx.recv() => {
@@ -458,6 +465,9 @@ pub(crate) fn start_wecom_if_configured(
                 }
                 () = shutdown_for_run.notified() => {
                     info!("wecom: drain signaled, stopping run loop");
+                }
+                () = cancel_token.cancelled() => {
+                    info!("wecom: channel cancelled, stopping run loop");
                 }
             }
         });

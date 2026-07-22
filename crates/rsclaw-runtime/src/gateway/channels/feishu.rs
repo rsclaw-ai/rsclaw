@@ -672,6 +672,7 @@ pub(crate) fn start_feishu_if_configured(
         {
             tracing::warn!("failed to register bare `feishu` channel: {e}");
         }
+        let cancel_token = manager.register_cancel_token(&acct_key);
 
         // Outbound throughput engine: hash-partitioned concurrent workers.
         //
@@ -704,12 +705,17 @@ pub(crate) fn start_feishu_if_configured(
             worker_txs.push(wtx);
             let fs_send = Arc::clone(&fs);
             let shutdown_w = shutdown.clone();
+            let cancel_w = cancel_token.clone();
             tokio::spawn(async move {
                 let mut last_send: Option<std::time::Instant> = None;
                 loop {
                     tokio::select! {
                         () = shutdown_w.notified() => {
                             info!(worker = w, "feishu: drain signaled, stopping outbound worker");
+                            break;
+                        }
+                        () = cancel_w.cancelled() => {
+                            info!(worker = w, "feishu: channel cancelled, stopping outbound worker");
                             break;
                         }
                         msg = wrx.recv() => {
@@ -731,12 +737,17 @@ pub(crate) fn start_feishu_if_configured(
         }
 
         let shutdown_for_out = shutdown.clone();
+        let cancel_for_out = cancel_token.clone();
         tokio::spawn(async move {
             use std::hash::{Hash, Hasher};
             loop {
                 tokio::select! {
                     () = shutdown_for_out.notified() => {
                         info!("feishu: drain signaled, stopping outbound dispatcher");
+                        break;
+                    }
+                    () = cancel_for_out.cancelled() => {
+                        info!("feishu: channel cancelled, stopping outbound dispatcher");
                         break;
                     }
                     msg = out_rx.recv() => {
@@ -764,6 +775,9 @@ pub(crate) fn start_feishu_if_configured(
                 }
                 () = shutdown_for_run.notified() => {
                     info!("feishu: drain signaled, stopping run loop");
+                }
+                () = cancel_token.cancelled() => {
+                    info!("feishu: channel cancelled, stopping run loop");
                 }
             }
         });

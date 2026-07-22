@@ -512,8 +512,10 @@ pub(crate) fn start_wechat_personal_if_configured(
         {
             tracing::warn!("failed to register bare `wechat` channel: {e}");
         }
+        let cancel_token = manager.register_cancel_token(&acct_key);
         let wc_send = Arc::clone(&wc);
         let shutdown_for_outbound = shutdown.clone();
+        let cancel_for_out = cancel_token.clone();
 
         tokio::spawn(async move {
             debug!("wechat: outbound sender task started");
@@ -524,10 +526,15 @@ pub(crate) fn start_wechat_personal_if_configured(
             let mut last_send: std::collections::HashMap<String, std::time::Instant> =
                 std::collections::HashMap::new();
             const PER_TARGET_INTERVAL: std::time::Duration = std::time::Duration::from_millis(3000);
+            let cancel_for_throttle = cancel_for_out.clone();
             loop {
                 tokio::select! {
                     () = shutdown_for_outbound.notified() => {
                         info!("wechat: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    () = cancel_for_out.cancelled() => {
+                        info!("wechat: channel cancelled, stopping outbound sender");
                         break;
                     }
                     msg = out_rx.recv() => {
@@ -539,6 +546,10 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 _ = tokio::time::sleep(wait) => {}
                                 () = shutdown_for_outbound.notified() => {
                                     info!("wechat: drain during throttle wait, dropping message");
+                                    break;
+                                }
+                                () = cancel_for_throttle.cancelled() => {
+                                    info!("wechat: channel cancelled during throttle wait, dropping message");
                                     break;
                                 }
                             }
@@ -566,6 +577,9 @@ pub(crate) fn start_wechat_personal_if_configured(
                 }
                 () = shutdown_for_poll.notified() => {
                     info!("wechat: drain signaled, stopping long-poll loop");
+                }
+                () = cancel_token.cancelled() => {
+                    info!("wechat: channel cancelled, stopping long-poll loop");
                 }
             }
         });

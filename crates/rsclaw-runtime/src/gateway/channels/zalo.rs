@@ -388,11 +388,18 @@ pub(crate) fn start_zalo_if_configured(
         }
         let zalo_send = Arc::clone(&zalo);
         let shutdown_for_out = shutdown.clone();
+        let chan_name = zalo.name().to_owned();
+        let cancel_token = manager.register_cancel_token(&chan_name);
+        let cancel_for_out = cancel_token.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = shutdown_for_out.notified() => {
                         info!("zalo: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    () = cancel_for_out.cancelled() => {
+                        info!("zalo: channel cancelled, stopping outbound sender");
                         break;
                     }
                     msg = out_rx.recv() => {
@@ -417,6 +424,9 @@ pub(crate) fn start_zalo_if_configured(
                 }
                 () = shutdown_for_run.notified() => {
                     info!("zalo: drain signaled, stopping run loop");
+                }
+                () = cancel_token.cancelled() => {
+                    info!("zalo: channel cancelled, stopping run loop");
                 }
             }
         });

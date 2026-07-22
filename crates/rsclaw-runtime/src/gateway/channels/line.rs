@@ -435,11 +435,18 @@ pub(crate) fn start_line_if_configured(
         }
         let line_send = Arc::clone(&line);
         let shutdown_for_out = shutdown.clone();
+        let chan_name = line.name().to_owned();
+        let cancel_token = manager.register_cancel_token(&chan_name);
+        let cancel_for_out = cancel_token.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = shutdown_for_out.notified() => {
                         info!("line: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    () = cancel_for_out.cancelled() => {
+                        info!("line: channel cancelled, stopping outbound sender");
                         break;
                     }
                     msg = out_rx.recv() => {
@@ -464,6 +471,9 @@ pub(crate) fn start_line_if_configured(
                 }
                 () = shutdown_for_run.notified() => {
                     info!("line: drain signaled, stopping run loop");
+                }
+                () = cancel_token.cancelled() => {
+                    info!("line: channel cancelled, stopping run loop");
                 }
             }
         });

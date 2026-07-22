@@ -414,11 +414,18 @@ fn start_custom_webhook(
 
     let ch_send = Arc::clone(&ch);
     let shutdown_for_out = shutdown.clone();
+    let chan_name = ch.name().to_owned();
+    let cancel_token = manager.register_cancel_token(&chan_name);
+    let cancel_for_out = cancel_token.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 () = shutdown_for_out.notified() => {
-                    info!("custom webhook: drain signaled, stopping outbound sender");
+                    info!("custom: drain signaled, stopping outbound sender");
+                    break;
+                }
+                () = cancel_for_out.cancelled() => {
+                    info!("custom: channel cancelled, stopping outbound sender");
                     break;
                 }
                 msg = out_rx.recv() => {
@@ -443,7 +450,10 @@ fn start_custom_webhook(
                 }
             }
             () = shutdown_for_run.notified() => {
-                info!("custom webhook: drain signaled, stopping run loop");
+                info!("custom: drain signaled, stopping run loop");
+            }
+            () = cancel_token.cancelled() => {
+                info!("custom: channel cancelled, stopping run loop");
             }
         }
     });

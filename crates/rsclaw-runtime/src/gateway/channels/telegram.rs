@@ -445,12 +445,19 @@ pub(crate) fn start_telegram_if_configured(
         let tg = Arc::new(TelegramChannel::new(token, api_base, on_message));
         let tg_send = Arc::clone(&tg);
         let shutdown_for_out = shutdown.clone();
+        let chan_name = format!("telegram/{}", acct_for_log);
+        let cancel_token = manager.register_cancel_token(&chan_name);
+        let cancel_for_out = cancel_token.clone();
 
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = shutdown_for_out.notified() => {
                         info!("telegram: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    () = cancel_for_out.cancelled() => {
+                        info!("telegram: channel cancelled, stopping outbound sender");
                         break;
                     }
                     msg = out_rx.recv() => {
@@ -464,7 +471,7 @@ pub(crate) fn start_telegram_if_configured(
         });
 
         if let Err(e) = manager.register_with_name(
-            format!("telegram/{}", acct_for_log),
+            chan_name,
             Arc::clone(&tg) as Arc<dyn Channel>,
         ) {
             tracing::warn!("failed to register channel: {e}");
@@ -479,6 +486,9 @@ pub(crate) fn start_telegram_if_configured(
                 }
                 () = shutdown_for_run.notified() => {
                     info!("telegram: drain signaled, stopping run loop");
+                }
+                () = cancel_token.cancelled() => {
+                    info!("telegram: channel cancelled, stopping run loop");
                 }
             }
         });

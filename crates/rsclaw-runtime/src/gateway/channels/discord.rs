@@ -508,11 +508,18 @@ pub(crate) fn start_discord_if_configured(
         ));
         let dc_send = Arc::clone(&dc);
         let shutdown_for_out = shutdown.clone();
+        let chan_name = dc.name().to_owned();
+        let cancel_token = manager.register_cancel_token(&chan_name);
+        let cancel_for_out = cancel_token.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = shutdown_for_out.notified() => {
                         info!("discord: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    () = cancel_for_out.cancelled() => {
+                        info!("discord: channel cancelled, stopping outbound sender");
                         break;
                     }
                     msg = out_rx.recv() => {
@@ -537,6 +544,9 @@ pub(crate) fn start_discord_if_configured(
                 }
                 () = shutdown_for_run.notified() => {
                     info!("discord: drain signaled, stopping run loop");
+                }
+                () = cancel_token.cancelled() => {
+                    info!("discord: channel cancelled, stopping run loop");
                 }
             }
         });
