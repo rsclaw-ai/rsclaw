@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, OutboundMessage};
+use rsclaw_config::runtime::RuntimeConfig;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -8,9 +11,6 @@ use super::{
     default_dm_scope,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, OutboundMessage};
-use rsclaw_config::runtime::RuntimeConfig;
 
 // ---------------------------------------------------------------------------
 // QQ Official Bot (QQ机器人)
@@ -291,7 +291,11 @@ pub(crate) fn start_qq_if_configured(
                         let target_id = target_id.clone();
                         let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route_account("qq", Some(&w_acct_btw)).or_else(|_| reg.route_account("qq", None)).or_else(|_| reg.default_agent()) {
+                            let handle = match reg
+                                .route_account("qq", Some(&w_acct_btw))
+                                .or_else(|_| reg.route_account("qq", None))
+                                .or_else(|_| reg.default_agent())
+                            {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -332,7 +336,11 @@ pub(crate) fn start_qq_if_configured(
                         let target_id = target_id.clone();
                         let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route_account("qq", Some(&w_acct_pp)).or_else(|_| reg.route_account("qq", None)).or_else(|_| reg.default_agent()) {
+                            let handle = match reg
+                                .route_account("qq", Some(&w_acct_pp))
+                                .or_else(|_| reg.route_account("qq", None))
+                                .or_else(|_| reg.default_agent())
+                            {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -345,7 +353,9 @@ pub(crate) fn start_qq_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
+                                    MessageKind::DirectMessage {
+                                        account_id: Some(w_acct_pp.clone()),
+                                    }
                                 },
                                 channel: "qq".to_string(),
                                 peer_id: sender_id.clone(),
@@ -440,7 +450,10 @@ pub(crate) fn start_qq_if_configured(
             qq_token_url.clone(),
         ));
 
-        if let Err(e) = manager.register_with_name(format!("qq/{}", acct_for_log), Arc::clone(&qq) as Arc<dyn rsclaw_channel::Channel>) {
+        if let Err(e) = manager.register_with_name(
+            format!("qq/{}", acct_for_log),
+            Arc::clone(&qq) as Arc<dyn rsclaw_channel::Channel>,
+        ) {
             tracing::warn!("failed to register channel: {e}");
         }
         let qq_send = Arc::clone(&qq);

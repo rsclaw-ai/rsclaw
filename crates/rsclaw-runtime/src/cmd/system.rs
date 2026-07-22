@@ -1,11 +1,11 @@
 use anyhow::Result;
+use rsclaw_cli::{HeartbeatCommand, SystemCommand};
+use rsclaw_config as config;
 
 use super::{
     config_json::{load_config_json, set_nested_value},
     style::*,
 };
-use rsclaw_cli::{HeartbeatCommand, SystemCommand};
-use rsclaw_config as config;
 
 pub async fn cmd_system(sub: SystemCommand) -> Result<()> {
     match sub {

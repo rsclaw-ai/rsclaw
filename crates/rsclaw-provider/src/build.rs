@@ -4,9 +4,9 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use rsclaw_config::runtime::RuntimeConfig;
 use tracing::info;
 
-use rsclaw_config::runtime::RuntimeConfig;
 use crate::{
     LlmProvider,
     anthropic::{self as anthropic, AnthropicProvider},
@@ -146,8 +146,7 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                 }
                 (_, &rsclaw_config::schema::ApiFormat::OpenAiResponses) => {
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
-                    let url = base_url
-                        .unwrap_or_else(|| crate::openai::OPENAI_API_BASE.to_owned());
+                    let url = base_url.unwrap_or_else(|| crate::openai::OPENAI_API_BASE.to_owned());
                     Arc::new(OpenAiProvider::responses_with_ua(url, key, user_agent))
                 }
                 (_, &rsclaw_config::schema::ApiFormat::Rsclaw) => {
@@ -163,8 +162,8 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                         .or_else(|| std::env::var("RSCLAW_KEY").ok())
                         .or_else(|| std::env::var("RSCLAW_SERVER_KEY").ok())
                         .filter(|s| !s.is_empty());
-                    let url = base_url
-                        .unwrap_or_else(|| crate::rsclaw::RSCLAW_DEFAULT_BASE.to_owned());
+                    let url =
+                        base_url.unwrap_or_else(|| crate::rsclaw::RSCLAW_DEFAULT_BASE.to_owned());
                     let provider = crate::rsclaw::RsclawProvider::new(url, key);
                     let provider = match provider_cfg.prefix_id.clone() {
                         Some(pid) => provider.with_prefix_id(pid),

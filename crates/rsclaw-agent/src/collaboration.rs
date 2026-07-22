@@ -245,8 +245,6 @@ pub(crate) async fn invoke_agent(
 #[cfg(test)]
 mod tests {
 
-    use super::*;
-    use crate::registry::AgentRegistry;
     use rsclaw_config::{
         runtime::{
             AgentsRuntime, ChannelRuntime, ExtRuntime, GatewayRuntime, ModelRuntime, OpsRuntime,
@@ -254,6 +252,9 @@ mod tests {
         },
         schema::{AgentEntry, BindMode, GatewayMode, ReloadMode, SessionConfig},
     };
+
+    use super::*;
+    use crate::registry::AgentRegistry;
 
     fn make_registry_with_echo(ids: &[&str]) -> AgentRegistry {
         // Build a minimal RuntimeConfig with stub agents.

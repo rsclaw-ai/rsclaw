@@ -841,7 +841,6 @@ pub async fn import_memories_to_store(
     mem_arc: &std::sync::Arc<tokio::sync::Mutex<rsclaw_memory::MemoryStore>>,
 ) -> Result<MemoryImportStats> {
     use rayon::prelude::*;
-
     use rsclaw_memory::MemoryDoc;
 
     let agents_dir = openclaw_dir.join("agents");
@@ -978,7 +977,6 @@ pub async fn import_workspace_memory(
     mem_arc: &std::sync::Arc<tokio::sync::Mutex<rsclaw_memory::MemoryStore>>,
 ) -> Result<MemoryImportStats> {
     use rayon::prelude::*;
-
     use rsclaw_memory::MemoryDoc;
 
     let mut sources: Vec<(String, String, String)> = Vec::new(); // (scope, kind, text)

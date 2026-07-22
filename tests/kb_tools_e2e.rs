@@ -69,7 +69,7 @@ fn search_ctx(fx: &Fixture) -> SearchCtx {
         index: fx.index.clone(),
         paths: fx.paths.clone(),
         embedder: fx.embedder.clone(),
-        reranker: None
+        reranker: None,
     }
 }
 

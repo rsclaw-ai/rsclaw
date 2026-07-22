@@ -12,10 +12,10 @@
 
 use anyhow::{Result, anyhow};
 use regex::RegexBuilder;
+use rsclaw_artifact::{ArtifactId, default_store};
 use serde_json::{Value, json};
 
 use super::runtime::{AgentRuntime, RunContext};
-use rsclaw_artifact::{ArtifactId, default_store};
 
 /// Apply `mode` to `full` text and return the selected slice.
 ///
@@ -394,9 +394,7 @@ impl AgentRuntime {
         // On the first chunk of content that won't fit in one page, prepend a
         // best-effort flash summary so the model can orient (and choose to
         // grep/query) instead of blindly paging.
-        let summary = if start_line == 0
-            && crate::context_mgr::estimate_tokens(&full) > budget
-        {
+        let summary = if start_line == 0 && crate::context_mgr::estimate_tokens(&full) > budget {
             self.artifact_summary(&ctx.session_key, &id, &full).await
         } else {
             None
@@ -477,7 +475,9 @@ impl AgentRuntime {
     /// needs `&mut`, which the tool dispatch can't give.
     async fn flash_summarize(&self, text: &str) -> Option<String> {
         use futures::StreamExt;
-        use rsclaw_provider::{AgentEndpoint, LlmRequest, Message, MessageContent, Role, StreamEvent};
+        use rsclaw_provider::{
+            AgentEndpoint, LlmRequest, Message, MessageContent, Role, StreamEvent,
+        };
 
         let flash_model = self.resolve_flash_model_name();
         let (provider_name, model_id) = self.providers.resolve_model(&flash_model);
@@ -579,9 +579,8 @@ impl AgentRuntime {
                         .enumerate()
                         .map(|(i, v)| (i, cosine(&q, v)))
                         .collect();
-                    scored.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    scored
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     scored
                 }
                 _ => substring_score(&chunks, query),
@@ -730,7 +729,10 @@ mod tests {
         let total_lines = text.lines().count();
         let (page, n, total) = paginate_to_budget(&text, 100);
         assert_eq!(total, total_lines);
-        assert!(n > 0 && n < total_lines, "expected a partial page, got {n}/{total_lines}");
+        assert!(
+            n > 0 && n < total_lines,
+            "expected a partial page, got {n}/{total_lines}"
+        );
         // Page must be a whole-line prefix (no mid-line cut) and within budget.
         assert!(text.starts_with(&page));
         assert!(page.ends_with(|c: char| c != '\n'));

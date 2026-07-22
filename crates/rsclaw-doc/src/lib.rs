@@ -475,7 +475,10 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
             continue;
         }
         let (text, size) = if let Some(stripped) = block.strip_prefix(HEADING_PREFIX) {
-            (stripped.trim_start_matches(HEADING_PREFIX).trim(), BODY_SIZE + 2.0)
+            (
+                stripped.trim_start_matches(HEADING_PREFIX).trim(),
+                BODY_SIZE + 2.0,
+            )
         } else {
             (block, BODY_SIZE)
         };

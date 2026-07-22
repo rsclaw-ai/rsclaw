@@ -1,5 +1,6 @@
-//! Native desktop session backed by `enigo` (input) + `rsclaw-platform::capture`
-//! (script-based screen capture + window enumeration; replaces xcap).
+//! Native desktop session backed by `enigo` (input) +
+//! `rsclaw-platform::capture` (script-based screen capture + window
+//! enumeration; replaces xcap).
 //!
 //! Input synthesis runs inside `tokio::task::spawn_blocking` with a fresh
 //! `Enigo` per call because `Enigo` is not `Send` on Windows. Screenshots
@@ -42,9 +43,11 @@ fn new_enigo() -> Result<Enigo, String> {
                 PROMPTED.call_once(|| {
                     let _ = crate::macos_perm::prompt_accessibility();
                 });
-                return format!("enigo init failed: {e} (macOS: a permission request was raised \
+                return format!(
+                    "enigo init failed: {e} (macOS: a permission request was raised \
                     — enable RsClaw under System Settings → Privacy & Security → \
-                    Accessibility AND Input Monitoring, then quit & reopen RsClaw)");
+                    Accessibility AND Input Monitoring, then quit & reopen RsClaw)"
+                );
             }
             #[cfg(not(target_os = "macos"))]
             " (check input permissions)"
@@ -117,14 +120,15 @@ fn capture_primary_monitor() -> Result<String, String> {
 /// viewer): when the child is open it is frontmost and gets captured;
 /// otherwise the main window does. A 200x200 minimum filters out tooltips and
 /// other tiny helper windows. Returns a PNG data URI.
-/// Find the frontmost on-screen window of an app (≥200×200) via the script-based
-/// window list. The list is front-to-back where the OS provides ordering, so the
-/// first match is frontmost — letting one call serve both the main window and a
-/// transient child (e.g. WeChat's merged-record viewer).
+/// Find the frontmost on-screen window of an app (≥200×200) via the
+/// script-based window list. The list is front-to-back where the OS provides
+/// ordering, so the first match is frontmost — letting one call serve both the
+/// main window and a transient child (e.g. WeChat's merged-record viewer).
 /// Virtual-screen rect (origin + size) via GetSystemMetrics — matches the area
-/// `capture_full_png` grabs (System.Windows.Forms.SystemInformation.VirtualScreen).
-/// Fast (no process spawn); used so the plugin's full-screen 0-1000 coords convert
-/// to correct screen pixels. SM_*VIRTUALSCREEN = 76..79.
+/// `capture_full_png` grabs
+/// (System.Windows.Forms.SystemInformation.VirtualScreen). Fast (no process
+/// spawn); used so the plugin's full-screen 0-1000 coords convert to correct
+/// screen pixels. SM_*VIRTUALSCREEN = 76..79.
 #[cfg(target_os = "windows")]
 fn virtual_screen_rect() -> (i32, i32, u32, u32) {
     unsafe extern "system" {
@@ -174,7 +178,10 @@ fn find_app_window(app_name: &str) -> Result<capture::WindowInfo, String> {
     };
     let matches = |w: &capture::WindowInfo| {
         let a = w.app.to_lowercase();
-        a == target || aliases.iter().any(|al| a.contains(al) || w.app.contains(al))
+        a == target
+            || aliases
+                .iter()
+                .any(|al| a.contains(al) || w.app.contains(al))
     };
     // WeChat's process owns several non-UI helper top-level windows (a tray-message
     // sink, IME hosts, a splash). They can be larger than the real chat window but
@@ -241,12 +248,13 @@ fn ocr_window(_app_name: &str) -> Result<String, String> {
     Err("ocr_window only implemented on macOS and Windows".to_string())
 }
 
-/// Maximise a window (by HWND) and force it to the foreground, even over another
-/// app (e.g. a stray File Explorer) — a background gateway process can't normally
-/// win SetForegroundWindow, so we AttachThreadInput to the current foreground
-/// thread first to bypass Windows' foreground lock. Maximising also guarantees the
-/// window is unoccluded for the CopyFromScreen region grab. CREATE_NO_WINDOW keeps
-/// the helper PowerShell from flashing a console.
+/// Maximise a window (by HWND) and force it to the foreground, even over
+/// another app (e.g. a stray File Explorer) — a background gateway process
+/// can't normally win SetForegroundWindow, so we AttachThreadInput to the
+/// current foreground thread first to bypass Windows' foreground lock.
+/// Maximising also guarantees the window is unoccluded for the CopyFromScreen
+/// region grab. CREATE_NO_WINDOW keeps the helper PowerShell from flashing a
+/// console.
 #[cfg(target_os = "windows")]
 fn focus_window(hwnd: u64) {
     use std::os::windows::process::CommandExt;
@@ -278,18 +286,25 @@ Add-Type $sig
         hwnd = hwnd
     );
     let mut cmd = Command::new("powershell");
-    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script]);
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &script,
+    ]);
     cmd.creation_flags(0x08000000);
     let _ = cmd.output();
 }
 
 /// Capture the WeChat window for OCR via a screen-region grab. WeChat 4.x's
 /// risk-control blanks PrintWindow (per-window) captures — they come back solid
-/// black — but a CopyFromScreen (GDI BitBlt) region grab of the window's on-screen
-/// rect is NOT blocked. We foreground + un-minimise the window first (CopyFromScreen
-/// captures whatever is displayed at those coords, so the window must be visible),
-/// then grab its rect. Returns the PNG plus the refreshed window bounds, so OCR maps
-/// hits to correct screen-absolute click points. macOS keeps its backing-store path.
+/// black — but a CopyFromScreen (GDI BitBlt) region grab of the window's
+/// on-screen rect is NOT blocked. We foreground + un-minimise the window first
+/// (CopyFromScreen captures whatever is displayed at those coords, so the
+/// window must be visible), then grab its rect. Returns the PNG plus the
+/// refreshed window bounds, so OCR maps hits to correct screen-absolute click
+/// points. macOS keeps its backing-store path.
 #[cfg(target_os = "windows")]
 fn wechat_region_capture(app_name: &str) -> Result<(Vec<u8>, capture::WindowInfo), String> {
     // IMPORTANT: do NOT programmatically focus / maximise / restore the window.
@@ -306,10 +321,10 @@ fn wechat_region_capture(app_name: &str) -> Result<(Vec<u8>, capture::WindowInfo
 }
 
 /// Heuristic: is a capture essentially blank (solid black / uniform)? WeChat
-/// risk-control blanks PrintWindow to pure black; if a region grab ever comes back
-/// blank too (window occluded, or stricter anti-capture), we fall back to WeChat's
-/// own screenshot. Samples sparsely and reports blank when <1% of sampled pixels
-/// are non-black.
+/// risk-control blanks PrintWindow to pure black; if a region grab ever comes
+/// back blank too (window occluded, or stricter anti-capture), we fall back to
+/// WeChat's own screenshot. Samples sparsely and reports blank when <1% of
+/// sampled pixels are non-black.
 #[cfg(target_os = "windows")]
 fn looks_blank(png: &[u8]) -> bool {
     match capture::png_to_rgba(png) {
@@ -368,10 +383,11 @@ Write-Output 'OK'"#,
     Ok(bytes)
 }
 
-/// FALLBACK capture via WeChat's OWN built-in screenshot (PC default hotkey Alt+A
-/// → drag-select the window → Enter copies to clipboard). Used only when the region
-/// grab comes back blank, since WeChat's internal screenshot is never blocked by its
-/// own risk-control. Intrusive (steals focus, flashes the selection overlay).
+/// FALLBACK capture via WeChat's OWN built-in screenshot (PC default hotkey
+/// Alt+A → drag-select the window → Enter copies to clipboard). Used only when
+/// the region grab comes back blank, since WeChat's internal screenshot is
+/// never blocked by its own risk-control. Intrusive (steals focus, flashes the
+/// selection overlay).
 #[cfg(target_os = "windows")]
 fn wechat_screenshot_png(win: &capture::WindowInfo) -> Result<Vec<u8>, String> {
     use std::{thread::sleep, time::Duration};
@@ -409,16 +425,17 @@ fn wechat_screenshot_png(win: &capture::WindowInfo) -> Result<Vec<u8>, String> {
 }
 
 /// Windows on-device OCR via Windows.Media.Ocr (WinRT) through PowerShell. For
-/// WeChat the window is captured via a screen-region grab (PrintWindow is blanked
-/// by WeChat risk-control); other apps use the occlusion-proof PrintWindow path.
-/// Prints the same JSON shape as macOS: `[{"text","conf","x","y","sx","sy"}]` with
-/// x/y 0-1000 window-relative and sx/sy screen-absolute click points. Because the
-/// captured image IS the window rect at a known origin, sx/sy land correctly.
-/// Capture the WeChat window via the Alt+A built-in screenshot tool (sync, for
-/// use inside spawn_blocking / sync OCR context). WeChat's WDA_EXCLUDEFROMCAPTURE
-/// blanks all GDI/BitBlt captures — Alt+A is the only reliable path on Windows.
-/// Returns (png_bytes, win_x, win_y, win_w, win_h) where the bounds let the OCR
-/// driver compute screen-absolute click coordinates.
+/// WeChat the window is captured via a screen-region grab (PrintWindow is
+/// blanked by WeChat risk-control); other apps use the occlusion-proof
+/// PrintWindow path. Prints the same JSON shape as macOS:
+/// `[{"text","conf","x","y","sx","sy"}]` with x/y 0-1000 window-relative and
+/// sx/sy screen-absolute click points. Because the captured image IS the window
+/// rect at a known origin, sx/sy land correctly. Capture the WeChat window via
+/// the Alt+A built-in screenshot tool (sync, for use inside spawn_blocking /
+/// sync OCR context). WeChat's WDA_EXCLUDEFROMCAPTURE blanks all GDI/BitBlt
+/// captures — Alt+A is the only reliable path on Windows. Returns (png_bytes,
+/// win_x, win_y, win_w, win_h) where the bounds let the OCR driver compute
+/// screen-absolute click coordinates.
 #[cfg(target_os = "windows")]
 fn wechat_altA_screenshot_sync(app_name: &str) -> Result<(Vec<u8>, i32, i32, u32, u32), String> {
     use std::os::windows::process::CommandExt;
@@ -463,13 +480,24 @@ if($p){{ [FWOCR]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
         proc = proc_name
     );
     let mut cmd = Command::new("powershell");
-    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_focus]);
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &ps_focus,
+    ]);
     cmd.creation_flags(0x08000000);
-    let focus_stdout = cmd.output()
+    let focus_stdout = cmd
+        .output()
         .map(|o| o.stdout)
         .unwrap_or_else(|_| b"0,0,1200,800".to_vec());
     let s = String::from_utf8_lossy(&focus_stdout);
-    let parts: Vec<i64> = s.trim().split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    let parts: Vec<i64> = s
+        .trim()
+        .split(',')
+        .filter_map(|p| p.trim().parse().ok())
+        .collect();
     let (wx, wy, ww, wh, cx, cy) = if parts.len() == 4 {
         let x = parts[0] as i32;
         let y = parts[1] as i32;
@@ -482,24 +510,38 @@ if($p){{ [FWOCR]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
     std::thread::sleep(std::time::Duration::from_millis(400));
     // Clear clipboard.
     let mut clr = Command::new("powershell");
-    clr.args(["-NoProfile", "-STA", "-Command",
-        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::Clear()"]);
+    clr.args([
+        "-NoProfile",
+        "-STA",
+        "-Command",
+        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::Clear()",
+    ]);
     clr.creation_flags(0x08000000);
     let _ = clr.output();
     // Press Alt+A via enigo.
     let mut enigo = new_enigo()?;
-    enigo.key(enigo::Key::Alt, enigo::Direction::Press).map_err(|e| format!("alt press: {e}"))?;
+    enigo
+        .key(enigo::Key::Alt, enigo::Direction::Press)
+        .map_err(|e| format!("alt press: {e}"))?;
     std::thread::sleep(std::time::Duration::from_millis(50));
-    enigo.key(enigo::Key::Unicode('a'), enigo::Direction::Click).map_err(|e| format!("a: {e}"))?;
+    enigo
+        .key(enigo::Key::Unicode('a'), enigo::Direction::Click)
+        .map_err(|e| format!("a: {e}"))?;
     std::thread::sleep(std::time::Duration::from_millis(50));
-    enigo.key(enigo::Key::Alt, enigo::Direction::Release).map_err(|e| format!("alt release: {e}"))?;
+    enigo
+        .key(enigo::Key::Alt, enigo::Direction::Release)
+        .map_err(|e| format!("alt release: {e}"))?;
     std::thread::sleep(std::time::Duration::from_millis(900));
     // Hover over window centre so the overlay selects the WeChat window.
     let (lx, ly) = scale_for_input(cx as u32, cy as u32);
-    enigo.move_mouse(lx, ly, enigo::Coordinate::Abs).map_err(|e| format!("mouse move: {e}"))?;
+    enigo
+        .move_mouse(lx, ly, enigo::Coordinate::Abs)
+        .map_err(|e| format!("mouse move: {e}"))?;
     std::thread::sleep(std::time::Duration::from_millis(600));
     // Confirm screenshot.
-    enigo.key(enigo::Key::Return, enigo::Direction::Click).map_err(|e| format!("enter: {e}"))?;
+    enigo
+        .key(enigo::Key::Return, enigo::Direction::Click)
+        .map_err(|e| format!("enter: {e}"))?;
     std::thread::sleep(std::time::Duration::from_millis(1000));
     // Read PNG from clipboard.
     let tmp = std::env::temp_dir().join(format!("rsclaw_ocr_altA_{}.png", std::process::id()));
@@ -528,7 +570,9 @@ if($p){{ [FWOCR]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
         },
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            Err(format!("Alt+A OCR screenshot: clipboard empty or PS failed: {stderr}"))
+            Err(format!(
+                "Alt+A OCR screenshot: clipboard empty or PS failed: {stderr}"
+            ))
         }
         Err(e) => Err(format!("Alt+A OCR screenshot: powershell spawn: {e}")),
     }
@@ -547,10 +591,7 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
         let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
         (png, win.x, win.y, win.w, win.h)
     };
-    let tmp = std::env::temp_dir().join(format!(
-        "rsclaw_ocr_{}.png",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("rsclaw_ocr_{}.png", std::process::id()));
     std::fs::write(&tmp, &png).map_err(|e| format!("write OCR temp PNG: {e}"))?;
     // Write the OCR script to a temp .ps1 (avoids -Command quoting hell) and run
     // it STA (WinRT requires it). Args: <png> <wx> <wy> <ww> <wh>.
@@ -558,13 +599,7 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
     let _ = std::fs::write(&ps, OCR_WIN_PS1);
     let mut ocr_cmd = Command::new("powershell");
     ocr_cmd
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-STA",
-            "-File",
-        ])
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-File"])
         .arg(&ps)
         .arg(&tmp)
         .arg(wx.to_string())
@@ -590,12 +625,12 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Windows.Media.Ocr driver (PowerShell, STA). argv: png, wx, wy, ww, wh (window
-/// screen bounds in logical px). Emits `[{"text","conf","x","y","sx","sy"}]`:
-/// x/y are 0-1000 window-relative line centres; sx/sy are screen-absolute click
-/// points (window origin + relative * window size). conf is 100 (Windows OCR has
-/// no per-line confidence). The captured PNG IS the window, so we normalise by
-/// the image's own pixel size.
+/// Windows.Media.Ocr driver (PowerShell, STA). argv: png, wx, wy, ww, wh
+/// (window screen bounds in logical px). Emits
+/// `[{"text","conf","x","y","sx","sy"}]`: x/y are 0-1000 window-relative line
+/// centres; sx/sy are screen-absolute click points (window origin + relative *
+/// window size). conf is 100 (Windows OCR has no per-line confidence). The
+/// captured PNG IS the window, so we normalise by the image's own pixel size.
 #[cfg(target_os = "windows")]
 const OCR_WIN_PS1: &str = r#"param([string]$img,[int]$wx,[int]$wy,[int]$ww,[int]$wh)
 $ErrorActionPreference='Stop'
@@ -888,9 +923,11 @@ fn parse_key(name: &str) -> Option<Key> {
 /// Only works on macOS; returns an error on other platforms.
 #[cfg(target_os = "macos")]
 fn cgwindow_fallback(owner_name: &str) -> Result<String, String> {
-    use core_foundation::base::{CFType, TCFType};
-    use core_foundation::number::CFNumber;
-    use core_foundation::string::CFString;
+    use core_foundation::{
+        base::{CFType, TCFType},
+        number::CFNumber,
+        string::CFString,
+    };
 
     const K_CG_WINDOW_LIST_OPTION_ALL: u32 = 0;
     const K_CG_NULL_WINDOW_ID: u32 = 0;
@@ -918,36 +955,24 @@ fn cgwindow_fallback(owner_name: &str) -> Result<String, String> {
     }
 
     /// Look up a value in a raw CFDictionaryRef by key string.
-    fn dict_val(
-        dict: core_foundation::dictionary::CFDictionaryRef,
-        key: &str,
-    ) -> Option<CFType> {
+    fn dict_val(dict: core_foundation::dictionary::CFDictionaryRef, key: &str) -> Option<CFType> {
         let cf_key = CFString::new(key);
-        let val =
-            unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
+        let val = unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
         if val.is_null() {
             None
         } else {
-            Some(unsafe {
-                CFType::wrap_under_get_rule(val as core_foundation::base::CFTypeRef)
-            })
+            Some(unsafe { CFType::wrap_under_get_rule(val as core_foundation::base::CFTypeRef) })
         }
     }
 
-    fn dict_num(
-        dict: core_foundation::dictionary::CFDictionaryRef,
-        key: &str,
-    ) -> i64 {
+    fn dict_num(dict: core_foundation::dictionary::CFDictionaryRef, key: &str) -> i64 {
         dict_val(dict, key)
             .and_then(|cf| cf.downcast::<CFNumber>())
             .and_then(|n| n.to_i64())
             .unwrap_or(0)
     }
 
-    fn dict_str(
-        dict: core_foundation::dictionary::CFDictionaryRef,
-        key: &str,
-    ) -> String {
+    fn dict_str(dict: core_foundation::dictionary::CFDictionaryRef, key: &str) -> String {
         dict_val(dict, key)
             .and_then(|cf| cf.downcast::<CFString>())
             .map(|s| s.to_string())
@@ -959,8 +984,7 @@ fn cgwindow_fallback(owner_name: &str) -> Result<String, String> {
         key: &str,
     ) -> Option<core_foundation::dictionary::CFDictionaryRef> {
         let cf_key = CFString::new(key);
-        let val =
-            unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
+        let val = unsafe { CFDictionaryGetValue(dict, cf_key.as_concrete_TypeRef() as *const _) };
         if val.is_null() {
             None
         } else {
@@ -968,9 +992,8 @@ fn cgwindow_fallback(owner_name: &str) -> Result<String, String> {
         }
     }
 
-    let cf_array_ref = unsafe {
-        CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTION_ALL, K_CG_NULL_WINDOW_ID)
-    };
+    let cf_array_ref =
+        unsafe { CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTION_ALL, K_CG_NULL_WINDOW_ID) };
     if cf_array_ref.is_null() {
         return Err("cgwindow_fallback: CGWindowListCopyWindowInfo returned NULL".to_string());
     }
@@ -1026,15 +1049,19 @@ fn cgwindow_fallback(owner_name: &str) -> Result<String, String> {
 
 impl NativeDesktopSession {
     /// Windows: capture WeChat via its OWN built-in screenshot (Alt+A), routing
-    /// pixels through the clipboard. Avoids GDI/PrintWindow (which WeChat blanks
-    /// via WDA_EXCLUDEFROMCAPTURE) and the screen-capture risk-control that
-    /// white-screens / force-logs-out the client.
+    /// pixels through the clipboard. Avoids GDI/PrintWindow (which WeChat
+    /// blanks via WDA_EXCLUDEFROMCAPTURE) and the screen-capture
+    /// risk-control that white-screens / force-logs-out the client.
     async fn wechat_builtin_screenshot(&self, bundle_id: &str) -> Result<String, String> {
         // 1. Find WeChat's HWND and window bounds, then force-focus using
-        //    AttachThreadInput (plain SetForegroundWindow is ignored from a
-        //    background gateway process).
+        //    AttachThreadInput (plain SetForegroundWindow is ignored from a background
+        //    gateway process).
         let bl = bundle_id.to_lowercase();
-        let proc_name = if bl.contains("weixin") { "Weixin" } else { "WeChat" };
+        let proc_name = if bl.contains("weixin") {
+            "Weixin"
+        } else {
+            "WeChat"
+        };
         let ps_focus = format!(
             r#"$sig=@'
 using System; using System.Runtime.InteropServices;
@@ -1079,15 +1106,21 @@ if($p){{ [FW2]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
                 let mut cmd = Command::new("powershell");
                 cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps]);
                 #[cfg(windows)]
-                { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000);
+                }
                 let out = cmd.output().unwrap_or(std::process::Output {
                     status: std::process::ExitStatus::default(),
                     stdout: vec![],
                     stderr: vec![],
                 });
                 let s = String::from_utf8_lossy(&out.stdout);
-                let parts: Vec<i64> = s.trim().split(',')
-                    .filter_map(|p| p.trim().parse().ok()).collect();
+                let parts: Vec<i64> = s
+                    .trim()
+                    .split(',')
+                    .filter_map(|p| p.trim().parse().ok())
+                    .collect();
                 if parts.len() == 4 {
                     let x = parts[0].max(0) as u32;
                     let y = parts[1].max(0) as u32;
@@ -1495,13 +1528,13 @@ end tell"#,
                 // macOS: post raw CGEvents for reliable multi-step dragging.
                 // enigo's move_mouse does not produce the exact CGEvent sequence
                 // that WeChat's screenshot overlay requires.
-                use core_graphics::event::{
-                    CGEvent, CGEventTapLocation, CGEventType, CGMouseButton,
+                use std::{thread::sleep, time::Duration};
+
+                use core_graphics::{
+                    event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton},
+                    event_source::{CGEventSource, CGEventSourceStateID},
+                    geometry::CGPoint,
                 };
-                use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-                use core_graphics::geometry::CGPoint;
-                use std::thread::sleep;
-                use std::time::Duration;
 
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .map_err(|()| "mouse_drag: CGEventSource::new failed".to_string())?;
@@ -1587,8 +1620,10 @@ end tell"#,
             // negative `clicks` scrolls UP toward older content.
             #[cfg(target_os = "macos")]
             {
-                use core_graphics::event::{CGEvent, CGEventTapLocation, ScrollEventUnit};
-                use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+                use core_graphics::{
+                    event::{CGEvent, CGEventTapLocation, ScrollEventUnit},
+                    event_source::{CGEventSource, CGEventSourceStateID},
+                };
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .map_err(|()| "scroll: CGEventSource::new failed".to_string())?;
                 let event =
@@ -1796,8 +1831,7 @@ end tell"#,
                     use std::os::windows::process::CommandExt;
                     ps_cmd.creation_flags(0x08000000);
                 }
-                match ps_cmd.output()
-                {
+                match ps_cmd.output() {
                     Ok(out) if out.status.success() => {
                         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
                     }
@@ -1862,8 +1896,7 @@ end tell"#,
                     use std::os::windows::process::CommandExt;
                     ps_cmd.creation_flags(0x08000000);
                 }
-                match ps_cmd.output()
-                {
+                match ps_cmd.output() {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
                     Ok(out) => Err(format!(
                         "Set-Clipboard failed: {}",

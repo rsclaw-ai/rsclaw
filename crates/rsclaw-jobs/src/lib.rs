@@ -18,9 +18,8 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use serde_json::json;
-
 use rsclaw_types::{ExternalJobKind, PollOutcome};
+use serde_json::json;
 
 // ---------------------------------------------------------------------------
 // Seedance (ByteDance ARK) — async submit + poll
@@ -747,10 +746,7 @@ pub async fn poll_openai_video(
 ///   502 → generation failed
 /// We don't read the 200 body here; the status is in the response head, so a
 /// poll stays cheap.
-pub async fn poll_rsclaw_image(
-    client: &reqwest::Client,
-    signed_url: &str,
-) -> Result<PollOutcome> {
+pub async fn poll_rsclaw_image(client: &reqwest::Client, signed_url: &str) -> Result<PollOutcome> {
     let resp = client
         .get(signed_url)
         .timeout(Duration::from_secs(30))
@@ -781,20 +777,17 @@ pub async fn poll_rsclaw_image(
 /// Flow:
 /// 1. `GET https://api.rsclaw.ai/v1/videos/{id}` (with Bearer; 307/308
 ///    re-attached by `rsclaw_http::get`) → JSON `{id, status, …}`.
-/// 2. `status == "completed"` →
-///    `GET https://api.rsclaw.ai/v1/videos/{id}/content` (with Bearer)
-///    returns 307 to a Cloudflare R2 presigned URL — we DON'T follow
-///    that hop here so Authorization never crosses to R2. The presigned
+/// 2. `status == "completed"` → `GET https://api.rsclaw.ai/v1/videos/{id}/content`
+///    (with Bearer) returns 307 to a Cloudflare R2 presigned URL — we DON'T
+///    follow that hop here so Authorization never crosses to R2. The presigned
 ///    URL is handed back as `PollOutcome::Done(url)`; the caller's
 ///    `download_artifact` GETs it without auth.
 /// 3. `status` in {"failed","cancelled"} → `PollOutcome::Failed(reason)`.
 /// 4. Else (`queued` / `in_progress`) → `PollOutcome::Pending`.
 pub async fn poll_rsclaw(api_key: &str, video_id: &str) -> Result<PollOutcome> {
     let host = rsclaw_provider::rsclaw_http::gen_host_base(None);
-    let client = rsclaw_provider::rsclaw_http::build_client(
-        rsclaw_provider::DEFAULT_USER_AGENT,
-        30,
-    )?;
+    let client =
+        rsclaw_provider::rsclaw_http::build_client(rsclaw_provider::DEFAULT_USER_AGENT, 30)?;
 
     // 1. Status probe.
     let status_url = format!("{host}/v1/videos/{video_id}");

@@ -1,6 +1,6 @@
-//! Voice generation tool — `voice_gen` (`POST /v1/audio/speech`, gen-api.md §5).
-//! High-quality text→speech with optional one-shot voice cloning. Synchronous;
-//! the shared submit/save path lives in `tools_audio.rs`.
+//! Voice generation tool — `voice_gen` (`POST /v1/audio/speech`, gen-api.md
+//! §5). High-quality text→speech with optional one-shot voice cloning.
+//! Synchronous; the shared submit/save path lives in `tools_audio.rs`.
 //!
 //! Distinct from `text_to_voice` (the simple, free, offline local-OS read-aloud
 //! tool) — cloning / high-quality is a separate capability, kept as its own

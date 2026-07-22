@@ -8,8 +8,6 @@
 //! reading files / writing output).
 
 use anyhow::{Context as _, Result};
-use serde_json::json;
-
 /// 37 built-in tool names that compile into the RsClaw binary. Used
 /// by `dump-prompt-spec` to partition the merged tool list into the
 /// cacheable half (these names) and the per-user half (everything
@@ -24,13 +22,14 @@ use serde_json::json;
 // export that didn't match what the gateway actually classifies as builtin.
 use rsclaw_agent::prompt_builder::BUILTIN_TOOL_NAMES as BUILTIN_TOOLS;
 use rsclaw_agent::{
-        prompt_builder::{build_shared_system_prefix, build_user_system},
-        tools_builder::build_tool_list,
-        workspace::WorkspaceContext,
-    };
+    prompt_builder::{build_shared_system_prefix, build_user_system},
+    tools_builder::build_tool_list,
+    workspace::WorkspaceContext,
+};
 use rsclaw_cli::{DebugCommand, DumpPromptSpecArgs};
 use rsclaw_config as config;
 use rsclaw_skill::loader::load_skills;
+use serde_json::json;
 
 pub async fn cmd_debug(sub: DebugCommand) -> Result<()> {
     match sub {

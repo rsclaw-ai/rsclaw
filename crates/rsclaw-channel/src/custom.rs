@@ -3,10 +3,10 @@
 //! Allows users to connect any platform without writing code, using JSON path
 //! extraction for inbound parsing and template-based outbound replies.
 
-use base64::Engine as _;
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use futures::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use reqwest::Client;
 use serde_json::Value;
@@ -16,8 +16,8 @@ use tracing::{debug, info, warn};
 
 use super::{Channel, OutboundMessage};
 use crate::{
-    retry::{SendRetry, send_with_retry},
     config::schema::CustomChannelConfig,
+    retry::{SendRetry, send_with_retry},
 };
 
 // ---------------------------------------------------------------------------
@@ -163,11 +163,18 @@ fn extract_string_value<'a>(root: &'a Value, path: &str) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
         Value::Array(arr) => {
-            let parts: Vec<String> = arr.iter().filter_map(|e| match e {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            }).collect();
-            if parts.is_empty() { None } else { Some(parts.join(",")) }
+            let parts: Vec<String> = arr
+                .iter()
+                .filter_map(|e| match e {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(","))
+            }
         }
         other => Some(other.to_string()),
     }
@@ -270,15 +277,32 @@ pub struct CustomWebhookChannel {
     pub cfg: CustomChannelConfig,
     client: Client,
     #[allow(clippy::type_complexity)]
-    on_message:
-        Arc<dyn Fn(String, String, String, Vec<rsclaw_types::ImageAttachment>, Vec<rsclaw_types::FileAttachment>, bool) + Send + Sync>,
+    on_message: Arc<
+        dyn Fn(
+                String,
+                String,
+                String,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
+                bool,
+            ) + Send
+            + Sync,
+    >,
 }
 
 impl CustomWebhookChannel {
     pub fn new(
         cfg: CustomChannelConfig,
         on_message: Arc<
-            dyn Fn(String, String, String, Vec<rsclaw_types::ImageAttachment>, Vec<rsclaw_types::FileAttachment>, bool) + Send + Sync,
+            dyn Fn(
+                    String,
+                    String,
+                    String,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
+                    bool,
+                ) + Send
+                + Sync,
         >,
     ) -> Self {
         Self {
@@ -309,14 +333,7 @@ impl CustomWebhookChannel {
                 parsed.file_name.as_deref().unwrap_or("file.bin"),
             )
             .await;
-            (self.on_message)(
-                parsed.sender,
-                parsed.text,
-                chat_id,
-                images,
-                files,
-                is_group,
-            );
+            (self.on_message)(parsed.sender, parsed.text, chat_id, images, files, is_group);
         } else {
             debug!(channel = %self.cfg.name, "custom webhook: inbound message did not match filter/paths");
         }
@@ -440,8 +457,17 @@ pub struct CustomWebSocketChannel {
     pub cfg: CustomChannelConfig,
     client: Client,
     #[allow(clippy::type_complexity)]
-    on_message:
-        Arc<dyn Fn(String, String, String, Vec<rsclaw_types::ImageAttachment>, Vec<rsclaw_types::FileAttachment>, bool) + Send + Sync>,
+    on_message: Arc<
+        dyn Fn(
+                String,
+                String,
+                String,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
+                bool,
+            ) + Send
+            + Sync,
+    >,
     /// Sender half for outbound messages.
     ws_tx: Mutex<Option<mpsc::Sender<String>>>,
 }
@@ -450,7 +476,15 @@ impl CustomWebSocketChannel {
     pub fn new(
         cfg: CustomChannelConfig,
         on_message: Arc<
-            dyn Fn(String, String, String, Vec<rsclaw_types::ImageAttachment>, Vec<rsclaw_types::FileAttachment>, bool) + Send + Sync,
+            dyn Fn(
+                    String,
+                    String,
+                    String,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
+                    bool,
+                ) + Send
+                + Sync,
         >,
     ) -> Self {
         Self {
@@ -923,7 +957,9 @@ async fn download_and_package_image(
     if bytes.is_empty() {
         return None;
     }
-    let mime = mime_guess::from_path(url).first_or_octet_stream().to_string();
+    let mime = mime_guess::from_path(url)
+        .first_or_octet_stream()
+        .to_string();
     let (final_bytes, final_mime) =
         rsclaw_util::downscale_image_for_vision(&bytes, &mime, 1 * 1024 * 1024, 1920, 85)
             .unwrap_or_else(|_| (bytes, mime));
@@ -937,10 +973,7 @@ async fn download_and_package_image(
 }
 
 /// Download multiple image URLs.
-async fn download_images(
-    client: &Client,
-    urls: &[String],
-) -> Vec<rsclaw_types::ImageAttachment> {
+async fn download_images(client: &Client, urls: &[String]) -> Vec<rsclaw_types::ImageAttachment> {
     let mut images = Vec::new();
     for url in urls {
         if let Some(img) = download_and_package_image(client, url).await {

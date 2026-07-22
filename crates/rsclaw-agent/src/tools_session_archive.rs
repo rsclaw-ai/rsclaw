@@ -23,10 +23,10 @@
 
 use anyhow::{Result, anyhow};
 use regex::RegexBuilder;
+use rsclaw_artifact::{ARTIFACT_THRESHOLD_CHARS, PreviewBudget, compact_text, default_store};
 use serde_json::{Value, json};
 
 use super::runtime::{AgentRuntime, RunContext};
-use rsclaw_artifact::{ARTIFACT_THRESHOLD_CHARS, PreviewBudget, compact_text, default_store};
 
 /// Per-mode cap on how many archive rows we return in one call. Bigger
 /// modes (full grep results) get chopped here so the response itself

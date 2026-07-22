@@ -962,13 +962,13 @@ impl RsclawProvider {
     /// [`rsclaw_embed::FleetHttp`] — the SAME redirect cache the OCR /
     /// embed / rerank lanes use, so the LB hop amortises fleet-wide.
     ///
-    /// - 308: the target origin is cached (per `Cache-Control: max-age`,
-    ///   or a short default) so subsequent calls route DIRECT until the
-    ///   TTL expires, instead of re-paying the LB redirect per request.
+    /// - 308: the target origin is cached (per `Cache-Control: max-age`, or a
+    ///   short default) so subsequent calls route DIRECT until the TTL expires,
+    ///   instead of re-paying the LB redirect per request.
     /// - 307: followed without caching (temporary by spec).
-    /// - All other statuses (incl. errors): returned as-is for the
-    ///   caller to interpret (e.g. turn() reads 404/409/503 as
-    ///   session-evicted and triggers replay).
+    /// - All other statuses (incl. errors): returned as-is for the caller to
+    ///   interpret (e.g. turn() reads 404/409/503 as session-evicted and
+    ///   triggers replay).
     ///
     /// `builder_timeout` is reqwest's per-hop deadline (NOT cumulative);
     /// `None` is used by streaming `turn()`, which bounds the headers
@@ -1003,15 +1003,16 @@ impl RsclawProvider {
     }
 
     async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
-        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
-            &split.prefix_id,
-            DynamicPrefixWire {
-                system: split.dynamic_system,
-                tools: &split.dynamic_tools,
-                user_tools: &split.dynamic_user_tools,
-                user_system: split.dynamic_user_system,
-            },
-        );
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) =
+            prefix_fields(
+                &split.prefix_id,
+                DynamicPrefixWire {
+                    system: split.dynamic_system,
+                    tools: &split.dynamic_tools,
+                    user_tools: &split.dynamic_user_tools,
+                    user_system: split.dynamic_user_system,
+                },
+            );
         let body = CreateSessionReq {
             prefix_id,
             model: &split.model,
@@ -1079,15 +1080,16 @@ impl RsclawProvider {
             &user_system_owned
         };
         let history: Vec<Value> = serialize_replay_history(&filtered);
-        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
-            &split.prefix_id,
-            DynamicPrefixWire {
-                system: split.dynamic_system,
-                tools: &split.dynamic_tools,
-                user_tools: &split.dynamic_user_tools,
-                user_system,
-            },
-        );
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) =
+            prefix_fields(
+                &split.prefix_id,
+                DynamicPrefixWire {
+                    system: split.dynamic_system,
+                    tools: &split.dynamic_tools,
+                    user_tools: &split.dynamic_user_tools,
+                    user_system,
+                },
+            );
         let body = ReplayReq {
             prefix_id,
             model: &split.model,
@@ -1378,7 +1380,8 @@ impl RsclawProvider {
         // Wrap it as a one-delta stream so the LlmStream interface is
         // unchanged for callers, while skipping the slow per-chunk SSE relay.
         if !use_stream {
-            let json: Value = match tokio::time::timeout(Duration::from_secs(30), resp.json()).await {
+            let json: Value = match tokio::time::timeout(Duration::from_secs(30), resp.json()).await
+            {
                 Ok(Ok(json)) => json,
                 Ok(Err(e)) => anyhow::bail!("rsclaw {path}: decode non-stream body: {e}"),
                 Err(_) => anyhow::bail!("rsclaw {path}: non-stream body timed out after 30s"),
@@ -1665,7 +1668,8 @@ struct ReplayReq<'a> {
     /// the comment there for the position-selection rule.
     #[serde(skip_serializing_if = "slice_ref_is_empty")]
     user_tools: &'a [Value],
-    /// Registry-path per-session system text. See `CreateSessionReq::user_system`.
+    /// Registry-path per-session system text. See
+    /// `CreateSessionReq::user_system`.
     #[serde(skip_serializing_if = "str::is_empty")]
     user_system: &'a str,
     history: Vec<Value>,
@@ -3005,10 +3009,9 @@ async fn parse_sse_chunk(
             // metadata for telemetry. No StreamEvent emission; clients
             // should tap this for observability if they care.
             "start" => {}
-            // Server-side keepalive. SSE-comment translators may also
-            // arrive here. Reset any keepalive timer the caller tracks;
-            // no StreamEvent.
-            "ping" => {}
+            // Wake the agent runtime's per-event idle watchdog without
+            // contributing content. The runtime discards empty text deltas.
+            "ping" => events.push(Ok(StreamEvent::TextDelta(String::new()))),
             // Open a new content block. `index` is the routing key;
             // future deltas with the same index land in this builder.
             // Unknown `block.type` is skipped (forward-compat: server
@@ -3992,10 +3995,9 @@ data: {"type":"block_stop","index":0}
     }
 
     #[tokio::test]
-    #[allow(clippy::never_loop)] // assert-empty: loop body diverges by design
-    async fn parse_v1_start_and_ping_emit_nothing() {
-        // `start` carries telemetry metadata; `ping` is a keepalive.
-        // Neither should surface as a StreamEvent.
+    async fn parse_v1_ping_emits_content_neutral_watchdog_events() {
+        // `start` carries telemetry metadata; each `ping` wakes the runtime
+        // watchdog with an empty text delta that is discarded before output.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let state = new_state();
@@ -4010,12 +4012,10 @@ data: {"type":"ping"}
             &state,
         )
         .await;
-        for e in evs {
-            match e {
-                Ok(ev) => panic!("start/ping must not emit events; got {ev:?}"),
-                Err(err) => panic!("start/ping must not surface as Err; got {err}"),
-            }
-        }
+        assert_eq!(evs.len(), 2);
+        assert!(evs
+            .iter()
+            .all(|event| matches!(event, Ok(StreamEvent::TextDelta(delta)) if delta.is_empty())));
     }
 
     #[tokio::test]
@@ -4562,15 +4562,16 @@ data: {"type":"block_stop","index":0}
             parameters: json!({"type":"object"}),
         });
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
-        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
-            &split.prefix_id,
-            DynamicPrefixWire {
-                system: split.dynamic_system,
-                tools: &split.dynamic_tools,
-                user_tools: &split.dynamic_user_tools,
-                user_system: split.dynamic_user_system,
-            },
-        );
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) =
+            prefix_fields(
+                &split.prefix_id,
+                DynamicPrefixWire {
+                    system: split.dynamic_system,
+                    tools: &split.dynamic_tools,
+                    user_tools: &split.dynamic_user_tools,
+                    user_system: split.dynamic_user_system,
+                },
+            );
         let body = CreateSessionReq {
             prefix_id,
             model: &split.model,
@@ -4636,15 +4637,16 @@ data: {"type":"block_stop","index":0}
             parameters: json!({"type":"object"}),
         });
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
-        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
-            &split.prefix_id,
-            DynamicPrefixWire {
-                system: split.dynamic_system,
-                tools: &split.dynamic_tools,
-                user_tools: &split.dynamic_user_tools,
-                user_system: split.dynamic_user_system,
-            },
-        );
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) =
+            prefix_fields(
+                &split.prefix_id,
+                DynamicPrefixWire {
+                    system: split.dynamic_system,
+                    tools: &split.dynamic_tools,
+                    user_tools: &split.dynamic_user_tools,
+                    user_system: split.dynamic_user_system,
+                },
+            );
         let body = CreateSessionReq {
             prefix_id,
             model: &split.model,
@@ -4684,15 +4686,16 @@ data: {"type":"block_stop","index":0}
             parameters: json!({"type":"object"}),
         });
         let split = split_request(&req, "", false).unwrap();
-        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
-            &split.prefix_id,
-            DynamicPrefixWire {
-                system: split.dynamic_system,
-                tools: &split.dynamic_tools,
-                user_tools: &split.dynamic_user_tools,
-                user_system: split.dynamic_user_system,
-            },
-        );
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) =
+            prefix_fields(
+                &split.prefix_id,
+                DynamicPrefixWire {
+                    system: split.dynamic_system,
+                    tools: &split.dynamic_tools,
+                    user_tools: &split.dynamic_user_tools,
+                    user_system: split.dynamic_user_system,
+                },
+            );
         let body = CreateSessionReq {
             prefix_id,
             model: &split.model,
@@ -4739,15 +4742,16 @@ data: {"type":"block_stop","index":0}
         });
         // Empty prefix_id forces the dynamic-LRU path.
         let split = split_request(&req, "", false).unwrap();
-        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) = prefix_fields(
-            &split.prefix_id,
-            DynamicPrefixWire {
-                system: split.dynamic_system,
-                tools: &split.dynamic_tools,
-                user_tools: &split.dynamic_user_tools,
-                user_system: split.dynamic_user_system,
-            },
-        );
+        let (prefix_id, dynamic_prefix, top_level_user_tools, top_level_user_system) =
+            prefix_fields(
+                &split.prefix_id,
+                DynamicPrefixWire {
+                    system: split.dynamic_system,
+                    tools: &split.dynamic_tools,
+                    user_tools: &split.dynamic_user_tools,
+                    user_system: split.dynamic_user_system,
+                },
+            );
         let body = CreateSessionReq {
             prefix_id,
             model: &split.model,

@@ -59,6 +59,16 @@ pub struct LiveStatus {
     pub in_flight_tools: Vec<(String, std::time::Instant)>,
 }
 
+use rsclaw_config::{live_config::LiveConfig, runtime::RuntimeConfig};
+use rsclaw_events::AgentEvent;
+use rsclaw_plugin::PluginRegistry;
+use rsclaw_provider::{
+    AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, RecallBundle, Role,
+    StreamEvent, ToolDef, failover::FailoverManager, registry::ProviderRegistry,
+};
+use rsclaw_skill::{RunOptions, SkillRegistry, run_tool};
+use rsclaw_store::Store;
+
 pub use super::context_mgr::estimate_tokens;
 use super::{
     context_mgr::{
@@ -76,16 +86,6 @@ use super::{
     tools_builder::{build_tool_list, toolset_allowed_names},
     workspace::{DEFAULT_MAX_CHARS_PER_FILE, DEFAULT_TOTAL_MAX_CHARS, SessionType},
 };
-use rsclaw_config::live_config::LiveConfig;
-use rsclaw_config::runtime::RuntimeConfig;
-use rsclaw_events::AgentEvent;
-use rsclaw_plugin::PluginRegistry;
-use rsclaw_provider::{
-    AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, RecallBundle, Role,
-    StreamEvent, ToolDef, failover::FailoverManager, registry::ProviderRegistry,
-};
-use rsclaw_skill::{RunOptions, SkillRegistry, run_tool};
-use rsclaw_store::Store;
 
 /// Agent-level timeout for a single turn (seconds).
 /// Reduced from OpenClaw's 48h default to 30min for better UX.
@@ -766,8 +766,7 @@ pub struct AgentRuntime {
     /// re-reading the same page is impossible. Interior-mutable because tool
     /// dispatch borrows `&self`. Entries are best-effort (lost on restart,
     /// which just resets paging to the top — harmless).
-    pub(crate) artifact_cursors:
-        std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    pub(crate) artifact_cursors: std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl AgentRuntime {
@@ -1975,8 +1974,9 @@ impl AgentRuntime {
         scratchpad: &mut [Message],
         budget: usize,
     ) {
-        use super::context_mgr::estimate_tokens;
         use rsclaw_provider::ContentPart;
+
+        use super::context_mgr::estimate_tokens;
 
         // Index every ToolResult part with its current token cost.
         let mut idx: Vec<(usize, usize, usize)> = Vec::new();
@@ -2953,9 +2953,7 @@ impl AgentRuntime {
             crate::preparse::PreParseResult::PassThrough => {
                 // Normal LLM flow continues below
             }
-            crate::preparse::PreParseResult::DirectResponse(response)
-                if cmd_permitted(text) =>
-            {
+            crate::preparse::PreParseResult::DirectResponse(response) if cmd_permitted(text) => {
                 // Handle special directives
                 let reply_text = match response.as_str() {
                     "__HELP__" => {
@@ -3370,9 +3368,7 @@ impl AgentRuntime {
                 }
                 // Fall through to LLM for unhandled directives
             }
-            crate::preparse::PreParseResult::ToolCall { tool, args }
-                if cmd_permitted(text) =>
-            {
+            crate::preparse::PreParseResult::ToolCall { tool, args } if cmd_permitted(text) => {
                 // Group chat safety: block dangerous preparse commands (/run, /ls, /cat, etc.)
                 let is_group = session_key.contains(":group:");
                 if is_group
@@ -5042,12 +5038,8 @@ impl AgentRuntime {
             // These become proper pinned `entity` memories — not raw notes.
             let user_entities = crate::context_mgr::extract_key_entities(text);
             if !user_entities.is_empty() {
-                let docs = crate::context_mgr::write_entity_memories(
-                    mem,
-                    &doc_scope,
-                    user_entities,
-                )
-                .await;
+                let docs =
+                    crate::context_mgr::write_entity_memories(mem, &doc_scope, user_entities).await;
                 for doc in docs {
                     if let Err(e) = self
                         .store
@@ -5687,12 +5679,7 @@ impl AgentRuntime {
         // same-call/same-name repeat breaks — because a tight poll loop is the
         // intended steady state, not stagnation. Tool-error breaks stay ON so a
         // genuinely wedged turn still ends (and cron re-launches it).
-        let daemon_mode: bool = self
-            .live
-            .agents
-            .read()
-            .await
-            .is_daemon_agent(&ctx.agent_id);
+        let daemon_mode: bool = self.live.agents.read().await.is_daemon_agent(&ctx.agent_id);
         if daemon_mode {
             warn!(
                 session = %ctx.session_key,
@@ -6588,6 +6575,9 @@ impl AgentRuntime {
                 }
                 match event? {
                     StreamEvent::TextDelta(delta) => {
+                        if delta.is_empty() {
+                            continue;
+                        }
                         // Close <think> tag when transitioning from reasoning to text.
                         if thinking_budget.unwrap_or(0) > 0
                             && !reasoning_buf.is_empty()
@@ -7425,8 +7415,7 @@ impl AgentRuntime {
                 }
 
                 // Detect consecutive identical tool calls (same name + same args).
-                let call_key =
-                    crate::loop_detection::hash_tool_call(&tool_name, &tool_input);
+                let call_key = crate::loop_detection::hash_tool_call(&tool_name, &tool_input);
                 if call_key == last_tool_key {
                     same_call_streak += 1;
                     // Repeated identical call costs extra in the stagnation budget.
@@ -7553,10 +7542,8 @@ impl AgentRuntime {
             // become an identical-retry loop.
             for p in &mut to_dispatch {
                 if let Some(def) = tools.iter().find(|t| t.name == p.tool_name) {
-                    let notes = crate::args_sanitizer::sanitize_args(
-                        &def.parameters,
-                        &mut p.tool_input,
-                    );
+                    let notes =
+                        crate::args_sanitizer::sanitize_args(&def.parameters, &mut p.tool_input);
                     if !notes.is_empty() {
                         debug!(tool = %p.tool_name, repairs = ?notes, "sanitize_args repaired call");
                     }
@@ -8665,6 +8652,7 @@ impl AgentRuntime {
         // stock_select needs tushare_token
         // We expose both tools if HTTP is available (always true in rsclaw)
         // The tools will error at runtime if tushare_token is missing when needed
+        // Built-in stock tools are always available (astock-core integration)
         true
     }
 
@@ -10189,17 +10177,17 @@ fn intermediate_notification_text(text: &str) -> Option<&str> {
     }
 }
 
-
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::context_mgr::msg_chars;
     use rsclaw_config::schema::{ContextPruningConfig, HardClearConfig, SoftTrimConfig};
     use rsclaw_provider::{Message, MessageContent, Role};
     use rsclaw_skill::SkillRegistry;
+
+    use super::*;
+    use crate::context_mgr::msg_chars;
 
     // ---------------------------------------------------------------
     // resolve_default_workspace — locks in the rule that file tools
@@ -10321,15 +10309,13 @@ mod tests {
 
         // First call creates it.
         let (id1, name1, created1) =
-            crate::tools_memory::resolve_or_create_collection(&kb, "会议记录", None)
-                .unwrap();
+            crate::tools_memory::resolve_or_create_collection(&kb, "会议记录", None).unwrap();
         assert!(created1);
         assert_eq!(name1, "会议记录");
 
         // Second call reuses the same collection (no duplicate).
         let (id2, _n, created2) =
-            crate::tools_memory::resolve_or_create_collection(&kb, "会议记录", None)
-                .unwrap();
+            crate::tools_memory::resolve_or_create_collection(&kb, "会议记录", None).unwrap();
         assert!(!created2);
         assert_eq!(id1, id2);
 
@@ -10421,10 +10407,7 @@ mod tests {
         assert!(clipped.len() < long.len());
 
         // No hits → empty string (caller skips injection entirely).
-        assert_eq!(
-            crate::tools_memory::format_kb_recall_block(&[], 600),
-            ""
-        );
+        assert_eq!(crate::tools_memory::format_kb_recall_block(&[], 600), "");
     }
 
     #[test]
@@ -10464,8 +10447,8 @@ mod tests {
             },
         ];
 
-        let bundle = crate::tools_memory::recall_bundle_from_docs(docs, 1200, "trace-1")
-            .expect("bundle");
+        let bundle =
+            crate::tools_memory::recall_bundle_from_docs(docs, 1200, "trace-1").expect("bundle");
         assert_eq!(bundle.context, "- 用户手机号: 13900001234");
         assert!(!bundle.context.contains("<recall>"));
         assert_eq!(bundle.metadata.doc_ids, vec!["entity-1"]);

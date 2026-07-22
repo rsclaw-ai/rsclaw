@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, OutboundMessage};
+use rsclaw_config::runtime::RuntimeConfig;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -8,9 +11,6 @@ use super::{
     default_dm_scope,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, OutboundMessage};
-use rsclaw_config::runtime::RuntimeConfig;
 
 pub(crate) fn start_matrix_if_configured(
     config: &RuntimeConfig,
@@ -256,7 +256,9 @@ pub(crate) fn start_matrix_if_configured(
                                                 thread_id: None,
                                             }
                                         } else {
-                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
+                                            MessageKind::DirectMessage {
+                                                account_id: Some(w_acct.clone()),
+                                            }
                                         },
                                         channel: "matrix".to_string(),
                                         peer_id: sender.clone(),
@@ -353,7 +355,10 @@ pub(crate) fn start_matrix_if_configured(
                         let room_id = room_id.clone();
                         let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route_account("matrix", Some(&w_acct_pp)).or_else(|_| reg.route_account("matrix", None)).or_else(|_| reg.default_agent())
+                            let handle = match reg
+                                .route_account("matrix", Some(&w_acct_pp))
+                                .or_else(|_| reg.route_account("matrix", None))
+                                .or_else(|_| reg.default_agent())
                             {
                                 Ok(h) => h,
                                 Err(_) => return,
@@ -367,7 +372,9 @@ pub(crate) fn start_matrix_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
+                                    MessageKind::DirectMessage {
+                                        account_id: Some(w_acct_pp.clone()),
+                                    }
                                 },
                                 channel: "matrix".to_string(),
                                 peer_id: sender.clone(),
@@ -469,7 +476,10 @@ pub(crate) fn start_matrix_if_configured(
             ch
         });
 
-        if let Err(e) = manager.register_with_name(format!("matrix/{}", acct_for_log), Arc::clone(&matrix) as Arc<dyn rsclaw_channel::Channel>) {
+        if let Err(e) = manager.register_with_name(
+            format!("matrix/{}", acct_for_log),
+            Arc::clone(&matrix) as Arc<dyn rsclaw_channel::Channel>,
+        ) {
             tracing::warn!("failed to register channel: {e}");
         }
         let matrix_send = Arc::clone(&matrix);

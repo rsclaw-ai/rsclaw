@@ -1,8 +1,7 @@
 //! google.rpc-style structured error details for A2A JSON-RPC.
 
-use serde_json::json;
-
 use rsclaw_a2a_types::types::JsonRpcError;
+use serde_json::json;
 
 pub fn invalid_argument(msg: impl Into<String>, field: impl Into<String>) -> JsonRpcError {
     JsonRpcError {

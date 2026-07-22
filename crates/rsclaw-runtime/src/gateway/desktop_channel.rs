@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
-use tracing::debug;
-
 use rsclaw_channel::Channel;
 use rsclaw_types::OutboundMessage;
+use tracing::debug;
+
 use crate::ws::{ConnRegistry, types::EventFrame};
 
 /// A channel that delivers outbound messages to the desktop UI via WebSocket

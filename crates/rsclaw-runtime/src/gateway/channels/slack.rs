@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use rsclaw_agent::{AgentMessage, AgentRegistry};
+use rsclaw_channel::{Channel, OutboundMessage};
+use rsclaw_config::runtime::RuntimeConfig;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -8,9 +11,6 @@ use super::{
     default_dm_scope,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
-use rsclaw_agent::{AgentMessage, AgentRegistry};
-use rsclaw_channel::{Channel, OutboundMessage};
-use rsclaw_config::runtime::RuntimeConfig;
 
 pub(crate) fn start_slack_if_configured(
     config: &RuntimeConfig,
@@ -261,7 +261,10 @@ pub(crate) fn start_slack_if_configured(
                                     let handle = if let Some(ref agent_id) = bound {
                                         match w_reg.get(agent_id) {
                                             Ok(h) => h,
-                                            Err(_) => match w_reg.route_account("slack", Some(&w_acct)).or_else(|_| w_reg.route_account("slack", None)) {
+                                            Err(_) => match w_reg
+                                                .route_account("slack", Some(&w_acct))
+                                                .or_else(|_| w_reg.route_account("slack", None))
+                                            {
                                                 Ok(h) => h,
                                                 Err(e) => {
                                                     error!("slack route: {e:#}");
@@ -270,7 +273,10 @@ pub(crate) fn start_slack_if_configured(
                                             },
                                         }
                                     } else {
-                                        match w_reg.route_account("slack", Some(&w_acct)).or_else(|_| w_reg.route_account("slack", None)) {
+                                        match w_reg
+                                            .route_account("slack", Some(&w_acct))
+                                            .or_else(|_| w_reg.route_account("slack", None))
+                                        {
                                             Ok(h) => h,
                                             Err(e) => {
                                                 error!("slack route: {e:#}");
@@ -287,7 +293,9 @@ pub(crate) fn start_slack_if_configured(
                                                 thread_id: None,
                                             }
                                         } else {
-                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
+                                            MessageKind::DirectMessage {
+                                                account_id: Some(w_acct.clone()),
+                                            }
                                         },
                                         channel: "slack".to_string(),
                                         peer_id: peer_id.clone(),
@@ -339,7 +347,10 @@ pub(crate) fn start_slack_if_configured(
                         let channel_id = channel_id.clone();
                         let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route_account("slack", Some(&w_acct_btw)).or_else(|_| reg.route_account("slack", None)) {
+                            let handle = match reg
+                                .route_account("slack", Some(&w_acct_btw))
+                                .or_else(|_| reg.route_account("slack", None))
+                            {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -384,13 +395,19 @@ pub(crate) fn start_slack_if_configured(
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
                                     Ok(h) => h,
-                                    Err(_) => match reg.route_account("slack", Some(&w_acct_pp)).or_else(|_| reg.route_account("slack", None)) {
+                                    Err(_) => match reg
+                                        .route_account("slack", Some(&w_acct_pp))
+                                        .or_else(|_| reg.route_account("slack", None))
+                                    {
                                         Ok(h) => h,
                                         Err(_) => return,
                                     },
                                 }
                             } else {
-                                match reg.route_account("slack", Some(&w_acct_pp)).or_else(|_| reg.route_account("slack", None)) {
+                                match reg
+                                    .route_account("slack", Some(&w_acct_pp))
+                                    .or_else(|_| reg.route_account("slack", None))
+                                {
                                     Ok(h) => h,
                                     Err(_) => return,
                                 }
@@ -404,7 +421,9 @@ pub(crate) fn start_slack_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
+                                    MessageKind::DirectMessage {
+                                        account_id: Some(w_acct_pp.clone()),
+                                    }
                                 },
                                 channel: "slack".to_string(),
                                 peer_id: peer_id.clone(),

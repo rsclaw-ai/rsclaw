@@ -1,8 +1,8 @@
 use anyhow::Result;
-
-use super::style::*;
 use rsclaw_cli::SandboxCommand;
 use rsclaw_config as config;
+
+use super::style::*;
 
 pub async fn cmd_sandbox(sub: SandboxCommand) -> Result<()> {
     let config = config::load()?;

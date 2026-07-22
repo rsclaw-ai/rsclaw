@@ -18,11 +18,11 @@ impl super::runtime::AgentRuntime {
         args: Value,
         ctx: &super::runtime::RunContext,
     ) -> Result<Value> {
-        let action = args["action"]
-            .as_str()
-            .ok_or_else(|| {
-                anyhow!("cron: `action` must be a string — one of: list, add, edit, remove, enable, disable")
-            })?;
+        let action = args["action"].as_str().ok_or_else(|| {
+            anyhow!(
+                "cron: `action` must be a string — one of: list, add, edit, remove, enable, disable"
+            )
+        })?;
 
         let cron_dir = rsclaw_config::loader::base_dir();
         let cron_path = cron_dir.join("cron.json5");

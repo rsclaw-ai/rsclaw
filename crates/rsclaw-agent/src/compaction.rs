@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use futures::StreamExt;
+use rsclaw_provider::{
+    AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
+};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt as _;
 use tracing::{debug, info, warn};
@@ -11,9 +14,6 @@ use tracing::{debug, info, warn};
 use super::{
     context_mgr::{compress_tool_results, estimate_tokens, msg_tokens},
     runtime::AgentRuntime,
-};
-use rsclaw_provider::{
-    AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
 
 /// Prefix for compaction summaries. Tells the LLM that the summary is

@@ -103,11 +103,8 @@ pub struct DingTalkChannel {
     token_cache: RwLock<Option<CachedToken>>,
     /// Callback: (sender_id, text, conversation_id, is_group, images).
     #[allow(clippy::type_complexity)]
-    on_message: Arc<
-        dyn Fn(String, String, String, bool, Vec<rsclaw_types::ImageAttachment>)
-            + Send
-            + Sync,
-    >,
+    on_message:
+        Arc<dyn Fn(String, String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
 }
 
 impl DingTalkChannel {
@@ -118,9 +115,7 @@ impl DingTalkChannel {
         api_base: Option<String>,
         oapi_base: Option<String>,
         on_message: Arc<
-            dyn Fn(String, String, String, bool, Vec<rsclaw_types::ImageAttachment>)
-                + Send
-                + Sync,
+            dyn Fn(String, String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
         >,
     ) -> Self {
         Self {
@@ -348,13 +343,8 @@ impl DingTalkChannel {
     async fn transcribe_voice(&self, download_code: &str) -> Result<String> {
         let audio_bytes = self.download_voice(download_code).await?;
 
-        crate::transcription::transcribe_audio(
-            &self.client,
-            &audio_bytes,
-            "voice.amr",
-            "audio/amr",
-        )
-        .await
+        crate::transcription::transcribe_audio(&self.client, &audio_bytes, "voice.amr", "audio/amr")
+            .await
     }
 
     /// Download a media file (picture/video/file) via DingTalk robot
@@ -569,28 +559,25 @@ impl DingTalkChannel {
                             })
                             .and_then(|v| v.as_str());
                         match pic_url {
-                            Some(url) => match crate::transcription::download_file(
-                                &self.client,
-                                url,
-                            )
-                            .await
-                            {
-                                Ok(bytes) => {
-                                    use base64::Engine;
-                                    let b64 =
-                                        base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                    images.push(rsclaw_types::ImageAttachment {
-                                        data: format!("data:image/png;base64,{b64}"),
-                                        mime_type: "image/png".to_owned(),
-                                        source_path: None,
-                                    });
-                                    String::new()
+                            Some(url) => {
+                                match crate::transcription::download_file(&self.client, url).await {
+                                    Ok(bytes) => {
+                                        use base64::Engine;
+                                        let b64 = base64::engine::general_purpose::STANDARD
+                                            .encode(&bytes);
+                                        images.push(rsclaw_types::ImageAttachment {
+                                            data: format!("data:image/png;base64,{b64}"),
+                                            mime_type: "image/png".to_owned(),
+                                            source_path: None,
+                                        });
+                                        String::new()
+                                    }
+                                    Err(e) => {
+                                        warn!("DingTalk image URL download failed: {e:#}");
+                                        return;
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("DingTalk image URL download failed: {e:#}");
-                                    return;
-                                }
-                            },
+                            }
                             None => {
                                 warn!("DingTalk picture message missing downloadCode and URL");
                                 return;
@@ -1220,13 +1207,8 @@ async fn dingtalk_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::transcription::transcribe_audio(
-        client,
-        &audio_bytes,
-        "video_audio.ogg",
-        "audio/ogg",
-    )
-    .await
+    crate::transcription::transcribe_audio(client, &audio_bytes, "video_audio.ogg", "audio/ogg")
+        .await
 }
 
 // ---------------------------------------------------------------------------

@@ -1063,8 +1063,8 @@ $synth.Speak('{}')
     /// drains before classifying the turn — once drained, it becomes
     /// `TaskOutcome::Structured`, taking precedence over the string classifier.
     pub(crate) async fn tool_task_finish(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let outcome: rsclaw_types::StructuredOutcome =
-            serde_json::from_value(args.clone()).map_err(|e| {
+        let outcome: rsclaw_types::StructuredOutcome = serde_json::from_value(args.clone())
+            .map_err(|e| {
                 anyhow!(
                     "task_finish: invalid outcome payload: {e}. Required fields: \
                      completion (full|partial|minimal|failed) and recommend \
@@ -1079,10 +1079,8 @@ $synth.Speak('{}')
             );
         }
 
-        if matches!(
-            outcome.completion,
-            rsclaw_types::Completion::Full
-        ) && outcome.accomplished.is_empty()
+        if matches!(outcome.completion, rsclaw_types::Completion::Full)
+            && outcome.accomplished.is_empty()
         {
             bail!(
                 "task_finish: completion=full requires non-empty `accomplished`. \
@@ -1252,9 +1250,18 @@ mod todo_tests {
     #[test]
     fn render_todo_marks_statuses() {
         let items = vec![
-            TodoItem { text: "读配置".to_owned(), status: "done".to_owned() },
-            TodoItem { text: "加 flag".to_owned(), status: "in_progress".to_owned() },
-            TodoItem { text: "跑测试".to_owned(), status: "pending".to_owned() },
+            TodoItem {
+                text: "读配置".to_owned(),
+                status: "done".to_owned(),
+            },
+            TodoItem {
+                text: "加 flag".to_owned(),
+                status: "in_progress".to_owned(),
+            },
+            TodoItem {
+                text: "跑测试".to_owned(),
+                status: "pending".to_owned(),
+            },
         ];
         assert_eq!(render_todo(&items), "[x] 读配置\n[>] 加 flag\n[ ] 跑测试");
     }

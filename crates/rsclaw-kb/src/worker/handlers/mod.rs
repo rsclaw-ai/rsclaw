@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::{
-    embedder::KbEmbedder, index::KbIndex, jobs::JobKind, paths::KbPaths, store::KbStore,
-};
+use crate::{embedder::KbEmbedder, index::KbIndex, jobs::JobKind, paths::KbPaths, store::KbStore};
 
 /// Job handler. One impl per `JobKind` variant. Handlers must be
 /// **idempotent** — the worker reclaim path will re-run them after

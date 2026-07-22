@@ -29,28 +29,27 @@
 //!
 //! Failure modes the tool surfaces
 //!
-//! * URL must be a WeChat `/s/<id>` link — we refuse other hosts
-//!   and other path shapes so the LLM can't accidentally point it
-//!   at an unrelated article platform.
-//! * If `cgiDataNew` is missing, WeChat either changed the shape
-//!   (rare; the field has been stable for years) or returned the
-//!   "环境异常" verification wall (which usually means an IP-rate
-//!   trip — the LLM can retry from a different network). Either
-//!   way we return a structured error rather than try to OCR or
-//!   spelunk further.
-//! * The knowledge base must be initialised — when it isn't, we
-//!   return `{ok:false, code:"kb_unavailable"}` so the LLM knows
-//!   to surface a config-error to the user instead of looping.
+//! * URL must be a WeChat `/s/<id>` link — we refuse other hosts and other path
+//!   shapes so the LLM can't accidentally point it at an unrelated article
+//!   platform.
+//! * If `cgiDataNew` is missing, WeChat either changed the shape (rare; the
+//!   field has been stable for years) or returned the "环境异常" verification
+//!   wall (which usually means an IP-rate trip — the LLM can retry from a
+//!   different network). Either way we return a structured error rather than
+//!   try to OCR or spelunk further.
+//! * The knowledge base must be initialised — when it isn't, we return
+//!   `{ok:false, code:"kb_unavailable"}` so the LLM knows to surface a
+//!   config-error to the user instead of looping.
 
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use futures::StreamExt;
+use rsclaw_provider::{ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent};
 use serde_json::{Value, json};
 
 use super::runtime::AgentRuntime;
-use rsclaw_provider::{ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent};
 
 /// User-Agent string that gets us past WeChat's IP-based gating
 /// without needing cookies. Mirrors what an actual iPhone WeChat
@@ -368,8 +367,8 @@ impl AgentRuntime {
         // straight to the resolved provider. If the primary errors
         // we walk the rest of the vision_chain manually below.
         let providers = Arc::clone(&self.providers);
-        let mut chain_iter = std::iter::once(vision_model.clone())
-            .chain(vision_chain.iter().skip(1).cloned());
+        let mut chain_iter =
+            std::iter::once(vision_model.clone()).chain(vision_chain.iter().skip(1).cloned());
         let mut stream_opt = None;
         let mut tried_chain: Vec<(String, String)> = Vec::new();
         loop {
@@ -595,8 +594,8 @@ fn parse_wechat_article(html_src: &str, fallback_url: &str) -> Option<ParsedArti
         .unwrap_or_else(|| meta_content(html_src, "og:title").unwrap_or_default());
     let account_nick = scan_quoted_field(html_src, "nick_name").map(js_unescape);
     let account_id = scan_quoted_field(html_src, "user_name").map(js_unescape);
-    let author = meta_content(html_src, "author")
-        .or_else(|| meta_content(html_src, "og:article:author"));
+    let author =
+        meta_content(html_src, "author").or_else(|| meta_content(html_src, "og:article:author"));
     let canonical_url = meta_content(html_src, "og:url").or_else(|| Some(fallback_url.to_owned()));
 
     let body_html = js_unescape(content_raw);
@@ -765,7 +764,10 @@ fn memchr(haystack: &[u8], needle: u8, from: usize) -> Option<usize> {
     if from >= haystack.len() {
         return None;
     }
-    haystack[from..].iter().position(|&b| b == needle).map(|p| p + from)
+    haystack[from..]
+        .iter()
+        .position(|&b| b == needle)
+        .map(|p| p + from)
 }
 
 fn pull_attr(tag: &str, attr: &str) -> Option<String> {
@@ -856,7 +858,10 @@ fn meta_content(html_src: &str, key: &str) -> Option<String> {
     for attr in ["property", "name"] {
         let needle = format!("<meta {attr}=\"{key}\"");
         if let Some(i) = html_src.find(&needle) {
-            let tag_end = html_src[i..].find('>').map(|e| i + e + 1).unwrap_or(html_src.len());
+            let tag_end = html_src[i..]
+                .find('>')
+                .map(|e| i + e + 1)
+                .unwrap_or(html_src.len());
             let tag = &html_src[i..tag_end];
             if let Some(v) = pull_attr(tag, "content") {
                 return Some(v);
@@ -939,7 +944,8 @@ mod tests {
 
     #[test]
     fn strip_html_extracts_images_and_text() {
-        let html_src = r#"<p>Hello <img data-croporisrc="https://x.png" src="placeholder.gif"/> world</p>"#;
+        let html_src =
+            r#"<p>Hello <img data-croporisrc="https://x.png" src="placeholder.gif"/> world</p>"#;
         let (text, imgs) = strip_html_to_text(html_src);
         assert!(text.contains("Hello"));
         assert!(text.contains("[图]"));
@@ -1036,7 +1042,8 @@ window.cgiDataNew = {
     #[test]
     fn parse_wechat_article_returns_none_when_no_cgi_data() {
         // The "环境异常" verification page has no cgiDataNew.
-        let html_src = r#"<html><body><div>当前环境异常，完成验证后即可继续访问</div></body></html>"#;
+        let html_src =
+            r#"<html><body><div>当前环境异常，完成验证后即可继续访问</div></body></html>"#;
         assert!(parse_wechat_article(html_src, "https://x").is_none());
     }
 }

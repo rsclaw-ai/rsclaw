@@ -14,7 +14,6 @@
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
@@ -463,8 +462,7 @@ impl DiscordChannel {
                             // gets a chance to fire (analyze vs save prompt).
                             // Other files go into `files` for the same reason.
                             // Audio/video still get auto-transcribed inline.
-                            let mut images: Vec<rsclaw_types::ImageAttachment> =
-                                Vec::new();
+                            let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
                             let mut files: Vec<rsclaw_types::FileAttachment> = Vec::new();
                             if let Some(attachments) = d["attachments"].as_array() {
                                 for att in attachments {

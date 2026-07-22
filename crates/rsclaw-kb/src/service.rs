@@ -632,8 +632,8 @@ impl KnowledgeService {
     /// from redb) so we surface it as a bool rather than an error.
     pub fn compact(&self) -> KResult<(CompactStats, bool)> {
         let now = chrono::Utc::now().timestamp_millis();
-        let stats = run_compactor_tick(&self.store, &self.paths, now)
-            .map_err(KnowledgeError::Internal)?;
+        let stats =
+            run_compactor_tick(&self.store, &self.paths, now).map_err(KnowledgeError::Internal)?;
         let snapshot_ok = match self.index.snapshot_hnsw(&self.paths) {
             Ok(()) => true,
             Err(e) => {
@@ -787,13 +787,13 @@ impl KnowledgeService {
         dry_run: bool,
     ) -> KResult<serde_json::Value> {
         use redb::ReadableTable;
+
         use crate::{
             canonicalize::canonicalize_url,
             store::{schema::KB_DOCS, seen::get_sync_state},
             sync::{KbSourceSyncer, SyncContext, SyncReason, UrlSyncer},
         };
-        let cutoff_ms =
-            chrono::Utc::now().timestamp_millis() - (interval_min as i64) * 60_000;
+        let cutoff_ms = chrono::Utc::now().timestamp_millis() - (interval_min as i64) * 60_000;
         let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
         {
             let rtx = self.store.begin_read()?;

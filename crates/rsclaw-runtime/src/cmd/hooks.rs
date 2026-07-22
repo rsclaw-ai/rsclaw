@@ -1,8 +1,8 @@
 use anyhow::Result;
-
-use super::{config_json::load_config_json, style::*};
 use rsclaw_cli::HooksCommand;
 use rsclaw_config as config;
+
+use super::{config_json::load_config_json, style::*};
 
 pub async fn cmd_hooks(sub: HooksCommand) -> Result<()> {
     let config = config::load()?;

@@ -10,9 +10,8 @@
 //! that would cause API errors.
 
 use regex::Regex;
-use serde_json::{Map, Value};
-
 use rsclaw_provider::{ContentPart, Message, MessageContent, Role, ToolDef};
+use serde_json::{Map, Value};
 
 /// Fix unescaped backslashes inside JSON string values.
 ///

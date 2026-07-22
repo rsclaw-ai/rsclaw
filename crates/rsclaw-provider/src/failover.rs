@@ -1,13 +1,14 @@
 //! Provider failover manager.
 //!
 //! Two layers of retry, composed:
-//!   1. **Model chain** (this file): iterate `[req.model, ...req.fallback_models,
-//!      ...self.fallbacks]` dedup'd; skip entries whose per-model health is
-//!      Cooling-not-expired or Disabled (see `provider::health`).
+//!   1. **Model chain** (this file): iterate `[req.model,
+//!      ...req.fallback_models, ...self.fallbacks]` dedup'd; skip entries whose
+//!      per-model health is Cooling-not-expired or Disabled (see
+//!      `provider::health`).
 //!   2. **Profile cooldown** (per chain entry): within a single model the
-//!      manager rotates through configured profile ids (different API keys
-//!      for the same provider — `auth.order[provider]`). 429/auth blips on
-//!      one key flip to the next.
+//!      manager rotates through configured profile ids (different API keys for
+//!      the same provider — `auth.order[provider]`). 429/auth blips on one key
+//!      flip to the next.
 //!
 //! On any call's outcome the manager updates **both** layers:
 //!   - profile cooldown for transient 429 / auth flaps on a specific key
@@ -384,8 +385,7 @@ impl FailoverManager {
 
     fn set_cooldown(&mut self, provider_name: &str, profile_id: &str, delay: Duration) {
         let key = cooldown_key(provider_name, profile_id);
-        self.cooldowns
-            .insert(key.clone(), Instant::now() + delay);
+        self.cooldowns.insert(key.clone(), Instant::now() + delay);
         *self.failure_counts.entry(key).or_insert(0) += 1;
     }
 
@@ -580,7 +580,10 @@ mod tests {
         mgr.set_cooldown("deepseek", "default", Duration::ZERO);
 
         assert!(!mgr.is_cooling_down("deepseek", "default"));
-        assert!(!mgr.cooldowns.contains_key(&cooldown_key("deepseek", "default")));
+        assert!(
+            !mgr.cooldowns
+                .contains_key(&cooldown_key("deepseek", "default"))
+        );
         assert_eq!(mgr.hit_count("deepseek", "default"), 0);
         assert!(mgr.cooldowns.contains_key(&cooldown_key("kimi", "default")));
         assert_eq!(mgr.hit_count("kimi", "default"), 1);

@@ -905,9 +905,9 @@ dependencies = [
 
 [[package]]
 name = "cap-rs"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "569c20672e48bd8ca4276d4771f98580850f908bb52b086778a24586aee071bc"
+checksum = "6f6152bacd3b4fbd751abdbbd599d76adbab570c01f0f7c9f358cdbceb0c2e92"
 dependencies = [
  "async-trait",
  "serde",
@@ -7670,6 +7670,7 @@ dependencies = [
  "reqwest",
  "rsclaw-browser",
  "rsclaw-channel",
+ "rsclaw-computer",
  "rsclaw-config",
  "rsclaw-desktop",
  "rsclaw-events",

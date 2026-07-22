@@ -14,16 +14,14 @@
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use rsclaw_platform::MemoryTier;
 #[allow(unused_imports)]
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::debug;
-
-use rsclaw_platform::MemoryTier;
 
 pub const LEGACY_REDB_UPGRADE_HELPER_ENV: &str = "RSCLAW_INTERNAL_REDB_LEGACY_UPGRADE";
 
@@ -871,8 +869,7 @@ impl RedbStore {
             let guard = table
                 .get(task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
-            let mut task: rsclaw_types::QueuedTask =
-                serde_json::from_str(guard.value())?;
+            let mut task: rsclaw_types::QueuedTask = serde_json::from_str(guard.value())?;
             drop(guard);
             task.turns = turn;
             task.updated_at = chrono::Utc::now().timestamp();
@@ -892,8 +889,7 @@ impl RedbStore {
             let guard = table
                 .get(task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
-            let mut task: rsclaw_types::QueuedTask =
-                serde_json::from_str(guard.value())?;
+            let mut task: rsclaw_types::QueuedTask = serde_json::from_str(guard.value())?;
             drop(guard);
             task.last_reply = Some(text.to_owned());
             task.updated_at = chrono::Utc::now().timestamp();
@@ -913,8 +909,7 @@ impl RedbStore {
             let guard = table
                 .get(task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
-            let mut task: rsclaw_types::QueuedTask =
-                serde_json::from_str(guard.value())?;
+            let mut task: rsclaw_types::QueuedTask = serde_json::from_str(guard.value())?;
             drop(guard);
             task.notified = true;
             task.updated_at = chrono::Utc::now().timestamp();
@@ -937,8 +932,7 @@ impl RedbStore {
             let guard = table
                 .get(task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
-            let mut task: rsclaw_types::QueuedTask =
-                serde_json::from_str(guard.value())?;
+            let mut task: rsclaw_types::QueuedTask = serde_json::from_str(guard.value())?;
             drop(guard);
             task.status = status;
             task.updated_at = chrono::Utc::now().timestamp();
@@ -951,11 +945,7 @@ impl RedbStore {
 
     /// Mark a task as failed, increment retry count. If retries >= max,
     /// mark as Dead. Returns the resulting status.
-    pub fn fail_task(
-        &self,
-        task_id: &str,
-        max_retries: u32,
-    ) -> Result<rsclaw_types::TaskStatus> {
+    pub fn fail_task(&self, task_id: &str, max_retries: u32) -> Result<rsclaw_types::TaskStatus> {
         use rsclaw_types::TaskStatus;
 
         let write = self.db.begin_write()?;
@@ -964,8 +954,7 @@ impl RedbStore {
             let guard = table
                 .get(task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
-            let mut task: rsclaw_types::QueuedTask =
-                serde_json::from_str(guard.value())?;
+            let mut task: rsclaw_types::QueuedTask = serde_json::from_str(guard.value())?;
             drop(guard);
             task.retries += 1;
             task.updated_at = chrono::Utc::now().timestamp();
@@ -984,10 +973,7 @@ impl RedbStore {
     }
 
     /// Get a task by ID.
-    pub fn get_task(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<rsclaw_types::QueuedTask>> {
+    pub fn get_task(&self, task_id: &str) -> Result<Option<rsclaw_types::QueuedTask>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(TASK_QUEUE)?;
         match table.get(task_id)? {
@@ -1090,8 +1076,7 @@ impl RedbStore {
                 let guard = table
                     .get(id.as_str())?
                     .ok_or_else(|| anyhow::anyhow!("task disappeared: {id}"))?;
-                let mut task: rsclaw_types::QueuedTask =
-                    serde_json::from_str(guard.value())?;
+                let mut task: rsclaw_types::QueuedTask = serde_json::from_str(guard.value())?;
                 drop(guard);
                 task.messages.push(message.clone());
                 task.updated_at = chrono::Utc::now().timestamp();
@@ -1294,10 +1279,7 @@ impl RedbStore {
     // -----------------------------------------------------------------------
 
     /// Insert a freshly-submitted external job.
-    pub fn enqueue_external_job(
-        &self,
-        job: &rsclaw_types::ExternalJob,
-    ) -> Result<()> {
+    pub fn enqueue_external_job(&self, job: &rsclaw_types::ExternalJob) -> Result<()> {
         let json = serde_json::to_string(job)?;
         let write = self.db.begin_write()?;
         {
@@ -1311,10 +1293,7 @@ impl RedbStore {
     /// Replace an existing job row (after polling, status update, etc.).
     /// Errors if the row no longer exists — callers should treat that as a
     /// concurrent delete and abandon the update.
-    pub fn update_external_job(
-        &self,
-        job: &rsclaw_types::ExternalJob,
-    ) -> Result<()> {
+    pub fn update_external_job(&self, job: &rsclaw_types::ExternalJob) -> Result<()> {
         let json = serde_json::to_string(job)?;
         let write = self.db.begin_write()?;
         {
@@ -1329,10 +1308,7 @@ impl RedbStore {
     }
 
     /// Fetch a single job by id.
-    pub fn get_external_job(
-        &self,
-        job_id: &str,
-    ) -> Result<Option<rsclaw_types::ExternalJob>> {
+    pub fn get_external_job(&self, job_id: &str) -> Result<Option<rsclaw_types::ExternalJob>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(EXTERNAL_JOBS)?;
         match table.get(job_id)? {
@@ -1350,10 +1326,7 @@ impl RedbStore {
     ///   2. Terminal jobs (`Done` / `Failed` / `TimedOut`) whose delivery
     ///      hasn't succeeded yet — `next_poll_at` is reused as the next
     ///      delivery-retry time when a previous attempt failed.
-    pub fn due_external_jobs(
-        &self,
-        now: i64,
-    ) -> Result<Vec<rsclaw_types::ExternalJob>> {
+    pub fn due_external_jobs(&self, now: i64) -> Result<Vec<rsclaw_types::ExternalJob>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(EXTERNAL_JOBS)?;
         let mut due = Vec::new();
@@ -1368,12 +1341,10 @@ impl RedbStore {
             // (cleanup_finished_external_jobs handles them).
             let needs_action = matches!(
                 job.status,
-                rsclaw_types::ExternalJobStatus::Pending
-                    | rsclaw_types::ExternalJobStatus::Polling
+                rsclaw_types::ExternalJobStatus::Pending | rsclaw_types::ExternalJobStatus::Polling
             ) || job.needs_delivery();
             if needs_action
-                && job.delivery_attempts
-                    < rsclaw_types::ExternalJob::MAX_DELIVERY_ATTEMPTS
+                && job.delivery_attempts < rsclaw_types::ExternalJob::MAX_DELIVERY_ATTEMPTS
             {
                 due.push(job);
             }
@@ -1615,8 +1586,10 @@ mod tests {
     /// once the holder drops the lock.
     #[test]
     fn create_with_lock_retry_waits_for_lock_release() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("lock.redb");

@@ -10,8 +10,8 @@
 //! validation speak.
 //!
 //! Repairs are deliberately conservative:
-//! - string wanted, scalar given → to_string; object/array given →
-//!   pretty JSON (the write_file `.json` case)
+//! - string wanted, scalar given → to_string; object/array given → pretty JSON
+//!   (the write_file `.json` case)
 //! - number/integer wanted, numeric string given → parsed
 //! - boolean wanted, "true"/"false" string given → parsed
 //! - enum property → trim whitespace (v1 leaks trailing `\n`), then
@@ -112,8 +112,9 @@ pub fn sanitize_args(schema: &Value, args: &mut Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     fn schema() -> Value {
         json!({

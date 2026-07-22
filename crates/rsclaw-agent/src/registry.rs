@@ -16,9 +16,8 @@ use std::{
 };
 
 use anyhow::Result;
-use tokio::sync::{RwLock, mpsc};
-
 use rsclaw_config::{runtime::RuntimeConfig, schema::AgentEntry};
+use tokio::sync::{RwLock, mpsc};
 
 /// Default maximum concurrent turns per agent when not configured.
 const DEFAULT_MAX_CONCURRENT: u32 = 4;
@@ -63,8 +62,7 @@ pub struct AgentHandle {
     /// `tokio::select!` observes immediately — even when the turn is stuck on
     /// a stalled await. Without this a hung turn would block the whole
     /// single-threaded queue until the 30-minute turn timeout fired.
-    pub cancel_tokens:
-        Arc<std::sync::RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    pub cancel_tokens: Arc<std::sync::RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Per-session plugin activation overrides:
     /// `session_key → { plugin_name → PluginOverride }`. Mutated by the
     /// `/plugin` slash command (host-side, never enters conversation
@@ -74,14 +72,14 @@ pub struct AgentHandle {
     /// can call them directly without the plugin_search → plugin_invoke
     /// two-step. The block lives in user_system (not in tools[]), so the
     /// shared prefix KV cache stays intact across overrides.
-    pub plugin_overrides: Arc<
-        std::sync::RwLock<HashMap<String, HashMap<String, crate::runtime::PluginOverride>>>,
-    >,
+    pub plugin_overrides:
+        Arc<std::sync::RwLock<HashMap<String, HashMap<String, crate::runtime::PluginOverride>>>>,
     /// Loaded WASM plugins shared with queue-bypassing slash handlers.
     pub wasm_plugins: Arc<std::sync::RwLock<Arc<Vec<rsclaw_plugin::WasmPlugin>>>>,
     /// Outbound notification sender shared with queue-bypassing slash handlers.
-    pub notification_tx:
-        Arc<std::sync::RwLock<Option<tokio::sync::broadcast::Sender<rsclaw_channel::OutboundMessage>>>>,
+    pub notification_tx: Arc<
+        std::sync::RwLock<Option<tokio::sync::broadcast::Sender<rsclaw_channel::OutboundMessage>>>,
+    >,
     /// Per-session re-enabled cold tools: `session_key → {tool_name}`.
     /// Cold builtin tools (near-zero observed usage) are deferred behind the
     /// `request_tool` stub on non-rsclaw providers; calling the stub records
@@ -814,9 +812,7 @@ impl AgentRegistry {
                     config: entry.clone(),
                     tx,
                     concurrency: Arc::new(tokio::sync::Semaphore::new(permits)),
-                    live_status: Arc::new(
-                        RwLock::new(crate::runtime::LiveStatus::default()),
-                    ),
+                    live_status: Arc::new(RwLock::new(crate::runtime::LiveStatus::default())),
                     providers: Arc::clone(&providers),
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     cancel_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -989,7 +985,6 @@ impl AgentRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rsclaw_config::{
         runtime::{
             AgentsRuntime, ChannelRuntime, ExtRuntime, GatewayRuntime, ModelRuntime, OpsRuntime,
@@ -997,6 +992,8 @@ mod tests {
         },
         schema::{AgentEntry, BindMode, GatewayMode, ReloadMode, SessionConfig},
     };
+
+    use super::*;
 
     fn make_runtime(agents: Vec<AgentEntry>) -> RuntimeConfig {
         RuntimeConfig {
@@ -1077,6 +1074,7 @@ mod tests {
             agent_dir: None,
             system: None,
             temperature: None,
+            daemon: false,
         }
     }
 

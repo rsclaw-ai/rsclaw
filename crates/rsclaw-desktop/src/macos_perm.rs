@@ -99,19 +99,16 @@ pub fn query() -> MacPermissions {
 /// with a permission error the user never saw a prompt for.
 #[cfg(target_os = "macos")]
 pub fn prompt_accessibility() -> bool {
-    use core_foundation::base::TCFType;
-    use core_foundation::boolean::CFBoolean;
-    use core_foundation::dictionary::CFDictionary;
-    use core_foundation::string::CFString;
+    use core_foundation::{
+        base::TCFType, boolean::CFBoolean, dictionary::CFDictionary, string::CFString,
+    };
 
     // SAFETY: `kAXTrustedCheckOptionPrompt` is a framework-owned CFStringRef —
     // wrap under the GET rule (we don't own it, must not release it). The
     // dictionary and boolean are ours and drop at scope end.
     let key = unsafe { CFString::wrap_under_get_rule(ffi::kAXTrustedCheckOptionPrompt) };
-    let opts = CFDictionary::from_CFType_pairs(&[(
-        key.as_CFType(),
-        CFBoolean::true_value().as_CFType(),
-    )]);
+    let opts =
+        CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::true_value().as_CFType())]);
     unsafe { ffi::AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef()) != 0 }
 }
 

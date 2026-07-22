@@ -569,9 +569,10 @@ pub struct AgentEntry {
     /// rsclaw extension: run this agent as a long-lived DAEMON loop (a realtime
     /// monitor that polls forever). Disables the turn-bounding guards (hard
     /// iteration ceiling, stagnation budget, same-call/same-name repeat breaks)
-    /// and the cron turn-timeout — the loop only ends on error or external stop,
-    /// with the agent's own cron as a restart backstop. Default false. Replaces
-    /// the old top-level `agents.defaults.daemonAgentIds` list.
+    /// and the cron turn-timeout — the loop only ends on error or external
+    /// stop, with the agent's own cron as a restart backstop. Default
+    /// false. Replaces the old top-level `agents.defaults.daemonAgentIds`
+    /// list.
     #[serde(default)]
     pub daemon: bool,
 }

@@ -15,11 +15,10 @@ use std::{
 
 use anyhow::Context;
 use chrono::{Datelike, TimeZone, Timelike, Utc};
+use rsclaw_config::schema::{CronDelivery, CronJobConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{debug, info, trace, warn};
-
-use rsclaw_config::schema::{CronDelivery, CronJobConfig};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -261,6 +260,8 @@ pub struct CronJob {
     pub delivery: Option<CronDelivery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_target: Option<String>,
+    /// Optional runtime behavior. `plugin-preflight:<plugin>:<tool>` calls a
+    /// plugin-owned preflight whose JSON result contains boolean `shouldRun`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

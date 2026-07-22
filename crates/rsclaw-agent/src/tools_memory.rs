@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
+use rsclaw_provider::{RecallBundle, RecallMetadata};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -13,7 +14,6 @@ use super::{
     prompt_builder::memory_age_label,
     runtime::{AgentRuntime, RunContext},
 };
-use rsclaw_provider::{RecallBundle, RecallMetadata};
 
 impl AgentRuntime {
     /// `knowledge_base` tool — read (hybrid search) plus user-directed write

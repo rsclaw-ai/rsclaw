@@ -81,8 +81,7 @@ pub struct WhatsAppChannel {
     api_base: String,
     client: Client,
     #[allow(clippy::type_complexity)]
-    on_message:
-        Arc<dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
+    on_message: Arc<dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
     // (from_number, text, images)
 }
 
@@ -90,9 +89,7 @@ impl WhatsAppChannel {
     pub fn new(
         phone_number_id: impl Into<String>,
         access_token: impl Into<String>,
-        on_message: Arc<
-            dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
-        >,
+        on_message: Arc<dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
     ) -> Self {
         Self::with_api_base(phone_number_id, access_token, None, on_message)
     }
@@ -101,9 +98,7 @@ impl WhatsAppChannel {
         phone_number_id: impl Into<String>,
         access_token: impl Into<String>,
         api_base: Option<String>,
-        on_message: Arc<
-            dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
-        >,
+        on_message: Arc<dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
     ) -> Self {
         Self {
             phone_number_id: phone_number_id.into(),
@@ -529,13 +524,8 @@ async fn whatsapp_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::transcription::transcribe_audio(
-        client,
-        &audio_bytes,
-        "video_audio.ogg",
-        "audio/ogg",
-    )
-    .await
+    crate::transcription::transcribe_audio(client, &audio_bytes, "video_audio.ogg", "audio/ogg")
+        .await
 }
 
 // ---------------------------------------------------------------------------

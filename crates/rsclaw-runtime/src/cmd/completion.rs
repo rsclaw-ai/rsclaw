@@ -1,5 +1,4 @@
 use anyhow::Result;
-
 use rsclaw_cli::CompletionArgs;
 
 pub async fn cmd_completion(args: CompletionArgs) -> Result<()> {

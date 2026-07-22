@@ -3,6 +3,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use rsclaw_agent::AgentMessage;
+use rsclaw_events::AgentEvent;
+
 use crate::{
     gateway::preparse::{PreparseOrigin, try_preparse_locally},
     ws::{
@@ -10,8 +13,6 @@ use crate::{
         types::{ErrorShape, EventFrame},
     },
 };
-use rsclaw_agent::AgentMessage;
-use rsclaw_events::AgentEvent;
 
 /// `chat.send` — the primary method the OpenClaw WebUI uses to send messages.
 ///

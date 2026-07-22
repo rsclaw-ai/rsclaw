@@ -1,7 +1,7 @@
 use anyhow::Result;
+use rsclaw_cli::{DaemonCommand, GatewayCommand};
 
 use crate::cmd::gateway::cmd_gateway;
-use rsclaw_cli::{DaemonCommand, GatewayCommand};
 
 /// Delegate daemon sub-commands to gateway equivalents.
 pub async fn cmd_daemon(sub: DaemonCommand) -> Result<()> {
