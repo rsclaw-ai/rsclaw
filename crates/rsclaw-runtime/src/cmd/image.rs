@@ -106,12 +106,13 @@ async fn vision_describe(
 }
 
 /// Resolve the vision model: --model flag, then agents.defaults.model.vision,
-/// then the rsclaw fleet default.
+/// then the rsclaw fleet default. Strips the `provider/` prefix (e.g.
+/// `rsclaw/rsclaw-vision-v1` → `rsclaw-vision-v1`) so the fleet endpoint
+/// receives the canonical bare model name.
 fn resolve_vision_model(cli_model: Option<&str>) -> Result<String> {
     if let Some(m) = cli_model {
-        return Ok(m.to_owned());
+        return Ok(strip_provider_prefix(m));
     }
-    // Try config: agents.defaults.model.vision
     if let Ok(cfg) = rsclaw_config::load() {
         if let Some(head) = cfg
             .raw
@@ -121,10 +122,17 @@ fn resolve_vision_model(cli_model: Option<&str>) -> Result<String> {
             .and_then(|d| d.model.as_ref())
             .and_then(|m| m.vision_head())
         {
-            return Ok(head.to_owned());
+            return Ok(strip_provider_prefix(head));
         }
     }
-    Ok(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned())
+    Ok(strip_provider_prefix(
+        rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION,
+    ))
+}
+
+/// Strip `provider/` prefix for fleet endpoints (e.g. `rsclaw/rsclaw-vision-v1` → `rsclaw-vision-v1`).
+fn strip_provider_prefix(model: &str) -> String {
+    model.rsplit_once('/').map(|(_, bare)| bare).unwrap_or(model).to_owned()
 }
 
 /// Resolve fleet base URL for vision, mirroring OcrClient's logic.
