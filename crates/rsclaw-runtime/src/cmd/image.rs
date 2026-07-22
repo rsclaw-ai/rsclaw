@@ -66,6 +66,10 @@ async fn vision_describe(
         "prompt": prompt,
         "images": [image_data_uri],
         "stream": false,
+        "options": {
+            "temperature": 0,
+            "top_k": 1,
+        },
     });
     if let Some(mt) = max_tokens {
         body["max_tokens"] = serde_json::json!(mt);
