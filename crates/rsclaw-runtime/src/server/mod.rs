@@ -189,14 +189,21 @@ pub struct AppState {
     pub cron_reload: broadcast::Sender<()>,
     /// Notification sender — routes OutboundMessage to the correct channel.
     pub notification_tx: broadcast::Sender<rsclaw_channel::OutboundMessage>,
-    /// WASM plugins for direct tool execution via API.
-    pub wasm_plugins: Arc<Vec<rsclaw_plugin::WasmPlugin>>,
-    /// Shell-bridge plugin registry for direct tool execution via API.
-    pub plugins: Arc<rsclaw_plugin::PluginRegistry>,
+    /// WASM plugins for direct tool execution via API. Swappable via reload.
+    pub wasm_plugins: Arc<tokio::sync::RwLock<Arc<Vec<rsclaw_plugin::WasmPlugin>>>>,
+    /// Shell-bridge plugin registry for direct tool execution via API. Swappable via reload.
+    pub plugins: Arc<tokio::sync::RwLock<Arc<rsclaw_plugin::PluginRegistry>>>,
     /// Skill registry — swappable for hot-reload via `/api/v1/reload`.
     pub skills: Arc<tokio::sync::RwLock<Arc<rsclaw_skill::SkillRegistry>>>,
     /// MCP server registry — supports hot-respawn via `/api/v1/reload`.
     pub mcp: Arc<rsclaw_mcp::McpRegistry>,
+    /// Channel manager — supports hot-add/remove via `/api/v1/reload`.
+    pub channel_manager: Arc<rsclaw_channel::ChannelManager>,
+    /// Outbound channel senders — needed for channel hot-reload routing.
+    pub channel_senders:
+        Arc<std::sync::RwLock<std::collections::HashMap<String, tokio::sync::mpsc::Sender<rsclaw_channel::OutboundMessage>>>>,
+    /// Agent spawner — needed for hot-adding agents via `/api/v1/reload`.
+    pub agent_spawner: Arc<rsclaw_agent::AgentSpawner>,
     /// Broadcast channel for restart-required events
     /// (config changed, model downloaded, etc.). Multi-source, single sink.
     pub restart_request_tx: broadcast::Sender<rsclaw_events::RestartRequest>,
@@ -239,6 +246,10 @@ pub struct AppState {
     /// written by every `FailoverManager` in the gateway. See
     /// `provider::health::ProviderHealthRegistry`.
     pub model_health: rsclaw_provider::health::ProviderHealthRegistry,
+    /// Provider registry — needed by `/api/v1/reload` to re-load plugins.
+    pub providers: Arc<rsclaw_provider::registry::ProviderRegistry>,
+    /// Shared WASM browser session — needed by `/api/v1/reload` for plugin host functions.
+    pub wasm_browser: Arc<tokio::sync::Mutex<Option<rsclaw_browser::BrowserSession>>>,
     /// H1: per-IP rate limiter for inbound HTTP requests.
     pub rate_limiter: Arc<RateLimiter>,
 }
@@ -1466,7 +1477,8 @@ async fn execute_tool(
 
     // Check WASM plugins first; wasm wins on collision (matches agent dispatch).
     if let Some((plugin_name, tool_inner)) = tool_name.split_once('.') {
-        for wp in state.wasm_plugins.iter() {
+        let wasm_snapshot = state.wasm_plugins.read().await.clone();
+        for wp in wasm_snapshot.iter() {
             if wp.name == plugin_name {
                 match wp.call_tool(tool_inner, args.clone()).await {
                     Ok(result) => return Json(serde_json::json!({"ok": true, "result": result})),
@@ -1479,7 +1491,8 @@ async fn execute_tool(
         // Fall through to JS plugins. The REST endpoint has no IM session
         // context, so _ctx fields are empty — host.notify will return
         // logged_only rather than dispatching.
-        if let Some(plugin) = state.plugins.get_js(plugin_name) {
+        let plugins_snapshot = state.plugins.read().await.clone();
+        if let Some(plugin) = plugins_snapshot.get_js(plugin_name) {
             let params = serde_json::json!({
                 "tool": tool_inner,
                 "args": args,
@@ -1615,7 +1628,8 @@ async fn plugin_describe(
         )
             .into_response();
     }
-    if let Some(wp) = state.wasm_plugins.iter().find(|p| p.name == name) {
+    let wasm_snapshot = state.wasm_plugins.read().await.clone();
+    if let Some(wp) = wasm_snapshot.iter().find(|p| p.name == name) {
         let tools: Vec<serde_json::Value> = wp
             .tools
             .iter()
@@ -1635,7 +1649,8 @@ async fn plugin_describe(
         }))
         .into_response();
     }
-    if let Some(plugin) = state.plugins.get_js(name) {
+    let plugins_snapshot = state.plugins.read().await.clone();
+    if let Some(plugin) = plugins_snapshot.get_js(name) {
         let tools: Vec<serde_json::Value> = plugin
             .manifest
             .tools
@@ -1820,6 +1835,7 @@ async fn http_reload(
         .map(|s| s.to_lowercase())
         .unwrap_or_else(|| "all".to_owned());
     let reload_skills = scope.contains("all") || scope.contains("skill");
+    let reload_plugins = scope.contains("all") || scope.contains("plugin");
     let reload_mcp = scope.contains("all") || scope.contains("mcp");
 
     // Re-load config from disk to pick up any changes.
@@ -1861,6 +1877,64 @@ async fn http_reload(
         }
     }
 
+    // --- Plugins: re-scan plugin dir, swap WASM + JS registries ---
+    if reload_plugins {
+        let base_dir = rsclaw_config::loader::base_dir();
+        let plugins_dir = base_dir.join("plugins");
+        match rsclaw_plugin::load_all_plugins(
+            &plugins_dir,
+            fresh_config.ext.plugins.as_ref(),
+            Arc::clone(&state.wasm_browser),
+            Some(state.notification_tx.clone()),
+            Some(Arc::clone(&state.providers)),
+            None,
+        )
+        .await
+        {
+            Ok(mut new_registry) => {
+                let new_wasm = Arc::new(new_registry.take_wasm_plugins());
+                let wasm_count = new_wasm.len();
+                let js_count = new_registry.js_count();
+
+                // Shutdown old JS plugin subprocesses to prevent orphan leaks.
+                {
+                    let old_plugins = state.plugins.read().await;
+                    for plugin in old_plugins.all() {
+                        plugin.shutdown().await;
+                    }
+                }
+
+                // Swap WASM plugins into AppState and all agent handles.
+                {
+                    let mut guard = state.wasm_plugins.write().await;
+                    *guard = Arc::clone(&new_wasm);
+                }
+                for handle in state.agents.all() {
+                    handle.set_wasm_plugins(Arc::clone(&new_wasm));
+                }
+
+                // Swap JS plugin registry.
+                {
+                    let mut guard = state.plugins.write().await;
+                    *guard = Arc::new(new_registry);
+                }
+
+                details.insert(
+                    "plugins".to_owned(),
+                    serde_json::json!({"reloaded": true, "wasm": wasm_count, "js": js_count}),
+                );
+                tracing::info!(wasm_count, js_count, "hot-reload: plugins reloaded");
+            }
+            Err(e) => {
+                details.insert(
+                    "plugins".to_owned(),
+                    serde_json::json!({"reloaded": false, "error": e.to_string()}),
+                );
+                tracing::warn!(error = %e, "hot-reload: plugin reload failed");
+            }
+        }
+    }
+
     // --- MCP: kill all existing servers and re-spawn from config ---
     if reload_mcp {
         let registry = Arc::clone(&state.mcp);
@@ -1876,6 +1950,155 @@ async fn http_reload(
         details.insert(
             "mcp".to_owned(),
             serde_json::json!({"reloaded": true, "servers": spawned}),
+        );
+    }
+
+    // --- Channels: remove deconfigured channels, report new ones ---
+    let reload_channels = scope.contains("all") || scope.contains("channel");
+    if reload_channels {
+        let configured_channels = fresh_config
+            .raw
+            .channels
+            .as_ref()
+            .map(|c| {
+                let mut names = Vec::new();
+                if c.telegram.is_some() { names.push("telegram".to_owned()); }
+                if c.discord.is_some() { names.push("discord".to_owned()); }
+                if c.slack.is_some() { names.push("slack".to_owned()); }
+                if c.whatsapp.is_some() { names.push("whatsapp".to_owned()); }
+                if c.signal.is_some() { names.push("signal".to_owned()); }
+                if c.feishu.is_some() { names.push("feishu".to_owned()); }
+                if c.dingtalk.is_some() { names.push("dingtalk".to_owned()); }
+                if c.wecom.is_some() { names.push("wecom".to_owned()); }
+                if c.wechat.is_some() { names.push("wechat".to_owned()); }
+                if c.qq.is_some() { names.push("qq".to_owned()); }
+                if c.line.is_some() { names.push("line".to_owned()); }
+                if c.zalo.is_some() { names.push("zalo".to_owned()); }
+                if c.matrix.is_some() { names.push("matrix".to_owned()); }
+                names
+            })
+            .unwrap_or_default();
+
+        let running = state.channel_manager.names();
+        let mut removed = Vec::new();
+        let mut needs_restart = Vec::new();
+
+        // Remove channels that are running but no longer configured.
+        for name in &running {
+            let base = name.split('/').next().unwrap_or(name);
+            if base == "cli" || base == "desktop" || base == "ws" {
+                continue;
+            }
+            if !configured_channels.iter().any(|c| c == base) {
+                state.channel_manager.unregister(name);
+                if let Ok(mut senders) = state.channel_senders.write() {
+                    senders.remove(name);
+                }
+                removed.push(name.clone());
+            }
+        }
+
+        // Detect new channels that need a restart to wire up.
+        for name in &configured_channels {
+            let is_running = running.iter().any(|r| {
+                r == name || r.starts_with(&format!("{name}/"))
+            });
+            if !is_running {
+                needs_restart.push(name.clone());
+            }
+        }
+
+        if !removed.is_empty() {
+            tracing::info!(removed = ?removed, "hot-reload: channels removed");
+        }
+        details.insert(
+            "channels".to_owned(),
+            serde_json::json!({
+                "reloaded": true,
+                "removed": removed,
+                "needs_restart": needs_restart,
+            }),
+        );
+    }
+
+    // --- Agents: diff config vs registry, spawn new / remove old ---
+    let reload_agents = scope.contains("all") || scope.contains("agent");
+    if reload_agents {
+        let config_agents = fresh_config
+            .raw
+            .agents
+            .as_ref()
+            .and_then(|a| a.list.as_ref())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| e.id.clone())
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+
+        let running_agents: std::collections::HashSet<String> = state
+            .agents
+            .all()
+            .iter()
+            .map(|h| h.id.clone())
+            .collect();
+
+        let mut spawned_ids = Vec::new();
+        let mut removed_ids = Vec::new();
+
+        // Spawn new agents that are in config but not running.
+        for entry in fresh_config
+            .raw
+            .agents
+            .as_ref()
+            .and_then(|a| a.list.as_ref())
+            .map(|e| e.iter())
+            .into_iter()
+            .flatten()
+        {
+            if !running_agents.contains(&entry.id) {
+                match state.agent_spawner.spawn_agent(entry.clone()) {
+                    Ok(id) => {
+                        spawned_ids.push(id);
+                    }
+                    Err(e) => {
+                        tracing::warn!(agent = %entry.id, error = %e, "hot-reload: agent spawn failed");
+                    }
+                }
+            }
+        }
+
+        // Remove agents that are running but no longer in config.
+        for id in &running_agents {
+            if !config_agents.contains(id) {
+                // Cancel in-flight turns for this agent.
+                if let Ok(handle) = state.agents.get(id) {
+                    if let Ok(tokens) = handle.cancel_tokens.read() {
+                        for (_sk, tok) in tokens.iter() {
+                            tok.cancel();
+                        }
+                    }
+                }
+                state.agents.remove_handle(id);
+                removed_ids.push(id.clone());
+            }
+        }
+
+        if !spawned_ids.is_empty() || !removed_ids.is_empty() {
+            tracing::info!(
+                spawned = ?spawned_ids,
+                removed = ?removed_ids,
+                "hot-reload: agents updated"
+            );
+        }
+        details.insert(
+            "agents".to_owned(),
+            serde_json::json!({
+                "reloaded": true,
+                "spawned": spawned_ids,
+                "removed": removed_ids,
+            }),
         );
     }
 

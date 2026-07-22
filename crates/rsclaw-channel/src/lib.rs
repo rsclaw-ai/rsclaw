@@ -642,14 +642,14 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRef
 use rsclaw_platform::MemoryTier;
 
 pub struct ChannelManager {
-    channels: HashMap<String, Arc<dyn Channel>>,
+    channels: std::sync::RwLock<HashMap<String, Arc<dyn Channel>>>,
     tier: MemoryTier,
 }
 
 impl ChannelManager {
     pub fn new(tier: MemoryTier) -> Self {
         Self {
-            channels: HashMap::new(),
+            channels: std::sync::RwLock::new(HashMap::new()),
             tier,
         }
     }
@@ -662,7 +662,7 @@ impl ChannelManager {
         }
     }
 
-    pub fn register(&mut self, ch: Arc<dyn Channel>) -> Result<()> {
+    pub fn register(&self, ch: Arc<dyn Channel>) -> Result<()> {
         let name = ch.name().to_owned();
         self.register_with_name(name, ch)
     }
@@ -676,27 +676,27 @@ impl ChannelManager {
     /// (detected via `Arc::ptr_eq`) — do not consume `max_concurrent` quota.
     /// This lets a real multi-account channel register multiple lookup keys
     /// (e.g. `"feishu"` and `"feishu/main"`) without burning extra slots.
-    pub fn register_with_name(&mut self, name: String, ch: Arc<dyn Channel>) -> Result<()> {
-        let is_alias = self
-            .channels
+    pub fn register_with_name(&self, name: String, ch: Arc<dyn Channel>) -> Result<()> {
+        let mut channels = self.channels.write().expect("ChannelManager lock poisoned");
+        let is_alias = channels
             .values()
             .any(|existing| Arc::ptr_eq(existing, &ch));
-        if !is_alias && self.distinct_channel_count() >= self.max_concurrent() {
+        if !is_alias && Self::distinct_channel_count_inner(&channels) >= self.max_concurrent() {
             anyhow::bail!(
                 "channel limit reached ({}) for memory tier {:?}",
                 self.max_concurrent(),
                 self.tier
             );
         }
-        self.channels.insert(name, ch);
+        channels.insert(name, ch);
         Ok(())
     }
 
     /// Count distinct underlying channels (collapses alias entries that point
     /// at the same `Arc<dyn Channel>`).
-    fn distinct_channel_count(&self) -> usize {
-        let mut seen: Vec<*const ()> = Vec::with_capacity(self.channels.len());
-        for ch in self.channels.values() {
+    fn distinct_channel_count_inner(channels: &HashMap<String, Arc<dyn Channel>>) -> usize {
+        let mut seen: Vec<*const ()> = Vec::with_capacity(channels.len());
+        for ch in channels.values() {
             let ptr = Arc::as_ptr(ch) as *const ();
             if !seen.iter().any(|p| *p == ptr) {
                 seen.push(ptr);
@@ -706,7 +706,17 @@ impl ChannelManager {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Channel>> {
-        self.channels.get(name).cloned()
+        self.channels.read().expect("ChannelManager lock poisoned").get(name).cloned()
+    }
+
+    /// Remove a channel by name. Returns the removed channel if it existed.
+    pub fn unregister(&self, name: &str) -> Option<Arc<dyn Channel>> {
+        self.channels.write().expect("ChannelManager lock poisoned").remove(name)
+    }
+
+    /// All registered channel names (for diffing during hot-reload).
+    pub fn names(&self) -> Vec<String> {
+        self.channels.read().expect("ChannelManager lock poisoned").keys().cloned().collect()
     }
 }
 
