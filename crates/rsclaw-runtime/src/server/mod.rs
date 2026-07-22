@@ -193,6 +193,10 @@ pub struct AppState {
     pub wasm_plugins: Arc<Vec<rsclaw_plugin::WasmPlugin>>,
     /// Shell-bridge plugin registry for direct tool execution via API.
     pub plugins: Arc<rsclaw_plugin::PluginRegistry>,
+    /// Skill registry — swappable for hot-reload via `/api/v1/reload`.
+    pub skills: Arc<tokio::sync::RwLock<Arc<rsclaw_skill::SkillRegistry>>>,
+    /// MCP server registry — supports hot-respawn via `/api/v1/reload`.
+    pub mcp: Arc<rsclaw_mcp::McpRegistry>,
     /// Broadcast channel for restart-required events
     /// (config changed, model downloaded, etc.). Multi-source, single sink.
     pub restart_request_tx: broadcast::Sender<rsclaw_events::RestartRequest>,
@@ -331,6 +335,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/config/reload", post(config_reload))
+        .route("/reload", post(http_reload))
         .route("/shutdown", post(http_shutdown))
         .route("/restart", post(http_restart))
         .route("/restart-dismiss", post(http_restart_dismiss))
@@ -1801,6 +1806,120 @@ async fn config_reload(State(_state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+/// Hot-reload plugins, skills, and/or MCP servers without restarting the gateway.
+///
+/// Query params: `?scope=skills,mcp,plugins` (default: all).
+async fn http_reload(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let scope = params
+        .get("scope")
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "all".to_owned());
+    let reload_skills = scope.contains("all") || scope.contains("skill");
+    let reload_mcp = scope.contains("all") || scope.contains("mcp");
+
+    // Re-load config from disk to pick up any changes.
+    let fresh_config = match rsclaw_config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"reloaded": false, "error": format!("config parse failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut details = serde_json::Map::new();
+
+    // --- Skills: rescan directories and swap the registry atomically ---
+    if reload_skills {
+        let base_dir = rsclaw_config::loader::base_dir();
+        let global_skills = base_dir.join("skills");
+        match rsclaw_skill::load_skills(&global_skills, None, fresh_config.ext.skills.as_ref()) {
+            Ok(new_registry) => {
+                let count = new_registry.len();
+                let mut guard = state.skills.write().await;
+                *guard = Arc::new(new_registry);
+                details.insert(
+                    "skills".to_owned(),
+                    serde_json::json!({"reloaded": true, "count": count}),
+                );
+                tracing::info!(count, "hot-reload: skills rescanned");
+            }
+            Err(e) => {
+                details.insert(
+                    "skills".to_owned(),
+                    serde_json::json!({"reloaded": false, "error": e.to_string()}),
+                );
+                tracing::warn!(error = %e, "hot-reload: skill rescan failed");
+            }
+        }
+    }
+
+    // --- MCP: kill all existing servers and re-spawn from config ---
+    if reload_mcp {
+        let registry = Arc::clone(&state.mcp);
+        {
+            let mut clients = registry.clients.lock().await;
+            let old_count = clients.len();
+            clients.clear();
+            if old_count > 0 {
+                tracing::info!(count = old_count, "hot-reload: cleared old MCP clients");
+            }
+        }
+        let spawned = respawn_mcp_servers(&fresh_config, Arc::clone(&registry)).await;
+        details.insert(
+            "mcp".to_owned(),
+            serde_json::json!({"reloaded": true, "servers": spawned}),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"reloaded": true, "details": details})),
+    )
+        .into_response()
+}
+
+/// Spawn MCP servers from config into the given registry. Returns count spawned.
+async fn respawn_mcp_servers(
+    config: &rsclaw_config::runtime::RuntimeConfig,
+    registry: Arc<rsclaw_mcp::McpRegistry>,
+) -> usize {
+    let mcp = match config.raw.mcp.as_ref() {
+        Some(m) if m.enabled != Some(false) => m,
+        _ => return 0,
+    };
+    let servers = match mcp.servers.as_ref() {
+        Some(s) => s,
+        None => return 0,
+    };
+    let mut count = 0;
+    for server_cfg in servers {
+        match rsclaw_mcp::McpClient::spawn(server_cfg).await {
+            Ok(mut client) => {
+                if let Err(e) = client.initialize().await {
+                    tracing::warn!(name = %server_cfg.name, error = %e, "hot-reload MCP: initialize failed");
+                    continue;
+                }
+                if let Err(e) = client.list_tools().await {
+                    tracing::warn!(name = %server_cfg.name, error = %e, "hot-reload MCP: list_tools failed");
+                }
+                registry.register(Arc::new(client)).await;
+                count += 1;
+            }
+            Err(e) => {
+                tracing::warn!(name = %server_cfg.name, error = %e, "hot-reload MCP: spawn failed");
+            }
+        }
+    }
+    tracing::info!(count, "hot-reload: MCP servers respawned");
+    count
 }
 
 /// Reject the request if the caller isn't a loopback peer.

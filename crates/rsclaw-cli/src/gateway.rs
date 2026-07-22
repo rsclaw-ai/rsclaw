@@ -8,6 +8,12 @@ pub enum GatewayCommand {
     Stop,
     /// Restart the gateway.
     Restart,
+    /// Hot-reload plugins, skills, and MCP servers without restarting.
+    Reload {
+        /// What to reload: plugins, skills, mcp (default: all).
+        #[arg(long, value_delimiter = ',')]
+        scope: Option<Vec<String>>,
+    },
     /// Run gateway in the foreground (for systemd/launchd).
     Run(GatewayRunArgs),
     /// Show gateway status.

@@ -1027,6 +1027,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         notification_tx: notification_tx.clone(),
         wasm_plugins: Arc::clone(&wasm_plugins),
         plugins: Arc::clone(&plugins),
+        skills: Arc::new(tokio::sync::RwLock::new(Arc::clone(&skills))),
+        mcp: Arc::clone(&mcp_registry),
         restart_request_tx: restart_request_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
