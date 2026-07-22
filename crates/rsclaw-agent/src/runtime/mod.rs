@@ -70,7 +70,7 @@ use rsclaw_provider::{
     AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, RecallBundle, Role,
     StreamEvent, ToolDef, failover::FailoverManager, registry::ProviderRegistry,
 };
-use rsclaw_skill::{RunOptions, SkillRegistry, run_tool};
+use rsclaw_skill::SkillRegistry;
 use rsclaw_store::Store;
 
 pub use super::context_mgr::estimate_tokens;

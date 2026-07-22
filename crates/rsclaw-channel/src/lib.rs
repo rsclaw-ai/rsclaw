@@ -712,6 +712,8 @@ impl ChannelManager {
             .values()
             .any(|existing| Arc::ptr_eq(existing, &ch));
         if !is_alias && Self::distinct_channel_count_inner(&channels) >= self.max_concurrent() {
+            drop(channels);
+            self.cancel_channel(&name);
             anyhow::bail!(
                 "channel limit reached ({}) for memory tier {:?}",
                 self.max_concurrent(),

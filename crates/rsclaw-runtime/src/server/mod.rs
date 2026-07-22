@@ -254,6 +254,9 @@ pub struct AppState {
     pub wasm_browser: Arc<tokio::sync::Mutex<Option<rsclaw_browser::BrowserSession>>>,
     /// H1: per-IP rate limiter for inbound HTTP requests.
     pub rate_limiter: Arc<RateLimiter>,
+    /// Serializes `/api/v1/reload` requests so concurrent calls cannot
+    /// double-spawn channels or race on provider/agent swaps.
+    pub reload_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 // AgentEvent is defined in rsclaw_events to avoid circular deps with agent.
@@ -1841,6 +1844,9 @@ async fn http_reload(
     let reload_providers = scope.contains("all") || scope.contains("provider");
     let reload_mcp = scope.contains("all") || scope.contains("mcp");
 
+    // Serialize concurrent reload requests to prevent double-spawn races.
+    let _reload_guard = state.reload_mutex.lock().await;
+
     // Re-load config from disk to pick up any changes.
     let fresh_config = match rsclaw_config::load() {
         Ok(cfg) => cfg,
@@ -1949,6 +1955,9 @@ async fn http_reload(
         }
         for handle in state.agents.all() {
             handle.set_providers(Arc::clone(&new_registry));
+        }
+        if let Ok(mut g) = state.agent_spawner.providers.write() {
+            *g = Arc::clone(&new_registry);
         }
         details.insert(
             "providers".to_owned(),

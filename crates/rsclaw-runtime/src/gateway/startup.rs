@@ -491,11 +491,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let model_health = rsclaw_provider::health::ProviderHealthRegistry::new();
 
     // Create AgentSpawner — enables agent-to-agent dynamic spawning.
+    let provider_slot: Arc<std::sync::RwLock<Arc<rsclaw_provider::registry::ProviderRegistry>>> =
+        Arc::new(std::sync::RwLock::new(Arc::clone(&providers)));
     let spawner = AgentSpawner::new_arc(
         Arc::clone(&registry),
         Arc::clone(&config),
         Arc::clone(&live),
-        Arc::clone(&providers),
+        Arc::clone(&provider_slot),
         Arc::clone(&skills),
         Arc::clone(&store),
         memory.clone(),
@@ -1048,6 +1050,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         providers: Arc::new(tokio::sync::RwLock::new(Arc::clone(&providers))),
         wasm_browser: Arc::clone(&wasm_browser),
         rate_limiter: Arc::new(crate::server::RateLimiter::new()),
+        reload_mutex: Arc::new(tokio::sync::Mutex::new(())),
     };
     crate::a2a::relay::start_spoke_if_configured(state.clone());
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));

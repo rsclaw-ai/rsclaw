@@ -1,7 +1,5 @@
 //! run_turn — drives a single conversation turn end-to-end.
 
-use futures::StreamExt;
-
 use super::*;
 
 impl AgentRuntime {

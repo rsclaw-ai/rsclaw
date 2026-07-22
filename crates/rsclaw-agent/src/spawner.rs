@@ -23,7 +23,10 @@ pub struct AgentSpawner {
     /// Live, hot-mutable config slices (temperature, etc.) shared across all
     /// runtimes spawned by this spawner.
     pub live: Arc<LiveConfig>,
-    pub providers: Arc<ProviderRegistry>,
+    /// Shared provider slot — swapped by `rsclaw reload --scope providers`.
+    /// Dynamically spawned agents clone this slot into their handle, so they
+    /// always see the latest registry without needing a per-handle set_providers.
+    pub providers: Arc<std::sync::RwLock<Arc<ProviderRegistry>>>,
     pub skills: Arc<SkillRegistry>,
     pub store: Arc<Store>,
     pub memory: Option<Arc<tokio::sync::Mutex<MemoryStore>>>,
@@ -50,7 +53,7 @@ impl AgentSpawner {
         registry: Arc<AgentRegistry>,
         config: Arc<RuntimeConfig>,
         live: Arc<LiveConfig>,
-        providers: Arc<ProviderRegistry>,
+        providers: Arc<std::sync::RwLock<Arc<ProviderRegistry>>>,
         skills: Arc<SkillRegistry>,
         store: Arc<Store>,
         memory: Option<Arc<tokio::sync::Mutex<MemoryStore>>>,
@@ -117,7 +120,7 @@ impl AgentSpawner {
             live_status: Arc::new(tokio::sync::RwLock::new(
                 crate::runtime::LiveStatus::default(),
             )),
-            providers: Arc::new(std::sync::RwLock::new(Arc::clone(&self.providers))),
+            providers: Arc::clone(&self.providers),
             abort_flags: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             cancel_tokens: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             lifetime: tokio_util::sync::CancellationToken::new(),
@@ -150,11 +153,17 @@ impl AgentSpawner {
         // Upgrade weak self-reference so child runtime can also spawn agents.
         let self_arc: Option<Arc<AgentSpawner>> = self.me.get().and_then(|w| w.upgrade());
 
+        let providers_snapshot = self
+            .providers
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_else(|_| Arc::new(ProviderRegistry::new()));
+
         let mut runtime = AgentRuntime::new(
             Arc::clone(&handle),
             Arc::clone(&self.config),
             Arc::clone(&self.live),
-            Arc::clone(&self.providers),
+            providers_snapshot,
             fallback_models,
             Arc::clone(&self.skills),
             Arc::clone(&self.store),
@@ -199,8 +208,8 @@ impl AgentSpawner {
                     chat_id,
                     ..
                 } = msg;
-                let result = runtime
-                    .run_turn(
+                let result = tokio::select! {
+                    r = runtime.run_turn(
                         &session_key,
                         &text,
                         &channel,
@@ -211,8 +220,12 @@ impl AgentSpawner {
                         images,
                         files,
                         crate::registry::TurnContext::default(),
-                    )
-                    .await;
+                    ) => r,
+                    _ = handle.lifetime.cancelled() => {
+                        info!(agent_id = %handle.id, "dynamic agent lifetime cancelled mid-turn");
+                        break;
+                    }
+                };
                 let reply = result.unwrap_or_else(|e| {
                     tracing::error!(agent = %handle.id, "dynamic agent turn error: {e:#}");
                     let outcome = if e.to_string().contains("canceled by A2A CancelTask") {
