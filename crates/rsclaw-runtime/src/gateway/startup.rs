@@ -1958,7 +1958,17 @@ fn spawn_agent_tasks(
         let config_for_task = Arc::clone(&config);
         tokio::spawn(async move {
             info!(agent_id = %handle.id, "agent runtime task started");
-            while let Some(msg) = rx.recv().await {
+            loop {
+                let msg = tokio::select! {
+                    _ = handle.lifetime.cancelled() => {
+                        info!(agent_id = %handle.id, "agent runtime lifetime cancelled, stopping");
+                        break;
+                    }
+                    msg = rx.recv() => match msg {
+                        Some(m) => m,
+                        None => break,
+                    },
+                };
                 info!(
                     agent_id = %handle.id,
                     session_key = %msg.session_key,

@@ -65,6 +65,11 @@ pub struct AgentHandle {
     /// a stalled await. Without this a hung turn would block the whole
     /// single-threaded queue until the 30-minute turn timeout fired.
     pub cancel_tokens: Arc<std::sync::RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Lifetime token for the agent's message-loop task. Fired by
+    /// `remove_handle` so the spawned loop terminates cleanly. Without this
+    /// the loop leaks forever on removal: the task holds `runtime.handle.tx`
+    /// alive, so `rx.recv()` never returns `None`.
+    pub lifetime: tokio_util::sync::CancellationToken,
     /// Per-session plugin activation overrides:
     /// `session_key → { plugin_name → PluginOverride }`. Mutated by the
     /// `/plugin` slash command (host-side, never enters conversation
@@ -833,6 +838,7 @@ impl AgentRegistry {
                     providers: Arc::new(std::sync::RwLock::new(Arc::clone(&providers))),
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     cancel_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    lifetime: tokio_util::sync::CancellationToken::new(),
                     plugin_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     wasm_plugins: Arc::new(std::sync::RwLock::new(Arc::new(Vec::new()))),
                     notification_tx: Arc::new(std::sync::RwLock::new(None)),
@@ -875,9 +881,14 @@ impl AgentRegistry {
     }
 
     /// Remove an agent handle by ID (used for task agents after completion).
+    /// Fires the handle's lifetime token so its message-loop task terminates
+    /// cleanly instead of leaking (the task holds the sender alive, so the
+    /// receiver never closes on its own).
     pub fn remove_handle(&self, id: &str) {
         let mut inner = self.inner.write().expect("agent registry lock poisoned");
-        inner.agents.remove(id);
+        if let Some(handle) = inner.agents.remove(id) {
+            handle.lifetime.cancel();
+        }
     }
 
     /// Look up an agent by ID.

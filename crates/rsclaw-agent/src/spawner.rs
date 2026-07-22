@@ -120,6 +120,7 @@ impl AgentSpawner {
             providers: Arc::new(std::sync::RwLock::new(Arc::clone(&self.providers))),
             abort_flags: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             cancel_tokens: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            lifetime: tokio_util::sync::CancellationToken::new(),
             plugin_overrides: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             wasm_plugins: Arc::new(std::sync::RwLock::new(Arc::new(Vec::new()))),
             notification_tx: Arc::new(std::sync::RwLock::new(None)),
@@ -174,7 +175,17 @@ impl AgentSpawner {
         let config_for_task = Arc::clone(&self.config);
         tokio::spawn(async move {
             info!(agent_id = %handle.id, "dynamic agent spawned");
-            while let Some(msg) = rx.recv().await {
+            loop {
+                let msg = tokio::select! {
+                    _ = handle.lifetime.cancelled() => {
+                        info!(agent_id = %handle.id, "dynamic agent lifetime cancelled, stopping");
+                        break;
+                    }
+                    msg = rx.recv() => match msg {
+                        Some(m) => m,
+                        None => break,
+                    },
+                };
                 let AgentMessage {
                     session_key,
                     text,
