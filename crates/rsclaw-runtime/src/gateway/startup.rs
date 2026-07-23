@@ -544,6 +544,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
+    // Populate handle skills/plugins slots so per-turn refresh works from turn 1.
+    for handle in registry.all() {
+        handle.set_skills(Arc::clone(&skills));
+        handle.set_js_plugins(Some(Arc::clone(&plugins)));
+    }
+
     spawn_agent_tasks(
         receivers,
         Arc::clone(&registry),

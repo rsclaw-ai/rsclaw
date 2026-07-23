@@ -147,6 +147,8 @@ impl AgentSpawner {
             new_session_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             context_window,
             effective_model,
+            skills: Arc::new(std::sync::RwLock::new(Arc::clone(&self.skills))),
+            js_plugins: Arc::new(std::sync::RwLock::new(self.plugins.clone())),
         });
 
         self.registry.insert_handle(Arc::clone(&handle));

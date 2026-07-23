@@ -129,6 +129,12 @@ pub struct AgentHandle {
     /// `/model` and `/status` display this so they show the real model
     /// instead of the literal "default" when only `agents.defaults` is set.
     pub effective_model: String,
+    /// Swappable skill registry slot — refreshed per-turn from handle so
+    /// `rsclaw reload --scope skills` propagates to running agents.
+    pub skills: Arc<std::sync::RwLock<Arc<rsclaw_skill::SkillRegistry>>>,
+    /// Swappable JS plugin registry slot — refreshed per-turn from handle so
+    /// `rsclaw reload --scope plugins` propagates to running agents.
+    pub js_plugins: Arc<std::sync::RwLock<Option<Arc<rsclaw_plugin::PluginRegistry>>>>,
 }
 
 /// Per-session context token statistics.
@@ -173,6 +179,33 @@ impl AgentHandle {
             .read()
             .map(|g| Arc::clone(&g))
             .unwrap_or_else(|_| Arc::new(rsclaw_provider::registry::ProviderRegistry::new()))
+    }
+
+    /// Return the current skill registry snapshot.
+    pub fn skills_snapshot(&self) -> Arc<rsclaw_skill::SkillRegistry> {
+        self.skills
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_else(|_| Arc::new(rsclaw_skill::SkillRegistry::new()))
+    }
+
+    /// Replace the skill registry (hot-reload).
+    pub fn set_skills(&self, skills: Arc<rsclaw_skill::SkillRegistry>) {
+        if let Ok(mut g) = self.skills.write() {
+            *g = skills;
+        }
+    }
+
+    /// Return the current JS plugin registry snapshot.
+    pub fn js_plugins_snapshot(&self) -> Option<Arc<rsclaw_plugin::PluginRegistry>> {
+        self.js_plugins.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Replace the JS plugin registry (hot-reload).
+    pub fn set_js_plugins(&self, plugins: Option<Arc<rsclaw_plugin::PluginRegistry>>) {
+        if let Ok(mut g) = self.js_plugins.write() {
+            *g = plugins;
+        }
     }
 
     /// Set the outbound notification sender visible to slash handlers.
@@ -854,6 +887,10 @@ impl AgentRegistry {
                     new_session_signal: Arc::new(AtomicBool::new(false)),
                     context_window,
                     effective_model,
+                    skills: Arc::new(std::sync::RwLock::new(Arc::new(
+                        rsclaw_skill::SkillRegistry::new(),
+                    ))),
+                    js_plugins: Arc::new(std::sync::RwLock::new(None)),
                 });
                 inner.agents.insert(entry.id.clone(), handle);
                 receivers.insert(entry.id.clone(), rx);

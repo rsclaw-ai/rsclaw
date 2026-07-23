@@ -1856,7 +1856,7 @@ impl AgentRuntime {
     /// natural refresh points (compact / clear / new).
     pub(crate) fn reload_skills(&mut self) {
         let dir = rsclaw_config::loader::base_dir().join("skills");
-        match rsclaw_skill::load_skills(&dir, None, None) {
+        match rsclaw_skill::load_skills(&dir, None, self.config.ext.skills.as_ref()) {
             Ok(reg) => {
                 let before = self.skills.all().count();
                 self.skills = Arc::new(reg);

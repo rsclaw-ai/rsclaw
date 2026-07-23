@@ -1861,6 +1861,20 @@ async fn http_reload(
 
     let mut details = serde_json::Map::new();
 
+    // Propagate hot-safe fields (temperature, auth, loop-detection, etc.)
+    // into LiveConfig — same as the file watcher does. Without this, HTTP
+    // reload reports success while live reads stay stale.
+    {
+        let (restart_tx, _) = tokio::sync::broadcast::channel::<Vec<String>>(1);
+        let restart_fields = state.live.apply(fresh_config.clone(), &restart_tx).await;
+        if !restart_fields.is_empty() {
+            details.insert(
+                "restart_recommended".to_owned(),
+                serde_json::json!(restart_fields),
+            );
+        }
+    }
+
     // --- Skills: rescan directories and swap the registry atomically ---
     if reload_skills {
         let base_dir = rsclaw_config::loader::base_dir();
@@ -1868,8 +1882,13 @@ async fn http_reload(
         match rsclaw_skill::load_skills(&global_skills, None, fresh_config.ext.skills.as_ref()) {
             Ok(new_registry) => {
                 let count = new_registry.len();
+                let new_arc = Arc::new(new_registry);
                 let mut guard = state.skills.write().await;
-                *guard = Arc::new(new_registry);
+                *guard = Arc::clone(&new_arc);
+                drop(guard);
+                for handle in state.agents.all() {
+                    handle.set_skills(Arc::clone(&new_arc));
+                }
                 details.insert(
                     "skills".to_owned(),
                     serde_json::json!({"reloaded": true, "count": count}),
@@ -1925,8 +1944,13 @@ async fn http_reload(
 
                 // Swap JS plugin registry.
                 {
+                    let new_js = Arc::new(new_registry);
                     let mut guard = state.plugins.write().await;
-                    *guard = Arc::new(new_registry);
+                    *guard = Arc::clone(&new_js);
+                    drop(guard);
+                    for handle in state.agents.all() {
+                        handle.set_js_plugins(Some(Arc::clone(&new_js)));
+                    }
                 }
 
                 details.insert(
@@ -2117,6 +2141,15 @@ async fn http_reload(
     // --- Agents: diff config vs registry, spawn new / remove old / restart changed ---
     let reload_agents = scope.contains("all") || scope.contains("agent");
     if reload_agents {
+        // Detect whether agents.defaults.model changed BEFORE swapping the slot.
+        let defaults_model_changed = {
+            let old_config = state.agent_spawner.config.read()
+                .map(|g| Arc::clone(&g))
+                .unwrap_or_else(|_| Arc::clone(&state.config));
+            serde_json::to_value(&old_config.agents.defaults.model).unwrap_or_default()
+                != serde_json::to_value(&fresh_config.agents.defaults.model).unwrap_or_default()
+        };
+
         // Swap the spawner's config slot so re-spawned agents get fresh defaults.
         if let Ok(mut g) = state.agent_spawner.config.write() {
             *g = Arc::new(fresh_config.clone());
@@ -2141,14 +2174,6 @@ async fn http_reload(
             .iter()
             .map(|h| h.id.clone())
             .collect();
-
-        // Detect whether agents.defaults.model changed (vision, flash, primary).
-        let defaults_model_changed = {
-            let old_defaults = &state.config.agents.defaults;
-            let new_defaults = &fresh_config.agents.defaults;
-            serde_json::to_value(&old_defaults.model).unwrap_or_default()
-                != serde_json::to_value(&new_defaults.model).unwrap_or_default()
-        };
 
         let mut spawned_ids = Vec::new();
         let mut removed_ids = Vec::new();

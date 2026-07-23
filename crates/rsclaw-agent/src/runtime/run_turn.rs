@@ -22,6 +22,12 @@ impl AgentRuntime {
         // Refresh providers from the handle's shared slot so hot-reload
         // (rsclaw gateway reload --scope providers) takes effect next turn.
         self.providers = self.handle.providers_snapshot();
+        // Refresh skills from the handle's shared slot so hot-reload
+        // (rsclaw gateway reload --scope skills) takes effect next turn.
+        self.skills = self.handle.skills_snapshot();
+        // Refresh JS plugins from the handle's shared slot so hot-reload
+        // (rsclaw gateway reload --scope plugins) takes effect next turn.
+        self.plugins = self.handle.js_plugins_snapshot();
 
         // Resolve @file references (e.g. @up_i_202604271325ab.png → full path
         // under workspace/uploads/, @dl_v_... → ~/Downloads/rsclaw/videos/).
