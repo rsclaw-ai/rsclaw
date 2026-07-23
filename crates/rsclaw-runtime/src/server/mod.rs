@@ -2117,6 +2117,11 @@ async fn http_reload(
     // --- Agents: diff config vs registry, spawn new / remove old / restart changed ---
     let reload_agents = scope.contains("all") || scope.contains("agent");
     if reload_agents {
+        // Swap the spawner's config slot so re-spawned agents get fresh defaults.
+        if let Ok(mut g) = state.agent_spawner.config.write() {
+            *g = Arc::new(fresh_config.clone());
+        }
+
         let config_entries = fresh_config
             .raw
             .agents
@@ -2137,6 +2142,14 @@ async fn http_reload(
             .map(|h| h.id.clone())
             .collect();
 
+        // Detect whether agents.defaults.model changed (vision, flash, primary).
+        let defaults_model_changed = {
+            let old_defaults = &state.config.agents.defaults;
+            let new_defaults = &fresh_config.agents.defaults;
+            serde_json::to_value(&old_defaults.model).unwrap_or_default()
+                != serde_json::to_value(&new_defaults.model).unwrap_or_default()
+        };
+
         let mut spawned_ids = Vec::new();
         let mut removed_ids = Vec::new();
         let mut restarted_ids = Vec::new();
@@ -2148,7 +2161,7 @@ async fn http_reload(
                     let model_changed = serde_json::to_value(&handle.config.model).unwrap_or_default()
                         != serde_json::to_value(&entry.model).unwrap_or_default();
                     let system_changed = handle.config.system != entry.system;
-                    if model_changed || system_changed {
+                    if model_changed || system_changed || defaults_model_changed {
                         // Cancel in-flight turns.
                         if let Ok(tokens) = handle.cancel_tokens.read() {
                             for (_sk, tok) in tokens.iter() {

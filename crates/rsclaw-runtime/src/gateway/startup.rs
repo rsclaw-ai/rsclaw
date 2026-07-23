@@ -493,9 +493,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // Create AgentSpawner — enables agent-to-agent dynamic spawning.
     let provider_slot: Arc<std::sync::RwLock<Arc<rsclaw_provider::registry::ProviderRegistry>>> =
         Arc::new(std::sync::RwLock::new(Arc::clone(&providers)));
+    let config_slot: Arc<std::sync::RwLock<Arc<RuntimeConfig>>> =
+        Arc::new(std::sync::RwLock::new(Arc::clone(&config)));
     let spawner = AgentSpawner::new_arc(
         Arc::clone(&registry),
-        Arc::clone(&config),
+        Arc::clone(&config_slot),
         Arc::clone(&live),
         Arc::clone(&provider_slot),
         Arc::clone(&skills),
