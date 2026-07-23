@@ -508,8 +508,8 @@ pub(crate) fn start_discord_if_configured(
         ));
         let dc_send = Arc::clone(&dc);
         let shutdown_for_out = shutdown.clone();
-        let chan_name = dc.name().to_owned();
-        let cancel_token = manager.register_cancel_token(&chan_name);
+        let acct_key = format!("discord/{}", acct_name);
+        let cancel_token = manager.register_cancel_token(&acct_key);
         let cancel_for_out = cancel_token.clone();
         tokio::spawn(async move {
             loop {
@@ -531,7 +531,7 @@ pub(crate) fn start_discord_if_configured(
                 }
             }
         });
-        if let Err(e) = manager.register(Arc::clone(&dc) as Arc<dyn Channel>) {
+        if let Err(e) = manager.register_with_name(acct_key, Arc::clone(&dc) as Arc<dyn Channel>) {
             tracing::warn!("failed to register channel: {e}");
         }
         let shutdown_for_run = shutdown.clone();

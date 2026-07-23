@@ -2030,6 +2030,15 @@ async fn http_reload(
                 if c.line.is_some() { names.push("line".to_owned()); }
                 if c.zalo.is_some() { names.push("zalo".to_owned()); }
                 if c.matrix.is_some() { names.push("matrix".to_owned()); }
+                // Include enabled custom channels so the removal diff doesn't
+                // unregister them.
+                if let Some(ref custom) = c.custom {
+                    for ch in custom {
+                        if ch.base.enabled.unwrap_or(true) {
+                            names.push(ch.name.clone());
+                        }
+                    }
+                }
                 names
             })
             .unwrap_or_default();
@@ -2049,6 +2058,11 @@ async fn http_reload(
                 if let Ok(mut senders) = state.channel_senders.write() {
                     senders.remove(name);
                 }
+                // Also remove from custom_webhooks map so /hooks/{name} stops
+                // dispatching to a cancelled channel.
+                state.custom_webhooks.write()
+                    .map(|mut wh| { wh.remove(name); })
+                    .ok();
                 removed.push(name.clone());
             }
         }
@@ -2122,6 +2136,55 @@ async fn http_reload(
                 added.push("matrix");
             }
         }
+
+        // Custom channels: tear down all running custom channels, then restart
+        // from the fresh config. This is simpler than diffing individual custom
+        // channels and avoids orphaned tasks from partial overlap.
+        {
+            let custom_names: Vec<String> = state.channel_manager.names()
+                .into_iter()
+                .filter(|n| {
+                    let base = n.split('/').next().unwrap_or(n);
+                    !["cli", "desktop", "ws",
+                      "telegram", "discord", "slack", "whatsapp", "signal",
+                      "feishu", "dingtalk", "wecom", "wechat", "qq",
+                      "line", "zalo", "matrix"].contains(&base)
+                })
+                .collect();
+            for name in &custom_names {
+                state.channel_manager.unregister(name);
+                if let Ok(mut senders) = state.channel_senders.write() {
+                    senders.remove(name);
+                }
+                state.custom_webhooks.write()
+                    .map(|mut wh| { wh.remove(name); })
+                    .ok();
+                removed.push(name.clone());
+            }
+
+            // Restart all configured custom channels.
+            if !custom_names.is_empty()
+                || fresh_config.channel.channels.custom.as_ref().is_some_and(|c| c.iter().any(|ch| ch.base.enabled.unwrap_or(true)))
+            {
+                use crate::gateway::channels::start_custom_channels;
+                start_custom_channels(
+                    &fresh_config,
+                    Arc::clone(&state.agents),
+                    &state.channel_manager,
+                    Arc::clone(&state.custom_webhooks),
+                    Arc::clone(&state.channel_senders),
+                    Arc::clone(&state.store.db),
+                    state.shutdown.clone(),
+                );
+                if let Some(ref custom_cfgs) = fresh_config.channel.channels.custom {
+                    for ch_cfg in custom_cfgs {
+                        if ch_cfg.base.enabled.unwrap_or(true) {
+                            added.push(ch_cfg.name.as_str());
+                        }
+                    }
+                }
+            }
+        }
         // Filter out channels that were "added" but weren't actually configured.
         added.retain(|name| configured_channels.iter().any(|c| c == name));
 
@@ -2155,13 +2218,45 @@ async fn http_reload(
             *g = Arc::new(fresh_config.clone());
         }
 
-        let config_entries = fresh_config
+        let raw_entries = fresh_config
             .raw
             .agents
             .as_ref()
             .and_then(|a| a.list.as_ref())
             .cloned()
             .unwrap_or_default();
+
+        // If agents.list is absent/empty, synthesize the implicit "main" agent
+        // from agents.defaults — same logic as AgentRegistry::from_config_with_receivers.
+        // Without this, reload would diff against an empty set and remove every
+        // running agent, leaving default_id pointing at a nonexistent handle.
+        let config_entries = if raw_entries.is_empty() {
+            let defaults = &fresh_config.agents.defaults;
+            vec![rsclaw_config::schema::AgentEntry {
+                id: "main".to_owned(),
+                default: Some(true),
+                name: Some("Main Agent".to_owned()),
+                workspace: defaults.workspace.clone(),
+                model: defaults.model.clone(),
+                flash_model: None,
+                lane: None,
+                lane_concurrency: None,
+                group_chat: None,
+                channels: None,
+                commands: None,
+                allowed_commands: None,
+                opencode: defaults.opencode.clone(),
+                claudecode: defaults.claudecode.clone(),
+                codex: defaults.codex.clone(),
+                agent_dir: None,
+                system: None,
+                temperature: None,
+                daemon: false,
+                description: None,
+            }]
+        } else {
+            raw_entries
+        };
 
         let config_agents: std::collections::HashSet<String> = config_entries
             .iter()

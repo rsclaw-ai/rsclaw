@@ -781,6 +781,10 @@ fn start_custom_websocket(
 
     let ch = Arc::new(CustomWebSocketChannel::new(ch_cfg, on_message));
 
+    let chan_name_for_cancel = ch_name.clone();
+    let cancel_token = manager.register_cancel_token(&chan_name_for_cancel);
+    let cancel_for_out = cancel_token.clone();
+
     let ch_send = Arc::clone(&ch);
     let shutdown_for_out = shutdown.clone();
     tokio::spawn(async move {
@@ -788,6 +792,10 @@ fn start_custom_websocket(
             tokio::select! {
                 () = shutdown_for_out.notified() => {
                     info!("custom WS: drain signaled, stopping outbound sender");
+                    break;
+                }
+                () = cancel_for_out.cancelled() => {
+                    info!("custom WS: channel cancelled, stopping outbound sender");
                     break;
                 }
                 msg = out_rx.recv() => {
@@ -813,6 +821,9 @@ fn start_custom_websocket(
             }
             () = shutdown_for_run.notified() => {
                 info!("custom WS: drain signaled, stopping run loop");
+            }
+            () = cancel_token.cancelled() => {
+                info!("custom WS: channel cancelled, stopping run loop");
             }
         }
     });
