@@ -11,6 +11,7 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 tracing = "0.1"
 async-trait = "0.1"
 futures = "0.3"

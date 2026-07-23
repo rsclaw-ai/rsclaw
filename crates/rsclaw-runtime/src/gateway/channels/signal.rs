@@ -76,7 +76,7 @@ impl Channel for SignalProxy {
 pub(crate) fn start_signal_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<rsclaw_channel::DmPolicyEnforcer>>>,
     >,
@@ -508,6 +508,7 @@ pub(crate) fn start_signal_if_configured(
         // fill the slot and pulse `ready` so the proxy can release any waiting
         // sends.
         let shutdown_for_signal = shutdown.clone();
+        let cancel_token = manager.register_cancel_token(&proxy_name);
         tokio::spawn(async move {
             match SignalChannel::spawn(phone, sig_cli_path, on_message).await {
                 Ok(ch) => {
@@ -518,11 +519,16 @@ pub(crate) fn start_signal_if_configured(
                     signal_ready.notify_waiters();
                     let ch_send = Arc::clone(&ch);
                     let shutdown_for_out = shutdown_for_signal.clone();
+                    let cancel_for_out = cancel_token.clone();
                     tokio::spawn(async move {
                         loop {
                             tokio::select! {
                                 () = shutdown_for_out.notified() => {
                                     info!("signal: drain signaled, stopping outbound sender");
+                                    break;
+                                }
+                                () = cancel_for_out.cancelled() => {
+                                    info!("signal: channel cancelled, stopping outbound sender");
                                     break;
                                 }
                                 msg = out_rx.recv() => {
@@ -543,6 +549,9 @@ pub(crate) fn start_signal_if_configured(
                         }
                         () = shutdown_for_signal.notified() => {
                             info!("signal: drain signaled, stopping run loop");
+                        }
+                        () = cancel_token.cancelled() => {
+                            info!("signal: channel cancelled, stopping run loop");
                         }
                     }
                 }

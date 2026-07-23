@@ -642,15 +642,45 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRef
 use rsclaw_platform::MemoryTier;
 
 pub struct ChannelManager {
-    channels: HashMap<String, Arc<dyn Channel>>,
+    channels: std::sync::RwLock<HashMap<String, Arc<dyn Channel>>>,
+    /// Per-channel cancellation tokens keyed by registration name. A channel's
+    /// run/outbound tasks select on their token; firing it (via `unregister`
+    /// or `cancel_channel`) stops them gracefully during hot-reload removal.
+    cancel_tokens: std::sync::RwLock<HashMap<String, tokio_util::sync::CancellationToken>>,
     tier: MemoryTier,
 }
 
 impl ChannelManager {
     pub fn new(tier: MemoryTier) -> Self {
         Self {
-            channels: HashMap::new(),
+            channels: std::sync::RwLock::new(HashMap::new()),
+            cancel_tokens: std::sync::RwLock::new(HashMap::new()),
             tier,
+        }
+    }
+
+    /// Mint and register a cancellation token for a channel registration name.
+    /// The channel's run/outbound tasks should select on the returned token so
+    /// they stop gracefully when the channel is unregistered.
+    pub fn register_cancel_token(&self, name: &str) -> tokio_util::sync::CancellationToken {
+        let tok = tokio_util::sync::CancellationToken::new();
+        self.cancel_tokens
+            .write()
+            .expect("ChannelManager cancel_tokens lock poisoned")
+            .insert(name.to_owned(), tok.clone());
+        tok
+    }
+
+    /// Fire (and drop) the cancellation token for a channel name, stopping its
+    /// run/outbound tasks. No-op if no token is registered.
+    pub fn cancel_channel(&self, name: &str) {
+        if let Some(tok) = self
+            .cancel_tokens
+            .write()
+            .expect("ChannelManager cancel_tokens lock poisoned")
+            .remove(name)
+        {
+            tok.cancel();
         }
     }
 
@@ -662,7 +692,7 @@ impl ChannelManager {
         }
     }
 
-    pub fn register(&mut self, ch: Arc<dyn Channel>) -> Result<()> {
+    pub fn register(&self, ch: Arc<dyn Channel>) -> Result<()> {
         let name = ch.name().to_owned();
         self.register_with_name(name, ch)
     }
@@ -676,27 +706,27 @@ impl ChannelManager {
     /// (detected via `Arc::ptr_eq`) — do not consume `max_concurrent` quota.
     /// This lets a real multi-account channel register multiple lookup keys
     /// (e.g. `"feishu"` and `"feishu/main"`) without burning extra slots.
-    pub fn register_with_name(&mut self, name: String, ch: Arc<dyn Channel>) -> Result<()> {
-        let is_alias = self
-            .channels
+    pub fn register_with_name(&self, name: String, ch: Arc<dyn Channel>) -> Result<()> {
+        let mut channels = self.channels.write().expect("ChannelManager lock poisoned");
+        let is_alias = channels
             .values()
             .any(|existing| Arc::ptr_eq(existing, &ch));
-        if !is_alias && self.distinct_channel_count() >= self.max_concurrent() {
+        if !is_alias && Self::distinct_channel_count_inner(&channels) >= self.max_concurrent() {
             anyhow::bail!(
                 "channel limit reached ({}) for memory tier {:?}",
                 self.max_concurrent(),
                 self.tier
             );
         }
-        self.channels.insert(name, ch);
+        channels.insert(name, ch);
         Ok(())
     }
 
     /// Count distinct underlying channels (collapses alias entries that point
     /// at the same `Arc<dyn Channel>`).
-    fn distinct_channel_count(&self) -> usize {
-        let mut seen: Vec<*const ()> = Vec::with_capacity(self.channels.len());
-        for ch in self.channels.values() {
+    fn distinct_channel_count_inner(channels: &HashMap<String, Arc<dyn Channel>>) -> usize {
+        let mut seen: Vec<*const ()> = Vec::with_capacity(channels.len());
+        for ch in channels.values() {
             let ptr = Arc::as_ptr(ch) as *const ();
             if !seen.iter().any(|p| *p == ptr) {
                 seen.push(ptr);
@@ -706,7 +736,25 @@ impl ChannelManager {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Channel>> {
-        self.channels.get(name).cloned()
+        self.channels.read().expect("ChannelManager lock poisoned").get(name).cloned()
+    }
+
+    /// Remove a channel by name. Returns the removed channel if it existed.
+    /// Also fires the channel's cancellation token so its run/outbound tasks
+    /// stop gracefully (not just the routing entry).
+    pub fn unregister(&self, name: &str) -> Option<Arc<dyn Channel>> {
+        self.cancel_channel(name);
+        self.channels.write().expect("ChannelManager lock poisoned").remove(name)
+    }
+
+    /// All registered channel names (for diffing during hot-reload).
+    pub fn names(&self) -> Vec<String> {
+        self.channels.read().expect("ChannelManager lock poisoned").keys().cloned().collect()
+    }
+
+    /// Whether a channel with the given name is registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.channels.read().expect("ChannelManager lock poisoned").contains_key(name)
     }
 }
 

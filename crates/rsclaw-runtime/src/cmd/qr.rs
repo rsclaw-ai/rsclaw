@@ -49,7 +49,7 @@ pub async fn cmd_qr(args: QrArgs) -> Result<()> {
         // Just print the payload for copy-paste.
         println!("payload: {payload_str}");
     } else {
-        println!("scan this QR code with the OpenClaw iOS app:");
+        println!("scan this QR code with the rsclaw app:");
         println!();
         rsclaw_channel::auth::display_qr_terminal(&payload_str)?;
     }

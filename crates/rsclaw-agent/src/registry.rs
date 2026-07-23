@@ -47,7 +47,9 @@ pub struct AgentHandle {
     /// Shared live status for /btw parallel queries.
     pub live_status: Arc<RwLock<crate::runtime::LiveStatus>>,
     /// Provider registry for direct LLM calls (used by /btw bypass).
-    pub providers: Arc<rsclaw_provider::registry::ProviderRegistry>,
+    /// Swappable shared slot so `rsclaw reload --scope providers` can hot-swap
+    /// the registry; all handles share the same slot.
+    pub providers: Arc<std::sync::RwLock<Arc<rsclaw_provider::registry::ProviderRegistry>>>,
     /// Per-session abort flags: session_key -> atomic abort flag.
     /// Uses std::sync::RwLock (not tokio) so it can be accessed in Drop impls.
     ///
@@ -63,6 +65,11 @@ pub struct AgentHandle {
     /// a stalled await. Without this a hung turn would block the whole
     /// single-threaded queue until the 30-minute turn timeout fired.
     pub cancel_tokens: Arc<std::sync::RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Lifetime token for the agent's message-loop task. Fired by
+    /// `remove_handle` so the spawned loop terminates cleanly. Without this
+    /// the loop leaks forever on removal: the task holds `runtime.handle.tx`
+    /// alive, so `rx.recv()` never returns `None`.
+    pub lifetime: tokio_util::sync::CancellationToken,
     /// Per-session plugin activation overrides:
     /// `session_key → { plugin_name → PluginOverride }`. Mutated by the
     /// `/plugin` slash command (host-side, never enters conversation
@@ -151,6 +158,21 @@ impl AgentHandle {
             .read()
             .map(|g| Arc::clone(&g))
             .unwrap_or_else(|_| Arc::new(Vec::new()))
+    }
+
+    /// Replace the provider registry visible to this handle (hot-reload).
+    pub fn set_providers(&self, providers: Arc<rsclaw_provider::registry::ProviderRegistry>) {
+        if let Ok(mut g) = self.providers.write() {
+            *g = providers;
+        }
+    }
+
+    /// Return the current provider registry snapshot.
+    pub fn providers_snapshot(&self) -> Arc<rsclaw_provider::registry::ProviderRegistry> {
+        self.providers
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_else(|_| Arc::new(rsclaw_provider::registry::ProviderRegistry::new()))
     }
 
     /// Set the outbound notification sender visible to slash handlers.
@@ -351,7 +373,7 @@ impl AgentHandle {
         let mut lines = vec![format!("Current model: {}", self.effective_model)];
         lines.push(String::new());
         lines.push("Registered providers:".to_owned());
-        for name in self.providers.names() {
+        for name in self.providers_snapshot().names() {
             lines.push(format!("  {name}"));
         }
         lines.join("\n")
@@ -813,9 +835,10 @@ impl AgentRegistry {
                     tx,
                     concurrency: Arc::new(tokio::sync::Semaphore::new(permits)),
                     live_status: Arc::new(RwLock::new(crate::runtime::LiveStatus::default())),
-                    providers: Arc::clone(&providers),
+                    providers: Arc::new(std::sync::RwLock::new(Arc::clone(&providers))),
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     cancel_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    lifetime: tokio_util::sync::CancellationToken::new(),
                     plugin_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     wasm_plugins: Arc::new(std::sync::RwLock::new(Arc::new(Vec::new()))),
                     notification_tx: Arc::new(std::sync::RwLock::new(None)),
@@ -858,9 +881,14 @@ impl AgentRegistry {
     }
 
     /// Remove an agent handle by ID (used for task agents after completion).
+    /// Fires the handle's lifetime token so its message-loop task terminates
+    /// cleanly instead of leaking (the task holds the sender alive, so the
+    /// receiver never closes on its own).
     pub fn remove_handle(&self, id: &str) {
         let mut inner = self.inner.write().expect("agent registry lock poisoned");
-        inner.agents.remove(id);
+        if let Some(handle) = inner.agents.remove(id) {
+            handle.lifetime.cancel();
+        }
     }
 
     /// Look up an agent by ID.

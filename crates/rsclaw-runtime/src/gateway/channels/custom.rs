@@ -19,7 +19,7 @@ use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key}
 pub(crate) fn start_custom_channels(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     custom_webhooks: Arc<
         std::sync::RwLock<
             std::collections::HashMap<String, Arc<rsclaw_channel::custom::CustomWebhookChannel>>,
@@ -82,7 +82,7 @@ fn start_custom_webhook(
     config: &RuntimeConfig,
     ch_cfg: rsclaw_config::schema::CustomChannelConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     custom_webhooks: Arc<
         std::sync::RwLock<
             std::collections::HashMap<String, Arc<rsclaw_channel::custom::CustomWebhookChannel>>,
@@ -414,11 +414,18 @@ fn start_custom_webhook(
 
     let ch_send = Arc::clone(&ch);
     let shutdown_for_out = shutdown.clone();
+    let chan_name = ch.name().to_owned();
+    let cancel_token = manager.register_cancel_token(&chan_name);
+    let cancel_for_out = cancel_token.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 () = shutdown_for_out.notified() => {
-                    info!("custom webhook: drain signaled, stopping outbound sender");
+                    info!("custom: drain signaled, stopping outbound sender");
+                    break;
+                }
+                () = cancel_for_out.cancelled() => {
+                    info!("custom: channel cancelled, stopping outbound sender");
                     break;
                 }
                 msg = out_rx.recv() => {
@@ -443,7 +450,10 @@ fn start_custom_webhook(
                 }
             }
             () = shutdown_for_run.notified() => {
-                info!("custom webhook: drain signaled, stopping run loop");
+                info!("custom: drain signaled, stopping run loop");
+            }
+            () = cancel_token.cancelled() => {
+                info!("custom: channel cancelled, stopping run loop");
             }
         }
     });
@@ -454,7 +464,7 @@ fn start_custom_websocket(
     config: &RuntimeConfig,
     ch_cfg: rsclaw_config::schema::CustomChannelConfig,
     registry: Arc<AgentRegistry>,
-    manager: &mut rsclaw_channel::ChannelManager,
+    manager: &rsclaw_channel::ChannelManager,
     channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,

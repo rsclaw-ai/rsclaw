@@ -238,6 +238,45 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 }
             }
         }
+        GatewayCommand::Reload { scope } => {
+            let config = config::load_quiet().ok();
+            let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(18888);
+            let auth_token = config
+                .and_then(|c| c.gateway.auth_token)
+                .unwrap_or_default();
+            let scope_param = scope
+                .map(|s| s.join(","))
+                .unwrap_or_else(|| "all".to_owned());
+            let url = format!(
+                "http://127.0.0.1:{port}/api/v1/reload?scope={scope_param}"
+            );
+            let client = reqwest::Client::new();
+            let mut req = client.post(&url);
+            if !auth_token.is_empty() {
+                req = req.bearer_auth(&auth_token);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value =
+                        resp.json().await.unwrap_or_default();
+                    println!("  {} Reload complete", green("[ok]"));
+                    if let Some(details) = body.get("details") {
+                        println!("  {}", serde_json::to_string_pretty(details).unwrap_or_default());
+                    }
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("reload failed ({status}): {body}");
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "gateway unreachable at {url} — is it running?\n  {e}"
+                    );
+                }
+            }
+            Ok(())
+        }
         GatewayCommand::Status => gateway_print_status().await,
         GatewayCommand::Health => {
             let config = config::load_quiet().ok();

@@ -536,8 +536,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // 9. Main dispatch loop.
     let mut rate_limiter = super::rate_limit::RateLimiter::default_write_limiter();
+    let shutdown_for_loop = state.shutdown.clone();
     loop {
-        match read_half.next().await {
+        let next_msg = tokio::select! {
+            msg = read_half.next() => msg,
+            () = shutdown_for_loop.notified() => {
+                info!(conn = %conn_id, "ws: drain signaled, closing connection");
+                break;
+            }
+        };
+        match next_msg {
             Some(Ok(Message::Text(text))) => {
                 let raw = text.to_string();
                 debug!(len = raw.len(), "ws recv");
@@ -599,7 +607,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state.ws_conns.unregister(&conn_id).await;
     info!("ws: connection {conn_id} disconnected");
     drop(outbound_tx);
-    let _ = write_task.await; // task cleanup, result irrelevant
+    // Abort (not await) the write task. On drain the socket is still open
+    // (client connected), so awaiting would hang forever — the spawned relay
+    // tasks keep feeding outbound_rx and never exit on their own. Aborting
+    // drops write_half (closing the socket) and outbound_rx (closing the
+    // channel, which makes the relay tasks' sends fail so they exit). This
+    // lets the axum connection close promptly during graceful shutdown.
+    write_task.abort();
 }
 
 // ---------------------------------------------------------------------------
