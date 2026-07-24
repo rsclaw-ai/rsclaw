@@ -19,11 +19,16 @@ use crate::{
 
 pub struct AgentSpawner {
     pub registry: Arc<AgentRegistry>,
-    pub config: Arc<RuntimeConfig>,
+    /// Shared config slot — swapped by `rsclaw reload` so dynamically spawned
+    /// agents pick up fresh defaults (model.vision, context_tokens, etc.).
+    pub config: Arc<std::sync::RwLock<Arc<RuntimeConfig>>>,
     /// Live, hot-mutable config slices (temperature, etc.) shared across all
     /// runtimes spawned by this spawner.
     pub live: Arc<LiveConfig>,
-    pub providers: Arc<ProviderRegistry>,
+    /// Shared provider slot — swapped by `rsclaw reload --scope providers`.
+    /// Dynamically spawned agents clone this slot into their handle, so they
+    /// always see the latest registry without needing a per-handle set_providers.
+    pub providers: Arc<std::sync::RwLock<Arc<ProviderRegistry>>>,
     pub skills: Arc<SkillRegistry>,
     pub store: Arc<Store>,
     pub memory: Option<Arc<tokio::sync::Mutex<MemoryStore>>>,
@@ -48,9 +53,9 @@ impl AgentSpawner {
     #[allow(clippy::too_many_arguments)]
     pub fn new_arc(
         registry: Arc<AgentRegistry>,
-        config: Arc<RuntimeConfig>,
+        config: Arc<std::sync::RwLock<Arc<RuntimeConfig>>>,
         live: Arc<LiveConfig>,
-        providers: Arc<ProviderRegistry>,
+        providers: Arc<std::sync::RwLock<Arc<ProviderRegistry>>>,
         skills: Arc<SkillRegistry>,
         store: Arc<Store>,
         memory: Option<Arc<tokio::sync::Mutex<MemoryStore>>>,
@@ -94,19 +99,25 @@ impl AgentSpawner {
             return Err(anyhow!("agent '{}' already exists", id));
         }
 
+        let config = self
+            .config
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_else(|_| Arc::clone(&*self.config.read().unwrap()));
+
         let (tx, mut rx) = mpsc::channel::<AgentMessage>(32);
         let max_concurrent = entry
             .lane_concurrency
-            .or(self.config.agents.defaults.max_concurrent)
+            .or(config.agents.defaults.max_concurrent)
             .unwrap_or(4) as usize;
         let context_window = entry
             .model
             .as_ref()
             .and_then(|m| m.context_tokens)
-            .or(self.config.agents.defaults.context_tokens)
+            .or(config.agents.defaults.context_tokens)
             .unwrap_or(0) as usize;
         let effective_model =
-            crate::runtime::resolve_primary_model_for(&entry, &self.config.agents.defaults)
+            crate::runtime::resolve_primary_model_for(&entry, &config.agents.defaults)
                 .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
         let handle = Arc::new(AgentHandle {
             id: id.clone(),
@@ -117,7 +128,7 @@ impl AgentSpawner {
             live_status: Arc::new(tokio::sync::RwLock::new(
                 crate::runtime::LiveStatus::default(),
             )),
-            providers: Arc::new(std::sync::RwLock::new(Arc::clone(&self.providers))),
+            providers: Arc::clone(&self.providers),
             abort_flags: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             cancel_tokens: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             lifetime: tokio_util::sync::CancellationToken::new(),
@@ -136,6 +147,8 @@ impl AgentSpawner {
             new_session_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             context_window,
             effective_model,
+            skills: Arc::new(std::sync::RwLock::new(Arc::clone(&self.skills))),
+            js_plugins: Arc::new(std::sync::RwLock::new(self.plugins.clone())),
         });
 
         self.registry.insert_handle(Arc::clone(&handle));
@@ -150,11 +163,17 @@ impl AgentSpawner {
         // Upgrade weak self-reference so child runtime can also spawn agents.
         let self_arc: Option<Arc<AgentSpawner>> = self.me.get().and_then(|w| w.upgrade());
 
+        let providers_snapshot = self
+            .providers
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_else(|_| Arc::new(ProviderRegistry::new()));
+
         let mut runtime = AgentRuntime::new(
             Arc::clone(&handle),
-            Arc::clone(&self.config),
+            Arc::clone(&config),
             Arc::clone(&self.live),
-            Arc::clone(&self.providers),
+            providers_snapshot,
             fallback_models,
             Arc::clone(&self.skills),
             Arc::clone(&self.store),
@@ -172,7 +191,7 @@ impl AgentSpawner {
 
         // Capture for i18n lookup on the error reply path inside the
         // spawned task.
-        let config_for_task = Arc::clone(&self.config);
+        let config_for_task = Arc::clone(&config);
         tokio::spawn(async move {
             info!(agent_id = %handle.id, "dynamic agent spawned");
             loop {
@@ -199,8 +218,8 @@ impl AgentSpawner {
                     chat_id,
                     ..
                 } = msg;
-                let result = runtime
-                    .run_turn(
+                let result = tokio::select! {
+                    r = runtime.run_turn(
                         &session_key,
                         &text,
                         &channel,
@@ -211,8 +230,12 @@ impl AgentSpawner {
                         images,
                         files,
                         crate::registry::TurnContext::default(),
-                    )
-                    .await;
+                    ) => r,
+                    _ = handle.lifetime.cancelled() => {
+                        info!(agent_id = %handle.id, "dynamic agent lifetime cancelled mid-turn");
+                        break;
+                    }
+                };
                 let reply = result.unwrap_or_else(|e| {
                     tracing::error!(agent = %handle.id, "dynamic agent turn error: {e:#}");
                     let outcome = if e.to_string().contains("canceled by A2A CancelTask") {

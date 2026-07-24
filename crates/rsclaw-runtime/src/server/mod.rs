@@ -254,6 +254,9 @@ pub struct AppState {
     pub wasm_browser: Arc<tokio::sync::Mutex<Option<rsclaw_browser::BrowserSession>>>,
     /// H1: per-IP rate limiter for inbound HTTP requests.
     pub rate_limiter: Arc<RateLimiter>,
+    /// Serializes `/api/v1/reload` requests so concurrent calls cannot
+    /// double-spawn channels or race on provider/agent swaps.
+    pub reload_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 // AgentEvent is defined in rsclaw_events to avoid circular deps with agent.
@@ -1841,6 +1844,9 @@ async fn http_reload(
     let reload_providers = scope.contains("all") || scope.contains("provider");
     let reload_mcp = scope.contains("all") || scope.contains("mcp");
 
+    // Serialize concurrent reload requests to prevent double-spawn races.
+    let _reload_guard = state.reload_mutex.lock().await;
+
     // Re-load config from disk to pick up any changes.
     let fresh_config = match rsclaw_config::load() {
         Ok(cfg) => cfg,
@@ -1855,6 +1861,20 @@ async fn http_reload(
 
     let mut details = serde_json::Map::new();
 
+    // Propagate hot-safe fields (temperature, auth, loop-detection, etc.)
+    // into LiveConfig — same as the file watcher does. Without this, HTTP
+    // reload reports success while live reads stay stale.
+    {
+        let (restart_tx, _) = tokio::sync::broadcast::channel::<Vec<String>>(1);
+        let restart_fields = state.live.apply(fresh_config.clone(), &restart_tx).await;
+        if !restart_fields.is_empty() {
+            details.insert(
+                "restart_recommended".to_owned(),
+                serde_json::json!(restart_fields),
+            );
+        }
+    }
+
     // --- Skills: rescan directories and swap the registry atomically ---
     if reload_skills {
         let base_dir = rsclaw_config::loader::base_dir();
@@ -1862,8 +1882,13 @@ async fn http_reload(
         match rsclaw_skill::load_skills(&global_skills, None, fresh_config.ext.skills.as_ref()) {
             Ok(new_registry) => {
                 let count = new_registry.len();
+                let new_arc = Arc::new(new_registry);
                 let mut guard = state.skills.write().await;
-                *guard = Arc::new(new_registry);
+                *guard = Arc::clone(&new_arc);
+                drop(guard);
+                for handle in state.agents.all() {
+                    handle.set_skills(Arc::clone(&new_arc));
+                }
                 details.insert(
                     "skills".to_owned(),
                     serde_json::json!({"reloaded": true, "count": count}),
@@ -1919,8 +1944,13 @@ async fn http_reload(
 
                 // Swap JS plugin registry.
                 {
+                    let new_js = Arc::new(new_registry);
                     let mut guard = state.plugins.write().await;
-                    *guard = Arc::new(new_registry);
+                    *guard = Arc::clone(&new_js);
+                    drop(guard);
+                    for handle in state.agents.all() {
+                        handle.set_js_plugins(Some(Arc::clone(&new_js)));
+                    }
                 }
 
                 details.insert(
@@ -1949,6 +1979,9 @@ async fn http_reload(
         }
         for handle in state.agents.all() {
             handle.set_providers(Arc::clone(&new_registry));
+        }
+        if let Ok(mut g) = state.agent_spawner.providers.write() {
+            *g = Arc::clone(&new_registry);
         }
         details.insert(
             "providers".to_owned(),
@@ -1997,6 +2030,15 @@ async fn http_reload(
                 if c.line.is_some() { names.push("line".to_owned()); }
                 if c.zalo.is_some() { names.push("zalo".to_owned()); }
                 if c.matrix.is_some() { names.push("matrix".to_owned()); }
+                // Include enabled custom channels so the removal diff doesn't
+                // unregister them.
+                if let Some(ref custom) = c.custom {
+                    for ch in custom {
+                        if ch.base.enabled.unwrap_or(true) {
+                            names.push(ch.name.clone());
+                        }
+                    }
+                }
                 names
             })
             .unwrap_or_default();
@@ -2016,6 +2058,11 @@ async fn http_reload(
                 if let Ok(mut senders) = state.channel_senders.write() {
                     senders.remove(name);
                 }
+                // Also remove from custom_webhooks map so /hooks/{name} stops
+                // dispatching to a cancelled channel.
+                state.custom_webhooks.write()
+                    .map(|mut wh| { wh.remove(name); })
+                    .ok();
                 removed.push(name.clone());
             }
         }
@@ -2089,6 +2136,55 @@ async fn http_reload(
                 added.push("matrix");
             }
         }
+
+        // Custom channels: tear down all running custom channels, then restart
+        // from the fresh config. This is simpler than diffing individual custom
+        // channels and avoids orphaned tasks from partial overlap.
+        {
+            let custom_names: Vec<String> = state.channel_manager.names()
+                .into_iter()
+                .filter(|n| {
+                    let base = n.split('/').next().unwrap_or(n);
+                    !["cli", "desktop", "ws",
+                      "telegram", "discord", "slack", "whatsapp", "signal",
+                      "feishu", "dingtalk", "wecom", "wechat", "qq",
+                      "line", "zalo", "matrix"].contains(&base)
+                })
+                .collect();
+            for name in &custom_names {
+                state.channel_manager.unregister(name);
+                if let Ok(mut senders) = state.channel_senders.write() {
+                    senders.remove(name);
+                }
+                state.custom_webhooks.write()
+                    .map(|mut wh| { wh.remove(name); })
+                    .ok();
+                removed.push(name.clone());
+            }
+
+            // Restart all configured custom channels.
+            if !custom_names.is_empty()
+                || fresh_config.channel.channels.custom.as_ref().is_some_and(|c| c.iter().any(|ch| ch.base.enabled.unwrap_or(true)))
+            {
+                use crate::gateway::channels::start_custom_channels;
+                start_custom_channels(
+                    &fresh_config,
+                    Arc::clone(&state.agents),
+                    &state.channel_manager,
+                    Arc::clone(&state.custom_webhooks),
+                    Arc::clone(&state.channel_senders),
+                    Arc::clone(&state.store.db),
+                    state.shutdown.clone(),
+                );
+                if let Some(ref custom_cfgs) = fresh_config.channel.channels.custom {
+                    for ch_cfg in custom_cfgs {
+                        if ch_cfg.base.enabled.unwrap_or(true) {
+                            added.push(ch_cfg.name.as_str());
+                        }
+                    }
+                }
+            }
+        }
         // Filter out channels that were "added" but weren't actually configured.
         added.retain(|name| configured_channels.iter().any(|c| c == name));
 
@@ -2108,13 +2204,59 @@ async fn http_reload(
     // --- Agents: diff config vs registry, spawn new / remove old / restart changed ---
     let reload_agents = scope.contains("all") || scope.contains("agent");
     if reload_agents {
-        let config_entries = fresh_config
+        // Detect whether agents.defaults.model changed BEFORE swapping the slot.
+        let defaults_model_changed = {
+            let old_config = state.agent_spawner.config.read()
+                .map(|g| Arc::clone(&g))
+                .unwrap_or_else(|_| Arc::clone(&state.config));
+            serde_json::to_value(&old_config.agents.defaults.model).unwrap_or_default()
+                != serde_json::to_value(&fresh_config.agents.defaults.model).unwrap_or_default()
+        };
+
+        // Swap the spawner's config slot so re-spawned agents get fresh defaults.
+        if let Ok(mut g) = state.agent_spawner.config.write() {
+            *g = Arc::new(fresh_config.clone());
+        }
+
+        let raw_entries = fresh_config
             .raw
             .agents
             .as_ref()
             .and_then(|a| a.list.as_ref())
             .cloned()
             .unwrap_or_default();
+
+        // If agents.list is absent/empty, synthesize the implicit "main" agent
+        // from agents.defaults — same logic as AgentRegistry::from_config_with_receivers.
+        // Without this, reload would diff against an empty set and remove every
+        // running agent, leaving default_id pointing at a nonexistent handle.
+        let config_entries = if raw_entries.is_empty() {
+            let defaults = &fresh_config.agents.defaults;
+            vec![rsclaw_config::schema::AgentEntry {
+                id: "main".to_owned(),
+                default: Some(true),
+                name: Some("Main Agent".to_owned()),
+                workspace: defaults.workspace.clone(),
+                model: defaults.model.clone(),
+                flash_model: None,
+                lane: None,
+                lane_concurrency: None,
+                group_chat: None,
+                channels: None,
+                commands: None,
+                allowed_commands: None,
+                opencode: defaults.opencode.clone(),
+                claudecode: defaults.claudecode.clone(),
+                codex: defaults.codex.clone(),
+                agent_dir: None,
+                system: None,
+                temperature: None,
+                daemon: false,
+                description: None,
+            }]
+        } else {
+            raw_entries
+        };
 
         let config_agents: std::collections::HashSet<String> = config_entries
             .iter()
@@ -2139,7 +2281,7 @@ async fn http_reload(
                     let model_changed = serde_json::to_value(&handle.config.model).unwrap_or_default()
                         != serde_json::to_value(&entry.model).unwrap_or_default();
                     let system_changed = handle.config.system != entry.system;
-                    if model_changed || system_changed {
+                    if model_changed || system_changed || defaults_model_changed {
                         // Cancel in-flight turns.
                         if let Ok(tokens) = handle.cancel_tokens.read() {
                             for (_sk, tok) in tokens.iter() {

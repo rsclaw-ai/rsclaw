@@ -388,8 +388,8 @@ pub(crate) fn start_zalo_if_configured(
         }
         let zalo_send = Arc::clone(&zalo);
         let shutdown_for_out = shutdown.clone();
-        let chan_name = zalo.name().to_owned();
-        let cancel_token = manager.register_cancel_token(&chan_name);
+        let acct_key = format!("zalo/{}", acct_name);
+        let cancel_token = manager.register_cancel_token(&acct_key);
         let cancel_for_out = cancel_token.clone();
         tokio::spawn(async move {
             loop {
@@ -411,7 +411,7 @@ pub(crate) fn start_zalo_if_configured(
                 }
             }
         });
-        if let Err(e) = manager.register(Arc::clone(&zalo) as Arc<dyn Channel>) {
+        if let Err(e) = manager.register_with_name(acct_key, Arc::clone(&zalo) as Arc<dyn Channel>) {
             tracing::warn!("failed to register channel: {e}");
         }
         let shutdown_for_run = shutdown.clone();
