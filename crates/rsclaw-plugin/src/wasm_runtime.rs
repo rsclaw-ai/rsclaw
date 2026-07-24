@@ -1052,13 +1052,16 @@ fn validate_plugin_sql(sql: &str, kind: PluginSqlKind) -> std::result::Result<()
                 let third = tokens.get(2).copied();
                 if second != Some("table")
                     && !(matches!(second, Some("temp" | "temporary")) && third == Some("table"))
+                    && second != Some("index")
+                    && !(second == Some("unique") && third == Some("index"))
                 {
-                    return Err("sql_execute only allows CREATE TABLE".to_owned());
+                    return Err("sql_execute only allows CREATE TABLE or CREATE INDEX".to_owned());
                 }
             }
             _ => {
                 return Err(
-                    "sql_execute only allows INSERT, UPDATE, DELETE, or CREATE TABLE".to_owned(),
+                    "sql_execute only allows INSERT, UPDATE, DELETE, CREATE TABLE, or CREATE INDEX"
+                        .to_owned(),
                 );
             }
         },
@@ -2305,6 +2308,18 @@ impl rsclaw::plugin::host_android::Host for HostState {
         json_body: Option<String>,
     ) -> HostTrapResult<Result<String, String>> {
         Ok(crate::android_uiauto::raw(&method, &path, json_body.as_deref()).await)
+    }
+
+    async fn android_stage_file(
+        &mut self,
+        local_path: String,
+        media_kind: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let canonical = match canonicalize_plugin_artifact_path(&local_path) {
+            Ok(path) => path,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(crate::android_uiauto::stage_file(&canonical, &media_kind).await)
     }
 
     async fn android_vlm_drive(

@@ -6,8 +6,12 @@
 //! are not exposed in the process argument list.
 
 use std::{
-    collections::VecDeque, fs::OpenOptions, io::Write, path::PathBuf, process::Stdio,
-    time::Duration,
+    collections::VecDeque,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::Engine as _;
@@ -28,6 +32,7 @@ const KEYBOARD_VISIBLE_COMMAND: &str = "keyboard-visible";
 const SEND_BUTTON_COMMAND: &str = "send-button";
 const LATEST_MESSAGE_BUBBLE_COMMAND: &str = "latest-message-bubble";
 const INPUT_TEXT_COMMAND: &str = "input-text";
+const OCR_REGION_COMMAND: &str = "ocr-region";
 const PASTE_KEYCODE: u16 = 279;
 const CLIPBOARD_LABEL: &str = "rsclaw";
 const WAKEUP_KEYCODE: u16 = 224;
@@ -39,6 +44,8 @@ const WAKEUP_SCREEN_RETRY_DELAYS: [Duration; 3] = [
 const BLACK_PIXEL_THRESHOLD: u8 = 8;
 const MAX_VISIBLE_NEAR_BLACK_FRAME_PERCENT: u64 = 5;
 const BLACK_FRAME_SAMPLE_AXIS: u32 = 128;
+const MAX_STAGE_BYTES: u64 = 200 * 1024 * 1024;
+const MAX_STAGE_NAME_BYTES: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
@@ -169,6 +176,9 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     if command == INPUT_TEXT_COMMAND {
         return input_text(args_json).await;
     }
+    if command == OCR_REGION_COMMAND {
+        return ocr_region(args_json, &config).await;
+    }
     let args = build_call_args(&config, command, args_json)?;
     if command == "screenshot" {
         return screenshot_with_wakeup(&config).await;
@@ -198,6 +208,29 @@ async fn input_text(args_json: &str) -> Result<String, String> {
         Some(&paste),
     )
     .await
+}
+
+/// Host-side local OCR for the plugin's fast UI-confirmation path. The plugin
+/// cannot ship a screenshot through the 64KB CLS arg channel, so this captures
+/// a fresh device frame, crops to the requested rect, and runs the native
+/// on-device OCR engine (macOS Vision / Windows.Media.Ocr) — no network OCR
+/// round trip. `imagePath` and `engine` in the args are advisory and ignored;
+/// the host always screenshots fresh and picks the platform engine.
+async fn ocr_region(args_json: &str, config: &Config) -> Result<String, String> {
+    let args: Value = serde_json::from_str(args_json)
+        .map_err(|e| format!("android uiauto: ocr-region args: {e}"))?;
+    let rect = args.get("rect").and_then(|r| {
+        let x = r.get("x")?.as_u64()? as u32;
+        let y = r.get("y")?.as_u64()? as u32;
+        let width = r.get("width")?.as_u64()? as u32;
+        let height = r.get("height")?.as_u64()? as u32;
+        Some((x, y, width, height))
+    });
+    let response = screenshot_with_wakeup(config).await?;
+    let png = screenshot_png(&response)?;
+    tokio::task::spawn_blocking(move || rsclaw_desktop::ocr_image_region(&png, rect))
+        .await
+        .map_err(|e| format!("android uiauto: ocr-region join: {e}"))?
 }
 
 fn input_text_value(args_json: &str) -> Result<String, String> {
@@ -1057,6 +1090,102 @@ pub(crate) async fn raw(
     }
     args.push(path.to_string());
     run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+}
+
+/// Push a local artifact file to device shared storage through the CLS
+/// relay-backed ADB tunnel and return the staged device path.
+///
+/// Images land in `DCIM/Camera` under a timestamped name so the album picker
+/// shows the staged image as the newest item; files and audio keep their
+/// original filename under `Download` because the plugin locates them by name
+/// in the file picker.
+pub(crate) async fn stage_file(local_path: &Path, media_kind: &str) -> Result<String, String> {
+    let config = Config::from_env()?;
+    let metadata = std::fs::metadata(local_path).map_err(|error| {
+        format!("android stage: cannot read {}: {error}", local_path.display())
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "android stage: {} is not a regular file",
+            local_path.display()
+        ));
+    }
+    if metadata.len() > MAX_STAGE_BYTES {
+        return Err(format!(
+            "android stage: file is {} bytes, limit is {MAX_STAGE_BYTES}",
+            metadata.len()
+        ));
+    }
+    let filename = local_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| {
+            !name.is_empty() && !name.contains('\0') && name.len() <= MAX_STAGE_NAME_BYTES
+        })
+        .ok_or_else(|| "android stage: local path has no usable filename".to_string())?;
+    let remote = match media_kind {
+        "image" => {
+            let extension = local_path
+                .extension()
+                .map(|value| value.to_string_lossy().to_ascii_lowercase())
+                .filter(|value| {
+                    matches!(value.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp")
+                })
+                .unwrap_or_else(|| "jpg".to_string());
+            format!(
+                "/sdcard/DCIM/Camera/rsclaw_{}.{extension}",
+                staged_timestamp_ms()?
+            )
+        }
+        "file" | "audio" => format!("/sdcard/Download/{filename}"),
+        _ => return Err(format!("android stage: unsupported media kind `{media_kind}`")),
+    };
+
+    let mut push_args = adb_base_args(&config, "push");
+    push_args.push(local_path.to_string_lossy().into_owned());
+    push_args.push(remote.clone());
+    run_cls_process(&config.cls_bin, &push_args, Duration::from_secs(120)).await?;
+
+    if media_kind == "image" {
+        // MediaProvider indexes adb pushes on its own, but the broadcast makes
+        // the image appear in the album picker immediately on older builds.
+        let mut scan_args = adb_base_args(&config, "shell");
+        scan_args.push("--".to_string());
+        scan_args.extend([
+            "am".to_string(),
+            "broadcast".to_string(),
+            "-a".to_string(),
+            "android.intent.action.MEDIA_SCANNER_SCAN_FILE".to_string(),
+            "-d".to_string(),
+            format!("file://{remote}"),
+        ]);
+        if let Err(error) =
+            run_cls_process(&config.cls_bin, &scan_args, Duration::from_secs(20)).await
+        {
+            tracing::warn!(
+                error = %error,
+                "android stage: media scan broadcast failed; MediaProvider may still index the file"
+            );
+        }
+    }
+    Ok(remote)
+}
+
+fn adb_base_args(config: &Config, subcommand: &str) -> Vec<String> {
+    vec![
+        "android".to_string(),
+        "adb".to_string(),
+        subcommand.to_string(),
+        "-n".to_string(),
+        config.node.clone(),
+    ]
+}
+
+fn staged_timestamp_ms() -> Result<u128, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .map_err(|error| format!("android stage: system clock before UNIX epoch: {error}"))
 }
 
 impl Config {

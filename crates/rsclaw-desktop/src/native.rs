@@ -758,6 +758,201 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
     result
 }
 
+/// One OCR hit in pixel coordinates relative to the image that was OCR'd
+/// (the cropped region, or the full image when no rect was given). Confidence
+/// is normalised to 0-1.
+struct OcrHit {
+    text: String,
+    confidence: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// OCR an in-memory PNG with the native on-device engine (macOS Vision,
+/// Windows.Media.Ocr on Windows) — no network round trip, so it is fast enough
+/// for per-keystroke UI confirmation. When `rect` is `Some((x, y, w, h))` the
+/// image is cropped to that pixel region first (clamped to the image bounds);
+/// the OCR then runs on the crop only. Returns JSON
+/// `{"ok":true,"lines":[{"text","confidence","x","y","width","height"}]}` where
+/// `confidence` is 0-1 and `x/y/width/height` are pixel coordinates in the
+/// ORIGINAL (uncropped) image. This is the host backend for the plugin's
+/// `android_ocr_region` fast path.
+pub fn ocr_image_region(png: &[u8], rect: Option<(u32, u32, u32, u32)>) -> Result<String, String> {
+    use image::GenericImageView;
+    let img = image::load_from_memory(png)
+        .map_err(|e| format!("ocr_image_region: decode PNG: {e}"))?;
+    let rgb = img.to_rgb8();
+    let iw = rgb.width();
+    let ih = rgb.height();
+    let (crop_x, crop_y, region) = match rect {
+        Some((rx, ry, rw, rh)) => {
+            let rx = rx.min(iw.saturating_sub(1));
+            let ry = ry.min(ih.saturating_sub(1));
+            let rw = rw.min(iw.saturating_sub(rx)).max(1);
+            let rh = rh.min(ih.saturating_sub(ry)).max(1);
+            (rx, ry, rgb.view(rx, ry, rw, rh).to_image())
+        }
+        None => (0, 0, rgb.clone()),
+    };
+    let (rw, rh) = (region.width(), region.height());
+    let tmp = std::env::temp_dir().join(format!("rsclaw_ocr_region_{}.png", std::process::id()));
+    region
+        .save(&tmp)
+        .map_err(|e| format!("ocr_image_region: write temp PNG: {e}"))?;
+
+    let result = (|| -> Result<String, String> {
+        let hits = ocr_file_hits(&tmp, rw, rh)?;
+        let mut lines: Vec<serde_json::Value> = Vec::new();
+        for hit in hits {
+            if hit.text.trim().is_empty() {
+                continue;
+            }
+            lines.push(serde_json::json!({
+                "text": hit.text,
+                "confidence": hit.confidence,
+                "x": (f64::from(crop_x) + hit.x).round() as i64,
+                "y": (f64::from(crop_y) + hit.y).round() as i64,
+                "width": hit.width.round() as i64,
+                "height": hit.height.round() as i64,
+            }));
+        }
+        Ok(serde_json::json!({ "ok": true, "lines": lines }).to_string())
+    })();
+
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// macOS Vision OCR of a PNG file already on disk. `iw`/`ih` are the image's
+/// pixel dimensions, used to denormalise Vision's [0,1] bottom-left bounding
+/// boxes into top-left pixel coordinates.
+#[cfg(target_os = "macos")]
+fn ocr_file_hits(path: &std::path::Path, iw: u32, ih: u32) -> Result<Vec<OcrHit>, String> {
+    use objc2::AnyThread;
+    use objc2_foundation::{NSArray, NSDictionary, NSString, NSURL};
+    use objc2_vision::{
+        VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel,
+    };
+
+    let path_str = NSString::from_str(&path.to_string_lossy());
+    let url = NSURL::fileURLWithPath(&path_str);
+    let options = NSDictionary::new();
+    let handler = unsafe {
+        VNImageRequestHandler::initWithURL_options(VNImageRequestHandler::alloc(), &url, &options)
+    };
+
+    let request = VNRecognizeTextRequest::new();
+    request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
+    request.setUsesLanguageCorrection(true);
+    let zh = NSString::from_str("zh-Hans");
+    let en = NSString::from_str("en-US");
+    let langs = NSArray::from_slice(&[&*zh, &*en]);
+    request.setRecognitionLanguages(&langs);
+
+    let req_ref: &VNRequest = &request;
+    let requests = NSArray::from_slice(&[req_ref]);
+    handler
+        .performRequests_error(&requests)
+        .map_err(|e| format!("Vision performRequests failed: {e}"))?;
+
+    let observations = match request.results() {
+        Some(o) => o,
+        None => return Ok(Vec::new()),
+    };
+
+    let (iw, ih) = (f64::from(iw), f64::from(ih));
+    let mut hits = Vec::new();
+    for obs in observations.iter() {
+        let candidates = obs.topCandidates(1);
+        let Some(top) = candidates.firstObject() else {
+            continue;
+        };
+        let text = top.string().to_string();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let bb = unsafe { obs.boundingBox() };
+        let width = bb.size.width * iw;
+        let height = bb.size.height * ih;
+        let x = bb.origin.x * iw;
+        // Vision's boundingBox origin is bottom-left; flip to a top-left y.
+        let y = (1.0 - bb.origin.y - bb.size.height) * ih;
+        hits.push(OcrHit {
+            text,
+            confidence: top.confidence() as f64,
+            x,
+            y,
+            width,
+            height,
+        });
+    }
+    Ok(hits)
+}
+
+/// Windows.Media.Ocr (WinRT via PowerShell) of a PNG file on disk. Runs the
+/// shared OCR_WIN_PS1 in full-image mode (window bounds 0) so the emitted
+/// sx/sy are pixel centres within the image. Windows OCR exposes no per-line
+/// size, so width/height are reported as 0.
+#[cfg(target_os = "windows")]
+fn ocr_file_hits(path: &std::path::Path, _iw: u32, _ih: u32) -> Result<Vec<OcrHit>, String> {
+    let ps = std::env::temp_dir().join("rsclaw_ocr_region.ps1");
+    let _ = std::fs::write(&ps, OCR_WIN_PS1);
+    let mut ocr_cmd = Command::new("powershell");
+    ocr_cmd
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-File"])
+        .arg(&ps)
+        .arg(path)
+        .arg("0")
+        .arg("0")
+        .arg("0")
+        .arg("0");
+    {
+        use std::os::windows::process::CommandExt;
+        ocr_cmd.creation_flags(0x08000000);
+    }
+    let out = ocr_cmd
+        .output()
+        .map_err(|e| format!("powershell OCR spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "Windows OCR failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if stdout.is_empty() || stdout == "null" {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Windows OCR parse failed: {e}; out={stdout}"))?;
+    let mut hits = Vec::new();
+    for row in rows {
+        let text = row.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let conf = row.get("conf").and_then(|v| v.as_f64()).unwrap_or(100.0);
+        let sx = row.get("sx").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let sy = row.get("sy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        hits.push(OcrHit {
+            text,
+            confidence: conf / 100.0,
+            x: sx,
+            y: sy,
+            width: 0.0,
+            height: 0.0,
+        });
+    }
+    Ok(hits)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn ocr_file_hits(_path: &std::path::Path, _iw: u32, _ih: u32) -> Result<Vec<OcrHit>, String> {
+    Err("ocr_image_region only implemented on macOS and Windows".to_string())
+}
+
 /// Convert a macOS bundle-id to the process name used by System Events.
 /// E.g. "com.tencent.xinWeChat" -> "WeChat", "com.apple.Safari" -> "Safari".
 fn bundle_to_app_name(bundle_id: &str) -> String {

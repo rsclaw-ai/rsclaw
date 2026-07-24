@@ -1294,29 +1294,25 @@ impl RsclawProvider {
         if let Some(mt) = req.max_tokens {
             body.insert("max_tokens".to_owned(), Value::from(mt));
         }
-        // Hard-bind the model id to the endpoint per the fleet's
-        // model-slot whitelist:
-        //   /fastshot → rsclaw-flash-v1
-        //   /vision   → rsclaw-vision-v1
-        //   /oneshot  → rsclaw-agent-v1
-        // The dispatch chain in `route_for` (rules 1–3 + 5–6) already
-        // routes requests here based on the caller's model hint or
-        // endpoint hint, so by the time we land in this function the
-        // path uniquely determines which slot the worker accepts.
-        // Forwarding `req.model` verbatim risks
-        // `model_slot_mismatch` 400s when the caller mixes
-        // (model=anthropic/..., endpoint=Flash) — we already routed to
-        // /fastshot, but the wire model field would have been wrong.
-        // Stamping the canonical id keeps callers from having to know
-        // the exact slot strings.
+        // Bind the model id to the endpoint per the fleet's model-slot
+        // whitelist. For /vision, prefer the caller's configured model
+        // (from agents.defaults.model.vision) so upgrades like v2 take
+        // effect without a code change. Fall back to the canonical slot
+        // name when the caller didn't specify a vision model.
         let canonical_model = match path {
-            "/fastshot" => "rsclaw-flash-v1",
-            "/vision" => "rsclaw-vision-v1",
-            _ => "rsclaw-agent-v1", // /oneshot and any future stateless variant
+            "/fastshot" => "rsclaw-flash-v1".to_owned(),
+            "/vision" => req
+                .model
+                .rsplit('/')
+                .next()
+                .filter(|m| m.starts_with("rsclaw-vision-"))
+                .unwrap_or("rsclaw-vision-v1")
+                .to_owned(),
+            _ => "rsclaw-agent-v1".to_owned(),
         };
         body.insert(
             "model".to_owned(),
-            Value::String(canonical_model.to_owned()),
+            Value::String(canonical_model),
         );
         let mut options = serde_json::Map::new();
         if let Some(t) = req.temperature {

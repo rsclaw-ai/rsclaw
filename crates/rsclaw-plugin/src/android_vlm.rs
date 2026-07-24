@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use rsclaw_computer::{
-    Action, ActionSpec, ExecCtx, MouseButton, Operator, Screenshot,
+    Action, ActionSpec, ExecCtx, MouseButton, Operator, Screenshot, ScrollDir,
     operator::{ActionFut, ActionOutput, ScreenshotFut},
 };
 
@@ -21,6 +21,10 @@ impl Operator for AndroidUiautoOperator {
         vec![
             ActionSpec::new("click(start_box='(x,y)')"),
             ActionSpec::new("type(content='')"),
+            ActionSpec::new("scroll(start_box='(x,y)', direction='down or up or left or right')"),
+            ActionSpec::new("activate_app(app='')"),
+            ActionSpec::with_note("press_back()", "# Android back button"),
+            ActionSpec::with_note("press_home()", "# Android home button"),
             ActionSpec::with_note("wait()", "# Wait for the current Android page to settle"),
             ActionSpec::new("finished(content='DONE|name')"),
             ActionSpec::new("call_user(reason='')"),
@@ -51,7 +55,7 @@ impl Operator for AndroidUiautoOperator {
         })
     }
 
-    fn execute<'a>(&'a self, action: &'a Action, _ctx: &'a ExecCtx) -> ActionFut<'a> {
+    fn execute<'a>(&'a self, action: &'a Action, ctx: &'a ExecCtx) -> ActionFut<'a> {
         Box::pin(async move {
             match action {
                 Action::Click {
@@ -74,6 +78,58 @@ impl Operator for AndroidUiautoOperator {
                 }
                 Action::Wait { seconds } => {
                     tokio::time::sleep(Duration::from_secs_f32(seconds.clamp(0.0, 30.0))).await;
+                    Ok(ActionOutput::ok())
+                }
+                Action::Scroll { x, y, direction, clicks } => {
+                    let w = ctx.screen_w as i32;
+                    let h = ctx.screen_h as i32;
+                    let cx = if *x > 0 { *x } else { w / 2 };
+                    let cy = if *y > 0 { *y } else { h / 2 };
+                    let dist = (h / 4).max(200) * clicks.abs().max(1).min(3);
+                    let (x1, y1, x2, y2) = match direction {
+                        ScrollDir::Up => (cx, cy + dist / 2, cx, cy - dist / 2),
+                        ScrollDir::Down => (cx, cy - dist / 2, cx, cy + dist / 2),
+                        ScrollDir::Left => (cx + dist / 2, cy, cx - dist / 2, cy),
+                        ScrollDir::Right => (cx - dist / 2, cy, cx + dist / 2, cy),
+                    };
+                    let args = serde_json::json!({
+                        "x1": x1, "y1": y1, "x2": x2, "y2": y2, "durationMs": 300
+                    }).to_string();
+                    crate::android_uiauto::call("swipe", &args)
+                        .await
+                        .map_err(|error| anyhow!(error))?;
+                    Ok(ActionOutput::ok())
+                }
+                Action::Hotkey { keys } => {
+                    let key_name = match keys.as_str() {
+                        "press_back" | "back" => "back",
+                        "press_home" | "home" => "home",
+                        "enter" | "return" => "enter",
+                        _ => {
+                            return Ok(ActionOutput::err(
+                                "unsupported hotkey for Android UIAutomator2",
+                            ));
+                        }
+                    };
+                    let args = serde_json::json!({ "key": key_name }).to_string();
+                    crate::android_uiauto::call("key", &args)
+                        .await
+                        .map_err(|error| anyhow!(error))?;
+                    Ok(ActionOutput::ok())
+                }
+                Action::ActivateApp { app } => {
+                    let lower = app.to_ascii_lowercase();
+                    let pkg = match lower.as_str() {
+                        a if a.contains("wechat") || a.contains("微信") => "com.tencent.mm",
+                        a if a.contains("douyin") || a.contains("抖音") => "com.ss.android.ugc.aweme",
+                        a if a.contains("alipay") || a.contains("支付宝") => "com.eg.android.AlipayGphone",
+                        _ => app.as_str(),
+                    };
+                    let args = serde_json::json!({ "package": pkg }).to_string();
+                    crate::android_uiauto::call("launch", &args)
+                        .await
+                        .map_err(|error| anyhow!(error))?;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                     Ok(ActionOutput::ok())
                 }
                 Action::Finished { .. } | Action::CallUser { .. } => Ok(ActionOutput::ok()),

@@ -111,17 +111,11 @@ pub enum CoordSpace {
 }
 
 impl CoordSpace {
-    /// Pick the coordinate space for a given model id. rsclaw-vision-v1
-    /// currently emits raw pixels; everything else follows the 0-1000
-    /// prompt convention. Single source of truth — flip the rsclaw branch
-    /// to `Normalized` once the model is fixed worker-side.
+    /// Pick the coordinate space for a given model id. All rsclaw-vision
+    /// models follow the 0-1000 normalized prompt convention.
     pub fn for_model(model: &str) -> Self {
-        let m = model.to_ascii_lowercase();
-        if m.contains("rsclaw-vision") {
-            CoordSpace::Pixels
-        } else {
-            CoordSpace::Normalized
-        }
+        let _ = model;
+        CoordSpace::Normalized
     }
 }
 
@@ -1305,16 +1299,19 @@ mod tests {
     }
 
     #[test]
-    fn coord_space_for_model_picks_pixels_for_rsclaw_vision() {
+    fn coord_space_for_model_always_normalized() {
         assert_eq!(
             CoordSpace::for_model("rsclaw-vision-v1"),
-            CoordSpace::Pixels
+            CoordSpace::Normalized
         );
         assert_eq!(
             CoordSpace::for_model("rsclaw/rsclaw-vision-v1"),
-            CoordSpace::Pixels
+            CoordSpace::Normalized
         );
-        // Everything else stays on the 0-1000 prompt convention.
+        assert_eq!(
+            CoordSpace::for_model("rsclaw-vision-v2"),
+            CoordSpace::Normalized
+        );
         assert_eq!(CoordSpace::for_model("ui-tars-1.5"), CoordSpace::Normalized);
         assert_eq!(
             CoordSpace::for_model("doubao-vision"),
