@@ -332,6 +332,7 @@ struct PatchAgentRequest {
 // Router builder
 // ---------------------------------------------------------------------------
 
+/// Build the Axum router with all API routes, middleware, and static file serving.
 pub fn build_router(state: AppState) -> Router {
     let mut api = Router::new()
         .route("/message", post(send_message))
@@ -2060,9 +2061,9 @@ async fn http_reload(
                 }
                 // Also remove from custom_webhooks map so /hooks/{name} stops
                 // dispatching to a cancelled channel.
-                state.custom_webhooks.write()
-                    .map(|mut wh| { wh.remove(name); })
-                    .ok();
+                if let Err(e) = state.custom_webhooks.write().map(|mut wh| { wh.remove(name); }) {
+                    tracing::warn!(name, error = %e, "hot-reload: failed to remove custom webhook entry");
+                }
                 removed.push(name.clone());
             }
         }
@@ -2288,8 +2289,10 @@ async fn http_reload(
                                 tok.cancel();
                             }
                         }
-                        state.agents.remove_handle(&entry.id);
-                        match state.agent_spawner.spawn_agent(entry.clone()) {
+                        // Atomic swap: replace_agent inserts the new handle and
+                        // cancels the old one's lifetime in a single write-lock
+                        // operation, so no message sees "agent not found".
+                        match state.agent_spawner.replace_agent(entry.clone()) {
                             Ok(id) => restarted_ids.push(id),
                             Err(e) => {
                                 tracing::warn!(agent = %entry.id, error = %e, "hot-reload: agent re-spawn failed");
@@ -5371,7 +5374,7 @@ async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
     match std::fs::read(&path) {
         Ok(data) => {
             let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, ct.parse().unwrap());
+            headers.insert(header::CONTENT_TYPE, ct.parse().unwrap_or_else(|_| header::HeaderValue::from_static("application/octet-stream")));
             (headers, data).into_response()
         }
         Err(e) => (

@@ -312,7 +312,7 @@ impl CronRunner {
                 });
             }
 
-            let state = job.state.as_mut().unwrap();
+            let state = job.state.as_mut().expect("state initialized above");
 
             // Clear stale running marker
             if let Some(running_at) = state.running_at_ms {

@@ -770,6 +770,7 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Create a new agent runtime with the given configuration and dependencies.
     pub fn new(
         #[allow(clippy::too_many_arguments)] handle: Arc<AgentHandle>,
         config: Arc<RuntimeConfig>,

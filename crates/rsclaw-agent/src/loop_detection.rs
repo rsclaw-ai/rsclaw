@@ -232,6 +232,7 @@ fn is_result_failure(result: &serde_json::Value) -> bool {
 }
 
 impl LoopDetector {
+    /// Create a loop detector with a single default threshold (critical = warning + 1).
     pub fn new(window: usize, default_threshold: usize) -> Self {
         // When constructed with a single threshold (backwards compat), use it as the
         // warning threshold; critical is set one step above.
@@ -259,6 +260,7 @@ impl LoopDetector {
         }
     }
 
+    /// Create with dual thresholds and per-tool override map.
     pub fn with_overrides(
         window: usize,
         warning_threshold: usize,

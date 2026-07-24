@@ -141,10 +141,12 @@ pub struct PairingStore {
 }
 
 impl PairingStore {
+    /// Create an empty pairing store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Check whether `peer_id` has been approved for DM access.
     pub fn is_approved(&self, peer_id: &str) -> bool {
         self.approved.contains(peer_id)
     }
@@ -186,6 +188,7 @@ impl PairingStore {
         Some(entry.peer_id)
     }
 
+    /// Revoke a previously approved peer.
     pub fn revoke(&mut self, peer_id: &str) {
         self.approved.remove(peer_id);
     }
@@ -248,6 +251,7 @@ pub enum PolicyResult {
 }
 
 impl DmPolicyEnforcer {
+    /// Create a new DM policy enforcer with the given policy and allowlist.
     pub fn new(policy: DmPolicy, allow_from: Vec<String>) -> Self {
         Self {
             policy,
@@ -284,6 +288,7 @@ impl DmPolicyEnforcer {
         self
     }
 
+    /// Check whether `peer_id` is allowed to send DMs under the current policy.
     pub async fn check(&self, peer_id: &str) -> PolicyResult {
         match &self.policy {
             DmPolicy::Disabled => {
@@ -319,6 +324,7 @@ impl DmPolicyEnforcer {
         }
     }
 
+    /// Approve a pairing code, returning the peer_id if the code was valid.
     pub async fn approve_pairing(&self, code: &str) -> Option<String> {
         let peer = self.pairing.lock().await.approve(code);
         // Persist to redb.
@@ -331,6 +337,7 @@ impl DmPolicyEnforcer {
         peer
     }
 
+    /// Revoke a previously approved peer from DM access.
     pub async fn revoke(&self, peer_id: &str) {
         self.pairing.lock().await.revoke(peer_id);
         // Remove from redb.
@@ -651,6 +658,7 @@ pub struct ChannelManager {
 }
 
 impl ChannelManager {
+    /// Create a new channel manager with the given memory tier.
     pub fn new(tier: MemoryTier) -> Self {
         Self {
             channels: std::sync::RwLock::new(HashMap::new()),
@@ -684,6 +692,7 @@ impl ChannelManager {
         }
     }
 
+    /// Return the maximum number of concurrent agent tasks for this memory tier.
     pub fn max_concurrent(&self) -> usize {
         match self.tier {
             MemoryTier::Low => 3,
@@ -692,6 +701,7 @@ impl ChannelManager {
         }
     }
 
+    /// Register a channel using its default name.
     pub fn register(&self, ch: Arc<dyn Channel>) -> Result<()> {
         let name = ch.name().to_owned();
         self.register_with_name(name, ch)
@@ -737,6 +747,7 @@ impl ChannelManager {
         seen.len()
     }
 
+    /// Look up a registered channel by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Channel>> {
         self.channels.read().expect("ChannelManager lock poisoned").get(name).cloned()
     }
