@@ -4009,9 +4009,11 @@ data: {"type":"ping"}
         )
         .await;
         assert_eq!(evs.len(), 2);
-        assert!(evs
-            .iter()
-            .all(|event| matches!(event, Ok(StreamEvent::TextDelta(delta)) if delta.is_empty())));
+        assert!(
+            evs.iter().all(
+                |event| matches!(event, Ok(StreamEvent::TextDelta(delta)) if delta.is_empty())
+            )
+        );
     }
 
     #[tokio::test]

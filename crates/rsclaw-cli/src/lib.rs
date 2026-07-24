@@ -179,7 +179,8 @@ pub enum Command {
     /// Alias for `gateway reload`.
     #[command(hide = true)]
     Reload {
-        /// What to reload: plugins, skills, mcp, channels, agents (default: all).
+        /// What to reload: plugins, skills, mcp, channels, agents (default:
+        /// all).
         #[arg(long, value_delimiter = ',')]
         scope: Option<Vec<String>>,
     },

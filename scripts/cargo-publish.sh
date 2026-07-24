@@ -64,8 +64,8 @@ publish_package() {
 
     printf '%s\n' "$output"
     if grep -qi 'already exists' <<<"$output"; then
-      echo "<<< ${name} already published"
-      return 0
+      echo "!!! ${name} version already exists on crates.io; bump every changed crate version before publishing"
+      return 1
     fi
 
     if grep -q '429 Too Many Requests' <<<"$output"; then

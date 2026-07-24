@@ -2518,6 +2518,40 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "📌 恢复本次对话:\n/cap-resume {agent} {session_id}",
     );
 
+    msg!("feishu_video_download_failed",
+        "en" => "Video download failed (timeout or connection issue). Please retry or use a smaller file.",
+        "zh" => "视频下载失败（超时或连接问题）。请重试或使用较小的文件。",
+        "ja" => "動画のダウンロードに失敗しました（タイムアウトまたは接続エラー）。再試行するか、小さいファイルを使用してください。",
+        "ko" => "동영상 다운로드에 실패했습니다 (시간 초과 또는 연결 문제). 다시 시도하거나 더 작은 파일을 사용하세요.",
+    );
+
+    msg!("feishu_file_too_large",
+        "en" => "File too large ({actual} MB, limit {limit} MB). Adjust via /config_upload_size <MB>",
+        "zh" => "文件太大（{actual} MB，限制 {limit} MB）。请通过 /config_upload_size <MB> 调整",
+        "ja" => "ファイルが大きすぎます（{actual} MB、制限 {limit} MB）。/config_upload_size <MB> で調整してください",
+        "ko" => "파일이 너무 큽니다 ({actual} MB, 제한 {limit} MB). /config_upload_size <MB>로 조정하세요",
+    );
+
+    msg!("feishu_file_download_failed",
+        "en" => "File download failed (timeout or connection issue). Please retry, use a smaller file, or provide a public URL.",
+        "zh" => "文件下载失败（超时或连接问题）。请重试、使用较小的文件，或提供公开 URL。",
+        "ja" => "ファイルのダウンロードに失敗しました（タイムアウトまたは接続エラー）。再試行するか、小さいファイルを使用するか、公開URLを提供してください。",
+        "ko" => "파일 다운로드에 실패했습니다 (시간 초과 또는 연결 문제). 다시 시도하거나, 더 작은 파일을 사용하거나, 공개 URL을 제공하세요.",
+    );
+
+    msg!("burn_after_read_label",
+        "en" => "Burn after reading",
+        "zh" => "阅后即焚",
+        "ja" => "読み取り後に消える",
+        "ko" => "읽고 나서 삭제",
+        "th" => "อ่านแล้วลบ",
+        "vi" => "Doc xong roi xoa",
+        "es" => "Leer y destruir",
+        "ru" => "Прочитать и удалить",
+        "fr" => "Lire puis detruire",
+        "de" => "Nach dem Lesen verbrennen",
+    );
+
     m
 });
 

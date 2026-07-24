@@ -53,15 +53,20 @@ impl super::runtime::AgentRuntime {
 
         let lang = args["lang"].as_str().map(str::to_owned);
         let prompt = args["prompt"].as_str().map(str::to_owned);
-        let max_tokens = args["max_tokens"].as_u64().map(|v| v as u32);
+        let max_tokens = match parse_max_tokens(&args) {
+            Ok(max_tokens) => max_tokens,
+            Err(message) => return Ok(json!({ "error": message })),
+        };
         // OCR transport is sync (block_in_place); run it off the async
         // worker so we don't stall the runtime thread on a slow page.
         let text = tokio::task::spawn_blocking(move || {
-            // Re-read lang inside: client.ocr uses the configured lang; a
-            // per-call override would need a richer client API. Keep it
-            // config-driven for now and note the requested lang.
-            let _ = &lang;
-            client.ocr(&payload, prompt.as_deref(), max_tokens)
+            client.ocr_with_options(
+                &payload,
+                prompt.as_deref(),
+                max_tokens,
+                None,
+                lang.as_deref(),
+            )
         })
         .await
         .map_err(|e| anyhow!("ocr: task join failed: {e}"))?;
@@ -76,5 +81,27 @@ impl super::runtime::AgentRuntime {
                 "hint": "Endpoint may be down or the image unreadable. Retry once; if it persists tell the user."
             })),
         }
+    }
+}
+
+fn parse_max_tokens(args: &Value) -> std::result::Result<Option<u32>, &'static str> {
+    args["max_tokens"]
+        .as_u64()
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| "ocr: `max_tokens` must be between 0 and 4294967295")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_tokens_rejects_values_that_do_not_fit_the_wire_type() {
+        assert_eq!(
+            parse_max_tokens(&json!({ "max_tokens": u32::MAX })),
+            Ok(Some(u32::MAX))
+        );
+        assert!(parse_max_tokens(&json!({ "max_tokens": u64::from(u32::MAX) + 1 })).is_err());
     }
 }

@@ -770,6 +770,8 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Create a new agent runtime with the given configuration and
+    /// dependencies.
     pub fn new(
         #[allow(clippy::too_many_arguments)] handle: Arc<AgentHandle>,
         config: Arc<RuntimeConfig>,
@@ -916,12 +918,11 @@ impl AgentRuntime {
 
 // Model resolution — extracted to `model_resolution.rs`. Re-exported here so
 // existing `crate::runtime::resolve_*` paths keep working.
-pub use super::model_resolution::{
-    VisionResolution, is_known_vision_model, model_supports_image_input,
-    resolve_flash_model_for, resolve_primary_model_for, resolve_vision_model_for,
-    vision_unavailable_message,
-};
 use super::model_resolution::effective_primary_is_rsclaw;
+pub use super::model_resolution::{
+    VisionResolution, is_known_vision_model, model_supports_image_input, resolve_flash_model_for,
+    resolve_primary_model_for, resolve_vision_model_for, vision_unavailable_message,
+};
 
 impl AgentRuntime {
     /// Estimate fixed context overhead: system prompt + tools tokens.
@@ -1846,7 +1847,6 @@ impl AgentRuntime {
         self.config.agents.is_daemon_agent(agent_id)
     }
 
-
     /// Resolve a session key through the alias table.
     /// Reload installed skills from disk and invalidate the cached system
     /// prompt so newly-installed (or removed) skills appear in the per-session
@@ -2062,8 +2062,6 @@ impl AgentRuntime {
             }
         });
     }
-
-
 
     // -----------------------------------------------------------------------
     // Organic evolution helpers

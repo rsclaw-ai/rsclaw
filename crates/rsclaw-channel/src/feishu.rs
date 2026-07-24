@@ -342,6 +342,8 @@ impl FeishuChannel {
     }
 
     #[allow(clippy::type_complexity)]
+    /// Create a new Feishu channel with the given credentials and message
+    /// callback.
     pub fn new(
         app_id: impl Into<String>,
         app_secret: impl Into<String>,
@@ -1138,7 +1140,13 @@ impl FeishuChannel {
                     }
                     Err(e) => {
                         warn!(error = format!("{e:#}"), "feishu: video download failed");
-                        "__DIRECT_REPLY__Video download failed (timeout or connection issue). Please retry or use a smaller file.".to_owned()
+                        format!(
+                            "__DIRECT_REPLY__{}",
+                            rsclaw_i18n::t(
+                                "feishu_video_download_failed",
+                                rsclaw_i18n::default_lang()
+                            )
+                        )
                     }
                 }
             }
@@ -1236,7 +1244,12 @@ impl FeishuChannel {
                             let actual = parts.get(1).unwrap_or(&"?");
                             let limit = parts.get(2).unwrap_or(&"?");
                             format!(
-                                "__DIRECT_REPLY__File too large ({actual} MB, limit {limit} MB). Adjust via /config_upload_size <MB>"
+                                "__DIRECT_REPLY__{}",
+                                rsclaw_i18n::t_fmt(
+                                    "feishu_file_too_large",
+                                    rsclaw_i18n::default_lang(),
+                                    &[("actual", actual), ("limit", limit)]
+                                )
                             )
                         } else {
                             // Log the full error chain ({e:#}) — without this the
@@ -1247,7 +1260,13 @@ impl FeishuChannel {
                                 error = format!("{e:#}"),
                                 "feishu: file download failed"
                             );
-                            "__DIRECT_REPLY__File download failed (timeout or connection issue). Please retry, use a smaller file, or provide a public URL.".to_owned()
+                            format!(
+                                "__DIRECT_REPLY__{}",
+                                rsclaw_i18n::t(
+                                    "feishu_file_download_failed",
+                                    rsclaw_i18n::default_lang()
+                                )
+                            )
                         }
                     }
                 }
@@ -1955,6 +1974,8 @@ pub struct FeishuNotifier {
 }
 
 impl FeishuNotifier {
+    /// Create a new Feishu notifier for sending notifications to a specific
+    /// chat.
     pub fn new(app_id: &str, app_secret: &str, target_chat_id: &str, brand: &str) -> Self {
         Self {
             app_id: app_id.to_string(),
@@ -2049,8 +2070,9 @@ impl NotificationSink for FeishuNotifier {
 
     fn send(&self, notification: &Notification) -> BoxFuture<'_, Result<()>> {
         let text = if notification.burn_after_read {
+            let burn_label = rsclaw_i18n::t("burn_after_read_label", rsclaw_i18n::default_lang());
             format!(
-                "**[阅后即焚]**\n\n**{}**\n\n{}\n\n_session_id: {}_",
+                "**[{burn_label}]**\n\n**{}**\n\n{}\n\n_session_id: {}_",
                 notification.title,
                 notification.body,
                 notification.session_id.as_deref().unwrap_or("N/A")

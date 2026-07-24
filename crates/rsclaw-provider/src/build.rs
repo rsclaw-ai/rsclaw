@@ -140,12 +140,19 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                 }
                 (_, &rsclaw_config::schema::ApiFormat::Ollama) => {
                     // Ollama backend: reasoning models use native /api/chat
-                    let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                    // Ollama is never OpenAI's API, including its default
+                    // localhost endpoint, so it must receive an explicitly
+                    // configured key only.
+                    let key = api_key;
                     let url = base_url.unwrap_or_else(|| "http://localhost:11434".to_owned());
                     Arc::new(OpenAiProvider::ollama_with_ua(url, key, user_agent))
                 }
                 (_, &rsclaw_config::schema::ApiFormat::OpenAiResponses) => {
-                    let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                    let key = openai_key_for_endpoint(
+                        api_key,
+                        base_url.is_none(),
+                        std::env::var("OPENAI_API_KEY").ok(),
+                    );
                     let url = base_url.unwrap_or_else(|| crate::openai::OPENAI_API_BASE.to_owned());
                     Arc::new(OpenAiProvider::responses_with_ua(url, key, user_agent))
                 }
@@ -184,14 +191,11 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     // llama.cpp, vLLM, SGLang, etc.)
                     // H3: only fall back to OPENAI_API_KEY for providers
                     // explicitly targeting OpenAI's own API endpoint.
-                    let key = if let Some(ref url) = base_url {
-                        // Custom endpoint — don't leak OPENAI_API_KEY to third-party APIs.
-                        // Use the provider's own key or leave it unset.
-                        api_key
-                    } else {
-                        // Defaults to OpenAI's API — use the standard env var.
-                        api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                    };
+                    let key = openai_key_for_endpoint(
+                        api_key,
+                        base_url.is_none(),
+                        std::env::var("OPENAI_API_KEY").ok(),
+                    );
                     if let Some(url) = base_url {
                         Arc::new(OpenAiProvider::with_user_agent(url, key, user_agent))
                     } else {
@@ -426,6 +430,16 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
     registry
 }
 
+/// Select the credential for an OpenAI API format without forwarding the
+/// process-wide OpenAI key to an explicitly configured endpoint.
+fn openai_key_for_endpoint(
+    configured_key: Option<String>,
+    uses_openai_default: bool,
+    openai_env_key: Option<String>,
+) -> Option<String> {
+    configured_key.or_else(|| uses_openai_default.then_some(openai_env_key).flatten())
+}
+
 /// Read an env var and treat both *unset* and *set-but-blank* as
 /// absent. Mirrors `std::env::var(name).ok()` for the absent case but
 /// adds whitespace-aware blank detection so callers can chain
@@ -469,5 +483,25 @@ mod tests {
             std::env::remove_var(spaces);
             std::env::remove_var(real);
         }
+    }
+
+    #[test]
+    fn custom_openai_shaped_endpoint_never_inherits_openai_env_key() {
+        assert_eq!(
+            openai_key_for_endpoint(None, false, Some("sk-openai".to_owned())),
+            None
+        );
+        assert_eq!(
+            openai_key_for_endpoint(
+                Some("custom-key".to_owned()),
+                false,
+                Some("sk-openai".to_owned())
+            ),
+            Some("custom-key".to_owned())
+        );
+        assert_eq!(
+            openai_key_for_endpoint(None, true, Some("sk-openai".to_owned())),
+            Some("sk-openai".to_owned())
+        );
     }
 }

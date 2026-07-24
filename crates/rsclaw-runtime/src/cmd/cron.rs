@@ -126,8 +126,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if status.is_success() {
-                let created: serde_json::Value =
-                    serde_json::from_str(&text).unwrap_or_default();
+                let created: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                 let id = created["id"].as_str().unwrap_or("?");
                 ok(&format!(
                     "added cron job '{}' ({})",

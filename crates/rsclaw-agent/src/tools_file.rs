@@ -942,8 +942,8 @@ impl super::runtime::AgentRuntime {
             }));
         }
 
-        let path = path.unwrap().to_owned();
-        let content = content.unwrap();
+        let path = path.expect("path verified non-none above").to_owned();
+        let content = content.expect("content verified non-none above");
 
         // Office/PDF formats are binary containers — writing prose into a
         // file named *.docx produces a fake document that won't open.
