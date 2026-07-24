@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw-runtime"
-version = "2026.6.26"
+version = "2026.7.1"
 edition = "2024"
 rust-version = "1.91"
 description = "rsclaw composition root: AppState/RPC handlers (a2a, cmd, cron, gateway, hooks, server, ws) + process entry point"
@@ -13,22 +13,22 @@ path = "src/lib.rs"
 
 [dependencies]
 # Extracted workspace crates
-rsclaw-agent = { path = "../rsclaw-agent", version = "0.1.0" }
+rsclaw-agent = { path = "../rsclaw-agent", version = "0.1.1" }
 rsclaw-types = { path = "../rsclaw-types", version = "0.1.0" }
 rsclaw-a2a-types = { path = "../rsclaw-a2a-types", version = "0.1.0" }
-rsclaw-config = { path = "../rsclaw-config", version = "0.1.0" }
+rsclaw-config = { path = "../rsclaw-config", version = "0.1.1" }
 rsclaw-artifact = { path = "../rsclaw-artifact", version = "0.1.0" }
 rsclaw-mcp = { path = "../rsclaw-mcp", version = "0.1.0" }
 rsclaw-cap = { path = "../rsclaw-cap", version = "0.1.0" }
 rsclaw-heartbeat = { path = "../rsclaw-heartbeat", version = "0.1.0" }
-rsclaw-cli = { path = "../rsclaw-cli", version = "0.1.0" }
+rsclaw-cli = { path = "../rsclaw-cli", version = "0.1.1" }
 rsclaw-migrate = { path = "../rsclaw-migrate", version = "0.1.0" }
 rsclaw-desktop = { path = "../rsclaw-desktop", version = "0.1.0" }
 rsclaw-evolution = { path = "../rsclaw-evolution", version = "0.1.0" }
 rsclaw-memory = { path = "../rsclaw-memory", version = "0.1.0" }
 rsclaw-doc = { path = "../rsclaw-doc", version = "0.1.0" }
 rsclaw-browser = { path = "../rsclaw-browser", version = "0.1.0" }
-rsclaw-channel = { path = "../rsclaw-channel", version = "0.1.0" }
+rsclaw-channel = { path = "../rsclaw-channel", version = "0.1.1" }
 rsclaw-computer = { path = "../rsclaw-computer", version = "0.1.0" }
 rsclaw-kb = { path = "../rsclaw-kb", version = "0.1.0" }
 rsclaw-plugin = { path = "../rsclaw-plugin", version = "0.1.0" }
@@ -37,7 +37,7 @@ rsclaw-tools = { path = "../rsclaw-tools", version = "0.1.0" }
 rsclaw-store = { path = "../rsclaw-store", version = "0.1.0" }
 rsclaw-jobs = { path = "../rsclaw-jobs", version = "0.1.0" }
 rsclaw-embed = { path = "../rsclaw-embed", version = "0.1.0" }
-rsclaw-provider = { path = "../rsclaw-provider", version = "0.1.0" }
+rsclaw-provider = { path = "../rsclaw-provider", version = "0.1.1" }
 rsclaw-retry = { path = "../rsclaw-retry", version = "0.1.0" }
 rsclaw-util = { path = "../rsclaw-util", version = "0.1.0" }
 rsclaw-platform = { path = "../rsclaw-platform", version = "0.1.0" }

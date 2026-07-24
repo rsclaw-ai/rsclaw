@@ -928,10 +928,10 @@ impl AgentRegistry {
         }
     }
 
-    /// Atomically replace an agent handle, cancelling the old handle's lifetime.
-    /// Used during hot-reload to swap agent handles without a gap where the agent
-    /// is missing from the registry (which would cause "agent not found" errors
-    /// for in-flight messages).
+    /// Atomically replace an agent handle, cancelling the old handle's
+    /// lifetime. Used during hot-reload to swap agent handles without a gap
+    /// where the agent is missing from the registry (which would cause
+    /// "agent not found" errors for in-flight messages).
     pub fn replace_handle(&self, handle: Arc<AgentHandle>) {
         let mut inner = self.inner.write().expect("agent registry lock poisoned");
         if let Some(old) = inner.agents.insert(handle.id.clone(), handle) {

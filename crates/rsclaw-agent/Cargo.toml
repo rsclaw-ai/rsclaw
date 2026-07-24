@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "Agent crate for RsClaw — internal workspace crate, not for direct use"
 edition = "2024"
 rust-version = "1.91"
@@ -46,9 +46,9 @@ which = "7"
 # Extracted workspace crates
 rsclaw-types = { path = "../rsclaw-types", version = "0.1.0" }
 rsclaw-a2a-types = { path = "../rsclaw-a2a-types", version = "0.1.0" }
-rsclaw-config = { path = "../rsclaw-config", version = "0.1.0" }
-rsclaw-provider = { path = "../rsclaw-provider", version = "0.1.0" }
-rsclaw-channel = { path = "../rsclaw-channel", version = "0.1.0" }
+rsclaw-config = { path = "../rsclaw-config", version = "0.1.1" }
+rsclaw-provider = { path = "../rsclaw-provider", version = "0.1.1" }
+rsclaw-channel = { path = "../rsclaw-channel", version = "0.1.1" }
 rsclaw-skill = { path = "../rsclaw-skill", version = "0.1.0" }
 rsclaw-browser = { path = "../rsclaw-browser", version = "0.1.0" }
 rsclaw-kb = { path = "../rsclaw-kb", version = "0.1.0" }

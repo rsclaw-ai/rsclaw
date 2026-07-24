@@ -131,9 +131,9 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 return Ok(());
             }
 
-            // If a system service is installed, start via service manager
-            // instead of spawning a bare process (avoids dual-start conflicts).
-            if service_installed() {
+            // The installed service owns only the default instance. Isolated
+            // --dev/--profile/config-path instances must start their own process.
+            if service_manager_allowed() && service_installed() {
                 println!(
                     "  {} Service detected, starting via service manager...",
                     dim("[..]")
@@ -212,8 +212,8 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                         },
                     }
 
-                    // Prefer service manager for restart if installed.
-                    if service_installed() {
+                    // The installed service owns only the default instance.
+                    if service_manager_allowed() && service_installed() {
                         if try_service_start() {
                             wait_for_gateway_health(&health).await?;
                             println!("  {} Gateway restarted via service", green("[ok]"));
@@ -387,8 +387,11 @@ fn process_alive(pid: u32) -> bool {
     rsclaw_platform::process_alive(pid)
 }
 
-/// Scan for a running gateway process when PID file is missing.
-/// Tries: 1) lsof/netstat on the gateway port, 2) pgrep by name.
+/// Scan for the process listening on this instance's configured gateway port.
+///
+/// This is only used when the current instance's PID file is absent. Do not
+/// fall back to process-name matching: that could select another `--dev` or
+/// `--profile` instance.
 fn find_gateway_pid() -> Option<u32> {
     let port = detect_port();
     let my_pid = std::process::id();
@@ -396,37 +399,12 @@ fn find_gateway_pid() -> Option<u32> {
     // Try finding by port first (most reliable).
     #[cfg(unix)]
     {
-        let output = std::process::Command::new("lsof")
-            .args(["-ti", &format!(":{port}"), "-sTCP:LISTEN"])
-            .output()
-            .ok();
-        if let Some(output) = output {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                if let Ok(pid) = line.trim().parse::<u32>() {
-                    if pid != my_pid && process_alive(pid) {
-                        return Some(pid);
-                    }
-                }
-            }
+        if let Some(pid) = find_pid_with_lsof(port, my_pid) {
+            return Some(pid);
         }
-
-        // Fallback: pgrep by process name.
-        for pattern in &["rsclaw gateway", "rsclaw"] {
-            let output = std::process::Command::new("pgrep")
-                .args(["-f", pattern])
-                .output()
-                .ok();
-            if let Some(output) = output {
-                let text = String::from_utf8_lossy(&output.stdout);
-                for line in text.lines() {
-                    if let Ok(pid) = line.trim().parse::<u32>() {
-                        if pid != my_pid && process_alive(pid) {
-                            return Some(pid);
-                        }
-                    }
-                }
-            }
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = find_pid_with_linux_socket_tools(port, my_pid) {
+            return Some(pid);
         }
     }
     #[cfg(windows)]
@@ -460,11 +438,161 @@ fn find_gateway_pid() -> Option<u32> {
     None
 }
 
+#[cfg(unix)]
+fn find_pid_with_lsof(port: u16, my_pid: u32) -> Option<u32> {
+    for lsof in ["lsof", "/usr/sbin/lsof"] {
+        let Some(output) = std::process::Command::new(lsof)
+            .args(["-ti", &format!(":{port}"), "-sTCP:LISTEN"])
+            .output()
+            .ok()
+        else {
+            continue;
+        };
+        if let Some(pid) = first_live_pid(&output.stdout, my_pid) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn first_live_pid(output: &[u8], my_pid: u32) -> Option<u32> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .find(|&pid| pid != my_pid && process_alive(pid))
+}
+
+#[cfg(target_os = "linux")]
+fn find_pid_with_linux_socket_tools(port: u16, my_pid: u32) -> Option<u32> {
+    for (command, args) in [
+        ("ss", &["-ltnp"][..]),
+        ("netstat", &["-ltnp"][..]),
+    ] {
+        let Some(output) = std::process::Command::new(command).args(args).output().ok() else {
+            continue;
+        };
+        if let Some(pid) = listener_pid_from_socket_output(&output.stdout, port, my_pid) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn listener_pid_from_socket_output(output: &[u8], port: u16, my_pid: u32) -> Option<u32> {
+    String::from_utf8_lossy(output).lines().find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let local_endpoint = fields.get(3)?;
+        if !socket_endpoint_has_port(local_endpoint, port) {
+            return None;
+        }
+        let pid = line
+            .split("pid=")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .or_else(|| fields.last().and_then(|field| field.split('/').next()))?
+            .parse::<u32>()
+            .ok()?;
+        (pid != my_pid && process_alive(pid)).then_some(pid)
+    })
+}
+
+#[cfg(unix)]
+fn socket_endpoint_has_port(endpoint: &str, port: u16) -> bool {
+    endpoint
+        .rsplit_once(':')
+        .and_then(|(_, value)| value.parse::<u16>().ok())
+        == Some(port)
+}
+
 fn detect_port() -> u16 {
-    config::load_quiet()
+    let instance_port = std::env::var("RSCLAW_PORT")
         .ok()
-        .map(|c| c.gateway.port)
-        .unwrap_or(18888)
+        .and_then(|port| port.parse::<u16>().ok());
+    let configured_port = config::load_quiet().ok().map(|c| c.gateway.port);
+    detect_port_from_sources(instance_port, configured_port)
+}
+
+fn detect_port_from_sources(
+    instance_port: Option<u16>,
+    configured_port: Option<u16>,
+) -> u16 {
+    instance_port.or(configured_port).unwrap_or(18888)
+}
+
+fn gateway_target_pid() -> Option<u32> {
+    select_gateway_pid(gateway_read_pid(), find_gateway_pid())
+}
+
+fn select_gateway_pid(pid_file_pid: Option<u32>, port_listener_pid: Option<u32>) -> Option<u32> {
+    pid_file_pid.or(port_listener_pid)
+}
+
+/// Whether the global service manager may control the current instance.
+///
+/// `run` sets these overrides for `--dev`, `--profile`, `--base-dir`, and
+/// `--config-path`; none of those isolated instances may start or stop the
+/// globally installed default service.
+fn service_manager_allowed() -> bool {
+    service_manager_allowed_with_overrides(
+        std::env::var_os("RSCLAW_BASE_DIR").is_some(),
+        std::env::var_os("RSCLAW_CONFIG_PATH").is_some(),
+    )
+}
+
+fn service_manager_allowed_with_overrides(
+    base_dir_overridden: bool,
+    config_path_overridden: bool,
+) -> bool {
+    !base_dir_overridden && !config_path_overridden
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        detect_port_from_sources, select_gateway_pid, service_manager_allowed_with_overrides,
+    };
+    #[cfg(unix)]
+    use super::socket_endpoint_has_port;
+
+    #[test]
+    fn gateway_pid_file_takes_priority_over_port_listener() {
+        assert_eq!(select_gateway_pid(Some(101), Some(202)), Some(101));
+    }
+
+    #[test]
+    fn gateway_port_listener_is_used_when_pid_file_is_absent() {
+        assert_eq!(select_gateway_pid(None, Some(202)), Some(202));
+        assert_eq!(select_gateway_pid(None, None), None);
+    }
+
+    #[test]
+    fn default_instance_port_is_18888_without_config() {
+        assert_eq!(detect_port_from_sources(None, None), 18888);
+        assert_eq!(detect_port_from_sources(None, Some(19000)), 19000);
+    }
+
+    #[test]
+    fn isolated_instance_port_overrides_missing_or_default_config() {
+        assert_eq!(detect_port_from_sources(Some(18889), None), 18889);
+        assert_eq!(detect_port_from_sources(Some(19100), Some(18888)), 19100);
+    }
+
+    #[test]
+    fn isolated_instances_cannot_manage_global_service() {
+        assert!(service_manager_allowed_with_overrides(false, false));
+        assert!(!service_manager_allowed_with_overrides(true, false));
+        assert!(!service_manager_allowed_with_overrides(false, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_port_matching_is_exact() {
+        assert!(socket_endpoint_has_port("127.0.0.1:19142", 19142));
+        assert!(socket_endpoint_has_port("[::1]:19142", 19142));
+        assert!(!socket_endpoint_has_port("127.0.0.1:119142", 19142));
+    }
 }
 
 /// Maximum time to wait for a gateway process to exit during CLI stop.
@@ -686,7 +814,7 @@ fn wait_for_process_exit(pid: u32) -> StopWaitOutcome {
 /// Build the gateway URL from config (bind_address + port).
 fn detect_url() -> String {
     let cfg = config::load_quiet().ok();
-    let port = cfg.as_ref().map(|c| c.gateway.port).unwrap_or(18888);
+    let port = detect_port();
     let bind = cfg
         .as_ref()
         .and_then(|c| c.gateway.bind_address.as_deref())
@@ -702,8 +830,8 @@ fn detect_url() -> String {
 
 pub fn gateway_signal_stop() -> Result<()> {
     // Try service manager first (handles auto-restart properly).
-    if try_service_stop() {
-        if let Some(pid) = gateway_read_pid().or_else(find_gateway_pid) {
+    if service_manager_allowed() && try_service_stop() {
+        if let Some(pid) = gateway_target_pid() {
             let outcome = wait_for_process_exit(pid);
             if should_remove_pid_after_stop(&outcome) {
                 let _ = std::fs::remove_file(gateway_pid_file());
@@ -720,12 +848,10 @@ pub fn gateway_signal_stop() -> Result<()> {
     }
 
     // Fallback: direct PID kill (for manual `gateway start` without service).
-    // Try PID file first, then scan for running gateway processes.
-    let pid = gateway_read_pid()
-        .or_else(find_gateway_pid)
-        .ok_or_else(|| {
-            anyhow::anyhow!("gateway is not running (no PID file and no matching process)")
-        })?;
+    // Try this instance's PID file first, then its configured port listener.
+    let pid = gateway_target_pid().ok_or_else(|| {
+        anyhow::anyhow!("gateway is not running (no PID file and no matching process)")
+    })?;
     if !process_alive(pid) {
         let _ = std::fs::remove_file(gateway_pid_file());
         anyhow::bail!("gateway process {pid} is not running");

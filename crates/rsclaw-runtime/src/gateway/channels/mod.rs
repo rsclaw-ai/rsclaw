@@ -33,9 +33,9 @@ pub(crate) use self::{
     feishu::start_feishu_if_configured, line::start_line_if_configured,
     matrix::start_matrix_if_configured, qq::start_qq_if_configured,
     signal::start_signal_if_configured, slack::start_slack_if_configured,
-    telegram::start_telegram_if_configured,
-    wechat::start_wechat_personal_if_configured, wecom::start_wecom_if_configured,
-    whatsapp::start_whatsapp_if_configured, zalo::start_zalo_if_configured,
+    telegram::start_telegram_if_configured, wechat::start_wechat_personal_if_configured,
+    wecom::start_wecom_if_configured, whatsapp::start_whatsapp_if_configured,
+    zalo::start_zalo_if_configured,
 };
 use super::{
     preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},

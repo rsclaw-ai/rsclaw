@@ -69,10 +69,14 @@ export async function saveConfig(config: any) {
   }).then((r) => r.json());
 }
 
-export async function reloadConfig() {
-  return gatewayFetch("/api/v1/config/reload", { method: "POST" }).then((r) =>
-    r.json(),
-  );
+export async function reloadConfig(scope?: string[]) {
+  const query = scope?.length
+    ? `?scope=${encodeURIComponent(scope.join(","))}`
+    : "";
+  return gatewayFetch(`/api/v1/reload${query}`, { method: "POST" }).then(async (r) => {
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  });
 }
 
 /**

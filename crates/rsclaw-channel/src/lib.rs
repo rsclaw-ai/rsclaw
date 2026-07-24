@@ -692,7 +692,8 @@ impl ChannelManager {
         }
     }
 
-    /// Return the maximum number of concurrent agent tasks for this memory tier.
+    /// Return the maximum number of concurrent agent tasks for this memory
+    /// tier.
     pub fn max_concurrent(&self) -> usize {
         match self.tier {
             MemoryTier::Low => 3,
@@ -718,9 +719,7 @@ impl ChannelManager {
     /// (e.g. `"feishu"` and `"feishu/main"`) without burning extra slots.
     pub fn register_with_name(&self, name: String, ch: Arc<dyn Channel>) -> Result<()> {
         let mut channels = self.channels.write().expect("ChannelManager lock poisoned");
-        let is_alias = channels
-            .values()
-            .any(|existing| Arc::ptr_eq(existing, &ch));
+        let is_alias = channels.values().any(|existing| Arc::ptr_eq(existing, &ch));
         if !is_alias && Self::distinct_channel_count_inner(&channels) >= self.max_concurrent() {
             drop(channels);
             self.cancel_channel(&name);
@@ -749,7 +748,11 @@ impl ChannelManager {
 
     /// Look up a registered channel by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Channel>> {
-        self.channels.read().expect("ChannelManager lock poisoned").get(name).cloned()
+        self.channels
+            .read()
+            .expect("ChannelManager lock poisoned")
+            .get(name)
+            .cloned()
     }
 
     /// Remove a channel by name. Returns the removed channel if it existed.
@@ -757,17 +760,28 @@ impl ChannelManager {
     /// stop gracefully (not just the routing entry).
     pub fn unregister(&self, name: &str) -> Option<Arc<dyn Channel>> {
         self.cancel_channel(name);
-        self.channels.write().expect("ChannelManager lock poisoned").remove(name)
+        self.channels
+            .write()
+            .expect("ChannelManager lock poisoned")
+            .remove(name)
     }
 
     /// All registered channel names (for diffing during hot-reload).
     pub fn names(&self) -> Vec<String> {
-        self.channels.read().expect("ChannelManager lock poisoned").keys().cloned().collect()
+        self.channels
+            .read()
+            .expect("ChannelManager lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Whether a channel with the given name is registered.
     pub fn contains(&self, name: &str) -> bool {
-        self.channels.read().expect("ChannelManager lock poisoned").contains_key(name)
+        self.channels
+            .read()
+            .expect("ChannelManager lock poisoned")
+            .contains_key(name)
     }
 }
 

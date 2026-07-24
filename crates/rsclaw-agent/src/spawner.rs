@@ -27,7 +27,8 @@ pub struct AgentSpawner {
     pub live: Arc<LiveConfig>,
     /// Shared provider slot — swapped by `rsclaw reload --scope providers`.
     /// Dynamically spawned agents clone this slot into their handle, so they
-    /// always see the latest registry without needing a per-handle set_providers.
+    /// always see the latest registry without needing a per-handle
+    /// set_providers.
     pub providers: Arc<std::sync::RwLock<Arc<ProviderRegistry>>>,
     pub skills: Arc<SkillRegistry>,
     pub store: Arc<Store>,
@@ -91,8 +92,9 @@ impl AgentSpawner {
     }
 
     /// Replace an existing agent atomically — used during hot-reload to swap
-    /// agent handles without a gap where the agent is missing from the registry.
-    /// The old handle's lifetime token is cancelled as a side effect.
+    /// agent handles without a gap where the agent is missing from the
+    /// registry. The old handle's lifetime token is cancelled as a side
+    /// effect.
     pub fn replace_agent(&self, entry: AgentEntry) -> Result<String> {
         let id = entry.id.clone();
 
@@ -149,7 +151,8 @@ impl AgentSpawner {
             js_plugins: Arc::new(std::sync::RwLock::new(self.plugins.clone())),
         });
 
-        // Atomic swap: old handle is removed and its lifetime cancelled inside replace_handle.
+        // Atomic swap: old handle is removed and its lifetime cancelled inside
+        // replace_handle.
         self.registry.replace_handle(Arc::clone(&handle));
 
         let fallback_models = handle

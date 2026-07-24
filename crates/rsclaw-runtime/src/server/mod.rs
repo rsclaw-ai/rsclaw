@@ -15,7 +15,7 @@
 //! restart)   DELETE /api/v1/agents/:id              remove agent (requires
 //! restart)   GET    /api/v1/health                   health check
 //!   GET    /api/v1/status                   gateway status
-//!   POST   /api/v1/config/reload            trigger hot reload
+//!   POST   /api/v1/reload                   trigger hot reload
 //!   GET    /api/v1/config                   current config (redacted)
 //!   GET    /api/v1/defaults                 provider/channel/search catalog
 //! (defaults.toml)   GET    /api/v1/stream                   SSE — subscribe to
@@ -87,7 +87,8 @@ impl RateLimiter {
 
     /// Returns true if the request should be rate-limited (rejected).
     pub async fn check(&self, ip: IpAddr, max_req: u32, window_secs: u64) -> bool {
-        self.check_at(ip, max_req, window_secs, Instant::now()).await
+        self.check_at(ip, max_req, window_secs, Instant::now())
+            .await
     }
 
     async fn check_at(&self, ip: IpAddr, max_req: u32, window_secs: u64, now: Instant) -> bool {
@@ -201,7 +202,8 @@ pub struct AppState {
     pub notification_tx: broadcast::Sender<rsclaw_channel::OutboundMessage>,
     /// WASM plugins for direct tool execution via API. Swappable via reload.
     pub wasm_plugins: Arc<tokio::sync::RwLock<Arc<Vec<rsclaw_plugin::WasmPlugin>>>>,
-    /// Shell-bridge plugin registry for direct tool execution via API. Swappable via reload.
+    /// Shell-bridge plugin registry for direct tool execution via API.
+    /// Swappable via reload.
     pub plugins: Arc<tokio::sync::RwLock<Arc<rsclaw_plugin::PluginRegistry>>>,
     /// Skill registry — swappable for hot-reload via `/api/v1/reload`.
     pub skills: Arc<tokio::sync::RwLock<Arc<rsclaw_skill::SkillRegistry>>>,
@@ -210,8 +212,14 @@ pub struct AppState {
     /// Channel manager — supports hot-add/remove via `/api/v1/reload`.
     pub channel_manager: Arc<rsclaw_channel::ChannelManager>,
     /// Outbound channel senders — needed for channel hot-reload routing.
-    pub channel_senders:
-        Arc<std::sync::RwLock<std::collections::HashMap<String, tokio::sync::mpsc::Sender<rsclaw_channel::OutboundMessage>>>>,
+    pub channel_senders: Arc<
+        std::sync::RwLock<
+            std::collections::HashMap<
+                String,
+                tokio::sync::mpsc::Sender<rsclaw_channel::OutboundMessage>,
+            >,
+        >,
+    >,
     /// Agent spawner — needed for hot-adding agents via `/api/v1/reload`.
     pub agent_spawner: Arc<rsclaw_agent::AgentSpawner>,
     /// Task queue manager — needed for channel hot-add via `/api/v1/reload`.
@@ -260,7 +268,8 @@ pub struct AppState {
     pub model_health: rsclaw_provider::health::ProviderHealthRegistry,
     /// Provider registry — swappable via `/api/v1/reload --scope providers`.
     pub providers: Arc<tokio::sync::RwLock<Arc<rsclaw_provider::registry::ProviderRegistry>>>,
-    /// Shared WASM browser session — needed by `/api/v1/reload` for plugin host functions.
+    /// Shared WASM browser session — needed by `/api/v1/reload` for plugin host
+    /// functions.
     pub wasm_browser: Arc<tokio::sync::Mutex<Option<rsclaw_browser::BrowserSession>>>,
     /// H1: per-IP rate limiter for inbound HTTP requests.
     pub rate_limiter: Arc<RateLimiter>,
@@ -342,7 +351,8 @@ struct PatchAgentRequest {
 // Router builder
 // ---------------------------------------------------------------------------
 
-/// Build the Axum router with all API routes, middleware, and static file serving.
+/// Build the Axum router with all API routes, middleware, and static file
+/// serving.
 pub fn build_router(state: AppState) -> Router {
     let mut api = Router::new()
         .route("/message", post(send_message))
@@ -849,6 +859,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reload_reports_failed_scopes() {
+        let details = serde_json::Map::from_iter([
+            ("plugins".to_owned(), serde_json::json!({"reloaded": false})),
+            ("skills".to_owned(), serde_json::json!({"reloaded": true})),
+        ]);
+
+        assert_eq!(reload_failed_scopes(&details), vec!["plugins"]);
+    }
+
+    #[test]
     fn open_gateway_trusts_identity_headers_only_from_direct_loopback() {
         let loopback = SocketAddr::from(([127, 0, 0, 1], 18889));
         let remote = SocketAddr::from(([203, 0, 113, 7], 18889));
@@ -861,17 +881,21 @@ mod tests {
     async fn rate_limiter_prunes_expired_peers() {
         let limiter = RateLimiter::new();
         let now = Instant::now();
-        assert!(!limiter
-            .check_at(IpAddr::from([192, 0, 2, 1]), 10, 60, now)
-            .await);
-        assert!(!limiter
-            .check_at(
-                IpAddr::from([192, 0, 2, 2]),
-                10,
-                60,
-                now + Duration::from_secs(61),
-            )
-            .await);
+        assert!(
+            !limiter
+                .check_at(IpAddr::from([192, 0, 2, 1]), 10, 60, now)
+                .await
+        );
+        assert!(
+            !limiter
+                .check_at(
+                    IpAddr::from([192, 0, 2, 2]),
+                    10,
+                    60,
+                    now + Duration::from_secs(61),
+                )
+                .await
+        );
         assert_eq!(limiter.inner.read().await.len(), 1);
     }
 
@@ -880,25 +904,29 @@ mod tests {
         let limiter = RateLimiter::new();
         let now = Instant::now();
         for index in 1..=MAX_TRACKED_RATE_LIMIT_IPS {
-            assert!(!limiter
+            assert!(
+                !limiter
+                    .check_at(
+                        IpAddr::V4(std::net::Ipv4Addr::from(index as u32)),
+                        1,
+                        60,
+                        now,
+                    )
+                    .await
+            );
+        }
+        assert!(
+            limiter
                 .check_at(
-                    IpAddr::V4(std::net::Ipv4Addr::from(index as u32)),
+                    IpAddr::V4(std::net::Ipv4Addr::from(
+                        (MAX_TRACKED_RATE_LIMIT_IPS + 1) as u32,
+                    )),
                     1,
                     60,
                     now,
                 )
-                .await);
-        }
-        assert!(limiter
-            .check_at(
-                IpAddr::V4(std::net::Ipv4Addr::from(
-                    (MAX_TRACKED_RATE_LIMIT_IPS + 1) as u32,
-                )),
-                1,
-                60,
-                now,
-            )
-            .await);
+                .await
+        );
         assert_eq!(limiter.inner.read().await.len(), MAX_TRACKED_RATE_LIMIT_IPS);
     }
 
@@ -1893,7 +1921,8 @@ async fn config_reload(State(_state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Hot-reload plugins, skills, and/or MCP servers without restarting the gateway.
+/// Hot-reload plugins, skills, and/or MCP servers without restarting the
+/// gateway.
 ///
 /// Query params: `?scope=skills,mcp,plugins` (default: all).
 async fn http_reload(
@@ -2082,19 +2111,45 @@ async fn http_reload(
             .as_ref()
             .map(|c| {
                 let mut names = Vec::new();
-                if c.telegram.is_some() { names.push("telegram".to_owned()); }
-                if c.discord.is_some() { names.push("discord".to_owned()); }
-                if c.slack.is_some() { names.push("slack".to_owned()); }
-                if c.whatsapp.is_some() { names.push("whatsapp".to_owned()); }
-                if c.signal.is_some() { names.push("signal".to_owned()); }
-                if c.feishu.is_some() { names.push("feishu".to_owned()); }
-                if c.dingtalk.is_some() { names.push("dingtalk".to_owned()); }
-                if c.wecom.is_some() { names.push("wecom".to_owned()); }
-                if c.wechat.is_some() { names.push("wechat".to_owned()); }
-                if c.qq.is_some() { names.push("qq".to_owned()); }
-                if c.line.is_some() { names.push("line".to_owned()); }
-                if c.zalo.is_some() { names.push("zalo".to_owned()); }
-                if c.matrix.is_some() { names.push("matrix".to_owned()); }
+                if c.telegram.is_some() {
+                    names.push("telegram".to_owned());
+                }
+                if c.discord.is_some() {
+                    names.push("discord".to_owned());
+                }
+                if c.slack.is_some() {
+                    names.push("slack".to_owned());
+                }
+                if c.whatsapp.is_some() {
+                    names.push("whatsapp".to_owned());
+                }
+                if c.signal.is_some() {
+                    names.push("signal".to_owned());
+                }
+                if c.feishu.is_some() {
+                    names.push("feishu".to_owned());
+                }
+                if c.dingtalk.is_some() {
+                    names.push("dingtalk".to_owned());
+                }
+                if c.wecom.is_some() {
+                    names.push("wecom".to_owned());
+                }
+                if c.wechat.is_some() {
+                    names.push("wechat".to_owned());
+                }
+                if c.qq.is_some() {
+                    names.push("qq".to_owned());
+                }
+                if c.line.is_some() {
+                    names.push("line".to_owned());
+                }
+                if c.zalo.is_some() {
+                    names.push("zalo".to_owned());
+                }
+                if c.matrix.is_some() {
+                    names.push("matrix".to_owned());
+                }
                 // Include enabled custom channels so the removal diff doesn't
                 // unregister them.
                 if let Some(ref custom) = c.custom {
@@ -2125,7 +2180,9 @@ async fn http_reload(
                 }
                 // Also remove from custom_webhooks map so /hooks/{name} stops
                 // dispatching to a cancelled channel.
-                if let Err(e) = state.custom_webhooks.write().map(|mut wh| { wh.remove(name); }) {
+                if let Err(e) = state.custom_webhooks.write().map(|mut wh| {
+                    wh.remove(name);
+                }) {
                     tracing::warn!(name, error = %e, "hot-reload: failed to remove custom webhook entry");
                 }
                 removed.push(name.clone());
@@ -2134,7 +2191,9 @@ async fn http_reload(
 
         // Hot-add channels that are configured but not yet running.
         let is_running = |name: &str| -> bool {
-            running.iter().any(|r| r == name || r.starts_with(&format!("{name}/")))
+            running
+                .iter()
+                .any(|r| r == name || r.starts_with(&format!("{name}/")))
                 || state.channel_manager.contains(name)
         };
         {
@@ -2149,55 +2208,177 @@ async fn http_reload(
             let sd = state.shutdown.clone();
 
             if !is_running("telegram") {
-                start_telegram_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_telegram_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("telegram");
             }
             if !is_running("discord") {
-                start_discord_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_discord_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("discord");
             }
             if !is_running("slack") {
-                start_slack_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_slack_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("slack");
             }
             if !is_running("whatsapp") {
-                start_whatsapp_if_configured(cfg, reg.clone(), mgr, Arc::clone(&state.whatsapp), Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_whatsapp_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&state.whatsapp),
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("whatsapp");
             }
             if !is_running("signal") {
-                start_signal_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_signal_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("signal");
             }
             if !is_running("feishu") {
-                start_feishu_if_configured(cfg, reg.clone(), mgr, Arc::clone(&state.feishu), Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_feishu_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&state.feishu),
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("feishu");
             }
             if !is_running("dingtalk") {
-                start_dingtalk_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_dingtalk_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("dingtalk");
             }
             if !is_running("wecom") {
-                start_wecom_if_configured(cfg, reg.clone(), mgr, Arc::clone(&state.wecom), Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_wecom_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&state.wecom),
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("wecom");
             }
             if !is_running("wechat") {
-                start_wechat_personal_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_wechat_personal_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("wechat");
             }
             if !is_running("qq") {
-                start_qq_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_qq_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("qq");
             }
             if !is_running("line") {
-                start_line_if_configured(cfg, reg.clone(), mgr, Arc::clone(&state.line), Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_line_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&state.line),
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("line");
             }
             if !is_running("zalo") {
-                start_zalo_if_configured(cfg, reg.clone(), mgr, Arc::clone(&state.zalo), Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_zalo_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&state.zalo),
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("zalo");
             }
             if !is_running("matrix") {
-                start_matrix_if_configured(cfg, reg.clone(), mgr, Arc::clone(&dme), Arc::clone(&db), Arc::clone(&cs), Arc::clone(&tq), sd.clone());
+                start_matrix_if_configured(
+                    cfg,
+                    reg.clone(),
+                    mgr,
+                    Arc::clone(&dme),
+                    Arc::clone(&db),
+                    Arc::clone(&cs),
+                    Arc::clone(&tq),
+                    sd.clone(),
+                );
                 added.push("matrix");
             }
         }
@@ -2206,14 +2387,18 @@ async fn http_reload(
         // from the fresh config. This is simpler than diffing individual custom
         // channels and avoids orphaned tasks from partial overlap.
         {
-            let custom_names: Vec<String> = state.channel_manager.names()
+            let custom_names: Vec<String> = state
+                .channel_manager
+                .names()
                 .into_iter()
                 .filter(|n| {
                     let base = n.split('/').next().unwrap_or(n);
-                    !["cli", "desktop", "ws",
-                      "telegram", "discord", "slack", "whatsapp", "signal",
-                      "feishu", "dingtalk", "wecom", "wechat", "qq",
-                      "line", "zalo", "matrix"].contains(&base)
+                    ![
+                        "cli", "desktop", "ws", "telegram", "discord", "slack", "whatsapp",
+                        "signal", "feishu", "dingtalk", "wecom", "wechat", "qq", "line", "zalo",
+                        "matrix",
+                    ]
+                    .contains(&base)
                 })
                 .collect();
             for name in &custom_names {
@@ -2221,15 +2406,24 @@ async fn http_reload(
                 if let Ok(mut senders) = state.channel_senders.write() {
                     senders.remove(name);
                 }
-                state.custom_webhooks.write()
-                    .map(|mut wh| { wh.remove(name); })
+                state
+                    .custom_webhooks
+                    .write()
+                    .map(|mut wh| {
+                        wh.remove(name);
+                    })
                     .ok();
                 removed.push(name.clone());
             }
 
             // Restart all configured custom channels.
             if !custom_names.is_empty()
-                || fresh_config.channel.channels.custom.as_ref().is_some_and(|c| c.iter().any(|ch| ch.base.enabled.unwrap_or(true)))
+                || fresh_config
+                    .channel
+                    .channels
+                    .custom
+                    .as_ref()
+                    .is_some_and(|c| c.iter().any(|ch| ch.base.enabled.unwrap_or(true)))
             {
                 use crate::gateway::channels::start_custom_channels;
                 start_custom_channels(
@@ -2266,12 +2460,16 @@ async fn http_reload(
         );
     }
 
-    // --- Agents: diff config vs registry, spawn new / remove old / restart changed ---
+    // --- Agents: diff config vs registry, spawn new / remove old / restart changed
+    // ---
     let reload_agents = scope.contains("all") || scope.contains("agent");
     if reload_agents {
         // Detect whether agents.defaults.model changed BEFORE swapping the slot.
         let defaults_model_changed = {
-            let old_config = state.agent_spawner.config.read()
+            let old_config = state
+                .agent_spawner
+                .config
+                .read()
                 .map(|g| Arc::clone(&g))
                 .unwrap_or_else(|_| Arc::clone(&state.config));
             serde_json::to_value(&old_config.agents.defaults.model).unwrap_or_default()
@@ -2292,9 +2490,10 @@ async fn http_reload(
             .unwrap_or_default();
 
         // If agents.list is absent/empty, synthesize the implicit "main" agent
-        // from agents.defaults — same logic as AgentRegistry::from_config_with_receivers.
-        // Without this, reload would diff against an empty set and remove every
-        // running agent, leaving default_id pointing at a nonexistent handle.
+        // from agents.defaults — same logic as
+        // AgentRegistry::from_config_with_receivers. Without this, reload would
+        // diff against an empty set and remove every running agent, leaving
+        // default_id pointing at a nonexistent handle.
         let config_entries = if raw_entries.is_empty() {
             let defaults = &fresh_config.agents.defaults;
             vec![rsclaw_config::schema::AgentEntry {
@@ -2323,17 +2522,11 @@ async fn http_reload(
             raw_entries
         };
 
-        let config_agents: std::collections::HashSet<String> = config_entries
-            .iter()
-            .map(|e| e.id.clone())
-            .collect();
+        let config_agents: std::collections::HashSet<String> =
+            config_entries.iter().map(|e| e.id.clone()).collect();
 
-        let running_agents: std::collections::HashSet<String> = state
-            .agents
-            .all()
-            .iter()
-            .map(|h| h.id.clone())
-            .collect();
+        let running_agents: std::collections::HashSet<String> =
+            state.agents.all().iter().map(|h| h.id.clone()).collect();
 
         let mut spawned_ids = Vec::new();
         let mut removed_ids = Vec::new();
@@ -2343,7 +2536,8 @@ async fn http_reload(
         for entry in &config_entries {
             if running_agents.contains(&entry.id) {
                 if let Ok(handle) = state.agents.get(&entry.id) {
-                    let model_changed = serde_json::to_value(&handle.config.model).unwrap_or_default()
+                    let model_changed = serde_json::to_value(&handle.config.model)
+                        .unwrap_or_default()
                         != serde_json::to_value(&entry.model).unwrap_or_default();
                     let system_changed = handle.config.system != entry.system;
                     if model_changed || system_changed || defaults_model_changed {
@@ -2415,14 +2609,37 @@ async fn http_reload(
         );
     }
 
+    let failed_scopes = reload_failed_scopes(&details);
+    let reloaded = failed_scopes.is_empty();
+    let status = if reloaded {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+
     (
-        StatusCode::OK,
-        Json(serde_json::json!({"reloaded": true, "details": details})),
+        status,
+        Json(serde_json::json!({
+            "reloaded": reloaded,
+            "failed_scopes": failed_scopes,
+            "details": details,
+        })),
     )
         .into_response()
 }
 
-/// Spawn MCP servers from config into the given registry. Returns count spawned.
+fn reload_failed_scopes(details: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    details
+        .iter()
+        .filter_map(|(scope, result)| {
+            (result.get("reloaded").and_then(serde_json::Value::as_bool) == Some(false))
+                .then_some(scope.clone())
+        })
+        .collect()
+}
+
+/// Spawn MCP servers from config into the given registry. Returns count
+/// spawned.
 async fn respawn_mcp_servers(
     config: &rsclaw_config::runtime::RuntimeConfig,
     registry: Arc<rsclaw_mcp::McpRegistry>,
@@ -4331,7 +4548,9 @@ async fn stream_sse(
                 Some(Ok(Event::default().data(data)))
             }
         })
-        .take_until(Box::pin(async move { shutdown_for_stream.notified().await }));
+        .take_until(Box::pin(
+            async move { shutdown_for_stream.notified().await },
+        ));
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -5426,7 +5645,12 @@ async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
     match std::fs::read(&path) {
         Ok(data) => {
             let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, ct.parse().unwrap_or_else(|_| header::HeaderValue::from_static("application/octet-stream")));
+            headers.insert(
+                header::CONTENT_TYPE,
+                ct.parse().unwrap_or_else(|_| {
+                    header::HeaderValue::from_static("application/octet-stream")
+                }),
+            );
             (headers, data).into_response()
         }
         Err(e) => (

@@ -342,7 +342,8 @@ impl FeishuChannel {
     }
 
     #[allow(clippy::type_complexity)]
-    /// Create a new Feishu channel with the given credentials and message callback.
+    /// Create a new Feishu channel with the given credentials and message
+    /// callback.
     pub fn new(
         app_id: impl Into<String>,
         app_secret: impl Into<String>,
@@ -1139,7 +1140,13 @@ impl FeishuChannel {
                     }
                     Err(e) => {
                         warn!(error = format!("{e:#}"), "feishu: video download failed");
-                        format!("__DIRECT_REPLY__{}", rsclaw_i18n::t("feishu_video_download_failed", rsclaw_i18n::default_lang()))
+                        format!(
+                            "__DIRECT_REPLY__{}",
+                            rsclaw_i18n::t(
+                                "feishu_video_download_failed",
+                                rsclaw_i18n::default_lang()
+                            )
+                        )
                     }
                 }
             }
@@ -1238,7 +1245,11 @@ impl FeishuChannel {
                             let limit = parts.get(2).unwrap_or(&"?");
                             format!(
                                 "__DIRECT_REPLY__{}",
-                                rsclaw_i18n::t_fmt("feishu_file_too_large", rsclaw_i18n::default_lang(), &[("actual", actual), ("limit", limit)])
+                                rsclaw_i18n::t_fmt(
+                                    "feishu_file_too_large",
+                                    rsclaw_i18n::default_lang(),
+                                    &[("actual", actual), ("limit", limit)]
+                                )
                             )
                         } else {
                             // Log the full error chain ({e:#}) — without this the
@@ -1249,7 +1260,13 @@ impl FeishuChannel {
                                 error = format!("{e:#}"),
                                 "feishu: file download failed"
                             );
-                            format!("__DIRECT_REPLY__{}", rsclaw_i18n::t("feishu_file_download_failed", rsclaw_i18n::default_lang()))
+                            format!(
+                                "__DIRECT_REPLY__{}",
+                                rsclaw_i18n::t(
+                                    "feishu_file_download_failed",
+                                    rsclaw_i18n::default_lang()
+                                )
+                            )
                         }
                     }
                 }
@@ -1957,7 +1974,8 @@ pub struct FeishuNotifier {
 }
 
 impl FeishuNotifier {
-    /// Create a new Feishu notifier for sending notifications to a specific chat.
+    /// Create a new Feishu notifier for sending notifications to a specific
+    /// chat.
     pub fn new(app_id: &str, app_secret: &str, target_chat_id: &str, brand: &str) -> Self {
         Self {
             app_id: app_id.to_string(),

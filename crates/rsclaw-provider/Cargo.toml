@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw-provider"
-version = "0.1.0"
+version = "0.1.1"
 description = "Provider crate for RsClaw — internal workspace crate, not for direct use"
 edition = "2024"
 rust-version = "1.91"
@@ -24,7 +24,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync", "time"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider", "socks"], default-features = false }
 rsclaw-types = { path = "../rsclaw-types", version = "0.1.0" }
-rsclaw-config = { path = "../rsclaw-config", version = "0.1.0" }
+rsclaw-config = { path = "../rsclaw-config", version = "0.1.1" }
 rsclaw-util = { path = "../rsclaw-util", version = "0.1.0" }
 rsclaw-i18n = { path = "../rsclaw-i18n", version = "0.1.0" }
 rsclaw-embed = { path = "../rsclaw-embed", version = "0.1.0" }

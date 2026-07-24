@@ -1,4 +1,5 @@
-//! CLI `rsclaw image {vision|ocr}` — directly call fleet vision / OCR endpoints.
+//! CLI `rsclaw image {vision|ocr}` — directly call fleet vision / OCR
+//! endpoints.
 //!
 //! OCR reuses the existing `OcrClient`. Vision uses the same `FleetHttp`
 //! infrastructure to target `/v1/agent/vision` (same pattern as OCR).
@@ -48,12 +49,14 @@ pub async fn cmd_image(sub: ImageCommand) -> Result<()> {
 
 /// Encode a local image file as a data URI.
 fn image_to_data_uri(path: &str) -> Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read image: {path}"))?;
+    let bytes = std::fs::read(path).with_context(|| format!("failed to read image: {path}"))?;
     let mime = mime_guess::from_path(path)
         .first_or_octet_stream()
         .to_string();
-    Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes)))
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
 }
 
 /// Call `/v1/agent/vision` (same FleetHttp + redirect cache as OCR).
@@ -110,7 +113,10 @@ async fn vision_describe(
         .get("content")
         .and_then(|v| v.as_str())
         .or_else(|| resp.get("text").and_then(|v| v.as_str()))
-        .or_else(|| resp.pointer("/choices/0/message/content").and_then(|v| v.as_str()))
+        .or_else(|| {
+            resp.pointer("/choices/0/message/content")
+                .and_then(|v| v.as_str())
+        })
         .context("vision response missing `content`")?;
     Ok(content.to_owned())
 }
@@ -140,9 +146,14 @@ fn resolve_vision_model(cli_model: Option<&str>) -> Result<String> {
     ))
 }
 
-/// Strip `provider/` prefix for fleet endpoints (e.g. `rsclaw/rsclaw-vision-v1` → `rsclaw-vision-v1`).
+/// Strip `provider/` prefix for fleet endpoints (e.g. `rsclaw/rsclaw-vision-v1`
+/// → `rsclaw-vision-v1`).
 fn strip_provider_prefix(model: &str) -> String {
-    model.rsplit_once('/').map(|(_, bare)| bare).unwrap_or(model).to_owned()
+    model
+        .rsplit_once('/')
+        .map(|(_, bare)| bare)
+        .unwrap_or(model)
+        .to_owned()
 }
 
 /// Resolve fleet base URL for vision, mirroring OcrClient's logic.
@@ -169,7 +180,10 @@ fn resolve_vision_base(cfg: &rsclaw_config::runtime::RuntimeConfig) -> String {
         .and_then(|p| p.base_url.as_ref())
         .map(|s| {
             let t = s.trim().trim_end_matches('/');
-            t.strip_suffix("/agent").unwrap_or(t).trim_end_matches('/').to_owned()
+            t.strip_suffix("/agent")
+                .unwrap_or(t)
+                .trim_end_matches('/')
+                .to_owned()
         })
         .filter(|s| !s.is_empty())
     {
@@ -187,6 +201,10 @@ fn resolve_fleet_key(cfg: &rsclaw_config::runtime::RuntimeConfig) -> Option<Stri
         .and_then(|p| p.api_key.as_ref())
         .and_then(|s| s.resolve_early())
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("RSCLAW_API_KEY").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("RSCLAW_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| std::env::var("RSCLAW_KEY").ok().filter(|s| !s.is_empty()))
 }

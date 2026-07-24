@@ -6867,7 +6867,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw"
-version = "2026.6.26"
+version = "2026.7.1"
 dependencies = [
  "aes",
  "anycli",
@@ -7030,7 +7030,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anycli",
  "anyhow",
@@ -7153,7 +7153,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw-channel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -7214,7 +7214,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap 4.6.0",
 ]
@@ -7247,7 +7247,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7571,7 +7571,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw-provider"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7612,7 +7612,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw-runtime"
-version = "2026.6.26"
+version = "2026.7.1"
 dependencies = [
  "aes",
  "anycli",
