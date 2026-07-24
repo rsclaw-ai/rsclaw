@@ -35,7 +35,7 @@ use std::os::windows::process::CommandExt;
 use std::{
     collections::HashMap,
     convert::Infallible,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     process::Command,
     sync::Arc,
@@ -68,6 +68,7 @@ use crate::{cmd::config_json::load_config_json, gateway::LiveConfig, ws::types::
 mod knowledge;
 
 const MAX_LOCAL_MEDIA_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_TRACKED_RATE_LIMIT_IPS: usize = 10_000;
 
 // H1: simple in-memory per-IP rate limiter with a sliding window.
 // Default: 100 req / 60s per IP. Bypassed when no limit is configured (rate_rps
@@ -86,14 +87,23 @@ impl RateLimiter {
 
     /// Returns true if the request should be rate-limited (rejected).
     pub async fn check(&self, ip: IpAddr, max_req: u32, window_secs: u64) -> bool {
+        self.check_at(ip, max_req, window_secs, Instant::now()).await
+    }
+
+    async fn check_at(&self, ip: IpAddr, max_req: u32, window_secs: u64, now: Instant) -> bool {
         if max_req == 0 {
             return false; // rate limiting disabled
         }
-        let now = Instant::now();
         let mut map = self.inner.write().await;
-        let entries = map.entry(ip).or_default();
         let cutoff = now - Duration::from_secs(window_secs);
-        entries.retain(|t| *t >= cutoff);
+        map.retain(|_, entries| {
+            entries.retain(|t| *t >= cutoff);
+            !entries.is_empty()
+        });
+        if !map.contains_key(&ip) && map.len() >= MAX_TRACKED_RATE_LIMIT_IPS {
+            return true;
+        }
+        let entries = map.entry(ip).or_default();
         if entries.len() >= max_req as usize {
             true
         } else {
@@ -837,6 +847,60 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_gateway_trusts_identity_headers_only_from_direct_loopback() {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 18889));
+        let remote = SocketAddr::from(([203, 0, 113, 7], 18889));
+        assert!(headers_are_trusted(false, loopback));
+        assert!(!headers_are_trusted(false, remote));
+        assert!(headers_are_trusted(true, remote));
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_prunes_expired_peers() {
+        let limiter = RateLimiter::new();
+        let now = Instant::now();
+        assert!(!limiter
+            .check_at(IpAddr::from([192, 0, 2, 1]), 10, 60, now)
+            .await);
+        assert!(!limiter
+            .check_at(
+                IpAddr::from([192, 0, 2, 2]),
+                10,
+                60,
+                now + Duration::from_secs(61),
+            )
+            .await);
+        assert_eq!(limiter.inner.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_bounds_active_peer_buckets() {
+        let limiter = RateLimiter::new();
+        let now = Instant::now();
+        for index in 1..=MAX_TRACKED_RATE_LIMIT_IPS {
+            assert!(!limiter
+                .check_at(
+                    IpAddr::V4(std::net::Ipv4Addr::from(index as u32)),
+                    1,
+                    60,
+                    now,
+                )
+                .await);
+        }
+        assert!(limiter
+            .check_at(
+                IpAddr::V4(std::net::Ipv4Addr::from(
+                    (MAX_TRACKED_RATE_LIMIT_IPS + 1) as u32,
+                )),
+                1,
+                60,
+                now,
+            )
+            .await);
+        assert_eq!(limiter.inner.read().await.len(), MAX_TRACKED_RATE_LIMIT_IPS);
+    }
 
     #[tokio::test]
     async fn media_path_is_limited_to_allowed_roots() {
@@ -2410,6 +2474,12 @@ pub(crate) fn is_loopback(addr: std::net::SocketAddr) -> bool {
     }
 }
 
+/// Whether request-supplied identity headers are authenticated or originate
+/// from a direct local connection.
+fn headers_are_trusted(auth_enabled: bool, peer: SocketAddr) -> bool {
+    auth_enabled || is_loopback(peer)
+}
+
 /// POST /api/v1/shutdown — exit the gateway process cleanly.
 /// Loopback-only; no token required (same trust model as /api/v1/cron/reload).
 async fn http_shutdown(
@@ -3724,39 +3794,21 @@ fn parse_oai_tools(tools: Option<&serde_json::Value>) -> Vec<rsclaw_provider::To
 
 async fn openai_chat_completions(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<OaiChatRequest>,
 ) -> impl IntoResponse {
     info!(stream = req.stream, model = ?req.model, "HTTP /v1/chat/completions");
 
-    // C1: when gateway runs without auth (open mode), reject x- headers
-    // from non-loopback sources to prevent header spoofing.
+    // In open mode, identity/session headers are trusted only on a direct
+    // loopback connection.
     let trusted_headers = {
         let gw = state.live.gateway.read().await;
-        if gw.auth_token.is_none() {
-            // Only trust headers when the request comes from localhost
-            use std::net::{IpAddr, Ipv4Addr};
-            let is_local = headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .and_then(|s| s.trim().parse::<IpAddr>().ok())
-                .map(|ip| {
-                    ip == IpAddr::V4(Ipv4Addr::LOCALHOST)
-                        || ip == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-                })
-                .unwrap_or(false);
-            if !is_local {
-                info!("open gateway: rejecting spoofed x- headers from non-loopback");
-                false
-            } else {
-                true
-            }
-        } else {
-            // Auth middleware validated the token — headers are trusted
-            true
-        }
+        headers_are_trusted(gw.auth_token.is_some(), peer)
     };
+    if !trusted_headers {
+        info!(%peer, "open gateway: ignoring identity headers from non-loopback peer");
+    }
 
     // Extract text from the last user message.
     let text = req

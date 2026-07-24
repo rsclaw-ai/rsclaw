@@ -29,7 +29,13 @@ pub async fn cmd_image(sub: ImageCommand) -> Result<()> {
             let client = rsclaw_kb::OcrClient::from_config()
                 .ok_or_else(|| anyhow::anyhow!("OCR not configured; set kb.ocr in rsclaw.json5"))?;
 
-            let result = client.ocr(&data_uri, args.prompt.as_deref(), args.max_tokens)?;
+            let result = client.ocr_with_options(
+                &data_uri,
+                args.prompt.as_deref(),
+                args.max_tokens,
+                args.model.as_deref(),
+                args.lang.as_deref(),
+            )?;
             println!("{result}");
         }
     }
