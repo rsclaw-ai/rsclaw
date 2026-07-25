@@ -295,7 +295,7 @@ fn capture_app_window(app_name: &str) -> Result<String, String> {
 /// `Windows.Media.Ocr`; on macOS native Vision FFI is planned (currently
 /// returns an empty result and callers fall back to VLM grounding).
 /// Returns a JSON array of recognised lines with 0-1000 relative centre
-/// coords: `[{"text":"东升","x":143,"y":699}, ...]`.
+/// coords: `[{"text":"用户","x":143,"y":699}, ...]`.
 /// Far more precise than VLM grounding for clicking a named row.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn ocr_window(_app_name: &str) -> Result<String, String> {

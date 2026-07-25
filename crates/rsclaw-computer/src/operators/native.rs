@@ -214,6 +214,17 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
             let btn = map_button(*button);
             try_input(enigo.button(btn, Click), "button")
         }
+        Action::ClickAndWait { x, y, wait_ms } => {
+            let (lx, ly) = scale_for_input(*x, *y, ctx.scale_factor);
+            if let Err(msg) = ok_or_msg(enigo.move_mouse(lx, ly, Coordinate::Abs), "move_mouse") {
+                return Ok(ActionOutput::err(msg));
+            }
+            let out = try_input(enigo.button(Button::Left, Click), "button")?;
+            if out.ok {
+                std::thread::sleep(std::time::Duration::from_millis(*wait_ms as u64));
+            }
+            Ok(out)
+        }
         Action::DoubleClick { x, y } => {
             let (lx, ly) = scale_for_input(*x, *y, ctx.scale_factor);
             if let Err(msg) = ok_or_msg(enigo.move_mouse(lx, ly, Coordinate::Abs), "move_mouse") {
@@ -224,7 +235,7 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
             }
             try_input(enigo.button(Button::Left, Click), "button")
         }
-        Action::LongPress { x, y } => {
+        Action::LongPress { x, y, .. } => {
             let (lx, ly) = scale_for_input(*x, *y, ctx.scale_factor);
             if let Err(msg) = ok_or_msg(enigo.move_mouse(lx, ly, Coordinate::Abs), "move_mouse") {
                 return Ok(ActionOutput::err(msg));

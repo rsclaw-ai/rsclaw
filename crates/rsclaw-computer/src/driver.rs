@@ -93,13 +93,9 @@ pub struct Step {
 /// How to interpret the bare coordinate numbers a model emits inside
 /// `start_box` / `end_box`.
 ///
-/// `Normalized` is the target convention (ui-tars-desktop's 0-1000 grid)
-/// and the correct long-term state. `Pixels` is the pragmatic client-side
-/// adaptation for rsclaw-vision (v1 and v2), which — despite the prompt
-/// explicitly asking for a 0-1000 grid — emit raw absolute pixels of the
-/// screenshot they were sent. That is a worker/model-side issue tracked
-/// separately; when the model is fixed to emit normalized coords, flip
-/// `CoordSpace::for_model` back so rsclaw-vision uses `Normalized`.
+/// `Normalized` is the target convention (ui-tars-desktop's 0-1000 grid).
+/// All rsclaw-vision models (v1, v2) follow the 0-1000 prompt convention.
+/// `Pixels` is kept for operators/models that emit raw screenshot pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoordSpace {
     /// 0-1000 normalized grid → rescale by `coord / 1000 * screen_dim`.
@@ -111,17 +107,11 @@ pub enum CoordSpace {
 }
 
 impl CoordSpace {
-    /// Pick the coordinate space for a given model id. rsclaw-vision
-    /// models (v1 and v2) emit raw pixels of the screenshot they were
-    /// sent, despite the prompt asking for a 0-1000 grid. Flip to
-    /// `Normalized` once the worker is fixed to honour the prompt.
+    /// Pick the coordinate space for a given model id. All rsclaw-vision
+    /// models follow the 0-1000 normalized prompt convention.
     pub fn for_model(model: &str) -> Self {
-        let m = model.to_ascii_lowercase();
-        if m.contains("rsclaw-vision") {
-            CoordSpace::Pixels
-        } else {
-            CoordSpace::Normalized
-        }
+        let _ = model;
+        CoordSpace::Normalized
     }
 }
 
@@ -560,6 +550,14 @@ impl VlmDriver<'_> {
                     continue;
                 };
 
+                info!(
+                    step = steps + 1,
+                    coord_space = ?self.coord_space,
+                    vision_scale,
+                    physical = ?action.coords(),
+                    "VLM coord mapping"
+                );
+
                 let ctx = ExecCtx {
                     screen_w,
                     screen_h,
@@ -599,6 +597,19 @@ impl VlmDriver<'_> {
                 }
                 if steps >= self.max_loop {
                     return Ok(DriverOutcome::MaxLoop { steps });
+                }
+                // Let the UI settle after actions that trigger animations
+                // (keyboard open, page transition, menu popup) before the
+                // next screenshot. Skip for wait (already sleeps) and
+                // terminal actions.
+                if !matches!(
+                    action,
+                    Action::Wait { .. }
+                        | Action::ClickAndWait { .. }
+                        | Action::Finished { .. }
+                        | Action::CallUser { .. }
+                ) {
+                    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                 }
             }
         }
@@ -1073,6 +1084,15 @@ fn parsed_to_action(
                 button: MouseButton::Left,
             })
         }
+        "click_and_wait" => {
+            let (x, y) = start_xy?;
+            let wait_ms = raw
+                .get("seconds")
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|s| (s * 1000.0) as u32)
+                .unwrap_or(2000);
+            Some(Action::ClickAndWait { x, y, wait_ms })
+        }
         "right_click" | "right_single" => {
             let (x, y) = start_xy?;
             Some(Action::Click {
@@ -1109,7 +1129,12 @@ fn parsed_to_action(
         }
         "long_press" | "long_click" => {
             let (x, y) = start_xy?;
-            Some(Action::LongPress { x, y })
+            let duration_ms = raw
+                .get("duration")
+                .or_else(|| raw.get("duration_ms"))
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1000);
+            Some(Action::LongPress { x, y, duration_ms })
         }
         "scroll" => {
             let (x, y) = start_xy.unwrap_or((screen_w as i32 / 2, screen_h as i32 / 2));
@@ -1148,6 +1173,9 @@ fn parsed_to_action(
         }),
         "press_back" => Some(Action::Hotkey {
             keys: "press_back".to_owned(),
+        }),
+        "press_delete" | "press_del" => Some(Action::Hotkey {
+            keys: "delete".to_owned(),
         }),
         "activate_app" | "open_app" | "launch_app" => {
             let app = raw
@@ -1329,18 +1357,18 @@ mod tests {
     }
 
     #[test]
-    fn coord_space_for_model_picks_pixels_for_rsclaw_vision() {
+    fn coord_space_for_model_always_normalized() {
         assert_eq!(
             CoordSpace::for_model("rsclaw-vision-v1"),
-            CoordSpace::Pixels
+            CoordSpace::Normalized
         );
         assert_eq!(
             CoordSpace::for_model("rsclaw/rsclaw-vision-v1"),
-            CoordSpace::Pixels
+            CoordSpace::Normalized
         );
         assert_eq!(
             CoordSpace::for_model("rsclaw-vision-v2"),
-            CoordSpace::Pixels
+            CoordSpace::Normalized
         );
         assert_eq!(CoordSpace::for_model("ui-tars-1.5"), CoordSpace::Normalized);
         assert_eq!(

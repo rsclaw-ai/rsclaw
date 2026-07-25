@@ -38,11 +38,15 @@ pub enum Action {
     /// Single click at (x, y).
     Click { x: i32, y: i32, button: MouseButton },
 
+    /// Click at (x, y) then wait `wait_ms` ms for the UI to settle
+    /// (page transition, keyboard animation, etc.) before next screenshot.
+    ClickAndWait { x: i32, y: i32, wait_ms: u32 },
+
     /// Double-click at (x, y) (left button).
     DoubleClick { x: i32, y: i32 },
 
-    /// Touch-and-hold at (x, y) for ~1 second (mobile long-press).
-    LongPress { x: i32, y: i32 },
+    /// Touch-and-hold at (x, y) for `duration_ms` milliseconds (mobile long-press).
+    LongPress { x: i32, y: i32, duration_ms: u32 },
 
     /// Click-drag from start to end.
     Drag {
@@ -86,6 +90,22 @@ pub enum Action {
 
     /// Terminal action — the model is stuck and needs human input.
     CallUser { reason: String },
+}
+
+impl Action {
+    /// Primary coordinates for diagnostic logging.
+    pub fn coords(&self) -> Option<(i32, i32)> {
+        match self {
+            Action::MouseMove { x, y }
+            | Action::Click { x, y, .. }
+            | Action::ClickAndWait { x, y, .. }
+            | Action::DoubleClick { x, y }
+            | Action::LongPress { x, y, .. }
+            | Action::Scroll { x, y, .. } => Some((*x, *y)),
+            Action::Drag { from_x, from_y, .. } => Some((*from_x, *from_y)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

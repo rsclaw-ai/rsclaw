@@ -2,7 +2,7 @@
 //!
 //! Phase 1 stopped raw-note pollution, but with only deterministic entity
 //! extraction (phone/ID/email) it also dropped soft durable signal like
-//! "我叫东升" or "我喜欢简洁的回答". This module adds an LLM distillation pass
+//! "我叫用户" or "我喜欢简洁的回答". This module adds an LLM distillation pass
 //! over the user message (a trusted source) that classifies durable knowledge
 //! into the fixed kind taxonomy and writes only the salient results.
 //!
@@ -181,7 +181,7 @@ pub(crate) fn correction_gate(text: &str) -> bool {
 
 const LESSON_PROMPT: &str = "The user message below is reacting to the assistant. ONLY if it corrects a mistake the assistant made, or states a durable rule about how the assistant should behave or answer in future, capture that as a concise imperative lesson the assistant should follow next time. Ignore one-off task requests, questions, greetings, and venting that carry no reusable rule.\nOutput a JSON array; each element: {\"kind\":\"lesson\",\"text\":\"<concise imperative lesson, written about the assistant, preserving the user's language for specifics>\",\"confidence\":<number 0..1>}\nExamples of text: \"When the user asks for code, do not add explanatory comments unless asked\", \"回答用户时不要用表格，用要点列表\".\nIf there is no durable behavioral lesson, output an empty array []. Output ONLY JSON — no explanation, no code fences.\n\nUser message:\n";
 
-const EXTRACTION_PROMPT: &str = "Extract durable, long-term-worthy information from the user message below. Capture only stable, reusable knowledge: identity, contact details, preferences, stable facts, project state, relationships between people/orgs, and reusable procedures. Ignore greetings, questions, one-off task requests, and emotional venting.\nCRITICAL: Use ONLY facts the user explicitly states in THIS message. Never infer, complete, guess, or invent any value — in particular do NOT fabricate emails, phone numbers, IDs, names, addresses, or dates (e.g. never output a placeholder like test@example.com). If a detail is not literally present in the message, omit it entirely.\nOutput a JSON array; each element: {\"kind\":\"<kind>\",\"text\":\"<concise third-person statement>\",\"confidence\":<number 0..1>}\nkind must be exactly one of: entity, preference, fact, project_state, relationship, procedure.\nWrite text in the third person and self-contained. CRITICAL: the text MUST be in the SAME language as the user message — if the user wrote in Chinese, the text MUST be in Chinese; if English, English. Never translate. Translating breaks keyword recall.\nExamples — Chinese in, Chinese out: \"用户名叫东升\", \"用户偏好简洁直接的回答\", \"用户最喜欢的车是 tesla\", \"用户的发布流程：cargo test，然后检查 UI，然后 commit\". English in, English out: \"User's name is John\", \"User prefers concise answers\".\nEvery item must include a numeric confidence in [0,1]. If nothing is worth remembering long-term, output an empty array []. Output ONLY JSON — no explanation, no code fences.\n\nUser message:\n";
+const EXTRACTION_PROMPT: &str = "Extract durable, long-term-worthy information from the user message below. Capture only stable, reusable knowledge: identity, contact details, preferences, stable facts, project state, relationships between people/orgs, and reusable procedures. Ignore greetings, questions, one-off task requests, and emotional venting.\nCRITICAL: Use ONLY facts the user explicitly states in THIS message. Never infer, complete, guess, or invent any value — in particular do NOT fabricate emails, phone numbers, IDs, names, addresses, or dates (e.g. never output a placeholder like test@example.com). If a detail is not literally present in the message, omit it entirely.\nOutput a JSON array; each element: {\"kind\":\"<kind>\",\"text\":\"<concise third-person statement>\",\"confidence\":<number 0..1>}\nkind must be exactly one of: entity, preference, fact, project_state, relationship, procedure.\nWrite text in the third person and self-contained. CRITICAL: the text MUST be in the SAME language as the user message — if the user wrote in Chinese, the text MUST be in Chinese; if English, English. Never translate. Translating breaks keyword recall.\nExamples — Chinese in, Chinese out: \"用户名叫用户\", \"用户偏好简洁直接的回答\", \"用户最喜欢的车是 tesla\", \"用户的发布流程：cargo test，然后检查 UI，然后 commit\". English in, English out: \"User's name is John\", \"User prefers concise answers\".\nEvery item must include a numeric confidence in [0,1]. If nothing is worth remembering long-term, output an empty array []. Output ONLY JSON — no explanation, no code fences.\n\nUser message:\n";
 
 /// Pre-insert dedup for extracted memories: exact text match within
 /// (scope, kind) first, then semantic near-dup across kinds (Phase 4 —
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn salience_gate_fires_on_self_description() {
-        assert!(salience_gate("我叫东升"));
+        assert!(salience_gate("我叫用户"));
         assert!(salience_gate("我比较喜欢简洁直接的回答，别啰嗦"));
         assert!(salience_gate("记一下我的发布流程：先 cargo test"));
         assert!(salience_gate("My name is Dongsheng"));
@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(v[0].kind, "preference");
 
         let fenced =
-            "```json\n[{\"kind\":\"entity\",\"text\":\"用户叫东升\",\"confidence\":0.9}]\n```";
+            "```json\n[{\"kind\":\"entity\",\"text\":\"用户叫用户\",\"confidence\":0.9}]\n```";
         assert_eq!(parse_items(fenced).len(), 1);
 
         let lines = "{\"kind\":\"fact\",\"text\":\"a\",\"confidence\":0.7}\n{\"kind\":\"preference\",\"text\":\"b\",\"confidence\":0.6}";

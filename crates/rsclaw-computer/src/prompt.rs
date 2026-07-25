@@ -216,15 +216,15 @@ Action: click(start_box='<box>120, 90</box>')
 
 const THOUGHT_EXAMPLES_MOBILE_ZH: &str = "\
 Example 1 — 目标 App 不在前台：
-Thought: 屏幕上是手机桌面，微信没有打开。任务是给东升发消息，第一步必须打开微信。用 activate_app 启动最可靠。
+Thought: 屏幕上是手机桌面，微信没有打开。任务是给用户发消息，第一步必须打开微信。用 activate_app 启动最可靠。
 Action: activate_app(app='微信')
 
 Example 2 — 点击聊天对象：
-Thought: 微信聊天列表已打开，能看到\"东升\"的会话条目，大约在屏幕中上方 (500, 280) 的位置。直接点击进入聊天。
+Thought: 微信聊天列表已打开，能看到\"用户\"的会话条目，大约在屏幕中上方 (500, 280) 的位置。直接点击进入聊天。
 Action: click(start_box='(500, 280)')
 
 Example 3 — 在输入框输入中文：
-Thought: 已进入东升的聊天页面，底部有输入框，光标已在闪烁。直接输入要发送的文字内容。
+Thought: 已进入用户的聊天页面，底部有输入框，光标已在闪烁。直接输入要发送的文字内容。
 Action: type(content='你好，宝宝最近睡眠怎么样？')
 
 Example 4 — 向上滑动翻看历史消息：
@@ -241,7 +241,7 @@ Action: press_back()
 
 Example 7 — 任务完成，终止：
 Thought: 截图显示消息已经发送成功，绿色气泡出现在聊天窗口右侧，任务完成。
-Action: finished(content='消息已成功发送给东升')
+Action: finished(content='消息已成功发送给用户')
 ";
 
 const THOUGHT_EXAMPLES_MOBILE_EN: &str = "\

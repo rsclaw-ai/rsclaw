@@ -73,9 +73,17 @@ impl Operator for AndroidUiautoOperator {
                         .map_err(|error| anyhow!(error))?;
                     Ok(ActionOutput::ok())
                 }
-                Action::LongPress { x, y } => {
+                Action::ClickAndWait { x, y, wait_ms } => {
+                    let args = serde_json::json!({ "x": x, "y": y }).to_string();
+                    crate::android_uiauto::call("tap", &args)
+                        .await
+                        .map_err(|error| anyhow!(error))?;
+                    tokio::time::sleep(Duration::from_millis(*wait_ms as u64)).await;
+                    Ok(ActionOutput::ok())
+                }
+                Action::LongPress { x, y, duration_ms } => {
                     let args =
-                        serde_json::json!({ "x": x, "y": y, "durationMs": 800 }).to_string();
+                        serde_json::json!({ "x": x, "y": y, "durationMs": duration_ms }).to_string();
                     crate::android_uiauto::call("long-press", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
@@ -124,6 +132,7 @@ impl Operator for AndroidUiautoOperator {
                         "press_back" | "back" => "back",
                         "press_home" | "home" => "home",
                         "enter" | "return" => "enter",
+                        "delete" | "del" | "backspace" => "del",
                         _ => {
                             return Ok(ActionOutput::err(
                                 "unsupported hotkey for Android UIAutomator2",

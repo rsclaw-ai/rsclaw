@@ -48,7 +48,7 @@ pub use browser::BrowserCommand;
 pub use channels::ChannelsCommand;
 pub use completion::CompletionArgs;
 pub use config::ConfigCommand;
-pub use cron::{CronAddArgs, CronCommand};
+pub use cron::{CronAddArgs, CronCommand, CronEditArgs};
 pub use daemon::DaemonCommand;
 pub use devices::DevicesCommand;
 pub use directory::DirectoryCommand;

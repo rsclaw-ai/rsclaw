@@ -137,28 +137,70 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 anyhow::bail!("gateway error {status}: {text}");
             }
         }
-        CronCommand::Edit { id } => {
-            let (jobs, _) = crate::cron::load_cron_jobs();
-            jobs.iter()
-                .find(|j| j.id == id)
-                .ok_or_else(|| anyhow::anyhow!("cron job '{id}' not found"))?;
-
-            // Open the jobs.json file in editor
-            let jobs_file = config::loader::base_dir().join("cron.json5");
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
-                if cfg!(windows) {
-                    "notepad".to_owned()
-                } else {
-                    "vi".to_owned()
+        CronCommand::Edit(args) => {
+            // Inline mode: at least one flag → patch via HTTP API.
+            let is_inline = args.schedule.is_some()
+                || args.message.is_some()
+                || args.agent.is_some()
+                || args.enable
+                || args.disable;
+            if is_inline {
+                let cfg = gateway_config()?;
+                let url = gateway_url(&cfg, &format!("/api/v1/cron/{}", args.id));
+                let mut body = serde_json::Map::new();
+                if let Some(ref s) = args.schedule {
+                    validate_cron_schedule(s)?;
+                    body.insert("schedule".to_owned(), serde_json::json!(s));
                 }
-            });
-            let status = std::process::Command::new(&editor)
-                .arg(&jobs_file)
-                .status()?;
-            if !status.success() {
-                anyhow::bail!("editor exited with {status}");
+                if let Some(ref m) = args.message {
+                    body.insert("message".to_owned(), serde_json::json!(m));
+                }
+                if let Some(ref a) = args.agent {
+                    body.insert("agent_id".to_owned(), serde_json::json!(a));
+                }
+                if args.enable {
+                    body.insert("enabled".to_owned(), serde_json::json!(true));
+                }
+                if args.disable {
+                    body.insert("enabled".to_owned(), serde_json::json!(false));
+                }
+                let client = reqwest::Client::new();
+                let resp = with_gateway_auth(client.put(&url), cfg.gateway.auth_token.as_deref())
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("gateway unreachable at {url}: {e}"))?;
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    ok(&format!("cron job '{}' updated", cyan(&args.id)));
+                } else {
+                    anyhow::bail!("gateway error {status}: {text}");
+                }
+            } else {
+                // Editor mode: no flags → open cron.json5 in $EDITOR.
+                let (jobs, _) = crate::cron::load_cron_jobs();
+                jobs.iter()
+                    .find(|j| j.id == args.id)
+                    .ok_or_else(|| anyhow::anyhow!("cron job '{}' not found", args.id))?;
+                let jobs_file = config::loader::base_dir().join("cron.json5");
+                let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
+                    if cfg!(windows) {
+                        "notepad".to_owned()
+                    } else {
+                        "vi".to_owned()
+                    }
+                });
+                let status = std::process::Command::new(&editor)
+                    .arg(&jobs_file)
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("editor exited with {status}");
+                }
+                // Tell gateway to reconcile file changes.
+                notify_gateway_cron_reload().await;
+                ok(&format!("edited cron jobs file (job '{}')", cyan(&args.id)));
             }
-            ok(&format!("edited cron jobs file"));
         }
         CronCommand::Enable { id } => {
             let cfg = gateway_config()?;
@@ -314,6 +356,27 @@ fn gateway_config() -> Result<rsclaw_config::runtime::RuntimeConfig> {
 
 fn gateway_url(cfg: &rsclaw_config::runtime::RuntimeConfig, path: &str) -> String {
     format!("http://127.0.0.1:{}{path}", cfg.gateway.port)
+}
+
+/// POST to gateway's cron/reload endpoint so it picks up file edits
+/// (cron.json5 hand-edited via editor mode). Best-effort.
+async fn notify_gateway_cron_reload() {
+    let Ok(cfg) = rsclaw_config::load() else {
+        return;
+    };
+    let url = format!("http://127.0.0.1:{}/api/v1/cron/reload", cfg.gateway.port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build();
+    let Ok(client) = client else {
+        return;
+    };
+    if let Err(e) = with_gateway_auth(client.post(&url), cfg.gateway.auth_token.as_deref())
+        .send()
+        .await
+    {
+        tracing::warn!("failed to notify gateway of cron reload: {e}");
+    }
 }
 
 // ---------------------------------------------------------------------------
