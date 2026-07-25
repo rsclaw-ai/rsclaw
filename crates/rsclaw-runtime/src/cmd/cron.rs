@@ -37,7 +37,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                     } else {
                         red("disabled")
                     };
-                    let schedule = j.cron_expr();
+                    let schedule = j.schedule.display();
                     println!(
                         "  {:<36} {:<10} {:<14} {}",
                         cyan(&j.id),
