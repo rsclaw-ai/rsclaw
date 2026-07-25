@@ -2004,13 +2004,34 @@ async fn http_reload(
         let base_dir = rsclaw_config::loader::base_dir();
         let plugins_dir = base_dir.join("plugins");
         let providers_snapshot = state.providers.read().await.clone();
+        // Resolve vision model for plugins, same as boot-time logic.
+        let vision_model = fresh_config
+            .raw
+            .agents
+            .as_ref()
+            .and_then(|a| a.defaults.as_ref())
+            .and_then(|d| d.model.as_ref())
+            .and_then(|m| m.vision_head().map(String::from))
+            .or_else(|| {
+                let primary_is_rsclaw = fresh_config
+                    .raw
+                    .agents
+                    .as_ref()
+                    .and_then(|a| a.defaults.as_ref())
+                    .and_then(|d| d.model.as_ref())
+                    .and_then(|m| m.primary_head())
+                    .map(|p| p.trim().starts_with("rsclaw/"))
+                    .unwrap_or(true);
+                primary_is_rsclaw
+                    .then(|| rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_string())
+            });
         match rsclaw_plugin::load_all_plugins(
             &plugins_dir,
             fresh_config.ext.plugins.as_ref(),
             Arc::clone(&state.wasm_browser),
             Some(state.notification_tx.clone()),
             Some(providers_snapshot),
-            None,
+            vision_model,
         )
         .await
         {

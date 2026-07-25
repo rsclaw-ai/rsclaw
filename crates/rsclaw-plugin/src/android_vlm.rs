@@ -20,6 +20,10 @@ impl Operator for AndroidUiautoOperator {
     fn action_spaces(&self) -> Vec<ActionSpec> {
         vec![
             ActionSpec::new("click(start_box='(x,y)')"),
+            ActionSpec::with_note(
+                "long_press(start_box='(x,y)')",
+                "# Touch and hold ~1s to open context menus",
+            ),
             ActionSpec::new("type(content='')"),
             ActionSpec::new("scroll(start_box='(x,y)', direction='down or up or left or right')"),
             ActionSpec::new("activate_app(app='')"),
@@ -65,6 +69,21 @@ impl Operator for AndroidUiautoOperator {
                 } => {
                     let args = serde_json::json!({ "x": x, "y": y }).to_string();
                     crate::android_uiauto::call("tap", &args)
+                        .await
+                        .map_err(|error| anyhow!(error))?;
+                    Ok(ActionOutput::ok())
+                }
+                Action::LongPress { x, y } => {
+                    let args =
+                        serde_json::json!({ "x": x, "y": y, "durationMs": 800 }).to_string();
+                    crate::android_uiauto::call("long-press", &args)
+                        .await
+                        .map_err(|error| anyhow!(error))?;
+                    Ok(ActionOutput::ok())
+                }
+                Action::DoubleClick { x, y } => {
+                    let args = serde_json::json!({ "x": x, "y": y }).to_string();
+                    crate::android_uiauto::call("double-tap", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
                     Ok(ActionOutput::ok())

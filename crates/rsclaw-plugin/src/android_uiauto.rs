@@ -59,6 +59,7 @@ enum ArgKind {
     Integer,
     Unsigned,
     String,
+    Boolean,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +86,32 @@ const SWIPE_ARGS: &[ArgSpec] = &[
 const LAUNCH_ARGS: &[ArgSpec] = &[
     ArgSpec::new("package", "--package", ArgKind::String, true),
     ArgSpec::new("activity", "--activity", ArgKind::String, false),
+];
+const LONG_PRESS_ARGS: &[ArgSpec] = &[
+    ArgSpec::new("x", "--x", ArgKind::Integer, true),
+    ArgSpec::new("y", "--y", ArgKind::Integer, true),
+    ArgSpec::new("durationMs", "--duration-ms", ArgKind::Unsigned, false),
+];
+const DOUBLE_TAP_ARGS: &[ArgSpec] = &[
+    ArgSpec::new("x", "--x", ArgKind::Integer, true),
+    ArgSpec::new("y", "--y", ArgKind::Integer, true),
+    ArgSpec::new("intervalMs", "--interval-ms", ArgKind::Unsigned, false),
+];
+const DRAG_ARGS: &[ArgSpec] = &[
+    ArgSpec::new("x1", "--x1", ArgKind::Integer, true),
+    ArgSpec::new("y1", "--y1", ArgKind::Integer, true),
+    ArgSpec::new("x2", "--x2", ArgKind::Integer, true),
+    ArgSpec::new("y2", "--y2", ArgKind::Integer, true),
+];
+const CLEAR_TEXT_ARGS: &[ArgSpec] = &[
+    ArgSpec::new("x", "--x", ArgKind::Integer, true),
+    ArgSpec::new("y", "--y", ArgKind::Integer, true),
+];
+const TYPE_AT_ARGS: &[ArgSpec] = &[
+    ArgSpec::new("x", "--x", ArgKind::Integer, true),
+    ArgSpec::new("y", "--y", ArgKind::Integer, true),
+    ArgSpec::new("text", "--text", ArgKind::String, true),
+    ArgSpec::new("replace", "--replace", ArgKind::Boolean, false),
 ];
 
 impl ArgSpec {
@@ -1261,6 +1288,9 @@ fn command_specs(command: &str) -> Option<&'static [ArgSpec]> {
         "tap" => Some(TAP_ARGS),
         "swipe" => Some(SWIPE_ARGS),
         "launch" => Some(LAUNCH_ARGS),
+        "long-press" => Some(LONG_PRESS_ARGS),
+        "double-tap" => Some(DOUBLE_TAP_ARGS),
+        "drag" => Some(DRAG_ARGS),
         _ => None,
     }
 }
@@ -1334,6 +1364,11 @@ fn append_option(args: &mut Vec<String>, spec: ArgSpec, value: &Value) -> Result
             validate_plain_value(spec.key, string, MAX_STRING_ARG_BYTES)?;
             args.push(spec.flag.to_string());
             args.push(string.to_string());
+        }
+        ArgKind::Boolean => {
+            if value.as_bool().unwrap_or(false) {
+                args.push(spec.flag.to_string());
+            }
         }
     }
     Ok(())

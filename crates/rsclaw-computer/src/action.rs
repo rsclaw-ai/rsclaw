@@ -41,6 +41,9 @@ pub enum Action {
     /// Double-click at (x, y) (left button).
     DoubleClick { x: i32, y: i32 },
 
+    /// Touch-and-hold at (x, y) for ~1 second (mobile long-press).
+    LongPress { x: i32, y: i32 },
+
     /// Click-drag from start to end.
     Drag {
         from_x: i32,
@@ -109,35 +112,36 @@ pub enum ScrollDir {
 /// One line of an Operator's documented action space, injected into the
 /// system prompt at runtime. Allows different operators to expose
 /// different capabilities (e.g. browser doesn't have hotkey/drag,
-/// mobile doesn't have right-click).
+/// mobile doesn't have right-click). Plugins may also supply their
+/// own action specs at runtime via `android-vlm-drive`.
 #[derive(Debug, Clone)]
 pub struct ActionSpec {
     /// LLM-facing signature line, e.g.
-    /// `click(start_box='<|box_start|>(x1,y1)<|box_end|>')`.
-    pub signature: &'static str,
+    /// `click(start_box='(x,y)')`.
+    pub signature: String,
     /// Optional inline annotation, e.g. `# Use \\n at end to submit`.
-    pub note: Option<&'static str>,
+    pub note: Option<String>,
 }
 
 impl ActionSpec {
-    pub const fn new(signature: &'static str) -> Self {
+    pub fn new(signature: impl Into<String>) -> Self {
         Self {
-            signature,
+            signature: signature.into(),
             note: None,
         }
     }
-    pub const fn with_note(signature: &'static str, note: &'static str) -> Self {
+    pub fn with_note(signature: impl Into<String>, note: impl Into<String>) -> Self {
         Self {
-            signature,
-            note: Some(note),
+            signature: signature.into(),
+            note: Some(note.into()),
         }
     }
 
     /// Render as a single line for the system prompt.
     pub fn render(&self) -> String {
-        match self.note {
+        match &self.note {
             Some(n) => format!("{}  {}", self.signature, n),
-            None => self.signature.to_owned(),
+            None => self.signature.clone(),
         }
     }
 }

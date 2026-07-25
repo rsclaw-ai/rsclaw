@@ -199,7 +199,10 @@ interface host-android {
     android-uiauto-raw: func(method: string, path: string, json-body: option<string>) -> result<string, string>;
 
     /// Run the native Thought/Action VLM driver against the CLS Android screen.
-    android-vlm-drive: func(instruction: string, max-steps: u32) -> result<string, string>;
+    /// `action-spaces`: optional list of action signatures the VLM may use
+    /// (e.g. "click(start_box='(x,y)')"). When provided, overrides the
+    /// operator's built-in action space.
+    android-vlm-drive: func(instruction: string, max-steps: u32, action-spaces: option<list<string>>) -> result<string, string>;
 
     /// Push a local artifact file to device shared storage through the CLS
     /// ADB tunnel. `media-kind` is one of `image`, `file`, or `audio`.

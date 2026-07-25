@@ -13,6 +13,15 @@ use std::fmt::Write;
 
 use super::{action::ActionSpec, app_rules::AppRule};
 
+/// Which GUI platform the operator drives. Selects the Thought/Output
+/// examples so the model sees action names matching the real action space
+/// (desktop: click/right_single/activate_app; mobile: tap/long_press/open_app).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformKind {
+    Desktop,
+    Mobile,
+}
+
 pub struct PromptInputs<'a> {
     pub instruction: &'a str,
     pub action_spaces: &'a [ActionSpec],
@@ -24,6 +33,7 @@ pub struct PromptInputs<'a> {
     /// need to be in the prompt for coord anchoring. Drivers handle
     /// the rescale to physical pixels.
     pub screen_size: Option<(u32, u32)>,
+    pub platform: PlatformKind,
 }
 
 /// Build the system prompt the VLM driver sends each turn. The final
@@ -85,17 +95,39 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     );
 
     out.push_str("\n## Thought Examples\n");
-    out.push_str(if lang == "Chinese" {
-        THOUGHT_EXAMPLES_ZH
-    } else {
-        THOUGHT_EXAMPLES_EN
+    out.push_str(match inputs.platform {
+        PlatformKind::Mobile => {
+            if lang == "Chinese" {
+                THOUGHT_EXAMPLES_MOBILE_ZH
+            } else {
+                THOUGHT_EXAMPLES_MOBILE_EN
+            }
+        }
+        PlatformKind::Desktop => {
+            if lang == "Chinese" {
+                THOUGHT_EXAMPLES_ZH
+            } else {
+                THOUGHT_EXAMPLES_EN
+            }
+        }
     });
 
     out.push_str("\n## Output Examples\n");
-    out.push_str(if lang == "Chinese" {
-        OUTPUT_EXAMPLE_ZH
-    } else {
-        OUTPUT_EXAMPLE_EN
+    out.push_str(match inputs.platform {
+        PlatformKind::Mobile => {
+            if lang == "Chinese" {
+                OUTPUT_EXAMPLE_MOBILE_ZH
+            } else {
+                OUTPUT_EXAMPLE_MOBILE_EN
+            }
+        }
+        PlatformKind::Desktop => {
+            if lang == "Chinese" {
+                OUTPUT_EXAMPLE_ZH
+            } else {
+                OUTPUT_EXAMPLE_EN
+            }
+        }
     });
 
     if !inputs.matched_rules.is_empty() {
@@ -182,6 +214,76 @@ Thought: Write your English thought here, following the style of the Thought Exa
 Action: click(start_box='<box>120, 90</box>')
 ";
 
+const THOUGHT_EXAMPLES_MOBILE_ZH: &str = "\
+Example 1 — 目标 App 不在前台：
+Thought: 屏幕上是手机桌面，微信没有打开。任务是给东升发消息，第一步必须打开微信。用 activate_app 启动最可靠。
+Action: activate_app(app='微信')
+
+Example 2 — 点击聊天对象：
+Thought: 微信聊天列表已打开，能看到\"东升\"的会话条目，大约在屏幕中上方 (500, 280) 的位置。直接点击进入聊天。
+Action: click(start_box='(500, 280)')
+
+Example 3 — 在输入框输入中文：
+Thought: 已进入东升的聊天页面，底部有输入框，光标已在闪烁。直接输入要发送的文字内容。
+Action: type(content='你好，宝宝最近睡眠怎么样？')
+
+Example 4 — 向上滑动翻看历史消息：
+Thought: 当前只能看到最近几条消息，需要往上翻看更早的记录。在屏幕中部向上滚动。
+Action: scroll(start_box='(500, 500)', direction='up')
+
+Example 5 — 等待页面加载：
+Thought: 刚点击了聊天条目，页面可能还在加载，先等一下再操作。
+Action: wait()
+
+Example 6 — 返回上一页：
+Thought: 当前在聊天设置页面，任务已经完成，按返回键回到聊天列表。
+Action: press_back()
+
+Example 7 — 任务完成，终止：
+Thought: 截图显示消息已经发送成功，绿色气泡出现在聊天窗口右侧，任务完成。
+Action: finished(content='消息已成功发送给东升')
+";
+
+const THOUGHT_EXAMPLES_MOBILE_EN: &str = "\
+Example 1 — Target app not in foreground:
+Thought: The screen shows the phone home screen; WeChat is not open. The task is to send a message to DongSheng, so the first step is to launch WeChat.
+Action: activate_app(app='WeChat')
+
+Example 2 — Tap a chat entry:
+Thought: The WeChat chat list is visible. The \"DongSheng\" conversation entry is in the upper-middle area, around (500, 280). Tap it to open the chat.
+Action: click(start_box='(500, 280)')
+
+Example 3 — Type text into the composer:
+Thought: Inside DongSheng's chat page, the input field is at the bottom with a blinking cursor. Type the message content directly.
+Action: type(content='Hi, how is the baby sleeping lately?')
+
+Example 4 — Scroll up through history:
+Thought: Only the most recent messages are visible; I need to scroll up for earlier ones. Scroll up from the center of the screen.
+Action: scroll(start_box='(500, 500)', direction='up')
+
+Example 5 — Wait for page load:
+Thought: I just tapped the chat entry; the page may still be loading. Wait briefly before the next action.
+Action: wait()
+
+Example 6 — Go back:
+Thought: Currently on the chat settings page; the task is done. Press the back key to return to the chat list.
+Action: press_back()
+
+Example 7 — Task complete, terminate:
+Thought: The screenshot shows the message was sent successfully — a green bubble appeared on the right side of the chat window. Task is complete.
+Action: finished(content='Message sent to DongSheng successfully')
+";
+
+const OUTPUT_EXAMPLE_MOBILE_ZH: &str = "\
+Thought: 这里写中文思考，按上面的 Thought Examples 风格 …
+Action: click(start_box='(500, 280)')
+";
+
+const OUTPUT_EXAMPLE_MOBILE_EN: &str = "\
+Thought: Write your English thought here, following the style of the Thought Examples above ...
+Action: click(start_box='(500, 280)')
+";
+
 /// True if the string contains any common CJK / Hiragana / Katakana
 /// codepoint, used to pick the Thought-section language.
 fn has_cjk(s: &str) -> bool {
@@ -219,6 +321,7 @@ mod tests {
             action_spaces: &[],
             matched_rules: &[],
             screen_size: None,
+            platform: PlatformKind::Desktop,
         };
         let p = build_system_prompt(&inputs);
         assert!(p.contains("## Action Space\n\n"), "prompt was:\n{p}");
@@ -231,6 +334,7 @@ mod tests {
             action_spaces: &[],
             matched_rules: &[],
             screen_size: None,
+            platform: PlatformKind::Desktop,
         };
         let p = build_system_prompt(&inputs);
         assert!(!p.contains("## App-Specific Rules"), "prompt was:\n{p}");
@@ -243,6 +347,7 @@ mod tests {
             action_spaces: &[],
             matched_rules: &[],
             screen_size: None,
+            platform: PlatformKind::Desktop,
         };
         let p = build_system_prompt(&inputs);
         assert!(
@@ -258,6 +363,7 @@ mod tests {
             action_spaces: &[],
             matched_rules: &[],
             screen_size: None,
+            platform: PlatformKind::Desktop,
         };
         let p = build_system_prompt(&inputs);
         assert!(
@@ -273,6 +379,7 @@ mod tests {
             action_spaces: &[],
             matched_rules: &[],
             screen_size: None,
+            platform: PlatformKind::Desktop,
         };
         let p = build_system_prompt(&inputs);
         assert!(p.contains("## Thought Examples"), "missing section");
@@ -287,6 +394,7 @@ mod tests {
             action_spaces: &[],
             matched_rules: &[],
             screen_size: None,
+            platform: PlatformKind::Desktop,
         };
         let p = build_system_prompt(&inputs);
         assert!(p.contains("## Thought Examples"), "missing section");
@@ -306,6 +414,7 @@ mod tests {
             action_spaces: &[],
             matched_rules: &refs,
             screen_size: None,
+            platform: PlatformKind::Desktop,
         };
         let p = build_system_prompt(&inputs);
         assert!(p.contains("### alpha"), "prompt was:\n{p}");

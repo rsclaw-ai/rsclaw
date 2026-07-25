@@ -43,12 +43,12 @@ use rsclaw_provider::{
 use tracing::{debug, info, warn};
 
 use super::{
-    action::{Action, ExecCtx, MouseButton, ParsedAction, ScrollDir},
+    action::{Action, ActionSpec, ExecCtx, MouseButton, ParsedAction, ScrollDir},
     app_rules::AppRuleSet,
     operator::Operator,
     parser::{CoordFormat, parse_vlm_response},
     permission::{PermissionDecision, PermissionRequest, PermissionStore},
-    prompt::{PromptInputs, build_system_prompt},
+    prompt::{PlatformKind, PromptInputs, build_system_prompt},
     status::ComputerUseStatus,
 };
 
@@ -160,6 +160,11 @@ pub struct VlmDriver<'a> {
     /// event so the UI can correlate them. Caller-minted (typically
     /// `vlm_drive-<uuid>`).
     pub run_id: String,
+    /// Plugin-supplied action space override. When `Some`, the driver
+    /// uses these specs in the system prompt instead of
+    /// `operator.action_spaces()`. Lets plugins declare exactly which
+    /// actions work in their context (e.g. WeChat chat screen).
+    pub action_spaces_override: Option<Vec<ActionSpec>>,
 }
 
 impl VlmDriver<'_> {
@@ -197,13 +202,21 @@ impl VlmDriver<'_> {
         let probe_dims = probe_snap.physical_size;
         let mut next_snap: Option<super::action::Screenshot> = Some(probe_snap);
 
-        let action_spaces = self.operator.action_spaces();
+        let action_spaces = self
+            .action_spaces_override
+            .clone()
+            .unwrap_or_else(|| self.operator.action_spaces());
         let matched: Vec<&_> = self.app_rules.match_instruction(instruction);
+        let platform = match self.operator.name() {
+            "adb" | "android_uiauto" | "iphone_mirror" => PlatformKind::Mobile,
+            _ => PlatformKind::Desktop,
+        };
         let system_prompt = build_system_prompt(&PromptInputs {
             instruction,
             action_spaces: &action_spaces,
             matched_rules: &matched,
             screen_size: Some(probe_dims),
+            platform,
         });
 
         info!(
@@ -361,12 +374,29 @@ impl VlmDriver<'_> {
                 // "you forgot Action:" reminder the model can't act on.
                 // Only exhausted retries fall through to the format-error
                 // path below.
-                if prediction.trim().is_empty() && empty_retries < MAX_EMPTY_RETRIES {
+                if prediction.trim().is_empty()
+                    && empty_retries < MAX_EMPTY_RETRIES
+                {
                     empty_retries += 1;
                     warn!(
                         retries = empty_retries,
                         streak = consecutive_unparseable,
                         "VLM returned an empty prediction (decoder dropout); retrying same turn"
+                    );
+                    continue;
+                }
+                // The vision worker occasionally emits a run of literal
+                // '?' instead of real tokens — same transient failure as
+                // an empty reply, so retry it the same way.
+                let all_question_marks = !prediction.trim().is_empty()
+                    && prediction.trim().chars().all(|c| c == '?');
+                if all_question_marks && empty_retries < MAX_EMPTY_RETRIES {
+                    empty_retries += 1;
+                    warn!(
+                        retries = empty_retries,
+                        chars = prediction.trim().len(),
+                        streak = consecutive_unparseable,
+                        "VLM returned all-'?' prediction (decoder dropout); retrying same turn"
                     );
                     continue;
                 }
@@ -1053,7 +1083,7 @@ fn parsed_to_action(
                 button: MouseButton::Middle,
             })
         }
-        "left_double" | "double_click" => {
+        "left_double" | "double_click" | "double_tap" => {
             let (x, y) = start_xy?;
             Some(Action::DoubleClick { x, y })
         }
@@ -1071,15 +1101,9 @@ fn parsed_to_action(
                 to_y: d,
             })
         }
-        "long_press" => {
-            // Approximated as a click; iOS / Android operators may
-            // upgrade this to a hold internally.
+        "long_press" | "long_click" => {
             let (x, y) = start_xy?;
-            Some(Action::Click {
-                x,
-                y,
-                button: MouseButton::Left,
-            })
+            Some(Action::LongPress { x, y })
         }
         "scroll" => {
             let (x, y) = start_xy.unwrap_or((screen_w as i32 / 2, screen_h as i32 / 2));

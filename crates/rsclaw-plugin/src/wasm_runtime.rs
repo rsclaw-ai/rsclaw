@@ -2326,11 +2326,12 @@ impl rsclaw::plugin::host_android::Host for HostState {
         &mut self,
         instruction: String,
         max_steps: u32,
+        action_spaces: Option<Vec<String>>,
     ) -> HostTrapResult<Result<String, String>> {
         use std::sync::atomic::AtomicBool;
 
         use rsclaw_computer::{
-            CoordSpace, DriverOutcome, VlmDriver,
+            ActionSpec, CoordSpace, DriverOutcome, VlmDriver,
             app_rules::AppRuleSet,
             parser::CoordFormat,
             permission::{CheckFut, PermissionDecision, PermissionStore, RecordFut},
@@ -2374,6 +2375,8 @@ impl rsclaw::plugin::host_android::Host for HostState {
         };
         let operator = crate::android_vlm::AndroidUiautoOperator;
         let rules = AppRuleSet::default();
+        let action_spaces_override =
+            action_spaces.map(|specs| specs.into_iter().map(ActionSpec::new).collect());
         let driver = VlmDriver {
             operator: &operator,
             provider,
@@ -2390,6 +2393,7 @@ impl rsclaw::plugin::host_android::Host for HostState {
             headless_auto_allow: true,
             status_emit: None,
             run_id: format!("android-vlm-drive-{}", uuid::Uuid::new_v4().simple()),
+            action_spaces_override,
         };
         let outcome = match driver.run(&instruction).await {
             Ok(outcome) => outcome,
