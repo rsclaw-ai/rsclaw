@@ -43,7 +43,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                         cyan(&j.id),
                         status,
                         agent,
-                        dim(schedule)
+                        dim(&schedule)
                     );
                 }
             }
