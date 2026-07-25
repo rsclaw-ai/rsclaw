@@ -95,27 +95,33 @@ pub struct Step {
 ///
 /// `Normalized` is the target convention (ui-tars-desktop's 0-1000 grid)
 /// and the correct long-term state. `Pixels` is the pragmatic client-side
-/// adaptation for rsclaw-vision-v1, which — despite the prompt explicitly
-/// asking for a 0-1000 grid — emits raw absolute pixels of the screenshot
-/// it was sent (like Doubao UI-TARS). That is a worker/model-side issue
-/// tracked separately; when the model is fixed to emit normalized coords,
-/// flip `CoordSpace::for_model` back so rsclaw-vision uses `Normalized`.
+/// adaptation for rsclaw-vision (v1 and v2), which — despite the prompt
+/// explicitly asking for a 0-1000 grid — emit raw absolute pixels of the
+/// screenshot they were sent. That is a worker/model-side issue tracked
+/// separately; when the model is fixed to emit normalized coords, flip
+/// `CoordSpace::for_model` back so rsclaw-vision uses `Normalized`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoordSpace {
     /// 0-1000 normalized grid → rescale by `coord / 1000 * screen_dim`.
     Normalized,
-    /// Raw pixels of the screenshot the model was sent. The driver sends
-    /// the full-resolution screenshot, so model coords are already in
-    /// physical-pixel space → identity (no rescale).
+    /// Raw pixels of the (possibly downscaled) screenshot the model was
+    /// sent → physical = `coord / vision_scale`. Identity when the
+    /// screenshot was not downscaled (`vision_scale == 1.0`).
     Pixels,
 }
 
 impl CoordSpace {
-    /// Pick the coordinate space for a given model id. All rsclaw-vision
-    /// models follow the 0-1000 normalized prompt convention.
+    /// Pick the coordinate space for a given model id. rsclaw-vision
+    /// models (v1 and v2) emit raw pixels of the screenshot they were
+    /// sent, despite the prompt asking for a 0-1000 grid. Flip to
+    /// `Normalized` once the worker is fixed to honour the prompt.
     pub fn for_model(model: &str) -> Self {
-        let _ = model;
-        CoordSpace::Normalized
+        let m = model.to_ascii_lowercase();
+        if m.contains("rsclaw-vision") {
+            CoordSpace::Pixels
+        } else {
+            CoordSpace::Normalized
+        }
     }
 }
 
@@ -1323,18 +1329,18 @@ mod tests {
     }
 
     #[test]
-    fn coord_space_for_model_always_normalized() {
+    fn coord_space_for_model_picks_pixels_for_rsclaw_vision() {
         assert_eq!(
             CoordSpace::for_model("rsclaw-vision-v1"),
-            CoordSpace::Normalized
+            CoordSpace::Pixels
         );
         assert_eq!(
             CoordSpace::for_model("rsclaw/rsclaw-vision-v1"),
-            CoordSpace::Normalized
+            CoordSpace::Pixels
         );
         assert_eq!(
             CoordSpace::for_model("rsclaw-vision-v2"),
-            CoordSpace::Normalized
+            CoordSpace::Pixels
         );
         assert_eq!(CoordSpace::for_model("ui-tars-1.5"), CoordSpace::Normalized);
         assert_eq!(
