@@ -217,17 +217,29 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     run_cls(&config.cls_bin, &args, deadline_for(command)).await
 }
 
-/// Type into the currently focused field through CLS's native text path.
+/// Type through CLS's native text path, optionally focusing a visual-only field.
 async fn input_text(args_json: &str, config: &Config) -> Result<String, String> {
-    let text = input_text_value(args_json)?;
-    let args = input_text_args(config, text);
+    let input = input_text_value(args_json)?;
+    let args = input_text_args(config, input);
     run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
 }
 
-fn input_text_args(config: &Config, text: String) -> Vec<String> {
+#[derive(Debug, PartialEq, Eq)]
+struct InputText {
+    text: String,
+    point: Option<(u32, u32)>,
+}
+
+fn input_text_args(config: &Config, input: InputText) -> Vec<String> {
     let mut args = uiauto_base_args(config, "text");
+    if let Some((x, y)) = input.point {
+        args.push("--x".to_string());
+        args.push(x.to_string());
+        args.push("--y".to_string());
+        args.push(y.to_string());
+    }
     args.push("--text".to_string());
-    args.push(text);
+    args.push(input.text);
     args
 }
 
@@ -254,14 +266,14 @@ async fn ocr_region(args_json: &str, config: &Config) -> Result<String, String> 
         .map_err(|e| format!("android uiauto: ocr-region join: {e}"))?
 }
 
-fn input_text_value(args_json: &str) -> Result<String, String> {
+fn input_text_value(args_json: &str) -> Result<InputText, String> {
     let value: Value = serde_json::from_str(args_json)
         .map_err(|error| format!("android uiauto: invalid args JSON: {error}"))?;
     let object = value
         .as_object()
         .ok_or_else(|| "android uiauto: args JSON must be an object".to_string())?;
-    if object.len() != 1 || !object.contains_key("text") {
-        return Err("android uiauto: `input-text` requires exactly `text`".to_string());
+    if !object.keys().all(|key| matches!(key.as_str(), "text" | "x" | "y")) {
+        return Err("android uiauto: `input-text` accepts only `text`, `x`, and `y`".to_string());
     }
     let text = object
         .get("text")
@@ -272,7 +284,25 @@ fn input_text_value(args_json: &str) -> Result<String, String> {
             "android uiauto: `text` must be 1-{MAX_INPUT_TEXT_BYTES} bytes without NUL"
         ));
     }
-    Ok(text.to_string())
+    let point = match (object.get("x"), object.get("y")) {
+        (None, None) => None,
+        (Some(x), Some(y)) => {
+            let x = x
+                .as_u64()
+                .filter(|value| *value <= u64::from(u32::MAX))
+                .ok_or_else(|| "android uiauto: `x` must be a u32".to_string())?;
+            let y = y
+                .as_u64()
+                .filter(|value| *value <= u64::from(u32::MAX))
+                .ok_or_else(|| "android uiauto: `y` must be a u32".to_string())?;
+            Some((x as u32, y as u32))
+        }
+        _ => return Err("android uiauto: `x` and `y` must be supplied together".to_string()),
+    };
+    Ok(InputText {
+        text: text.to_string(),
+        point,
+    })
 }
 
 fn keyevent_keycode(args_json: &str) -> Result<i32, String> {
@@ -2008,14 +2038,21 @@ mod tests {
 
     #[test]
     fn input_text_value_keeps_utf8_for_native_text_entry() {
-        let text = input_text_value(r#"{"text":"你好\n宝宝"}"#).expect("valid input text");
-        assert_eq!(text, "你好\n宝宝");
+        let input = input_text_value(r#"{"text":"你好\n宝宝"}"#).expect("valid input text");
+        assert_eq!(input.text, "你好\n宝宝");
+        assert_eq!(input.point, None);
     }
 
     #[test]
     fn input_text_uses_cls_native_text_command() {
         assert_eq!(
-            input_text_args(&config(), "你好".to_string()),
+            input_text_args(
+                &config(),
+                InputText {
+                    text: "你好".to_string(),
+                    point: Some((123, 456)),
+                },
+            ),
             [
                 "android",
                 "uiauto",
@@ -2024,6 +2061,10 @@ mod tests {
                 "android-dev",
                 "--port",
                 "6790",
+                "--x",
+                "123",
+                "--y",
+                "456",
                 "--text",
                 "你好",
             ]
@@ -2031,9 +2072,14 @@ mod tests {
     }
 
     #[test]
-    fn input_text_value_rejects_missing_extra_empty_and_nul_values() {
+    fn input_text_value_accepts_only_complete_optional_coordinates() {
+        let input = input_text_value(r#"{"text":"ok","x":123,"y":456}"#)
+            .expect("valid coordinate text entry");
+        assert_eq!(input.point, Some((123, 456)));
         assert!(input_text_value("{}").is_err());
         assert!(input_text_value(r#"{"text":"ok","extra":true}"#).is_err());
+        assert!(input_text_value(r#"{"text":"ok","x":123}"#).is_err());
+        assert!(input_text_value(r#"{"text":"ok","x":-1,"y":456}"#).is_err());
         assert!(input_text_value(r#"{"text":""}"#).is_err());
         assert!(input_text_value("{\"text\":\"a\\u0000b\"}").is_err());
     }
