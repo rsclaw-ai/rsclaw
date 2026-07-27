@@ -1052,16 +1052,13 @@ fn validate_plugin_sql(sql: &str, kind: PluginSqlKind) -> std::result::Result<()
                 let third = tokens.get(2).copied();
                 if second != Some("table")
                     && !(matches!(second, Some("temp" | "temporary")) && third == Some("table"))
-                    && second != Some("index")
-                    && !(second == Some("unique") && third == Some("index"))
                 {
-                    return Err("sql_execute only allows CREATE TABLE or CREATE INDEX".to_owned());
+                    return Err("sql_execute only allows CREATE TABLE".to_owned());
                 }
             }
             _ => {
                 return Err(
-                    "sql_execute only allows INSERT, UPDATE, DELETE, CREATE TABLE, or CREATE INDEX"
-                        .to_owned(),
+                    "sql_execute only allows INSERT, UPDATE, DELETE, or CREATE TABLE".to_owned(),
                 );
             }
         },
@@ -3321,6 +3318,7 @@ mod android_helper_tests {
         for sql in [
             "delete from kv where key = ?1",
             "create index idx_quotes_code on quotes(code)",
+            "create unique index idx_quotes_code on quotes(code)",
             "alter table quotes add column x text",
             "vacuum",
         ] {
