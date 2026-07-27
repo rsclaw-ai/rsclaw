@@ -1050,15 +1050,18 @@ fn validate_plugin_sql(sql: &str, kind: PluginSqlKind) -> std::result::Result<()
             "create" => {
                 let second = tokens.get(1).copied();
                 let third = tokens.get(2).copied();
-                if second != Some("table")
-                    && !(matches!(second, Some("temp" | "temporary")) && third == Some("table"))
-                {
-                    return Err("sql_execute only allows CREATE TABLE".to_owned());
+                let creates_table = second == Some("table")
+                    || (matches!(second, Some("temp" | "temporary")) && third == Some("table"));
+                let creates_index =
+                    second == Some("index") || (second == Some("unique") && third == Some("index"));
+                if !creates_table && !creates_index {
+                    return Err("sql_execute only allows CREATE TABLE or CREATE INDEX".to_owned());
                 }
             }
             _ => {
                 return Err(
-                    "sql_execute only allows INSERT, UPDATE, DELETE, or CREATE TABLE".to_owned(),
+                    "sql_execute only allows INSERT, UPDATE, DELETE, CREATE TABLE, or CREATE INDEX"
+                        .to_owned(),
                 );
             }
         },
@@ -3264,6 +3267,20 @@ mod android_helper_tests {
         );
         assert!(
             validate_plugin_sql(
+                "create index if not exists idx_quotes_code on quotes(code)",
+                PluginSqlKind::Execute
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_sql(
+                "create unique index idx_quotes_code on quotes(code)",
+                PluginSqlKind::Execute
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_sql(
                 "insert into quotes (code, price) values (?1, ?2)",
                 PluginSqlKind::Execute
             )
@@ -3317,8 +3334,6 @@ mod android_helper_tests {
         }
         for sql in [
             "delete from kv where key = ?1",
-            "create index idx_quotes_code on quotes(code)",
-            "create unique index idx_quotes_code on quotes(code)",
             "alter table quotes add column x text",
             "vacuum",
         ] {
