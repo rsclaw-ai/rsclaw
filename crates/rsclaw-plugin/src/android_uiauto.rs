@@ -1,9 +1,9 @@
-//! CLS tunnel transport for Android agent and UIAutomator2 host imports.
+//! CLS tunnel transport for Android host imports.
 //!
-//! The gateway never opens ADB or the CLS AccessibilityService. Every device
-//! operation goes through the tunneled UIAutomator2/WebDriver server. Native
-//! request JSON uses a mode-0600 temporary file so message bodies and selectors
-//! are not exposed in the process argument list.
+//! The gateway never opens ADB or the CLS AccessibilityService directly. Device
+//! operations go through CLS; raw WebDriver requests use a mode-0600 temporary
+//! file so message bodies and selectors are not exposed in the process argument
+//! list.
 
 use std::{
     collections::VecDeque,
@@ -33,8 +33,6 @@ const SEND_BUTTON_COMMAND: &str = "send-button";
 const LATEST_MESSAGE_BUBBLE_COMMAND: &str = "latest-message-bubble";
 const INPUT_TEXT_COMMAND: &str = "input-text";
 const OCR_REGION_COMMAND: &str = "ocr-region";
-const PASTE_KEYCODE: u16 = 279;
-const CLIPBOARD_LABEL: &str = "rsclaw";
 const WAKEUP_SCREEN_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(500),
     Duration::from_millis(750),
@@ -200,7 +198,7 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         return detect_latest_message_bubble(&config).await;
     }
     if command == INPUT_TEXT_COMMAND {
-        return input_text(args_json).await;
+        return input_text(args_json, &config).await;
     }
     if command == OCR_REGION_COMMAND {
         return ocr_region(args_json, &config).await;
@@ -219,28 +217,18 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     run_cls(&config.cls_bin, &args, deadline_for(command)).await
 }
 
-async fn input_text(args_json: &str) -> Result<String, String> {
+/// Type into the currently focused field through CLS's native text path.
+async fn input_text(args_json: &str, config: &Config) -> Result<String, String> {
     let text = input_text_value(args_json)?;
-    let session = uiauto_session_id().await?;
-    let clipboard = serde_json::json!({
-        "content": base64::engine::general_purpose::STANDARD.encode(text.as_bytes()),
-        "contentType": "plaintext",
-        "label": CLIPBOARD_LABEL,
-    })
-    .to_string();
-    raw(
-        "POST",
-        &format!("/session/{session}/appium/device/set_clipboard"),
-        Some(&clipboard),
-    )
-    .await?;
-    let paste = serde_json::json!({ "keycode": PASTE_KEYCODE }).to_string();
-    raw(
-        "POST",
-        &format!("/session/{session}/appium/device/press_keycode"),
-        Some(&paste),
-    )
-    .await
+    let args = input_text_args(config, text);
+    run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+}
+
+fn input_text_args(config: &Config, text: String) -> Vec<String> {
+    let mut args = uiauto_base_args(config, "text");
+    args.push("--text".to_string());
+    args.push(text);
+    args
 }
 
 /// Host-side local OCR for the plugin's fast UI-confirmation path. The plugin
@@ -301,43 +289,6 @@ fn keyevent_keycode(args_json: &str) -> Result<i32, String> {
         return Err(format!("android uiauto: keyevent keycode {keycode} out of range"));
     }
     Ok(keycode as i32)
-}
-
-async fn uiauto_session_id() -> Result<String, String> {
-    let sessions = raw("GET", "/sessions", None).await?;
-    if let Some(session) = session_id_from_response(&sessions) {
-        return Ok(session);
-    }
-    let body = serde_json::json!({
-        "capabilities": {
-            "alwaysMatch": {
-                "platformName": "Android",
-                "appium:automationName": "UiAutomator2",
-                "appium:noReset": true,
-                "appium:newCommandTimeout": 300,
-            }
-        }
-    })
-    .to_string();
-    let created = raw("POST", "/session", Some(&body)).await?;
-    session_id_from_response(&created)
-        .ok_or_else(|| "android uiauto: session response missing sessionId".to_string())
-}
-
-fn session_id_from_response(raw: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(raw).ok()?;
-    value
-        .get("value")
-        .and_then(|value| {
-            value.get("sessionId").or_else(|| {
-                let row = value.as_array().and_then(|rows| rows.first())?;
-                row.get("sessionId").or_else(|| row.get("id"))
-            })
-        })
-        .or_else(|| value.get("sessionId"))
-        .and_then(Value::as_str)
-        .filter(|session| !session.is_empty())
-        .map(str::to_string)
 }
 
 async fn detect_contact_badge(config: &Config) -> Result<String, String> {
@@ -2056,9 +2007,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_text_value_keeps_utf8_for_clipboard_paste() {
+    fn input_text_value_keeps_utf8_for_native_text_entry() {
         let text = input_text_value(r#"{"text":"你好\n宝宝"}"#).expect("valid input text");
         assert_eq!(text, "你好\n宝宝");
+    }
+
+    #[test]
+    fn input_text_uses_cls_native_text_command() {
+        assert_eq!(
+            input_text_args(&config(), "你好".to_string()),
+            [
+                "android",
+                "uiauto",
+                "text",
+                "-n",
+                "android-dev",
+                "--port",
+                "6790",
+                "--text",
+                "你好",
+            ]
+        );
     }
 
     #[test]
@@ -2067,19 +2036,6 @@ mod tests {
         assert!(input_text_value(r#"{"text":"ok","extra":true}"#).is_err());
         assert!(input_text_value(r#"{"text":""}"#).is_err());
         assert!(input_text_value("{\"text\":\"a\\u0000b\"}").is_err());
-    }
-
-    #[test]
-    fn parses_existing_and_new_uiautomator2_session_ids() {
-        assert_eq!(
-            session_id_from_response(r#"{"value":[{"sessionId":"existing"}]}"#).as_deref(),
-            Some("existing")
-        );
-        assert_eq!(
-            session_id_from_response(r#"{"value":{"sessionId":"created"}}"#).as_deref(),
-            Some("created")
-        );
-        assert_eq!(session_id_from_response(r#"{"value":[]}"#), None);
     }
 
     #[test]
