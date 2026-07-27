@@ -35,7 +35,6 @@ const INPUT_TEXT_COMMAND: &str = "input-text";
 const OCR_REGION_COMMAND: &str = "ocr-region";
 const PASTE_KEYCODE: u16 = 279;
 const CLIPBOARD_LABEL: &str = "rsclaw";
-const WAKEUP_KEYCODE: u16 = 224;
 const WAKEUP_SCREEN_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(500),
     Duration::from_millis(750),
@@ -206,6 +205,13 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     if command == OCR_REGION_COMMAND {
         return ocr_region(args_json, &config).await;
     }
+    if command == "keyevent" {
+        let keycode = keyevent_keycode(args_json)?;
+        let mut args = uiauto_base_args(&config, "key");
+        args.push("--keycode".to_string());
+        args.push(keycode.to_string());
+        return run_cls(&config.cls_bin, &args, Duration::from_secs(15)).await;
+    }
     let args = build_call_args(&config, command, args_json)?;
     if command == "screenshot" {
         return screenshot_with_wakeup(&config).await;
@@ -279,6 +285,22 @@ fn input_text_value(args_json: &str) -> Result<String, String> {
         ));
     }
     Ok(text.to_string())
+}
+
+fn keyevent_keycode(args_json: &str) -> Result<i32, String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android uiauto: invalid keyevent args: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "android uiauto: keyevent args must be an object".to_string())?;
+    let keycode = object
+        .get("keycode")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "android uiauto: keyevent requires integer `keycode`".to_string())?;
+    if !(0..=i32::MAX as i64).contains(&keycode) {
+        return Err(format!("android uiauto: keyevent keycode {keycode} out of range"));
+    }
+    Ok(keycode as i32)
 }
 
 async fn uiauto_session_id() -> Result<String, String> {
@@ -852,12 +874,10 @@ async fn screenshot_with_wakeup(config: &Config) -> Result<String, String> {
 
     tracing::info!(
         node = %config.node,
-        "Android screenshot is black; waking the device through UIAutomator2"
+        "Android screenshot is black; waking the device through CLS power control"
     );
-    let mut wake_args = uiauto_base_args(config, "key");
-    wake_args.push("--keycode".to_string());
-    wake_args.push(WAKEUP_KEYCODE.to_string());
-    run_cls(&config.cls_bin, &wake_args, deadline_for("key")).await?;
+    let wake_args = power_base_args(config, "wake");
+    run_cls(&config.cls_bin, &wake_args, Duration::from_secs(20)).await?;
 
     for (index, delay) in WAKEUP_SCREEN_RETRY_DELAYS.iter().enumerate() {
         tokio::time::sleep(*delay).await;
@@ -874,7 +894,7 @@ async fn screenshot_with_wakeup(config: &Config) -> Result<String, String> {
     }
 
     Err(
-        "android uiauto: screenshot remains black after UIAutomator2 wakeup retries; device may be locked or its display unavailable"
+        "android uiauto: screenshot remains black after CLS power-wake retries; device may be locked or its display unavailable"
             .to_string(),
     )
 }
@@ -1278,6 +1298,17 @@ fn uiauto_base_args(config: &Config, command: &str) -> Vec<String> {
         config.node.clone(),
         "--port".to_string(),
         config.port.to_string(),
+    ]
+}
+
+/// Build a CLS display-power command without involving UIAutomator2.
+fn power_base_args(config: &Config, command: &str) -> Vec<String> {
+    vec![
+        "android".to_string(),
+        "power".to_string(),
+        command.to_string(),
+        "-n".to_string(),
+        config.node.clone(),
     ]
 }
 
@@ -2280,10 +2311,37 @@ mod tests {
     }
 
     #[test]
+    fn builds_cls_power_wake_args_without_uiautomator() {
+        assert_eq!(
+            power_base_args(&config(), "wake"),
+            ["android", "power", "wake", "-n", "android-dev"]
+        );
+    }
+
+    #[test]
+    fn launch_forwards_dynamic_package_to_cls_uiautomator() {
+        assert_eq!(
+            build_call_args(&config(), "launch", r#"{"package":"org.example.app"}"#)
+                .expect("launch arguments"),
+            [
+                "android",
+                "uiauto",
+                "launch",
+                "-n",
+                "android-dev",
+                "--port",
+                "6790",
+                "--package",
+                "org.example.app",
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_unknown_commands_and_options() {
         assert!(build_call_args(&config(), "stop", "{}").is_err());
         assert!(
-            build_call_args(&config(), "app-state", r#"{"package":"com.tencent.mm"}"#).is_err()
+            build_call_args(&config(), "app-state", r#"{"package":"org.example.app"}"#).is_err()
         );
         assert!(build_call_args(&config(), "screenshot", r#"{"output":"/tmp/x"}"#).is_err());
     }
@@ -2361,7 +2419,7 @@ mod tests {
             validate_raw_request(
                 "POST",
                 "/session/abc/appium/device/app_state",
-                Some(r#"{"appId":"com.tencent.mm"}"#),
+                Some(r#"{"appId":"org.example.app"}"#),
             )
             .is_err()
         );
@@ -2441,7 +2499,7 @@ mod tests {
             validate_raw_request(
                 "POST",
                 "/session/abc/appium/device/activate_app",
-                Some(r#"{"appId":"com.tencent.mm"}"#),
+                Some(r#"{"appId":"org.example.app"}"#),
             )
             .is_ok()
         );
@@ -2449,7 +2507,7 @@ mod tests {
             validate_raw_request(
                 "POST",
                 "/session/abc/appium/device/start_activity",
-                Some(r#"{"appPackage":"com.tencent.mm","appActivity":".ui.LauncherUI"}"#),
+                Some(r#"{"appPackage":"org.example.app","appActivity":".ExampleActivity"}"#),
             )
             .is_ok()
         );

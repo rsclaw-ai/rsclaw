@@ -146,14 +146,7 @@ impl Operator for AndroidUiautoOperator {
                     Ok(ActionOutput::ok())
                 }
                 Action::ActivateApp { app } => {
-                    let lower = app.to_ascii_lowercase();
-                    let pkg = match lower.as_str() {
-                        a if a.contains("wechat") || a.contains("微信") => "com.tencent.mm",
-                        a if a.contains("douyin") || a.contains("抖音") => "com.ss.android.ugc.aweme",
-                        a if a.contains("alipay") || a.contains("支付宝") => "com.eg.android.AlipayGphone",
-                        _ => app.as_str(),
-                    };
-                    let args = serde_json::json!({ "package": pkg }).to_string();
+                    let args = serde_json::json!({ "package": app }).to_string();
                     crate::android_uiauto::call("launch", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
