@@ -7,8 +7,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use super::default_dm_scope;
-use crate::gateway::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally};
-use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
+use crate::gateway::{
+    preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},
+    session::{MessageKind, SessionKeyParams, derive_session_key},
+};
 
 pub(crate) fn start_telegram_if_configured(
     config: &RuntimeConfig,
@@ -148,13 +150,19 @@ pub(crate) fn start_telegram_if_configured(
                     if is_group {
                         match group_policy.as_ref() {
                             rsclaw_config::schema::GroupPolicy::Disabled => {
-                                warn!(chat_id, "telegram group message rejected: groupPolicy=disabled");
+                                warn!(
+                                    chat_id,
+                                    "telegram group message rejected: groupPolicy=disabled"
+                                );
                                 return;
                             }
                             rsclaw_config::schema::GroupPolicy::Allowlist => {
                                 let cid = chat_id.to_string();
                                 if !group_allow.iter().any(|g| *g == cid) {
-                                    warn!(chat_id, "telegram group message rejected: not in groupAllowFrom");
+                                    warn!(
+                                        chat_id,
+                                        "telegram group message rejected: not in groupAllowFrom"
+                                    );
                                     return;
                                 }
                             }
@@ -175,7 +183,11 @@ pub(crate) fn start_telegram_if_configured(
                                     .send(OutboundMessage {
                                         target_id: chat_id.to_string(),
                                         is_group: false,
-                                        text: rsclaw_i18n::t_fmt("pairing_required", rsclaw_i18n::default_lang(), &[("code", &code)]),
+                                        text: rsclaw_i18n::t_fmt(
+                                            "pairing_required",
+                                            rsclaw_i18n::default_lang(),
+                                            &[("code", &code)],
+                                        ),
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
@@ -193,7 +205,11 @@ pub(crate) fn start_telegram_if_configured(
                                     .send(OutboundMessage {
                                         target_id: chat_id.to_string(),
                                         is_group: false,
-                                        text: rsclaw_i18n::t("pairing_queue_full", rsclaw_i18n::default_lang()).to_owned(),
+                                        text: rsclaw_i18n::t(
+                                            "pairing_queue_full",
+                                            rsclaw_i18n::default_lang(),
+                                        )
+                                        .to_owned(),
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
@@ -215,7 +231,10 @@ pub(crate) fn start_telegram_if_configured(
                         let mut map = queues.lock().await;
                         let needs_create = match map.get(&queue_key) {
                             Some(existing) if !existing.is_closed() => false,
-                            Some(_) => { map.remove(&queue_key); true }
+                            Some(_) => {
+                                map.remove(&queue_key);
+                                true
+                            }
                             None => true,
                         };
                         if needs_create {
@@ -227,16 +246,32 @@ pub(crate) fn start_telegram_if_configured(
                             let w_tq = Arc::clone(&tq);
                             let w_acct = w_acct_outer.clone();
                             tokio::spawn(async move {
-                                while let Some((text, peer_id, chat_id, is_group, bound, images, file_attachments)) = urx.recv().await {
+                                while let Some((
+                                    text,
+                                    peer_id,
+                                    chat_id,
+                                    is_group,
+                                    bound,
+                                    images,
+                                    file_attachments,
+                                )) = urx.recv().await
+                                {
                                     let handle = if let Some(ref agent_id) = bound {
                                         match w_reg.get(agent_id) {
                                             Ok(h) => h,
-                                            Err(_) => match w_reg.route_account("telegram", Some(&w_acct)) {
+                                            Err(_) => match w_reg
+                                                .route_account("telegram", Some(&w_acct))
+                                            {
                                                 Ok(h) => h,
-                                                Err(_) => match w_reg.route_account("telegram", None) {
-                                                    Ok(h) => h,
-                                                    Err(e) => { error!("route error: {e:#}"); continue; }
-                                                },
+                                                Err(_) => {
+                                                    match w_reg.route_account("telegram", None) {
+                                                        Ok(h) => h,
+                                                        Err(e) => {
+                                                            error!("route error: {e:#}");
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
                                             },
                                         }
                                     } else {
@@ -244,7 +279,10 @@ pub(crate) fn start_telegram_if_configured(
                                             Ok(h) => h,
                                             Err(_) => match w_reg.route_account("telegram", None) {
                                                 Ok(h) => h,
-                                                Err(e) => { error!("route error: {e:#}"); continue; }
+                                                Err(e) => {
+                                                    error!("route error: {e:#}");
+                                                    continue;
+                                                }
                                             },
                                         }
                                     };
@@ -257,7 +295,9 @@ pub(crate) fn start_telegram_if_configured(
                                                 thread_id: None,
                                             }
                                         } else {
-                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
+                                            MessageKind::DirectMessage {
+                                                account_id: Some(w_acct.clone()),
+                                            }
                                         },
                                         channel: "telegram".to_string(),
                                         peer_id: peer_id.to_string(),
@@ -272,12 +312,24 @@ pub(crate) fn start_telegram_if_configured(
                                         reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
-                                        files: file_attachments.iter().filter_map(|f| {
-                                            crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
-                                        }).collect(),
+                                        files: file_attachments
+                                            .iter()
+                                            .filter_map(|f| {
+                                                crate::gateway::task_queue::stage_file(
+                                                    &f.filename,
+                                                    &f.data,
+                                                    &f.mime_type,
+                                                )
+                                                .ok()
+                                            })
+                                            .collect(),
                                         account: Some(w_acct.clone()),
                                     };
-                                    if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                    if let Err(e) = w_tq.submit(
+                                        &session_key,
+                                        qmsg,
+                                        crate::gateway::task_queue::Priority::User,
+                                    ) {
                                         error!(user = %w_uid, "telegram: queue submit failed: {e:#}");
                                     }
                                 }
@@ -301,13 +353,15 @@ pub(crate) fn start_telegram_if_configured(
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
                                     Ok(h) => h,
-                                    Err(_) => match reg.route_account("telegram", Some(&w_acct_btw)) {
-                                        Ok(h) => h,
-                                        Err(_) => match reg.route_account("telegram", None) {
+                                    Err(_) => {
+                                        match reg.route_account("telegram", Some(&w_acct_btw)) {
                                             Ok(h) => h,
-                                            Err(_) => return,
-                                        },
-                                    },
+                                            Err(_) => match reg.route_account("telegram", None) {
+                                                Ok(h) => h,
+                                                Err(_) => return,
+                                            },
+                                        }
+                                    }
                                 }
                             } else {
                                 match reg.route_account("telegram", Some(&w_acct_btw)) {
@@ -319,18 +373,25 @@ pub(crate) fn start_telegram_if_configured(
                                 }
                             };
                             if let Some(reply_text) = btw_direct_call(
-                                &question, &handle.live_status, &handle.providers, &cfg,
-                            ).await {
-                                if let Err(e) = tx.send(OutboundMessage {
-                                    target_id: chat_id_s,
-                                    is_group: false,
-                                    text: format!("[/btw] {}", reply_text),
-                                    reply_to: None,
-                                    images: vec![],
-                                    channel: None,
-                                    account: Some(w_acct_btw.clone()),
-                                    files: vec![],
-                                }).await
+                                &question,
+                                &handle.live_status,
+                                &handle.providers,
+                                &cfg,
+                            )
+                            .await
+                            {
+                                if let Err(e) = tx
+                                    .send(OutboundMessage {
+                                        target_id: chat_id_s,
+                                        is_group: false,
+                                        text: format!("[/btw] {}", reply_text),
+                                        reply_to: None,
+                                        images: vec![],
+                                        channel: None,
+                                        account: Some(w_acct_btw.clone()),
+                                        files: vec![],
+                                    })
+                                    .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
                                 }
@@ -351,7 +412,8 @@ pub(crate) fn start_telegram_if_configured(
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
                                     Ok(h) => h,
-                                    Err(_) => match reg.route_account("telegram", Some(&w_acct_pp)) {
+                                    Err(_) => match reg.route_account("telegram", Some(&w_acct_pp))
+                                    {
                                         Ok(h) => h,
                                         Err(_) => match reg.route_account("telegram", None) {
                                             Ok(h) => h,
@@ -377,13 +439,23 @@ pub(crate) fn start_telegram_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
+                                    MessageKind::DirectMessage {
+                                        account_id: Some(w_acct_pp.clone()),
+                                    }
                                 },
                                 channel: "telegram".to_string(),
                                 peer_id: peer_id_s.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "telegram", &peer_id_s, crate::gateway::preparse::PreparseOrigin::User).await {
+                            if let Some(mut reply) = try_preparse_locally(
+                                &text,
+                                &handle,
+                                "telegram",
+                                &peer_id_s,
+                                crate::gateway::preparse::PreparseOrigin::User,
+                            )
+                            .await
+                            {
                                 reply.target_id = chat_id_s;
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
@@ -414,18 +486,23 @@ pub(crate) fn start_telegram_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+                            if let Ok(Ok(r)) =
+                                tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+                                    .await
+                            {
                                 if !r.is_empty {
-                                    if let Err(e) = tx.send(OutboundMessage {
-                                        target_id: chat_id_s,
-                                        is_group,
-                                        text: r.text,
-                                        reply_to: None,
-                                        images: r.images,
-                                        files: r.files,
-                                        channel: None,
-                                        account: Some(w_acct_pp.clone()),
-                                    }).await
+                                    if let Err(e) = tx
+                                        .send(OutboundMessage {
+                                            target_id: chat_id_s,
+                                            is_group,
+                                            text: r.text,
+                                            reply_to: None,
+                                            images: r.images,
+                                            files: r.files,
+                                            channel: None,
+                                            account: Some(w_acct_pp.clone()),
+                                        })
+                                        .await
                                     {
                                         tracing::warn!("failed to send message: {e}");
                                     }
@@ -434,7 +511,15 @@ pub(crate) fn start_telegram_if_configured(
                         });
                         return;
                     }
-                    if let Err(e) = user_tx.try_send((text, peer_id, chat_id, is_group, bound, images, file_attachments)) {
+                    if let Err(e) = user_tx.try_send((
+                        text,
+                        peer_id,
+                        chat_id,
+                        is_group,
+                        bound,
+                        images,
+                        file_attachments,
+                    )) {
                         warn!(user = %queue_key, error = %e, "telegram: user queue full, dropping message");
                     }
                 });
@@ -470,10 +555,7 @@ pub(crate) fn start_telegram_if_configured(
             }
         });
 
-        if let Err(e) = manager.register_with_name(
-            chan_name,
-            Arc::clone(&tg) as Arc<dyn Channel>,
-        ) {
+        if let Err(e) = manager.register_with_name(chan_name, Arc::clone(&tg) as Arc<dyn Channel>) {
             tracing::warn!("failed to register channel: {e}");
         }
         let shutdown_for_run = shutdown.clone();

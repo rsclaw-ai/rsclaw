@@ -27,7 +27,8 @@ pub struct AgentSpawner {
     pub live: Arc<LiveConfig>,
     /// Shared provider slot — swapped by `rsclaw reload --scope providers`.
     /// Dynamically spawned agents clone this slot into their handle, so they
-    /// always see the latest registry without needing a per-handle set_providers.
+    /// always see the latest registry without needing a per-handle
+    /// set_providers.
     pub providers: Arc<std::sync::RwLock<Arc<ProviderRegistry>>>,
     pub skills: Arc<SkillRegistry>,
     pub store: Arc<Store>,
@@ -90,6 +91,189 @@ impl AgentSpawner {
         self.spawn_agent_with_kind(entry, AgentKind::Named)
     }
 
+    /// Replace an existing agent atomically — used during hot-reload to swap
+    /// agent handles without a gap where the agent is missing from the
+    /// registry. The old handle's lifetime token is cancelled as a side
+    /// effect.
+    pub fn replace_agent(&self, entry: AgentEntry) -> Result<String> {
+        let id = entry.id.clone();
+
+        let config = self
+            .config
+            .read()
+            .map(|g| Arc::clone(&g))
+            .map_err(|_| anyhow!("config rwlock poisoned"))?;
+
+        let (tx, mut rx) = mpsc::channel::<AgentMessage>(32);
+        let max_concurrent = entry
+            .lane_concurrency
+            .or(config.agents.defaults.max_concurrent)
+            .unwrap_or(4) as usize;
+        let context_window = entry
+            .model
+            .as_ref()
+            .and_then(|m| m.context_tokens)
+            .or(config.agents.defaults.context_tokens)
+            .unwrap_or(0) as usize;
+        let effective_model =
+            crate::runtime::resolve_primary_model_for(&entry, &config.agents.defaults)
+                .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
+
+        let handle = Arc::new(AgentHandle {
+            id: id.clone(),
+            kind: AgentKind::Named,
+            config: entry.clone(),
+            tx,
+            concurrency: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+            live_status: Arc::new(tokio::sync::RwLock::new(
+                crate::runtime::LiveStatus::default(),
+            )),
+            providers: Arc::clone(&self.providers),
+            abort_flags: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            lifetime: tokio_util::sync::CancellationToken::new(),
+            plugin_overrides: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            wasm_plugins: Arc::new(std::sync::RwLock::new(Arc::new(Vec::new()))),
+            notification_tx: Arc::new(std::sync::RwLock::new(None)),
+            cold_enabled: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            started_at: std::time::Instant::now(),
+            session_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            session_tokens: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            last_ctx_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_sys_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_tools_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_msg_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            clear_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            new_session_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            context_window,
+            effective_model,
+            skills: Arc::new(std::sync::RwLock::new(Arc::clone(&self.skills))),
+            js_plugins: Arc::new(std::sync::RwLock::new(self.plugins.clone())),
+        });
+
+        // Atomic swap: old handle is removed and its lifetime cancelled inside
+        // replace_handle.
+        self.registry.replace_handle(Arc::clone(&handle));
+
+        let fallback_models = handle
+            .config
+            .model
+            .as_ref()
+            .and_then(|m| m.fallbacks.clone())
+            .unwrap_or_default();
+
+        let self_arc: Option<Arc<AgentSpawner>> = self.me.get().and_then(|w| w.upgrade());
+
+        let providers_snapshot = self
+            .providers
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_else(|_| Arc::new(ProviderRegistry::new()));
+
+        let mut runtime = AgentRuntime::new(
+            Arc::clone(&handle),
+            Arc::clone(&config),
+            Arc::clone(&self.live),
+            providers_snapshot,
+            fallback_models,
+            Arc::clone(&self.skills),
+            Arc::clone(&self.store),
+            self.memory.clone(),
+            Some(Arc::clone(&self.registry)),
+            Some(self.event_tx.clone()),
+            self_arc,
+            self.plugins.clone(),
+            None,
+            None,
+            self.model_health.clone(),
+            self.cap_manager.clone(),
+            self.cap_live_manager.clone(),
+        );
+
+        // Capture for i18n lookup on the error reply path inside the
+        // spawned task.
+        let config_for_task = Arc::clone(&config);
+        tokio::spawn(async move {
+            info!(agent_id = %handle.id, "dynamic agent replaced (hot-reload)");
+            loop {
+                let msg = tokio::select! {
+                    _ = handle.lifetime.cancelled() => {
+                        info!(agent_id = %handle.id, "dynamic agent lifetime cancelled, stopping");
+                        break;
+                    }
+                    msg = rx.recv() => match msg {
+                        Some(m) => m,
+                        None => break,
+                    },
+                };
+                let AgentMessage {
+                    session_key,
+                    text,
+                    channel,
+                    account,
+                    peer_id,
+                    reply_tx,
+                    extra_tools,
+                    images,
+                    files,
+                    chat_id,
+                    ..
+                } = msg;
+                let result = tokio::select! {
+                    r = runtime.run_turn(
+                        &session_key,
+                        &text,
+                        &channel,
+                        &peer_id,
+                        &chat_id,
+                        account.as_deref(),
+                        extra_tools,
+                        images,
+                        files,
+                        crate::registry::TurnContext::default(),
+                    ) => r,
+                    _ = handle.lifetime.cancelled() => {
+                        info!(agent_id = %handle.id, "dynamic agent lifetime cancelled mid-turn");
+                        break;
+                    }
+                };
+                let reply = result.unwrap_or_else(|e| {
+                    tracing::error!(agent = %handle.id, "dynamic agent turn error: {e:#}");
+                    let outcome = if e.to_string().contains("canceled by A2A CancelTask") {
+                        crate::registry::ReplyOutcome::Canceled
+                    } else {
+                        crate::registry::ReplyOutcome::Error
+                    };
+                    let i18n_lang = config_for_task
+                        .raw
+                        .gateway
+                        .as_ref()
+                        .and_then(|g| g.language.as_deref())
+                        .map(rsclaw_i18n::resolve_lang)
+                        .unwrap_or("en");
+                    let user_text = match outcome {
+                        crate::registry::ReplyOutcome::Canceled => "[canceled]".to_owned(),
+                        _ => rsclaw_i18n::t("backend_unavailable", i18n_lang),
+                    };
+                    AgentReply {
+                        text: user_text,
+                        is_empty: false,
+                        tool_calls: None,
+                        images: vec![],
+                        files: vec![],
+                        pending_analysis: None,
+                        needs_outer_done_emit: false,
+                        outcome,
+                    }
+                });
+                let _ = reply_tx.send(reply);
+            }
+            info!(agent_id = %handle.id, "dynamic agent task ended");
+        });
+
+        Ok(id)
+    }
+
     /// Dynamically spawn a new agent at runtime with explicit kind.
     /// Returns the new agent's ID on success.
     pub fn spawn_agent_with_kind(&self, entry: AgentEntry, kind: AgentKind) -> Result<String> {
@@ -103,7 +287,7 @@ impl AgentSpawner {
             .config
             .read()
             .map(|g| Arc::clone(&g))
-            .unwrap_or_else(|_| Arc::clone(&*self.config.read().unwrap()));
+            .map_err(|_| anyhow!("config rwlock poisoned"))?;
 
         let (tx, mut rx) = mpsc::channel::<AgentMessage>(32);
         let max_concurrent = entry

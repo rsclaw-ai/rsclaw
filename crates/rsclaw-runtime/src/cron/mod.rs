@@ -312,7 +312,7 @@ impl CronRunner {
                 });
             }
 
-            let state = job.state.as_mut().unwrap();
+            let state = job.state.as_mut().expect("state initialized above");
 
             // Clear stale running marker
             if let Some(running_at) = state.running_at_ms {
@@ -559,7 +559,12 @@ impl CronRunner {
             }
 
             if reload_triggered {
-                // Reload jobs from redb.
+                // Reconcile cron.json5 -> redb (catches hand-edits from
+                // `rsclaw cron edit <id>` editor mode). Safe to always run:
+                // compares file vs redb and only overwrites changed fields.
+                if let Some(store) = cron_store() {
+                    reconcile_file_to_redb_on_boot(&store);
+                }
                 let old_count = jobs.len();
                 let (new_jobs, parse_ok) = load_cron_jobs();
 

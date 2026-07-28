@@ -3,7 +3,7 @@
 //! Reads lines from stdin and sends replies to stdout.
 //! Useful for development, testing, and `rsclaw tui`.
 
-use std::sync::Arc;
+use std::{io::Write, sync::Arc};
 
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -42,7 +42,19 @@ impl Channel for CliChannel {
             stdout.write_all(msg.text.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
 
-            // I7: save images to temp files and print paths
+            // Save images to a fresh, private directory rather than a shared
+            // predictable path. The paths are intentionally retained so a
+            // terminal user can open them after this send completes.
+            let image_dir = if msg.images.is_empty() {
+                None
+            } else {
+                Some(
+                    tempfile::Builder::new()
+                        .prefix("rsclaw-cli-images-")
+                        .tempdir()?
+                        .keep(),
+                )
+            };
             for (i, data_uri) in msg.images.iter().enumerate() {
                 let (mime, data) = match parse_data_url(data_uri) {
                     Some(pair) => pair,
@@ -51,22 +63,20 @@ impl Channel for CliChannel {
                         continue;
                     }
                 };
-                let ext = super::attachments::mime_to_ext(&mime);
-                let dir = std::env::temp_dir().join("rsclaw-cli-images");
-                std::fs::create_dir_all(&dir).ok();
-                let fname = format!("image_{}{}", i, ext);
-                let path = dir.join(&fname);
                 // Decode data_uri (already parsed) and write bytes
                 use base64::Engine;
                 match base64::engine::general_purpose::STANDARD.decode(&data) {
                     Ok(bytes) => {
-                        if let Err(e) = tokio::fs::write(&path, &bytes).await {
-                            debug!(?e, "cli: failed to save image {}", i);
-                        } else {
-                            stdout
-                                .write_all(format!("[image: {}]\n", path.display()).as_bytes())
-                                .await?;
-                        }
+                        let file = tempfile::Builder::new()
+                            .prefix(&format!("image_{i}_"))
+                            .suffix(super::attachments::mime_to_ext(&mime))
+                            .tempfile_in(image_dir.as_ref().expect("image directory exists"))?;
+                        let mut file = file;
+                        file.write_all(&bytes)?;
+                        let (_, path) = file.keep()?;
+                        stdout
+                            .write_all(format!("[image: {}]\n", path.display()).as_bytes())
+                            .await?;
                     }
                     Err(e) => {
                         debug!(?e, "cli: failed to decode base64 image {}", i);

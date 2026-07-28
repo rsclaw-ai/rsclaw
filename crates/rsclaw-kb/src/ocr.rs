@@ -95,22 +95,26 @@ impl OcrClient {
         prompt: Option<&str>,
         max_tokens: Option<u32>,
     ) -> Result<String> {
-        let mut body = serde_json::json!({
-            "image": image,
-            "stream": false,
-        });
-        if let Some(m) = &self.model {
-            body["model"] = serde_json::json!(m);
-        }
-        if let Some(l) = &self.lang {
-            body["lang"] = serde_json::json!(l);
-        }
-        if let Some(p) = prompt {
-            body["prompt"] = serde_json::json!(p);
-        }
-        if let Some(mt) = max_tokens {
-            body["max_tokens"] = serde_json::json!(mt);
-        }
+        self.ocr_with_options(image, prompt, max_tokens, None, None)
+    }
+
+    /// Run OCR with optional per-request model and language overrides. Omitted
+    /// overrides retain the configured `kb.ocr` values.
+    pub fn ocr_with_options(
+        &self,
+        image: &str,
+        prompt: Option<&str>,
+        max_tokens: Option<u32>,
+        model: Option<&str>,
+        lang: Option<&str>,
+    ) -> Result<String> {
+        let body = ocr_request_body(
+            image,
+            prompt,
+            max_tokens,
+            model.or(self.model.as_deref()),
+            lang.or(self.lang.as_deref()),
+        );
 
         let send = || async {
             let resp = self
@@ -149,6 +153,32 @@ impl OcrClient {
             .context("ocr response missing `content`")?;
         Ok(content.to_owned())
     }
+}
+
+fn ocr_request_body(
+    image: &str,
+    prompt: Option<&str>,
+    max_tokens: Option<u32>,
+    model: Option<&str>,
+    lang: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "image": image,
+        "stream": false,
+    });
+    if let Some(model) = model {
+        body["model"] = serde_json::json!(model);
+    }
+    if let Some(lang) = lang {
+        body["lang"] = serde_json::json!(lang);
+    }
+    if let Some(prompt) = prompt {
+        body["prompt"] = serde_json::json!(prompt);
+    }
+    if let Some(max_tokens) = max_tokens {
+        body["max_tokens"] = serde_json::json!(max_tokens);
+    }
+    body
 }
 
 /// Pull the rsclaw provider's API key for fleet calls (OCR, embed, rerank —
@@ -207,5 +237,25 @@ impl std::fmt::Debug for OcrClient {
             .field("url", &self.url)
             .field("model", &self.model)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_body_includes_cli_model_and_language_overrides() {
+        let body = ocr_request_body(
+            "data:image/png;base64,AA==",
+            Some("read the receipt"),
+            Some(2048),
+            Some("rsclaw-ocr-v2"),
+            Some("ja"),
+        );
+        assert_eq!(body["model"], "rsclaw-ocr-v2");
+        assert_eq!(body["lang"], "ja");
+        assert_eq!(body["max_tokens"], 2048);
+        assert_eq!(body["prompt"], "read the receipt");
     }
 }

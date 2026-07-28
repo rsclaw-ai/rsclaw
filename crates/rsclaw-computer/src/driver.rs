@@ -43,12 +43,12 @@ use rsclaw_provider::{
 use tracing::{debug, info, warn};
 
 use super::{
-    action::{Action, ExecCtx, MouseButton, ParsedAction, ScrollDir},
+    action::{Action, ActionSpec, ExecCtx, MouseButton, ParsedAction, ScrollDir},
     app_rules::AppRuleSet,
     operator::Operator,
     parser::{CoordFormat, parse_vlm_response},
     permission::{PermissionDecision, PermissionRequest, PermissionStore},
-    prompt::{PromptInputs, build_system_prompt},
+    prompt::{PlatformKind, PromptInputs, build_system_prompt},
     status::ComputerUseStatus,
 };
 
@@ -93,35 +93,25 @@ pub struct Step {
 /// How to interpret the bare coordinate numbers a model emits inside
 /// `start_box` / `end_box`.
 ///
-/// `Normalized` is the target convention (ui-tars-desktop's 0-1000 grid)
-/// and the correct long-term state. `Pixels` is the pragmatic client-side
-/// adaptation for rsclaw-vision-v1, which — despite the prompt explicitly
-/// asking for a 0-1000 grid — emits raw absolute pixels of the screenshot
-/// it was sent (like Doubao UI-TARS). That is a worker/model-side issue
-/// tracked separately; when the model is fixed to emit normalized coords,
-/// flip `CoordSpace::for_model` back so rsclaw-vision uses `Normalized`.
+/// `Normalized` is the target convention (ui-tars-desktop's 0-1000 grid).
+/// All rsclaw-vision models (v1, v2) follow the 0-1000 prompt convention.
+/// `Pixels` is kept for operators/models that emit raw screenshot pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoordSpace {
     /// 0-1000 normalized grid → rescale by `coord / 1000 * screen_dim`.
     Normalized,
-    /// Raw pixels of the screenshot the model was sent. The driver sends
-    /// the full-resolution screenshot, so model coords are already in
-    /// physical-pixel space → identity (no rescale).
+    /// Raw pixels of the (possibly downscaled) screenshot the model was
+    /// sent → physical = `coord / vision_scale`. Identity when the
+    /// screenshot was not downscaled (`vision_scale == 1.0`).
     Pixels,
 }
 
 impl CoordSpace {
-    /// Pick the coordinate space for a given model id. rsclaw-vision-v1
-    /// currently emits raw pixels; everything else follows the 0-1000
-    /// prompt convention. Single source of truth — flip the rsclaw branch
-    /// to `Normalized` once the model is fixed worker-side.
+    /// Pick the coordinate space for a given model id. All rsclaw-vision
+    /// models follow the 0-1000 normalized prompt convention.
     pub fn for_model(model: &str) -> Self {
-        let m = model.to_ascii_lowercase();
-        if m.contains("rsclaw-vision") {
-            CoordSpace::Pixels
-        } else {
-            CoordSpace::Normalized
-        }
+        let _ = model;
+        CoordSpace::Normalized
     }
 }
 
@@ -166,6 +156,11 @@ pub struct VlmDriver<'a> {
     /// event so the UI can correlate them. Caller-minted (typically
     /// `vlm_drive-<uuid>`).
     pub run_id: String,
+    /// Plugin-supplied action space override. When `Some`, the driver
+    /// uses these specs in the system prompt instead of
+    /// `operator.action_spaces()`. Lets plugins declare exactly which
+    /// actions work in their context (e.g. WeChat chat screen).
+    pub action_spaces_override: Option<Vec<ActionSpec>>,
 }
 
 impl VlmDriver<'_> {
@@ -203,13 +198,21 @@ impl VlmDriver<'_> {
         let probe_dims = probe_snap.physical_size;
         let mut next_snap: Option<super::action::Screenshot> = Some(probe_snap);
 
-        let action_spaces = self.operator.action_spaces();
+        let action_spaces = self
+            .action_spaces_override
+            .clone()
+            .unwrap_or_else(|| self.operator.action_spaces());
         let matched: Vec<&_> = self.app_rules.match_instruction(instruction);
+        let platform = match self.operator.name() {
+            "adb" | "android_uiauto" | "iphone_mirror" => PlatformKind::Mobile,
+            _ => PlatformKind::Desktop,
+        };
         let system_prompt = build_system_prompt(&PromptInputs {
             instruction,
             action_spaces: &action_spaces,
             matched_rules: &matched,
             screen_size: Some(probe_dims),
+            platform,
         });
 
         info!(
@@ -367,12 +370,29 @@ impl VlmDriver<'_> {
                 // "you forgot Action:" reminder the model can't act on.
                 // Only exhausted retries fall through to the format-error
                 // path below.
-                if prediction.trim().is_empty() && empty_retries < MAX_EMPTY_RETRIES {
+                if prediction.trim().is_empty()
+                    && empty_retries < MAX_EMPTY_RETRIES
+                {
                     empty_retries += 1;
                     warn!(
                         retries = empty_retries,
                         streak = consecutive_unparseable,
                         "VLM returned an empty prediction (decoder dropout); retrying same turn"
+                    );
+                    continue;
+                }
+                // The vision worker occasionally emits a run of literal
+                // '?' instead of real tokens — same transient failure as
+                // an empty reply, so retry it the same way.
+                let all_question_marks = !prediction.trim().is_empty()
+                    && prediction.trim().chars().all(|c| c == '?');
+                if all_question_marks && empty_retries < MAX_EMPTY_RETRIES {
+                    empty_retries += 1;
+                    warn!(
+                        retries = empty_retries,
+                        chars = prediction.trim().len(),
+                        streak = consecutive_unparseable,
+                        "VLM returned all-'?' prediction (decoder dropout); retrying same turn"
                     );
                     continue;
                 }
@@ -530,6 +550,14 @@ impl VlmDriver<'_> {
                     continue;
                 };
 
+                info!(
+                    step = steps + 1,
+                    coord_space = ?self.coord_space,
+                    vision_scale,
+                    physical = ?action.coords(),
+                    "VLM coord mapping"
+                );
+
                 let ctx = ExecCtx {
                     screen_w,
                     screen_h,
@@ -569,6 +597,19 @@ impl VlmDriver<'_> {
                 }
                 if steps >= self.max_loop {
                     return Ok(DriverOutcome::MaxLoop { steps });
+                }
+                // Let the UI settle after actions that trigger animations
+                // (keyboard open, page transition, menu popup) before the
+                // next screenshot. Skip for wait (already sleeps) and
+                // terminal actions.
+                if !matches!(
+                    action,
+                    Action::Wait { .. }
+                        | Action::ClickAndWait { .. }
+                        | Action::Finished { .. }
+                        | Action::CallUser { .. }
+                ) {
+                    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                 }
             }
         }
@@ -1043,6 +1084,15 @@ fn parsed_to_action(
                 button: MouseButton::Left,
             })
         }
+        "click_and_wait" => {
+            let (x, y) = start_xy?;
+            let wait_ms = raw
+                .get("seconds")
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|s| (s * 1000.0) as u32)
+                .unwrap_or(2000);
+            Some(Action::ClickAndWait { x, y, wait_ms })
+        }
         "right_click" | "right_single" => {
             let (x, y) = start_xy?;
             Some(Action::Click {
@@ -1059,7 +1109,7 @@ fn parsed_to_action(
                 button: MouseButton::Middle,
             })
         }
-        "left_double" | "double_click" => {
+        "left_double" | "double_click" | "double_tap" => {
             let (x, y) = start_xy?;
             Some(Action::DoubleClick { x, y })
         }
@@ -1077,15 +1127,14 @@ fn parsed_to_action(
                 to_y: d,
             })
         }
-        "long_press" => {
-            // Approximated as a click; iOS / Android operators may
-            // upgrade this to a hold internally.
+        "long_press" | "long_click" => {
             let (x, y) = start_xy?;
-            Some(Action::Click {
-                x,
-                y,
-                button: MouseButton::Left,
-            })
+            let duration_ms = raw
+                .get("duration")
+                .or_else(|| raw.get("duration_ms"))
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1000);
+            Some(Action::LongPress { x, y, duration_ms })
         }
         "scroll" => {
             let (x, y) = start_xy.unwrap_or((screen_w as i32 / 2, screen_h as i32 / 2));
@@ -1124,6 +1173,9 @@ fn parsed_to_action(
         }),
         "press_back" => Some(Action::Hotkey {
             keys: "press_back".to_owned(),
+        }),
+        "press_delete" | "press_del" => Some(Action::Hotkey {
+            keys: "delete".to_owned(),
         }),
         "activate_app" | "open_app" | "launch_app" => {
             let app = raw
@@ -1305,16 +1357,19 @@ mod tests {
     }
 
     #[test]
-    fn coord_space_for_model_picks_pixels_for_rsclaw_vision() {
+    fn coord_space_for_model_always_normalized() {
         assert_eq!(
             CoordSpace::for_model("rsclaw-vision-v1"),
-            CoordSpace::Pixels
+            CoordSpace::Normalized
         );
         assert_eq!(
             CoordSpace::for_model("rsclaw/rsclaw-vision-v1"),
-            CoordSpace::Pixels
+            CoordSpace::Normalized
         );
-        // Everything else stays on the 0-1000 prompt convention.
+        assert_eq!(
+            CoordSpace::for_model("rsclaw-vision-v2"),
+            CoordSpace::Normalized
+        );
         assert_eq!(CoordSpace::for_model("ui-tars-1.5"), CoordSpace::Normalized);
         assert_eq!(
             CoordSpace::for_model("doubao-vision"),

@@ -2396,7 +2396,9 @@ impl AgentRuntime {
             let wait_ms = args["wait_ms"].as_u64().unwrap_or(8000);
 
             let mut browser = self.browser.lock().await;
-            let session = browser.as_mut().unwrap();
+            let session = browser
+                .as_mut()
+                .expect("browser initialized — checked above");
 
             // 1. Inject interceptor BEFORE navigating (catches all requests from start).
             let inject_js = r#"(function(){
@@ -2535,7 +2537,11 @@ impl AgentRuntime {
 
         // Now lock again for execute -- guard is dropped, avoiding borrow issues.
         let mut browser = self.browser.lock().await;
-        let result = browser.as_mut().unwrap().execute(action, &args).await;
+        let result = browser
+            .as_mut()
+            .expect("browser initialized — checked above")
+            .execute(action, &args)
+            .await;
         // execute() internally restarts the CDP session on transport errors
         // (WebSocket closed, Chrome crash, etc.). Retry once transparently so
         // the agent doesn't see a spurious "CDP WebSocket closed" error and
@@ -2549,7 +2555,11 @@ impl AgentRuntime {
                 || msg.contains("CDP response channel closed");
             if is_transport {
                 warn!("browser: transparent retry after transport error: {e}");
-                return browser.as_mut().unwrap().execute(action, &args).await;
+                return browser
+                    .as_mut()
+                    .expect("browser initialized — checked above")
+                    .execute(action, &args)
+                    .await;
             }
         }
         result

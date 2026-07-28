@@ -248,7 +248,7 @@ Pin name / phone / IDs / company so they survive Peripheral demotion forever:
 
 ```bash
 # In-chat
-/remember 我叫东升,生日是 1990-01-01
+/remember 我叫用户,生日是 1990-01-01
 # Then either ask the agent to pin, or:
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:18888/api/v1/memory/<id>/pin"

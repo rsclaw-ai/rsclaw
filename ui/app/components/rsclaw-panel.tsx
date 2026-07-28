@@ -29,7 +29,6 @@ import {
   getConfig,
   saveConfig,
   reloadConfig,
-  restartGateway,
   getHubTools,
   getHubSkills,
   getHubPlugins,
@@ -975,12 +974,12 @@ function AgentManagerPage() {
           });
         } catch {}
       }
-      try { await reloadConfig(); } catch {}
+      await reloadConfig(["agents"]);
       // Re-read from config to refresh list
       await fetchAgentList();
       setShowModal(false);
       resetForm();
-      toast.success(getLang() === "cn" ? "\u5DF2\u4FDD\u5B58\uFF0C\u9700\u91CD\u542F\u7F51\u5173\u751F\u6548" : "Saved. Restart gateway to take effect.");
+      toast.success(getLang() === "cn" ? "\u5DF2\u4FDD\u5B58\u5E76\u91CD\u65B0\u52A0\u8F7D" : "Saved and reloaded.");
     } catch (e) {
       toast.fromError(Locale.RsClawPanel.Agents.SaveFailed, e);
     }
@@ -1001,10 +1000,10 @@ function AgentManagerPage() {
         if (cfg.agents?.list) {
           cfg.agents.list = cfg.agents.list.filter((a: any) => a.id !== id);
           await invoke("write_config", { content: JSON.stringify(cfg, null, 2) });
-          try { await reloadConfig(); } catch {}
+          await reloadConfig(["agents"]);
         }
       }
-      toast.success(getLang() === "cn" ? "\u5DF2\u5220\u9664\uFF0C\u9700\u91CD\u542F\u7F51\u5173\u751F\u6548" : "Deleted. Restart gateway to take effect.");
+      toast.success(getLang() === "cn" ? "\u5DF2\u5220\u9664\u5E76\u91CD\u65B0\u52A0\u8F7D" : "Deleted and reloaded.");
     } catch (e) {
       // Revert optimistic update on failure
       await fetchAgentList();
@@ -3875,7 +3874,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="rsclaw/2026.5.5"
+                              placeholder="rsclaw/2026.7.1"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -3950,7 +3949,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="e.g. rsclaw/2026.5.5"
+                              placeholder="e.g. rsclaw/2026.7.1"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -4005,7 +4004,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="e.g. rsclaw/2026.5.5"
+                              placeholder="e.g. rsclaw/2026.7.1"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -5784,27 +5783,13 @@ function PluginsTab() {
       await tauriInvokeV2("install_plugin", { spec: trimmed });
       await fetchPlugins();
       setInstallSpec("");
-      // Plugin manifests are only registered into PluginRegistry /
-      // WasmPlugin slot at gateway boot. reloadConfig() doesn't pick
-      // up new manifest files — only a full re-exec does. POST /restart
-      // is a graceful drain: in-flight requests finish, the listener
-      // releases the port, then the same binary re-execs and rebinds.
-      // User-visible: ~1-2s of "checking..." in the sidebar status dot.
-      let restarting = false;
-      try {
-        await restartGateway();
-        restarting = true;
-      } catch {
-        // Endpoint is loopback-only — non-Tauri / remote UI would 403.
-        // Fall back to the in-process reload so at least the channel
-        // and provider registries refresh. Plugin won't go live until
-        // the next manual restart.
-        try { await reloadConfig(); } catch {}
-      }
+      // `/api/v1/reload` re-scans plugins, shuts down the old JS bridge,
+      // and swaps both WASM and JS registries into running agents.
+      await reloadConfig(["plugins"]);
       toast.success(
         zh
-          ? `${trimmed} ${restarting ? "已安装，网关重启中…" : "已安装"}`
-          : `${trimmed} ${restarting ? "installed, gateway restarting…" : "installed"}`,
+          ? `${trimmed} 已安装并重新加载`
+          : `${trimmed} installed and reloaded`,
       );
     } catch (e: any) {
       const msg = typeof e === "string" ? e : e?.message || "";
@@ -5818,20 +5803,12 @@ function PluginsTab() {
     try {
       await tauriInvokeV2("uninstall_plugin", { name });
       await fetchPlugins(); setDetail(null);
-      // Mirror install path — the gateway still has the plugin loaded
-      // in PluginRegistry until restart. reloadConfig() doesn't unload
-      // a WASM module; only re-exec does.
-      let restarting = false;
-      try {
-        await restartGateway();
-        restarting = true;
-      } catch {
-        try { await reloadConfig(); } catch {}
-      }
+      // Mirror install: hot-reload swaps out the old plugin registries.
+      await reloadConfig(["plugins"]);
       toast.success(
         zh
-          ? `${name} ${restarting ? "已卸载，网关重启中…" : "已卸载"}`
-          : `${name} ${restarting ? "uninstalled, gateway restarting…" : "uninstalled"}`,
+          ? `${name} 已卸载并重新加载`
+          : `${name} uninstalled and reloaded`,
       );
     } catch (e: any) {
       const msg = typeof e === "string" ? e : e?.message || "";

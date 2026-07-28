@@ -49,6 +49,11 @@ android-call: func(command: string, args-json: string)
 /// Returns the server JSON body in its native shape.
 android-uiauto-raw: func(method: string, path: string, json-body: option<string>)
     -> result<string, string>;
+
+/// Push a local artifact file to device shared storage through the CLS
+/// relay-backed ADB transport. Returns the staged device path.
+android-stage-file: func(local-path: string, media-kind: string)
+    -> result<string, string>;
 }
 ```
 
@@ -128,6 +133,24 @@ touch-pointer sequences only; clipboard, keycode, and app lifecycle calls accept
 only their exact typed fields. Adding a raw endpoint therefore requires adding both its
 path capability and its body contract plus tests.
 
+### `android-stage-file`
+
+Stages one local artifact onto the device through `cls android adb push`
+(relay-backed ADB owned by CLS; the host still never spawns `adb` itself).
+
+- `local-path` is canonicalized against the plugin artifact allowlist
+  (workspace, `var/plugins`, `~/Downloads/rsclaw`) before anything runs.
+- `media-kind` is one of `image`, `file`, or `audio`; anything else is rejected.
+- Files larger than 200 MiB and filenames longer than 200 bytes are rejected.
+- Images are pushed to `/sdcard/DCIM/Camera/rsclaw_<epoch-ms>.<ext>` with a
+  whitelisted image extension, so the album picker shows them as the newest
+  item. Files and audio keep their original filename under `/sdcard/Download/`
+  because pickers locate them by name.
+- After an image push the host fires one best-effort
+  `MEDIA_SCANNER_SCAN_FILE` broadcast through `cls android adb shell`; failure
+  only logs a warning because MediaProvider indexes relay pushes on its own.
+- The returned string is the staged device path.
+
 ## Response and error contract
 
 - Success returns compact JSON with the same fields and value types printed by
@@ -150,6 +173,8 @@ Default deadlines:
 | status/key/tap/swipe/current/launch/terminate | 20 s |
 | raw | 30 s |
 | source/tree/inspect/wait-current/screenshot | 45 s |
+| stage-file push | 120 s |
+| stage-file media scan | 20 s |
 
 `wait-current` may request a shorter logical timeout in its arguments; the host
 still enforces its 45-second process deadline.
@@ -170,8 +195,13 @@ still enforces its 45-second process deadline.
   CLS node to that Android automation plugin. Before multiple plugins or
   gateways may share a node, rsclaw needs a host-global, token-bound flow lease;
   a per-process mutex would not protect multi-call or multi-gateway workflows.
-- File staging, clipboard reads/general management, and unrestricted raw calls
-  remain unsupported and must not silently invoke ADB.
+- File staging is only available through the bounded `android-stage-file`
+  import: the host canonicalizes the plugin path against the artifact allowlist,
+  caps file size, restricts the media kind, and picks the device directory
+  (`DCIM/Camera` for images, `Download` otherwise). Plugins never receive ADB
+  argument control.
+- Clipboard reads/general management and unrestricted raw calls remain
+  unsupported and must not silently invoke ADB.
 
 ## Verification
 

@@ -143,8 +143,8 @@ pub fn resolve_vision_model_for(
 /// Returns:
 ///   - `Some(true)` — explicitly declared as image-capable.
 ///   - `Some(false)` — explicitly declared as text-only.
-///   - `None` — no `models[].input` entry found; caller should fall back to
-///     the blocklist heuristic.
+///   - `None` — no `models[].input` entry found; caller should fall back to the
+///     blocklist heuristic.
 pub fn model_supports_image_input(
     config: &rsclaw_config::schema::Config,
     model_name: &str,

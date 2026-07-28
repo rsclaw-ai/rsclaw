@@ -411,7 +411,8 @@ pub(crate) fn start_zalo_if_configured(
                 }
             }
         });
-        if let Err(e) = manager.register_with_name(acct_key, Arc::clone(&zalo) as Arc<dyn Channel>) {
+        if let Err(e) = manager.register_with_name(acct_key, Arc::clone(&zalo) as Arc<dyn Channel>)
+        {
             tracing::warn!("failed to register channel: {e}");
         }
         let shutdown_for_run = shutdown.clone();

@@ -1565,7 +1565,7 @@ pub fn build_tool_list(
                 "image": {"type": "string", "description": "Image to OCR: a workspace/uploads file path, an http(s):// URL, or a data:image/...;base64,... URI."},
                 "lang":  {"type": "string", "description": "Optional language hint (zh/en/...). Omit to auto-detect."},
                 "prompt": {"type": "string", "description": "Optional prompt to guide the OCR output (e.g. request structured JSON, bbox annotations, or specific fields). Omit for plain verbatim text."},
-                "max_tokens": {"type": "integer", "description": "Optional max output tokens. Omit for endpoint default."}
+                "max_tokens": {"type": "integer", "minimum": 0, "maximum": u32::MAX, "description": "Optional max output tokens. Omit for endpoint default."}
             },
             "required": ["image"]
         }),

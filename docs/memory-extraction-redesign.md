@@ -286,7 +286,7 @@ auto-recall 可以恢复,但必须和写入重构一起做,否则会把历史脏
 ## 验收标准
 
 - 新开 20 轮闲聊/催促/普通搜索请求后,memory 新增条目数为 0 或接近 0。
-- 明确事实输入如"我叫东升,幸运数字是 88"后,写入 `entity/preference/fact`,不是 raw `note`。
+- 明确事实输入如"我叫用户,幸运数字是 88"后,写入 `entity/preference/fact`,不是 raw `note`。
 - 同一事实重复输入 3 次后,store 只有 1 条逻辑记忆,`access_count` 或 `importance` 更新。
 - `ask_user` banner、多 agent 测试 prompt、internal repair prompt 不进入普通 agent scope。
 - `/remember` 仍可显式保存,但保存内容参与去重和 tier 判定。

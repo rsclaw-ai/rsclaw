@@ -124,3 +124,5 @@ pub fn create_session() -> Box<dyn DesktopSession> {
 
 pub mod macos_perm;
 mod native;
+
+pub use native::ocr_image_region;

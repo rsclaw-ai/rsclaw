@@ -604,7 +604,12 @@ impl AgentRuntime {
     // A2A dispatch
     // -----------------------------------------------------------------------
 
-    pub(super) async fn dispatch_a2a(&self, ctx: &RunContext, agent_id: &str, args: Value) -> Result<Value> {
+    pub(super) async fn dispatch_a2a(
+        &self,
+        ctx: &RunContext,
+        agent_id: &str,
+        args: Value,
+    ) -> Result<Value> {
         let text = args["text"]
             .as_str()
             .ok_or_else(|| anyhow!("A2A: `text` argument required"))?

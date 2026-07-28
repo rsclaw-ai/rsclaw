@@ -591,6 +591,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     headless_auto_allow: false,
                     status_emit: status_emit_clone,
                     run_id: run_id_clone,
+                    action_spaces_override: None,
                 };
 
                 // Hard ceiling on async task duration (R3 review I1).
@@ -829,6 +830,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 headless_auto_allow: false,
                 status_emit: status_emit.clone(),
                 run_id: attempt_run_id,
+                action_spaces_override: None,
             };
             let attempt_result = tokio::time::timeout(
                 std::time::Duration::from_secs(VLM_DRIVE_HARD_TIMEOUT_SECS),

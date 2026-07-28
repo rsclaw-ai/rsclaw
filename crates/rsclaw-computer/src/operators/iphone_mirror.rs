@@ -254,6 +254,15 @@ fn execute_blocking(action: &Action, _ctx: &ExecCtx) -> Result<ActionOutput> {
                 .map_err(|e| anyhow!("click failed: {e}"))?;
             Ok(ActionOutput::ok())
         }
+        Action::ClickAndWait { x, y, wait_ms } => {
+            let (sx, sy) = to_screen(*x, *y);
+            let _ = enigo.move_mouse(sx, sy, Coordinate::Abs);
+            enigo
+                .button(Button::Left, Click)
+                .map_err(|e| anyhow!("click_and_wait click failed: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(*wait_ms as u64));
+            Ok(ActionOutput::ok())
+        }
         Action::DoubleClick { x, y } => {
             let (sx, sy) = to_screen(*x, *y);
             let _ = enigo.move_mouse(sx, sy, Coordinate::Abs);
@@ -264,6 +273,18 @@ fn execute_blocking(action: &Action, _ctx: &ExecCtx) -> Result<ActionOutput> {
             enigo
                 .button(Button::Left, Click)
                 .map_err(|e| anyhow!("double_click step2 failed: {e}"))?;
+            Ok(ActionOutput::ok())
+        }
+        Action::LongPress { x, y, .. } => {
+            let (sx, sy) = to_screen(*x, *y);
+            let _ = enigo.move_mouse(sx, sy, Coordinate::Abs);
+            enigo
+                .button(Button::Left, Press)
+                .map_err(|e| anyhow!("long_press press failed: {e}"))?;
+            std::thread::sleep(Duration::from_millis(800));
+            enigo
+                .button(Button::Left, Release)
+                .map_err(|e| anyhow!("long_press release failed: {e}"))?;
             Ok(ActionOutput::ok())
         }
         Action::MouseMove { x, y } => {

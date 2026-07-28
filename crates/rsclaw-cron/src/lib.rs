@@ -103,6 +103,35 @@ impl CronSchedule {
         }
     }
 
+    /// Human-readable schedule string for display (e.g. "every 30s",
+    /// "every 5m", "* * * * *").
+    pub fn display(&self) -> String {
+        match self {
+            CronSchedule::Flat(s) => s.to_owned(),
+            CronSchedule::Tagged(CronScheduleTagged::Nested { expr, .. }) => expr.clone(),
+            CronSchedule::Tagged(CronScheduleTagged::Every { every_ms, .. }) => {
+                if let Some(ms) = every_ms {
+                    if *ms > 0 {
+                        return format_every_ms(*ms);
+                    }
+                }
+                "every".to_owned()
+            }
+            CronSchedule::Tagged(CronScheduleTagged::Once { at_ms, delay_ms }) => {
+                if let Some(ms) = at_ms {
+                    let dt = chrono::DateTime::from_timestamp_millis(*ms as i64)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_else(|| "?".to_owned());
+                    return format!("once at {dt}");
+                } else if let Some(ms) = delay_ms {
+                    format_once_delay(*ms)
+                } else {
+                    "once".to_owned()
+                }
+            }
+        }
+    }
+
     pub fn tz(&self) -> Option<&str> {
         match self {
             CronSchedule::Flat(_) => None,
@@ -161,6 +190,49 @@ impl CronSchedule {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Human-readable schedule formatting
+// ---------------------------------------------------------------------------
+
+fn format_every_ms(ms: u64) -> String {
+    if ms == 0 {
+        return "every".to_owned();
+    }
+    if ms < 1000 {
+        return format!("every {}ms", ms);
+    }
+    let secs = ms / 1000;
+    if secs < 60 {
+        return format!("every {}s", secs);
+    }
+    let mins = secs / 60;
+    let rem_secs = secs % 60;
+    if mins < 60 {
+        if rem_secs == 0 {
+            return format!("every {}m", mins);
+        }
+        return format!("every {}m{}s", mins, rem_secs);
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        if rem_mins == 0 {
+            return format!("every {}h", hours);
+        }
+        return format!("every {}h{}m", hours, rem_mins);
+    }
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+    if rem_hours == 0 {
+        return format!("every {}d", days);
+    }
+    format!("every {}d{}h", days, rem_hours)
+}
+
+fn format_once_delay(ms: u64) -> String {
+    format!("once in {}", format_every_ms(ms).strip_prefix("every ").unwrap_or("?"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

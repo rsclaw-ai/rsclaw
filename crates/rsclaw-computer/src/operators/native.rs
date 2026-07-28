@@ -214,6 +214,17 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
             let btn = map_button(*button);
             try_input(enigo.button(btn, Click), "button")
         }
+        Action::ClickAndWait { x, y, wait_ms } => {
+            let (lx, ly) = scale_for_input(*x, *y, ctx.scale_factor);
+            if let Err(msg) = ok_or_msg(enigo.move_mouse(lx, ly, Coordinate::Abs), "move_mouse") {
+                return Ok(ActionOutput::err(msg));
+            }
+            let out = try_input(enigo.button(Button::Left, Click), "button")?;
+            if out.ok {
+                std::thread::sleep(std::time::Duration::from_millis(*wait_ms as u64));
+            }
+            Ok(out)
+        }
         Action::DoubleClick { x, y } => {
             let (lx, ly) = scale_for_input(*x, *y, ctx.scale_factor);
             if let Err(msg) = ok_or_msg(enigo.move_mouse(lx, ly, Coordinate::Abs), "move_mouse") {
@@ -223,6 +234,17 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
                 return Ok(ActionOutput::err(msg));
             }
             try_input(enigo.button(Button::Left, Click), "button")
+        }
+        Action::LongPress { x, y, .. } => {
+            let (lx, ly) = scale_for_input(*x, *y, ctx.scale_factor);
+            if let Err(msg) = ok_or_msg(enigo.move_mouse(lx, ly, Coordinate::Abs), "move_mouse") {
+                return Ok(ActionOutput::err(msg));
+            }
+            if let Err(msg) = ok_or_msg(enigo.button(Button::Left, Press), "button press") {
+                return Ok(ActionOutput::err(msg));
+            }
+            std::thread::sleep(Duration::from_millis(800));
+            try_input(enigo.button(Button::Left, Release), "button release")
         }
         Action::Drag {
             from_x,
@@ -770,7 +792,7 @@ mod tests {
             "expected at least 9 action specs, got {}",
             specs.len()
         );
-        let sigs: Vec<&str> = specs.iter().map(|s| s.signature).collect();
+        let sigs: Vec<&str> = specs.iter().map(|s| s.signature.as_str()).collect();
         for needle in ["click", "type", "hotkey", "scroll", "wait", "finished"] {
             assert!(
                 sigs.iter().any(|s| s.contains(needle)),

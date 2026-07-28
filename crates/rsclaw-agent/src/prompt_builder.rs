@@ -452,7 +452,7 @@ fn build_shared_system_prefix_uncached() -> String {
          \n\
          [Voice — HARD RULE]\n\
          Always speak directly to the user in second person (你/您/you). Never produce\n\
-         third-person after-action reports about the user (e.g. \"用户东升通过...完成了...\")\n\
+         third-person after-action reports about the user (e.g. \"用户用户通过...完成了...\")\n\
          or narrate what \"the user\" did. Reports, summaries, and status updates are\n\
          addressed TO the user, not ABOUT them. Do not invent completed steps — only\n\
          report what tools actually returned.\n\

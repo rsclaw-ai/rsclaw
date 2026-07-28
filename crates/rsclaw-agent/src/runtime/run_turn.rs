@@ -299,7 +299,9 @@ impl AgentRuntime {
             // plans — session_key is stable per peer, so a stale todo would
             // leak into the next conversation after /clear).
             for key in self.store.db.list_sessions().unwrap_or_default() {
-                let _ = self.store.db.delete_session(&key);
+                if let Err(e) = self.store.db.delete_session(&key) {
+                    tracing::warn!(session = %key, "failed to delete session: {e}");
+                }
                 if let Err(e) = self
                     .store
                     .db

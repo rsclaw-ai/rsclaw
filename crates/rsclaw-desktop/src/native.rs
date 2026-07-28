@@ -6,7 +6,13 @@
 //! `Enigo` per call because `Enigo` is not `Send` on Windows. Screenshots
 //! are similarly blocking.
 
-use std::process::Command;
+use std::{
+    fs::OpenOptions,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use base64::Engine;
 use enigo::{
@@ -22,6 +28,54 @@ use super::DesktopSession;
 /// Unit struct — holds no state because every enigo call needs a fresh
 /// instance on the calling OS thread.
 pub struct NativeDesktopSession;
+
+struct PrivateTempFile {
+    path: PathBuf,
+}
+
+impl PrivateTempFile {
+    fn create(prefix: &str, suffix: &str) -> Result<Self, String> {
+        static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..32 {
+            let nonce = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| format!("read system time for temp file: {e}"))?
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "{prefix}{}-{nanos}-{nonce}{suffix}",
+                std::process::id()
+            ));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(_) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("create private temp file: {e}")),
+            }
+        }
+        Err("create private temp file: too many name collisions".to_owned())
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateTempFile {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %self.path.display(), %error, "failed to remove private OCR temp file");
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -241,7 +295,7 @@ fn capture_app_window(app_name: &str) -> Result<String, String> {
 /// `Windows.Media.Ocr`; on macOS native Vision FFI is planned (currently
 /// returns an empty result and callers fall back to VLM grounding).
 /// Returns a JSON array of recognised lines with 0-1000 relative centre
-/// coords: `[{"text":"东升","x":143,"y":699}, ...]`.
+/// coords: `[{"text":"用户","x":143,"y":699}, ...]`.
 /// Far more precise than VLM grounding for clicking a named row.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn ocr_window(_app_name: &str) -> Result<String, String> {
@@ -437,18 +491,12 @@ fn wechat_screenshot_png(win: &capture::WindowInfo) -> Result<Vec<u8>, String> {
 /// win_x, win_y, win_w, win_h) where the bounds let the OCR driver compute
 /// screen-absolute click coordinates.
 #[cfg(target_os = "windows")]
-fn wechat_altA_screenshot_sync(app_name: &str) -> Result<(Vec<u8>, i32, i32, u32, u32), String> {
+fn wechat_altA_screenshot_sync(_app_name: &str) -> Result<(Vec<u8>, i32, i32, u32, u32), String> {
     use std::os::windows::process::CommandExt;
-    let proc_name = if app_name.to_lowercase().contains("weixin") {
-        "Weixin"
-    } else {
-        "WeChat"
-    };
     // Focus WeChat via AttachThreadInput and get its window rect.
-    let ps_focus = format!(
-        r#"$sig=@'
+    let ps_focus = r#"$sig=@'
 using System; using System.Runtime.InteropServices;
-public class FWOCR {{
+public class FWOCR {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
@@ -457,28 +505,26 @@ public class FWOCR {{
   [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a,uint b,bool f);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out RECT r);
-  [StructLayout(LayoutKind.Sequential)] public struct RECT{{public int L,T,R,B;}}
-  public static string Go(IntPtr h){{
+  [StructLayout(LayoutKind.Sequential)] public struct RECT{public int L,T,R,B;}
+  public static string Go(IntPtr h){
     ShowWindow(h,5);
     IntPtr fg=GetForegroundWindow(); uint pid; uint fgT=GetWindowThreadProcessId(fg,out pid);
     uint cur=GetCurrentThreadId(); AttachThreadInput(cur,fgT,true);
     BringWindowToTop(h); SetForegroundWindow(h); AttachThreadInput(cur,fgT,false);
     RECT r; GetWindowRect(h,out r);
     return r.L+","+r.T+","+(r.R-r.L)+","+(r.B-r.T);
-  }}
-}}
+  }
+}
 '@
 Add-Type $sig -ErrorAction SilentlyContinue
-$p=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*' -and $_.MainWindowHandle -ne 0}} | Select-Object -First 1
-if(-not $p){{
-  $wx=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*'}} | Select-Object -First 1
-  if($wx){{ $path=$wx.Path; if($path){{ Start-Process $path }} }}
+$p=Get-Process | Where-Object {($_.ProcessName -like '*WeChat*' -or $_.ProcessName -like '*Weixin*') -and $_.MainWindowHandle -ne 0} | Select-Object -First 1
+if(-not $p){
+  $wx=Get-Process | Where-Object {($_.ProcessName -like '*WeChat*' -or $_.ProcessName -like '*Weixin*')} | Select-Object -First 1
+  if($wx){ $path=$wx.Path; if($path){ Start-Process $path } }
   Start-Sleep -Milliseconds 1500
-  $p=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*' -and $_.MainWindowHandle -ne 0}} | Select-Object -First 1
-}}
-if($p){{ [FWOCR]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
-        proc = proc_name
-    );
+  $p=Get-Process | Where-Object {($_.ProcessName -like '*WeChat*' -or $_.ProcessName -like '*Weixin*') -and $_.MainWindowHandle -ne 0} | Select-Object -First 1
+}
+if($p){ [FWOCR]::Go($p.MainWindowHandle) } else { Write-Error 'WECHAT_WINDOW_NOT_FOUND'; exit 1 }"#;
     let mut cmd = Command::new("powershell");
     cmd.args([
         "-NoProfile",
@@ -488,25 +534,32 @@ if($p){{ [FWOCR]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
         &ps_focus,
     ]);
     cmd.creation_flags(0x08000000);
-    let focus_stdout = cmd
+    let focus = cmd
         .output()
-        .map(|o| o.stdout)
-        .unwrap_or_else(|_| b"0,0,1200,800".to_vec());
-    let s = String::from_utf8_lossy(&focus_stdout);
+        .map_err(|e| format!("WeChat focus: powershell spawn: {e}"))?;
+    if !focus.status.success() {
+        return Err(format!(
+            "WeChat focus failed: {}",
+            String::from_utf8_lossy(&focus.stderr).trim()
+        ));
+    }
+    let s = String::from_utf8_lossy(&focus.stdout);
     let parts: Vec<i64> = s
         .trim()
         .split(',')
         .filter_map(|p| p.trim().parse().ok())
         .collect();
-    let (wx, wy, ww, wh, cx, cy) = if parts.len() == 4 {
-        let x = parts[0] as i32;
-        let y = parts[1] as i32;
-        let w = parts[2].max(1) as u32;
-        let h = parts[3].max(1) as u32;
-        (x, y, w, h, x + (w as i32 / 2), y + (h as i32 / 2))
-    } else {
-        (0, 0, 1200u32, 800u32, 600i32, 400i32)
-    };
+    if parts.len() != 4 || parts[2] <= 0 || parts[3] <= 0 {
+        return Err(format!(
+            "WeChat focus returned invalid window bounds: {s:?}"
+        ));
+    }
+    let wx = parts[0] as i32;
+    let wy = parts[1] as i32;
+    let ww = parts[2] as u32;
+    let wh = parts[3] as u32;
+    let cx = wx + (ww as i32 / 2);
+    let cy = wy + (wh as i32 / 2);
     std::thread::sleep(std::time::Duration::from_millis(400));
     // Clear clipboard.
     let mut clr = Command::new("powershell");
@@ -517,7 +570,9 @@ if($p){{ [FWOCR]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
         "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::Clear()",
     ]);
     clr.creation_flags(0x08000000);
-    let _ = clr.output();
+    if let Err(e) = clr.output() {
+        tracing::debug!(?e, "Alt+A OCR: failed to clear clipboard before capture");
+    }
     // Press Alt+A via enigo.
     let mut enigo = new_enigo()?;
     enigo
@@ -544,22 +599,21 @@ if($p){{ [FWOCR]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
         .map_err(|e| format!("enter: {e}"))?;
     std::thread::sleep(std::time::Duration::from_millis(1000));
     // Read PNG from clipboard.
-    let tmp = std::env::temp_dir().join(format!("rsclaw_ocr_altA_{}.png", std::process::id()));
+    let tmp = PrivateTempFile::create("rsclaw-ocr-alta-", ".png")?;
     let ps_read = format!(
         "Add-Type -AssemblyName System.Windows.Forms; \
          Add-Type -AssemblyName System.Drawing; \
          $img=[System.Windows.Forms.Clipboard]::GetImage(); \
          if($img -eq $null){{ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }}; \
          $img.Save('{}',[System.Drawing.Imaging.ImageFormat]::Png); 'ok'",
-        tmp.display()
+        tmp.path().display()
     );
     let mut ps_cmd = Command::new("powershell");
     ps_cmd.args(["-NoProfile", "-STA", "-Command", &ps_read]);
     ps_cmd.creation_flags(0x08000000);
     match ps_cmd.output() {
-        Ok(out) if out.status.success() => match std::fs::read(&tmp) {
+        Ok(out) if out.status.success() => match std::fs::read(tmp.path()) {
             Ok(bytes) => {
-                let _ = std::fs::remove_file(&tmp);
                 if bytes.is_empty() {
                     Err("Alt+A OCR screenshot: empty clipboard image".to_string())
                 } else {
@@ -591,17 +645,17 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
         let png = capture::capture_window_png(win.id).map_err(|e| e.to_string())?;
         (png, win.x, win.y, win.w, win.h)
     };
-    let tmp = std::env::temp_dir().join(format!("rsclaw_ocr_{}.png", std::process::id()));
-    std::fs::write(&tmp, &png).map_err(|e| format!("write OCR temp PNG: {e}"))?;
+    let tmp = PrivateTempFile::create("rsclaw-ocr-win-", ".png")?;
+    std::fs::write(tmp.path(), &png).map_err(|e| format!("write OCR temp PNG: {e}"))?;
     // Write the OCR script to a temp .ps1 (avoids -Command quoting hell) and run
     // it STA (WinRT requires it). Args: <png> <wx> <wy> <ww> <wh>.
-    let ps = std::env::temp_dir().join("rsclaw_ocr_win.ps1");
-    let _ = std::fs::write(&ps, OCR_WIN_PS1);
+    let ps = PrivateTempFile::create("rsclaw-ocr-win-", ".ps1")?;
+    std::fs::write(ps.path(), OCR_WIN_PS1).map_err(|e| format!("write OCR script: {e}"))?;
     let mut ocr_cmd = Command::new("powershell");
     ocr_cmd
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-File"])
-        .arg(&ps)
-        .arg(&tmp)
+        .arg(ps.path())
+        .arg(tmp.path())
         .arg(wx.to_string())
         .arg(wy.to_string())
         .arg(ww.to_string())
@@ -615,7 +669,6 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
     let out = ocr_cmd
         .output()
         .map_err(|e| format!("powershell OCR spawn failed: {e}"))?;
-    let _ = std::fs::remove_file(&tmp);
     if !out.status.success() {
         return Err(format!(
             "Windows OCR failed: {}",
@@ -683,12 +736,12 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
         return Ok("[]".to_string());
     }
     // Vision reads the image from a file URL (avoids constructing a CGImage from
-    // raw bytes). Write a per-process temp PNG, OCR it, then delete.
-    let tmp = std::env::temp_dir().join(format!("rsclaw_ocr_{}.png", std::process::id()));
-    std::fs::write(&tmp, &png).map_err(|e| format!("write OCR temp PNG: {e}"))?;
+    // raw bytes). Keep a uniquely named temp file alive through the request.
+    let tmp = PrivateTempFile::create("rsclaw-ocr-", ".png")?;
+    std::fs::write(tmp.path(), &png).map_err(|e| format!("write OCR temp PNG: {e}"))?;
 
     let result = (|| -> Result<String, String> {
-        let path = NSString::from_str(&tmp.to_string_lossy());
+        let path = NSString::from_str(&tmp.path().to_string_lossy());
         let url = NSURL::fileURLWithPath(&path);
         let options = NSDictionary::new();
         let handler = unsafe {
@@ -754,8 +807,202 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
         Ok(serde_json::Value::Array(out).to_string())
     })();
 
+    result
+}
+
+/// One OCR hit in pixel coordinates relative to the image that was OCR'd
+/// (the cropped region, or the full image when no rect was given). Confidence
+/// is normalised to 0-1.
+struct OcrHit {
+    text: String,
+    confidence: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// OCR an in-memory PNG with the native on-device engine (macOS Vision,
+/// Windows.Media.Ocr on Windows) — no network round trip, so it is fast enough
+/// for per-keystroke UI confirmation. When `rect` is `Some((x, y, w, h))` the
+/// image is cropped to that pixel region first (clamped to the image bounds);
+/// the OCR then runs on the crop only. Returns JSON
+/// `{"ok":true,"lines":[{"text","confidence","x","y","width","height"}]}` where
+/// `confidence` is 0-1 and `x/y/width/height` are pixel coordinates in the
+/// ORIGINAL (uncropped) image. This is the host backend for the plugin's
+/// `android_ocr_region` fast path.
+pub fn ocr_image_region(png: &[u8], rect: Option<(u32, u32, u32, u32)>) -> Result<String, String> {
+    use image::GenericImageView;
+    let img = image::load_from_memory(png)
+        .map_err(|e| format!("ocr_image_region: decode PNG: {e}"))?;
+    let rgb = img.to_rgb8();
+    let iw = rgb.width();
+    let ih = rgb.height();
+    let (crop_x, crop_y, region) = match rect {
+        Some((rx, ry, rw, rh)) => {
+            let rx = rx.min(iw.saturating_sub(1));
+            let ry = ry.min(ih.saturating_sub(1));
+            let rw = rw.min(iw.saturating_sub(rx)).max(1);
+            let rh = rh.min(ih.saturating_sub(ry)).max(1);
+            (rx, ry, rgb.view(rx, ry, rw, rh).to_image())
+        }
+        None => (0, 0, rgb.clone()),
+    };
+    let (rw, rh) = (region.width(), region.height());
+    let tmp = std::env::temp_dir().join(format!("rsclaw_ocr_region_{}.png", std::process::id()));
+    region
+        .save(&tmp)
+        .map_err(|e| format!("ocr_image_region: write temp PNG: {e}"))?;
+
+    let result = (|| -> Result<String, String> {
+        let hits = ocr_file_hits(&tmp, rw, rh)?;
+        let mut lines: Vec<serde_json::Value> = Vec::new();
+        for hit in hits {
+            if hit.text.trim().is_empty() {
+                continue;
+            }
+            lines.push(serde_json::json!({
+                "text": hit.text,
+                "confidence": hit.confidence,
+                "x": (f64::from(crop_x) + hit.x).round() as i64,
+                "y": (f64::from(crop_y) + hit.y).round() as i64,
+                "width": hit.width.round() as i64,
+                "height": hit.height.round() as i64,
+            }));
+        }
+        Ok(serde_json::json!({ "ok": true, "lines": lines }).to_string())
+    })();
+
     let _ = std::fs::remove_file(&tmp);
     result
+}
+
+/// macOS Vision OCR of a PNG file already on disk. `iw`/`ih` are the image's
+/// pixel dimensions, used to denormalise Vision's [0,1] bottom-left bounding
+/// boxes into top-left pixel coordinates.
+#[cfg(target_os = "macos")]
+fn ocr_file_hits(path: &std::path::Path, iw: u32, ih: u32) -> Result<Vec<OcrHit>, String> {
+    use objc2::AnyThread;
+    use objc2_foundation::{NSArray, NSDictionary, NSString, NSURL};
+    use objc2_vision::{
+        VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel,
+    };
+
+    let path_str = NSString::from_str(&path.to_string_lossy());
+    let url = NSURL::fileURLWithPath(&path_str);
+    let options = NSDictionary::new();
+    let handler = unsafe {
+        VNImageRequestHandler::initWithURL_options(VNImageRequestHandler::alloc(), &url, &options)
+    };
+
+    let request = VNRecognizeTextRequest::new();
+    request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
+    request.setUsesLanguageCorrection(true);
+    let zh = NSString::from_str("zh-Hans");
+    let en = NSString::from_str("en-US");
+    let langs = NSArray::from_slice(&[&*zh, &*en]);
+    request.setRecognitionLanguages(&langs);
+
+    let req_ref: &VNRequest = &request;
+    let requests = NSArray::from_slice(&[req_ref]);
+    handler
+        .performRequests_error(&requests)
+        .map_err(|e| format!("Vision performRequests failed: {e}"))?;
+
+    let observations = match request.results() {
+        Some(o) => o,
+        None => return Ok(Vec::new()),
+    };
+
+    let (iw, ih) = (f64::from(iw), f64::from(ih));
+    let mut hits = Vec::new();
+    for obs in observations.iter() {
+        let candidates = obs.topCandidates(1);
+        let Some(top) = candidates.firstObject() else {
+            continue;
+        };
+        let text = top.string().to_string();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let bb = unsafe { obs.boundingBox() };
+        let width = bb.size.width * iw;
+        let height = bb.size.height * ih;
+        let x = bb.origin.x * iw;
+        // Vision's boundingBox origin is bottom-left; flip to a top-left y.
+        let y = (1.0 - bb.origin.y - bb.size.height) * ih;
+        hits.push(OcrHit {
+            text,
+            confidence: top.confidence() as f64,
+            x,
+            y,
+            width,
+            height,
+        });
+    }
+    Ok(hits)
+}
+
+/// Windows.Media.Ocr (WinRT via PowerShell) of a PNG file on disk. Runs the
+/// shared OCR_WIN_PS1 in full-image mode (window bounds 0) so the emitted
+/// sx/sy are pixel centres within the image. Windows OCR exposes no per-line
+/// size, so width/height are reported as 0.
+#[cfg(target_os = "windows")]
+fn ocr_file_hits(path: &std::path::Path, _iw: u32, _ih: u32) -> Result<Vec<OcrHit>, String> {
+    let ps = std::env::temp_dir().join("rsclaw_ocr_region.ps1");
+    let _ = std::fs::write(&ps, OCR_WIN_PS1);
+    let mut ocr_cmd = Command::new("powershell");
+    ocr_cmd
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-File"])
+        .arg(&ps)
+        .arg(path)
+        .arg("0")
+        .arg("0")
+        .arg("0")
+        .arg("0");
+    {
+        use std::os::windows::process::CommandExt;
+        ocr_cmd.creation_flags(0x08000000);
+    }
+    let out = ocr_cmd
+        .output()
+        .map_err(|e| format!("powershell OCR spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "Windows OCR failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if stdout.is_empty() || stdout == "null" {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Windows OCR parse failed: {e}; out={stdout}"))?;
+    let mut hits = Vec::new();
+    for row in rows {
+        let text = row.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let conf = row.get("conf").and_then(|v| v.as_f64()).unwrap_or(100.0);
+        let sx = row.get("sx").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let sy = row.get("sy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        hits.push(OcrHit {
+            text,
+            confidence: conf / 100.0,
+            x: sx,
+            y: sy,
+            width: 0.0,
+            height: 0.0,
+        });
+    }
+    Ok(hits)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn ocr_file_hits(_path: &std::path::Path, _iw: u32, _ih: u32) -> Result<Vec<OcrHit>, String> {
+    Err("ocr_image_region only implemented on macOS and Windows".to_string())
 }
 
 /// Convert a macOS bundle-id to the process name used by System Events.

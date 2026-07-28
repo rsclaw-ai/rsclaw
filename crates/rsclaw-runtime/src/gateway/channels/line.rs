@@ -458,7 +458,8 @@ pub(crate) fn start_line_if_configured(
                 }
             }
         });
-        if let Err(e) = manager.register_with_name(acct_key, Arc::clone(&line) as Arc<dyn Channel>) {
+        if let Err(e) = manager.register_with_name(acct_key, Arc::clone(&line) as Arc<dyn Channel>)
+        {
             tracing::warn!("failed to register channel: {e}");
         }
         let shutdown_for_run = shutdown.clone();
