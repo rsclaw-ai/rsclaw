@@ -84,6 +84,7 @@ const LAUNCH_ARGS: &[ArgSpec] = &[
     ArgSpec::new("package", "--package", ArgKind::String, true),
     ArgSpec::new("activity", "--activity", ArgKind::String, false),
 ];
+const RELAUNCH_ARGS: &[ArgSpec] = LAUNCH_ARGS;
 const LONG_PRESS_ARGS: &[ArgSpec] = &[
     ArgSpec::new("x", "--x", ArgKind::Integer, true),
     ArgSpec::new("y", "--y", ArgKind::Integer, true),
@@ -203,6 +204,10 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     if command == OCR_REGION_COMMAND {
         return ocr_region(args_json, &config).await;
     }
+    if command == "foreground-package" {
+        validate_no_args(command, args_json)?;
+        return foreground_package(&config).await;
+    }
     if command == "keyevent" {
         let keycode = keyevent_keycode(args_json)?;
         let mut args = uiauto_base_args(&config, "key");
@@ -214,10 +219,14 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     if command == "screenshot" {
         return screenshot_with_wakeup(&config).await;
     }
+    if command == "relaunch" {
+        return relaunch_with_adb_foreground_fallback(&config, &args).await;
+    }
     run_cls(&config.cls_bin, &args, deadline_for(command)).await
 }
 
-/// Type through CLS's native text path, optionally focusing a visual-only field.
+/// Type through CLS's native text path, optionally focusing a visual-only
+/// field.
 async fn input_text(args_json: &str, config: &Config) -> Result<String, String> {
     let input = input_text_value(args_json)?;
     let args = input_text_args(config, input);
@@ -272,7 +281,10 @@ fn input_text_value(args_json: &str) -> Result<InputText, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "android uiauto: args JSON must be an object".to_string())?;
-    if !object.keys().all(|key| matches!(key.as_str(), "text" | "x" | "y")) {
+    if !object
+        .keys()
+        .all(|key| matches!(key.as_str(), "text" | "x" | "y"))
+    {
         return Err("android uiauto: `input-text` accepts only `text`, `x`, and `y`".to_string());
     }
     let text = object
@@ -316,7 +328,9 @@ fn keyevent_keycode(args_json: &str) -> Result<i32, String> {
         .and_then(Value::as_i64)
         .ok_or_else(|| "android uiauto: keyevent requires integer `keycode`".to_string())?;
     if !(0..=i32::MAX as i64).contains(&keycode) {
-        return Err(format!("android uiauto: keyevent keycode {keycode} out of range"));
+        return Err(format!(
+            "android uiauto: keyevent keycode {keycode} out of range"
+        ));
     }
     Ok(keycode as i32)
 }
@@ -1130,7 +1144,10 @@ pub(crate) async fn raw(
 pub(crate) async fn stage_file(local_path: &Path, media_kind: &str) -> Result<String, String> {
     let config = Config::from_env()?;
     let metadata = std::fs::metadata(local_path).map_err(|error| {
-        format!("android stage: cannot read {}: {error}", local_path.display())
+        format!(
+            "android stage: cannot read {}: {error}",
+            local_path.display()
+        )
     })?;
     if !metadata.is_file() {
         return Err(format!(
@@ -1157,7 +1174,10 @@ pub(crate) async fn stage_file(local_path: &Path, media_kind: &str) -> Result<St
                 .extension()
                 .map(|value| value.to_string_lossy().to_ascii_lowercase())
                 .filter(|value| {
-                    matches!(value.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp")
+                    matches!(
+                        value.as_str(),
+                        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
+                    )
                 })
                 .unwrap_or_else(|| "jpg".to_string());
             format!(
@@ -1166,7 +1186,11 @@ pub(crate) async fn stage_file(local_path: &Path, media_kind: &str) -> Result<St
             )
         }
         "file" | "audio" => format!("/sdcard/Download/{filename}"),
-        _ => return Err(format!("android stage: unsupported media kind `{media_kind}`")),
+        _ => {
+            return Err(format!(
+                "android stage: unsupported media kind `{media_kind}`"
+            ));
+        }
     };
 
     let mut push_args = adb_base_args(&config, "push");
@@ -1207,6 +1231,119 @@ fn adb_base_args(config: &Config, subcommand: &str) -> Vec<String> {
         "-n".to_string(),
         config.node.clone(),
     ]
+}
+
+/// Relaunch an app through CLS, recovering with a controlled ADB launcher
+/// intent when CLS cannot verify its foreground window on a device.
+async fn relaunch_with_adb_foreground_fallback(
+    config: &Config,
+    relaunch_args: &[String],
+) -> Result<String, String> {
+    let package = command_option(relaunch_args, "--package")?;
+    let cls_result = run_cls(&config.cls_bin, relaunch_args, Duration::from_secs(20)).await;
+    // On this device CLS can complete the start but report an empty current
+    // window. The activity manager is the authoritative foreground signal.
+    if wait_for_foreground_package(config, package).await? {
+        return Ok(cls_result.unwrap_or_else(|_| {
+            serde_json::json!({ "relaunch": "cls-verified-by-adb", "package": package })
+                .to_string()
+        }));
+    }
+
+    let cls_error = cls_result.err();
+    let activity = command_option(relaunch_args, "--activity")?;
+    let component = format!("{package}/{activity}");
+    let mut launch_args = adb_base_args(config, "shell");
+    launch_args.extend([
+        "am".to_string(),
+        "start".to_string(),
+        "-n".to_string(),
+        component,
+    ]);
+    run_cls_process(&config.cls_bin, &launch_args, Duration::from_secs(20)).await?;
+
+    for delay in [Duration::from_millis(500), Duration::from_millis(750)] {
+        if foreground_package_matches(config, package).await? {
+            return Ok(
+                serde_json::json!({ "relaunch": "adb-fallback", "package": package }).to_string(),
+            );
+        }
+        tokio::time::sleep(delay).await;
+    }
+    if foreground_package_matches(config, package).await? {
+        return Ok(serde_json::json!({ "relaunch": "adb-fallback", "package": package }).to_string());
+    }
+
+    let cls_context = cls_error
+        .map(|error| format!("; CLS relaunch result: {error}"))
+        .unwrap_or_default();
+    Err(format!(
+        "android uiauto: relaunch fallback did not foreground `{package}`{cls_context}"
+    ))
+}
+
+/// Return the value following an option from an internally built CLS command.
+fn command_option<'a>(args: &'a [String], option: &str) -> Result<&'a str, String> {
+    args.windows(2)
+        .find_map(|pair| (pair[0] == option).then_some(pair[1].as_str()))
+        .ok_or_else(|| format!("android uiauto: internally built command is missing `{option}`"))
+}
+
+/// Return the package owning Android's resumed activity or focused window.
+async fn foreground_package(config: &Config) -> Result<String, String> {
+    let output = foreground_activity_dump(config).await?;
+    foreground_package_from_dump(&output)
+        .map(|package| serde_json::json!({ "package": package }).to_string())
+        .ok_or_else(|| "android uiauto: foreground package is unavailable".to_string())
+}
+
+/// Wait briefly for Android to report the target as foreground.
+async fn wait_for_foreground_package(config: &Config, package: &str) -> Result<bool, String> {
+    for delay in [
+        Duration::ZERO,
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(4),
+    ] {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if foreground_package_matches(config, package).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Verify the target package owns Android's resumed activity or focused window.
+async fn foreground_package_matches(config: &Config, package: &str) -> Result<bool, String> {
+    Ok(foreground_package_from_dump(&foreground_activity_dump(config).await?)
+        .as_deref()
+        == Some(package))
+}
+
+/// Read Android's current resumed/focused activity through the CLS ADB relay.
+async fn foreground_activity_dump(config: &Config) -> Result<String, String> {
+    let mut args = adb_base_args(config, "shell");
+    args.extend([
+        "dumpsys".to_string(),
+        "activity".to_string(),
+        "activities".to_string(),
+    ]);
+    let output = run_cls_process(&config.cls_bin, &args, Duration::from_secs(20)).await?;
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+/// Extract the package from Android's resumed activity or focused window line.
+fn foreground_package_from_dump(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find(|line| line.contains("topResumedActivity") || line.contains("mCurrentFocus"))
+        .and_then(|line| line.split_once(" u0 ").map(|(_, component)| component))
+        .and_then(|component| component.split('/').next())
+        .map(str::trim)
+        .filter(|package| !package.is_empty())
+        .map(str::to_string)
 }
 
 fn staged_timestamp_ms() -> Result<u128, String> {
@@ -1260,7 +1397,11 @@ fn build_call_args(config: &Config, command: &str, args_json: &str) -> Result<Ve
     validate_object_keys(command, object, specs)?;
     validate_command_requirements(command, object, specs)?;
 
-    let mut args = uiauto_base_args(config, command);
+    let mut args = if command == "relaunch" {
+        relaunch_base_args(config)
+    } else {
+        uiauto_base_args(config, command)
+    };
     for spec in specs {
         let Some(value) = object.get(spec.key) else {
             continue;
@@ -1282,6 +1423,17 @@ fn uiauto_base_args(config: &Config, command: &str) -> Vec<String> {
     ]
 }
 
+/// Build CLS's high-level app relaunch command without a UIAutomator2 port.
+fn relaunch_base_args(config: &Config) -> Vec<String> {
+    vec![
+        "android".to_string(),
+        "uiauto".to_string(),
+        "relaunch".to_string(),
+        "--node".to_string(),
+        config.node.clone(),
+    ]
+}
+
 /// Build a CLS display-power command without involving UIAutomator2.
 fn power_base_args(config: &Config, command: &str) -> Vec<String> {
     vec![
@@ -1300,6 +1452,7 @@ fn command_specs(command: &str) -> Option<&'static [ArgSpec]> {
         "tap" => Some(TAP_ARGS),
         "swipe" => Some(SWIPE_ARGS),
         "launch" => Some(LAUNCH_ARGS),
+        "relaunch" => Some(RELAUNCH_ARGS),
         "long-press" => Some(LONG_PRESS_ARGS),
         "double-tap" => Some(DOUBLE_TAP_ARGS),
         "drag" => Some(DRAG_ARGS),
@@ -2337,6 +2490,59 @@ mod tests {
                 "org.example.app",
             ]
         );
+    }
+
+    #[test]
+    fn relaunch_uses_cls_high_level_command_without_uiautomator_port() {
+        assert_eq!(
+            build_call_args(&config(), "relaunch", r#"{"package":"org.example.app"}"#)
+                .expect("relaunch arguments"),
+            [
+                "android",
+                "uiauto",
+                "relaunch",
+                "--node",
+                "android-dev",
+                "--package",
+                "org.example.app",
+            ]
+        );
+        assert_eq!(
+            build_call_args(
+                &config(),
+                "relaunch",
+                r#"{"package":"org.example.app","activity":".MainActivity"}"#
+            )
+            .expect("relaunch activity arguments"),
+            [
+                "android",
+                "uiauto",
+                "relaunch",
+                "--node",
+                "android-dev",
+                "--package",
+                "org.example.app",
+                "--activity",
+                ".MainActivity",
+            ]
+        );
+    }
+
+    #[test]
+    fn foreground_package_extracts_resumed_or_focused_app() {
+        assert_eq!(
+            foreground_package_from_dump(
+                "topResumedActivity=ActivityRecord{abc u0 com.tencent.mm/.ui.LauncherUI}"
+            ),
+            Some("com.tencent.mm".to_string())
+        );
+        assert_eq!(
+            foreground_package_from_dump(
+                "mCurrentFocus=Window{abc u0 com.miui.home/com.miui.home.launcher.Launcher}"
+            ),
+            Some("com.miui.home".to_string())
+        );
+        assert_eq!(foreground_package_from_dump("Window{abc u0 com.tencent.mm/.ui.LauncherUI}"), None);
     }
 
     #[test]
