@@ -82,8 +82,8 @@ impl Operator for AndroidUiautoOperator {
                     Ok(ActionOutput::ok())
                 }
                 Action::LongPress { x, y, duration_ms } => {
-                    let args =
-                        serde_json::json!({ "x": x, "y": y, "durationMs": duration_ms }).to_string();
+                    let args = serde_json::json!({ "x": x, "y": y, "durationMs": duration_ms })
+                        .to_string();
                     crate::android_uiauto::call("long-press", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
@@ -107,7 +107,12 @@ impl Operator for AndroidUiautoOperator {
                     tokio::time::sleep(Duration::from_secs_f32(seconds.clamp(0.0, 30.0))).await;
                     Ok(ActionOutput::ok())
                 }
-                Action::Scroll { x, y, direction, clicks } => {
+                Action::Scroll {
+                    x,
+                    y,
+                    direction,
+                    clicks,
+                } => {
                     let w = ctx.screen_w as i32;
                     let h = ctx.screen_h as i32;
                     let cx = if *x > 0 { *x } else { w / 2 };
@@ -121,7 +126,8 @@ impl Operator for AndroidUiautoOperator {
                     };
                     let args = serde_json::json!({
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2, "durationMs": 300
-                    }).to_string();
+                    })
+                    .to_string();
                     crate::android_uiauto::call("swipe", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;

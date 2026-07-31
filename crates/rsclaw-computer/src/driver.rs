@@ -940,21 +940,35 @@ const STREAM_ABORTED: &str = "vlm stream: aborted by user";
 /// `abort` is polled between every chunk: a single user-initiated stop
 /// drops the in-flight stream within ~one chunk roundtrip rather than
 /// waiting up to 30s for the full prediction to land.
+/// Per-request bound on connection setup and on each stream chunk. Mirrors
+/// `host_vlm::vlm_parse`'s timeout pattern. Without this, a stalled
+/// connection to the vision provider (e.g. a CLS/relay tunnel reconnect
+/// that never completes) leaves `stream.next()` pending forever: the
+/// `abort` flag is only checked *after* an event arrives, so a fully
+/// stalled stream never reaches that check and the driver — and whatever
+/// UI lock its caller is holding — hangs indefinitely instead of failing.
+const STREAM_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 async fn stream_prediction(
     provider: &dyn LlmProvider,
     req: LlmRequest,
     abort: &AtomicBool,
 ) -> Result<String> {
-    let mut stream = provider
-        .stream(req)
+    let mut stream = tokio::time::timeout(STREAM_STEP_TIMEOUT, provider.stream(req))
         .await
+        .context("provider.stream() setup timed out")?
         .context("provider.stream() failed to start")?;
     let mut text = String::new();
     let mut reasoning = String::new();
-    while let Some(event) = stream.next().await {
+    loop {
+        let event = match tokio::time::timeout(STREAM_STEP_TIMEOUT, stream.next()).await {
+            Ok(event) => event,
+            Err(_) => anyhow::bail!("VLM stream timed out waiting for the next chunk"),
+        };
         if abort.load(Ordering::SeqCst) {
             anyhow::bail!(STREAM_ABORTED);
         }
+        let Some(event) = event else { break };
         match event? {
             StreamEvent::TextDelta(d) => text.push_str(&d),
             StreamEvent::ReasoningDelta(d) => reasoning.push_str(&d),
