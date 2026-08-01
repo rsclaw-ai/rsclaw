@@ -643,7 +643,13 @@ pub fn stage_file(filename: &str, data: &[u8], mime_type: &str) -> Result<Queued
 
 /// Read a staged file back into a [`FileAttachment`].
 fn unstage_file(qf: &QueuedFile) -> FileAttachment {
-    let data = std::fs::read(&qf.path).unwrap_or_default();
+    let data = match std::fs::read(&qf.path) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(path = %qf.path, err = %e, "staged file missing or unreadable");
+            Vec::new()
+        }
+    };
     FileAttachment {
         filename: qf.filename.clone(),
         data,

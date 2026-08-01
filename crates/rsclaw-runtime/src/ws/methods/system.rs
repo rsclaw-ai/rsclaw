@@ -293,10 +293,19 @@ pub async fn logs_tail(ctx: MethodCtx) -> MethodResult {
             let all: Vec<&str> = content.lines().collect();
             let start = all.len().saturating_sub(limit);
             let tail: Vec<&str> = all[start..].to_vec();
+            // Redact common secret patterns in log lines before sending
+            // over WS, matching the HTTP /api/v1/logs endpoint behavior.
+            let redact_re = regex::Regex::new(
+                r"(?i)(?:bearer |api[_-]?key[=:]\s*|sk-|token[=:]\s*)[a-zA-Z0-9_-]{16,}",
+            )
+            .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
             let entries: Vec<serde_json::Value> = tail
                 .iter()
                 .enumerate()
-                .map(|(i, line)| serde_json::json!({ "index": start + i, "line": line }))
+                .map(|(i, line)| {
+                    let redacted = redact_re.replace_all(line, "[REDACTED]");
+                    serde_json::json!({ "index": start + i, "line": redacted })
+                })
                 .collect();
             return Ok(serde_json::json!({ "lines": tail, "entries": entries, "source": path }));
         }
