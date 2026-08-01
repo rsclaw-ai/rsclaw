@@ -2000,6 +2000,7 @@ async fn http_reload(
     }
 
     // --- Plugins: re-scan plugin dir, swap WASM + JS registries ---
+    let mut codex_mcp_for_reload: Vec<rsclaw_config::schema::McpServerConfig> = Vec::new();
     if reload_plugins {
         let base_dir = rsclaw_config::loader::base_dir();
         let plugins_dir = base_dir.join("plugins");
@@ -2039,6 +2040,37 @@ async fn http_reload(
                 let new_wasm = Arc::new(new_registry.take_wasm_plugins());
                 let wasm_count = new_wasm.len();
                 let js_count = new_registry.js_count();
+                let codex_count = new_registry.codex_count();
+
+                // Collect codex skills and MCP servers before consuming the registry.
+                let codex_mcp: Vec<rsclaw_config::schema::McpServerConfig> = new_registry
+                    .codex_all()
+                    .iter()
+                    .flat_map(|cp| cp.mcp_servers.clone())
+                    .collect();
+                let codex_skills: Vec<(rsclaw_skill::SkillManifest,)> = new_registry
+                    .codex_all()
+                    .iter()
+                    .flat_map(|cp| {
+                        cp.skills.iter().map(|skill| {
+                            let manifest = rsclaw_skill::SkillManifest {
+                                name: skill.name.clone(),
+                                description: if skill.description.is_empty() {
+                                    None
+                                } else {
+                                    Some(skill.description.clone())
+                                },
+                                version: None,
+                                requires_rsclaw: None,
+                                tools: Vec::new(),
+                                extra: Default::default(),
+                                dir: cp.dir.clone(),
+                                prompt: skill.template.clone(),
+                            };
+                            (manifest,)
+                        })
+                    })
+                    .collect();
 
                 // Shutdown old JS plugin subprocesses to prevent orphan leaks.
                 {
@@ -2068,11 +2100,39 @@ async fn http_reload(
                     }
                 }
 
+                // Rebuild skill registry: reload base skills + merge codex skills.
+                {
+                    let reload_base = rsclaw_config::loader::base_dir();
+                    let global_skills = reload_base.join("skills");
+                    let mut skill_reg = rsclaw_skill::load_skills(
+                        &global_skills,
+                        None,
+                        fresh_config.ext.skills.as_ref(),
+                    )
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("hot-reload skills: {e:#}");
+                        rsclaw_skill::SkillRegistry::new()
+                    });
+                    for (manifest,) in codex_skills {
+                        skill_reg.insert(manifest);
+                    }
+                    let new_skills = Arc::new(skill_reg);
+                    let mut guard = state.skills.write().await;
+                    *guard = Arc::clone(&new_skills);
+                    drop(guard);
+                    for handle in state.agents.all() {
+                        handle.set_skills(Arc::clone(&new_skills));
+                    }
+                }
+
+                // Store codex MCP servers for the MCP reload step below.
+                codex_mcp_for_reload = codex_mcp;
+
                 details.insert(
                     "plugins".to_owned(),
-                    serde_json::json!({"reloaded": true, "wasm": wasm_count, "js": js_count}),
+                    serde_json::json!({"reloaded": true, "wasm": wasm_count, "js": js_count, "codex": codex_count}),
                 );
-                tracing::info!(wasm_count, js_count, "hot-reload: plugins reloaded");
+                tracing::info!(wasm_count, js_count, codex_count, "hot-reload: plugins reloaded");
             }
             Err(e) => {
                 details.insert(
@@ -2116,7 +2176,7 @@ async fn http_reload(
                 tracing::info!(count = old_count, "hot-reload: cleared old MCP clients");
             }
         }
-        let spawned = respawn_mcp_servers(&fresh_config, Arc::clone(&registry)).await;
+        let spawned = respawn_mcp_servers(&fresh_config, &codex_mcp_for_reload, Arc::clone(&registry)).await;
         details.insert(
             "mcp".to_owned(),
             serde_json::json!({"reloaded": true, "servers": spawned}),
@@ -2659,22 +2719,28 @@ fn reload_failed_scopes(details: &serde_json::Map<String, serde_json::Value>) ->
         .collect()
 }
 
-/// Spawn MCP servers from config into the given registry. Returns count
-/// spawned.
+/// Spawn MCP servers from config and codex plugins into the given registry.
+/// Returns count spawned.
 async fn respawn_mcp_servers(
     config: &rsclaw_config::runtime::RuntimeConfig,
+    codex_servers: &[rsclaw_config::schema::McpServerConfig],
     registry: Arc<rsclaw_mcp::McpRegistry>,
 ) -> usize {
-    let mcp = match config.raw.mcp.as_ref() {
-        Some(m) if m.enabled != Some(false) => m,
-        _ => return 0,
-    };
-    let servers = match mcp.servers.as_ref() {
-        Some(s) => s,
-        None => return 0,
-    };
+    let config_servers = config
+        .raw
+        .mcp
+        .as_ref()
+        .and_then(|m| {
+            if m.enabled == Some(false) {
+                None
+            } else {
+                m.servers.as_ref().map(|s| s.as_slice())
+            }
+        })
+        .unwrap_or_default();
+
     let mut count = 0;
-    for server_cfg in servers {
+    for server_cfg in config_servers.iter().chain(codex_servers.iter()) {
         match rsclaw_mcp::McpClient::spawn(server_cfg).await {
             Ok(mut client) => {
                 if let Err(e) = client.initialize().await {

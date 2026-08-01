@@ -260,13 +260,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // 4. Load skills.
     let global_skills = base_dir.join("skills");
-    let skills = Arc::new(
+    let mut skills_registry =
         load_skills(&global_skills, None, config.ext.skills.as_ref()).unwrap_or_else(|e| {
             warn!("failed to load skills: {e:#}");
             SkillRegistry::new()
-        }),
-    );
-    info!("{} skill(s) loaded", skills.len());
+        });
+    info!("{} skill(s) loaded", skills_registry.len());
 
     // Auto-install allowlist (security gate for the skill_install tool): load
     // the local cache now so the gate has data immediately, then refresh from
@@ -440,12 +439,41 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         let _ = plugin_registry.slots.set_memory(Arc::new(slot), "built-in");
     }
     info!(
-        "{} plugin(s) loaded (js={}, wasm={}), memory slot: {}",
+        "{} plugin(s) loaded (js={}, wasm={}, codex={}), memory slot: {}",
         plugin_registry.len(),
         plugin_registry.js_count(),
         plugin_registry.wasm_count(),
+        plugin_registry.codex_count(),
         plugin_registry.slots.has_memory()
     );
+
+    // Merge codex plugin skills into the skill registry.
+    let codex_mcp_servers: Vec<rsclaw_config::schema::McpServerConfig> = plugin_registry
+        .codex_all()
+        .iter()
+        .flat_map(|cp| cp.mcp_servers.clone())
+        .collect();
+    for cp in plugin_registry.codex_all() {
+        for skill in &cp.skills {
+            let manifest = rsclaw_skill::SkillManifest {
+                name: skill.name.clone(),
+                description: if skill.description.is_empty() {
+                    None
+                } else {
+                    Some(skill.description.clone())
+                },
+                version: None,
+                requires_rsclaw: None,
+                tools: Vec::new(),
+                extra: Default::default(),
+                dir: cp.dir.clone(),
+                prompt: skill.template.clone(),
+            };
+            skills_registry.insert(manifest);
+        }
+    }
+    let skills = Arc::new(skills_registry);
+    info!("{} total skill(s) (including codex)", skills.len());
 
     let wasm_plugins = Arc::new(plugin_registry.take_wasm_plugins());
     let plugins = Arc::new(plugin_registry);
@@ -513,7 +541,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // Spawn MCP servers and discover tools (before agent tasks so tools are
     // available).
     let mcp_registry = Arc::new(rsclaw_mcp::McpRegistry::new());
-    spawn_mcp_servers(&config, Arc::clone(&mcp_registry)).await;
+    spawn_mcp_servers(&config, &codex_mcp_servers, Arc::clone(&mcp_registry)).await;
 
     // Clone memory before passing to agent tasks so heartbeat can also use it.
     let heartbeat_memory = memory.clone();
@@ -2362,25 +2390,33 @@ fn resolve_bind_addr(config: &RuntimeConfig) -> SocketAddr {
 // MCP server process management
 // ---------------------------------------------------------------------------
 
-async fn spawn_mcp_servers(config: &RuntimeConfig, registry: Arc<rsclaw_mcp::McpRegistry>) {
-    let mcp = match config.raw.mcp.as_ref() {
-        Some(m) => m,
-        None => return,
-    };
+async fn spawn_mcp_servers(
+    config: &RuntimeConfig,
+    codex_servers: &[rsclaw_config::schema::McpServerConfig],
+    registry: Arc<rsclaw_mcp::McpRegistry>,
+) {
+    let config_enabled = config
+        .raw
+        .mcp
+        .as_ref()
+        .map(|m| m.enabled != Some(false))
+        .unwrap_or(true);
 
-    if mcp.enabled == Some(false) {
+    if !config_enabled {
         return;
     }
 
-    let servers = match mcp.servers.as_ref() {
-        Some(s) => s,
-        None => return,
-    };
+    let config_servers = config
+        .raw
+        .mcp
+        .as_ref()
+        .and_then(|m| m.servers.as_ref())
+        .map(|s| s.as_slice())
+        .unwrap_or_default();
 
-    for server_cfg in servers {
+    for server_cfg in config_servers.iter().chain(codex_servers.iter()) {
         match rsclaw_mcp::McpClient::spawn(server_cfg).await {
             Ok(mut client) => {
-                // Initialize + discover tools.
                 if let Err(e) = client.initialize().await {
                     error!(name = %server_cfg.name, error = %e, "MCP initialize failed");
                     continue;
