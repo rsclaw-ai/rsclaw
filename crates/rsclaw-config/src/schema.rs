@@ -1,5 +1,11 @@
 //! rsclaw JSON5 config schema — full field coverage.
-//! Unknown fields cause deserialization to fail (deny_unknown_fields).
+//! Unknown fields on most structs are silently tolerated (retained in the raw
+//! config and written back on save). This is a deliberate trade-off: the only
+//! struct that rejects unknown fields is `KbOcrConfig` (because unrecognized
+//! OCR params are likely misconfiguration). Future hardening may extend
+//! `deny_unknown_fields` to more structs, but this must be done carefully to
+//! avoid breaking existing deployments that have extra keys from prior
+//! versions or manual edits.
 
 use std::collections::HashMap;
 

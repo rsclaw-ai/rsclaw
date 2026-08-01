@@ -376,7 +376,7 @@ pub(crate) async fn spawn_streaming_task(
                 AgentEvent::Artifact {
                     artifact_id, parts, ..
                 } => {
-                    let _ = persist_store.append_artifact(
+                    if let Err(e) = persist_store.append_artifact(
                         &persist_task_id,
                         A2aArtifact {
                             artifact_id,
@@ -385,24 +385,30 @@ pub(crate) async fn spawn_streaming_task(
                             description: None,
                             metadata: None,
                         },
-                    );
+                    ) {
+                        warn!(err = %e, task_id = %persist_task_id, "streaming persist: append_artifact failed");
+                    }
                 }
                 AgentEvent::Status { state, final_, .. } => {
-                    let _ = persist_store.set_status(&persist_task_id, state);
+                    if let Err(e) = persist_store.set_status(&persist_task_id, state) {
+                        warn!(err = %e, task_id = %persist_task_id, "streaming persist: set_status failed");
+                    }
                     if final_ {
-                        // Push config GC: terminal state means no more
-                        // webhooks will fire for this task — clear its
-                        // notification configs so they don't linger in
-                        // the store. (No-op if there were no configs.)
-                        let _ = persist_store.delete_push_configs_for_task(&persist_task_id);
+                        if let Err(e) = persist_store.delete_push_configs_for_task(&persist_task_id) {
+                            warn!(err = %e, task_id = %persist_task_id, "streaming persist: delete_push_configs failed");
+                        }
                         break;
                     }
                 }
                 AgentEvent::InputRequired { .. } => {
-                    let _ = persist_store.set_status(&persist_task_id, TaskState::InputRequired);
+                    if let Err(e) = persist_store.set_status(&persist_task_id, TaskState::InputRequired) {
+                        warn!(err = %e, task_id = %persist_task_id, "streaming persist: set_status(input_required) failed");
+                    }
                 }
                 AgentEvent::AuthRequired { .. } => {
-                    let _ = persist_store.set_status(&persist_task_id, TaskState::AuthRequired);
+                    if let Err(e) = persist_store.set_status(&persist_task_id, TaskState::AuthRequired) {
+                        warn!(err = %e, task_id = %persist_task_id, "streaming persist: set_status(auth_required) failed");
+                    }
                 }
             }
         }

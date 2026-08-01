@@ -284,6 +284,18 @@ impl IntoRuntime for Config {
             .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
             .or_else(|| std::env::var("OPENCLAW_GATEWAY_TOKEN").ok());
 
+        // Warn if token_ref exists but couldn't resolve early (likely File/Exec
+        // ref). The gateway will start unauthenticated — this is a misconfig
+        // that's easy to miss otherwise.
+        if auth_token.is_none() && token_ref.is_some() {
+            tracing::warn!(
+                "gateway.auth.token is set but could not be resolved from ENV. \
+                 File/Exec-based secrets require `secrets.providers` config, \
+                 and are not yet integrated with the early-resolve path. \
+                 The gateway will start WITHOUT authentication."
+            );
+        }
+
         // A2A inbound auth — resolve config-listed tokens/keys, then merge
         // env-set lists for back-compat with the original env-only design.
         // Empty in both => middleware passes through (dev mode).

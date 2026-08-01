@@ -82,6 +82,7 @@ impl LlmProvider for GeminiProvider {
                         .as_deref()
                         .unwrap_or(super::DEFAULT_USER_AGENT),
                 )
+                .timeout(std::time::Duration::from_secs(120))
                 .json(&body)
                 .send()
                 .await
@@ -149,7 +150,9 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     }
 
     // Generation config.
-    let gen_cfg = body["generationConfig"].as_object_mut().unwrap();
+    let gen_cfg = body["generationConfig"]
+        .as_object_mut()
+        .expect("generationConfig field constructed above");
     if let Some(max) = req.max_tokens {
         gen_cfg.insert("maxOutputTokens".to_owned(), json!(max));
     }

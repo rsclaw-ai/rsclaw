@@ -609,7 +609,23 @@ pub async fn update_run(_ctx: MethodCtx) -> MethodResult {
     Ok(serde_json::json!({ "error": "self-update not supported" }))
 }
 
-pub async fn system_shutdown(_ctx: MethodCtx) -> MethodResult {
+/// Require an auth token for destructive system operations. When the gateway
+/// has a token configured, every connection reaching the handler has already
+/// passed the handshake auth check, so the connection is inherently trusted.
+/// In open-gateway mode (no token), WS clients cannot trigger shutdown/restart
+/// — use the HTTP endpoints instead (which enforce loopback-only).
+fn require_auth_for_destructive(ctx: &MethodCtx) -> bool {
+    ctx.state
+        .live
+        .gateway
+        .try_read()
+        .is_ok_and(|g| g.auth_token.is_some())
+}
+
+pub async fn system_shutdown(ctx: MethodCtx) -> MethodResult {
+    if !require_auth_for_destructive(&ctx) {
+        return Err(ErrorShape::unauthorized("authentication required for system.shutdown"));
+    }
     // Exit the gateway process cleanly. We spawn the exit on a delay so the
     // caller's WS frame has time to flush. Clients (tray Quit, CLI) use this
     // instead of sending signals, so it works uniformly on every platform.
@@ -628,6 +644,9 @@ pub async fn system_shutdown(_ctx: MethodCtx) -> MethodResult {
 /// after `axum::serve()` returns guarantees the parent has already released
 /// the listener, so the child cannot lose the bind() race against itself.
 pub async fn system_restart(ctx: MethodCtx) -> MethodResult {
+    if !require_auth_for_destructive(&ctx) {
+        return Err(ErrorShape::unauthorized("authentication required for system.restart"));
+    }
     tracing::warn!("system.restart requested via WS");
     ctx.state.shutdown.request_restart();
     Ok(serde_json::json!({ "restarting": true }))

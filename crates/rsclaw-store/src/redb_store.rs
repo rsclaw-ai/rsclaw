@@ -452,35 +452,52 @@ impl RedbStore {
     /// Double-writes: the message is stored under the active session key
     /// (compaction may delete these) AND under an `archive:` prefixed key
     /// (never deleted, preserves complete conversation history).
+    ///
+    /// The SessionMeta read and update are done inside the write transaction
+    /// to avoid a read-modify-write race with concurrent `append_message`
+    /// calls (different tokio tasks could both read the same `message_count`,
+    /// compute the same `seq`, and the second `insert` silently overwrites
+    /// the first message).
     pub fn append_message(&self, session_key: &str, message: &serde_json::Value) -> Result<u64> {
-        let meta_opt = self.get_session_meta(session_key)?;
-        let mut meta = meta_opt.unwrap_or_else(|| SessionMeta {
-            session_key: session_key.to_owned(),
-            message_count: 0,
-            last_active: chrono::Utc::now().timestamp(),
-            created_at: chrono::Utc::now().timestamp(),
-            generation: 1,
-        });
-
-        let seq = meta.message_count;
-        meta.message_count += 1;
-        meta.last_active = chrono::Utc::now().timestamp();
-
-        let msg_key = format!("{session_key}:{seq:016}");
-        let generation = meta.generation;
-        let archive_key = format!("archive:{session_key}:gen{generation}:{seq:016}");
         let msg_json = serde_json::to_string(message)?;
+        let now = chrono::Utc::now().timestamp();
 
         let write = self.db.begin_write()?;
+
+        // Read + update meta inside the write transaction (redb write tx is
+        // exclusive — closes the read-modify-write race).
+        let (seq, generation) = {
+            let mut metas = write.open_table(SESSION_META)?;
+            let mut meta: SessionMeta = metas
+                .get(session_key)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()?
+                .unwrap_or_else(|| SessionMeta {
+                    session_key: session_key.to_owned(),
+                    message_count: 0,
+                    last_active: now,
+                    created_at: now,
+                    generation: 1,
+                });
+
+            let seq = meta.message_count;
+            meta.message_count += 1;
+            meta.last_active = now;
+
+            let meta_json = serde_json::to_string(&meta)?;
+            metas.insert(session_key, meta_json.as_str())?;
+
+            (seq, meta.generation)
+        };
+
+        let msg_key = format!("{session_key}:{seq:016}");
+        let archive_key = format!("archive:{session_key}:gen{generation}:{seq:016}");
+
         {
             let mut msgs = write.open_table(MESSAGES)?;
             msgs.insert(msg_key.as_str(), msg_json.as_str())?;
             // Archive: complete history, never deleted by compaction.
             msgs.insert(archive_key.as_str(), msg_json.as_str())?;
-
-            let meta_json = serde_json::to_string(&meta)?;
-            let mut metas = write.open_table(SESSION_META)?;
-            metas.insert(session_key, meta_json.as_str())?;
         }
         write.commit()?;
 

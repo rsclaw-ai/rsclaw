@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -373,12 +374,14 @@ async fn handle_send_message(
         metadata: None,
     };
     if let Err(e) = state.task_store.put(&initial_task) {
-        info!(err = %e, "failed to persist initial task");
+        warn!(err = %e, "failed to persist initial task");
     }
     // §7.5: record the creating principal so only it (or the operator token)
     // can later read/cancel/configure this task.
     if let Some(c) = caller.as_ref() {
-        let _ = state.task_store.put_owner(&task_id, &c.id);
+        if let Err(e) = state.task_store.put_owner(&task_id, &c.id) {
+            warn!(err = %e, task_id = %task_id, "failed to persist task owner");
+        }
     }
 
     // Register a cancellation token so CancelTask can stop the in-flight turn.
@@ -518,12 +521,20 @@ async fn handle_send_message(
                 metadata: None,
             };
 
-            let _ = state.task_store.append_artifact(&task_id, artifact.clone());
-            if let Some(ref outcome) = pending_outcome {
-                let _ = state.task_store.attach_outcome_metadata(&task_id, outcome);
+            if let Err(e) = state.task_store.append_artifact(&task_id, artifact.clone()) {
+                warn!(err = %e, task_id = %task_id, "failed to persist artifact");
             }
-            let _ = state.task_store.set_status(&task_id, TaskState::Completed);
-            let _ = state.task_store.delete_push_configs_for_task(&task_id);
+            if let Some(ref outcome) = pending_outcome {
+                if let Err(e) = state.task_store.attach_outcome_metadata(&task_id, outcome) {
+                    warn!(err = %e, task_id = %task_id, "failed to persist outcome metadata");
+                }
+            }
+            if let Err(e) = state.task_store.set_status(&task_id, TaskState::Completed) {
+                warn!(err = %e, task_id = %task_id, "failed to persist completed status");
+            }
+            if let Err(e) = state.task_store.delete_push_configs_for_task(&task_id) {
+                warn!(err = %e, task_id = %task_id, "failed to clean up push configs");
+            }
             state.task_cancels.remove(&task_id);
 
             state

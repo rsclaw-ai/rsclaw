@@ -706,58 +706,74 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         let mut rx = notification_rx;
         tokio::spawn(async move {
             info!("notification router started");
-            while let Ok(msg) = rx.recv().await {
-                if let Some(ref ch_name) = msg.channel {
-                    // Try per-account sender first (wechat/acct → wechat),
-                    // same pattern as task_queue::channel_tx_for.
-                    let tx = {
-                        let senders_guard =
-                            senders.read().expect("channel_senders RwLock poisoned");
-                        msg.account
-                            .as_ref()
-                            .filter(|a| !a.is_empty())
-                            .and_then(|acct| {
-                                let key = format!("{ch_name}/{acct}");
-                                senders_guard.get(&key).cloned()
-                            })
-                            .or_else(|| senders_guard.get(ch_name).cloned())
-                    };
-                    if let Some(tx) = tx {
-                        info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
-                        if let Err(e) = tx.send(msg.clone()).await {
-                            tracing::warn!(error = %e, "notification send failed");
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        if let Some(ref ch_name) = msg.channel {
+                            // Try per-account sender first (wechat/acct → wechat),
+                            // same pattern as task_queue::channel_tx_for.
+                            let tx = {
+                                let senders_guard =
+                                    senders.read().expect("channel_senders RwLock poisoned");
+                                msg.account
+                                    .as_ref()
+                                    .filter(|a| !a.is_empty())
+                                    .and_then(|acct| {
+                                        let key = format!("{ch_name}/{acct}");
+                                        senders_guard.get(&key).cloned()
+                                    })
+                                    .or_else(|| senders_guard.get(ch_name).cloned())
+                            };
+                            if let Some(tx) = tx {
+                                info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
+                                if let Err(e) = tx.send(msg.clone()).await {
+                                    tracing::warn!(error = %e, "notification send failed");
+                                }
+                            } else if is_sync_only_channel(ch_name) {
+                                // sync-only channels (HTTP /api/v1/message, future stdio
+                                // MCP, etc.) carry their reply back through their own
+                                // transport — the oneshot reply_tx on the AgentMessage,
+                                // an SSE byte stream, etc. The notification fan-out
+                                // here is a fire-and-forget event-bus emit for
+                                // observers (UI, telemetry) and the absence of a
+                                // registered sender is by design, not a misconfig.
+                                // Surface at debug so operators can still see the
+                                // dispatch path without flooding logs on every API
+                                // call.
+                                tracing::debug!(
+                                    channel = %ch_name,
+                                    "notification: sync-only channel, no sender expected"
+                                );
+                            } else {
+                                warn!(channel = %ch_name, "no channel sender registered for notification");
+                            }
+                        } else {
+                            // No channel specified — send to first registered channel (default)
+                            let first = {
+                                let guard = senders.read().expect("channel_senders RwLock poisoned");
+                                guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
+                            };
+                            if let Some((ch_name, tx)) = first {
+                                info!(channel = %ch_name, "routing notification to default channel");
+                                if let Err(e) = tx.send(msg.clone()).await {
+                                    tracing::warn!(error = %e, "notification send failed");
+                                }
+                            } else {
+                                warn!("notification: no channels registered");
+                            }
                         }
-                    } else if is_sync_only_channel(ch_name) {
-                        // sync-only channels (HTTP /api/v1/message, future stdio
-                        // MCP, etc.) carry their reply back through their own
-                        // transport — the oneshot reply_tx on the AgentMessage,
-                        // an SSE byte stream, etc. The notification fan-out
-                        // here is a fire-and-forget event-bus emit for
-                        // observers (UI, telemetry) and the absence of a
-                        // registered sender is by design, not a misconfig.
-                        // Surface at debug so operators can still see the
-                        // dispatch path without flooding logs on every API
-                        // call.
-                        tracing::debug!(
-                            channel = %ch_name,
-                            "notification: sync-only channel, no sender expected"
-                        );
-                    } else {
-                        warn!(channel = %ch_name, "no channel sender registered for notification");
                     }
-                } else {
-                    // No channel specified — send to first registered channel (default)
-                    let first = {
-                        let guard = senders.read().expect("channel_senders RwLock poisoned");
-                        guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
-                    };
-                    if let Some((ch_name, tx)) = first {
-                        info!(channel = %ch_name, "routing notification to default channel");
-                        if let Err(e) = tx.send(msg.clone()).await {
-                            tracing::warn!(error = %e, "notification send failed");
-                        }
-                    } else {
-                        warn!("notification: no channels registered");
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // A burst overflowed the channel buffer. The notification
+                        // router is best-effort — skip the missed messages and
+                        // keep running so fan-out doesn't die for the rest of
+                        // the process lifetime.
+                        tracing::warn!(skipped = n, "notification router: lagged, skipping missed messages");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("notification router: channel closed, exiting");
+                        break;
                     }
                 }
             }
@@ -997,7 +1013,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let a2a_bus = crate::a2a::event::TaskEventBus::new();
     let a2a_task_store = {
         let path = rsclaw_config::loader::base_dir().join("var/data/a2a/tasks.redb");
-        Arc::new(crate::a2a::store::TaskStore::open(&path).expect("open A2A task store"))
+        match crate::a2a::store::TaskStore::open(&path) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                return Err(e).context("failed to open A2A task store");
+            }
+        }
     };
     let a2a_push_dispatcher = Arc::new(crate::a2a::push::PushDispatcher::new(
         Arc::clone(&a2a_task_store),

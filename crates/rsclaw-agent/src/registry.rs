@@ -280,7 +280,7 @@ impl AgentHandle {
                 ctx_lines.push_str("Context: (no sessions)\n");
             } else {
                 for (key, t) in map.iter() {
-                    let short_key = if key.len() > 20 { &key[..20] } else { key };
+                    let short_key: String = key.chars().take(20).collect();
                     let pct = if ctx_limit > 0 {
                         t.total * 100 / ctx_limit
                     } else {
