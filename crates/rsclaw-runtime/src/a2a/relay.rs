@@ -475,7 +475,9 @@ impl RelayHub {
         result
     }
 
-    fn register_connection(
+    /// Register a connected spoke node's WS sender.
+    /// **For tests only** — production wiring is via the hub WS handler.
+    pub fn register_connection(
         &self,
         node_id: &str,
         tx: mpsc::UnboundedSender<AxumWsMessage>,
