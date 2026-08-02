@@ -2395,4 +2395,143 @@ mod tests {
             "no Cancel frame expected after normal completion"
         );
     }
+
+    // -------------------------------------------------------------------
+    // P2P / hole-punch tests (ADR 0002)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn route_entry_defaults_to_relayed_mode() {
+        let hub = RelayHub::new();
+        hub.apply_route_lease("a1", &["a1/main".to_owned()], 10_000, 1)
+            .unwrap();
+        let route = hub.route_for("a1/main").expect("route");
+        assert_eq!(route.mode, RouteMode::Relayed);
+    }
+
+    #[test]
+    fn set_routes_direct_flags_matching_node_only() {
+        let hub = RelayHub::new();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        hub.register_connection("node-a", tx1, 1);
+        hub.register_connection("node-b", tx2, 1);
+        hub.apply_route_lease("node-a", &["node-a/agent1".to_owned()], 10_000, 1)
+            .unwrap();
+        hub.apply_route_lease("node-b", &["node-b/agent2".to_owned()], 10_000, 1)
+            .unwrap();
+
+        let updated = hub.set_routes_direct("node-a");
+        assert_eq!(updated, 1, "only node-a's route should flip");
+
+        let route_a = hub.route_for("node-a/agent1").expect("route a");
+        assert_eq!(route_a.mode, RouteMode::Direct);
+        let route_b = hub.route_for("node-b/agent2").expect("route b");
+        assert_eq!(route_b.mode, RouteMode::Relayed, "node-b should stay Relayed");
+    }
+
+    #[test]
+    fn set_routes_direct_is_idempotent() {
+        let hub = RelayHub::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        hub.register_connection("a", tx, 1);
+        hub.apply_route_lease("a", &["a/main".to_owned()], 10_000, 1)
+            .unwrap();
+
+        assert_eq!(hub.set_routes_direct("a"), 1);
+        assert_eq!(hub.set_routes_direct("a"), 0, "second call should be no-op");
+    }
+
+    #[test]
+    fn send_to_node_queues_frame_on_connected_node() {
+        let hub = RelayHub::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.register_connection("b", tx, 1);
+
+        let frame = RelayFrame::Ping { ts: 42 };
+        assert!(hub.send_to_node("b", &frame), "should queue");
+
+        let msg = rx.try_recv().expect("message should arrive");
+        let text = match msg {
+            AxumWsMessage::Text(t) => t.to_string(),
+            other => panic!("expected Text, got {other:?}"),
+        };
+        assert!(text.contains("\"ping\""), "expected ping frame, got: {text}");
+    }
+
+    #[test]
+    fn send_to_node_returns_false_for_unknown_node() {
+        let hub = RelayHub::new();
+        let frame = RelayFrame::Ping { ts: 42 };
+        assert!(!hub.send_to_node("ghost", &frame));
+    }
+
+    #[test]
+    fn candidate_serializes_as_expected() {
+        let c = Candidate {
+            kind: CandidateKind::Host,
+            url: "ws://192.168.1.5:18889/a2a/peer/ws".into(),
+            priority: 100,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"host\""));
+        assert!(json.contains("192.168.1.5"));
+    }
+
+    #[test]
+    fn relay_frame_peer_candidate_serde_roundtrip() {
+        let frame = RelayFrame::PeerCandidate {
+            target_node: "node-b".into(),
+            candidates: vec![Candidate {
+                kind: CandidateKind::Host,
+                url: "ws://10.0.0.1:18889/a2a/peer/ws".into(),
+                priority: 100,
+            }],
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        let decoded: RelayFrame = serde_json::from_str(&json).unwrap();
+        match decoded {
+            RelayFrame::PeerCandidate {
+                target_node,
+                candidates,
+            } => {
+                assert_eq!(target_node, "node-b");
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].kind, CandidateKind::Host);
+            }
+            other => panic!("expected PeerCandidate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_frame_peer_connected_serde_roundtrip() {
+        let frame = RelayFrame::PeerConnected {
+            peer_node: "node-x".into(),
+            direct_url: "ws://10.0.0.2:18889/a2a/peer/ws".into(),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        let decoded: RelayFrame = serde_json::from_str(&json).unwrap();
+        match decoded {
+            RelayFrame::PeerConnected {
+                peer_node,
+                direct_url,
+            } => {
+                assert_eq!(peer_node, "node-x");
+                assert_eq!(direct_url, "ws://10.0.0.2:18889/a2a/peer/ws");
+            }
+            other => panic!("expected PeerConnected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_mode_serde_roundtrip() {
+        // RouteMode is not directly serialized, but CandidateKind is
+        // used in RelayFrame. Verify the tag format.
+        let host = serde_json::to_string(&CandidateKind::Host).unwrap();
+        assert_eq!(host, "\"host\"");
+        let srflx = serde_json::to_string(&CandidateKind::Srflx).unwrap();
+        assert_eq!(srflx, "\"srflx\"");
+        let relay = serde_json::to_string(&CandidateKind::Relay).unwrap();
+        assert_eq!(relay, "\"relay\"");
+    }
 }

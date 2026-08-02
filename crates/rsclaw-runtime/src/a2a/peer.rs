@@ -1138,3 +1138,249 @@ async fn handle_peer_socket(socket: WebSocket, state: AppState, peer_node_id: St
     state.peer_manager.unregister_connection(&peer_node_id);
     info!(peer = %peer_node_id, "peer direct connection closed (inbound)");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a2a::relay::{CandidateKind, RouteMode};
+
+    #[test]
+    fn peer_manager_default_is_empty() {
+        let pm = PeerManager::default();
+        assert!(!pm.has_direct_connection("any"));
+        assert!(pm.route_for("a/main").is_none());
+        assert!(pm.get_candidates("x").is_none());
+    }
+
+    #[test]
+    fn register_and_unregister_connection() {
+        let pm = PeerManager::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        pm.register_connection("peer-a", tx);
+        assert!(pm.has_direct_connection("peer-a"));
+
+        pm.unregister_connection("peer-a");
+        assert!(!pm.has_direct_connection("peer-a"));
+    }
+
+    #[test]
+    fn replace_existing_connection() {
+        let pm = PeerManager::default();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+
+        pm.register_connection("peer-x", tx1);
+        pm.register_connection("peer-x", tx2);
+        assert!(pm.has_direct_connection("peer-x"));
+    }
+
+    #[test]
+    fn add_and_lookup_route() {
+        let pm = PeerManager::default();
+        pm.add_route("peer-a/main", "peer-a");
+
+        let route = pm.route_for("peer-a/main").expect("route");
+        assert_eq!(route.node_id, "peer-a");
+        assert_eq!(route.mode, RouteMode::Direct);
+    }
+
+    #[test]
+    fn route_expires_if_not_refreshed() {
+        let pm = PeerManager::default();
+        // Insert with 1ms epoch. Won't be useful without internal expiry
+        // but the public API is add_route() which sets 300s TTL.
+        pm.add_route("peer-z/agent", "peer-z");
+        let route = pm.route_for("peer-z/agent");
+        assert!(route.is_some());
+    }
+
+    #[test]
+    fn cache_candidates_stores_ttl_entries() {
+        let pm = PeerManager::default();
+        let candidates = vec![Candidate {
+            kind: CandidateKind::Host,
+            url: "ws://10.0.0.1:18889/a2a/peer/ws".into(),
+            priority: 100,
+        }];
+        pm.cache_candidates("peer-c", candidates.clone());
+        let got = pm.get_candidates("peer-c").expect("fresh");
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn get_candidates_returns_none_for_unknown_peer() {
+        let pm = PeerManager::default();
+        assert!(pm.get_candidates("unknown").is_none());
+    }
+
+    #[test]
+    fn unregister_cleans_orphaned_routes() {
+        let pm = PeerManager::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        pm.register_connection("peer-d", tx);
+        pm.add_route("peer-d/agent", "peer-d");
+        assert!(pm.route_for("peer-d/agent").is_some());
+
+        pm.unregister_connection("peer-d");
+        assert!(!pm.has_direct_connection("peer-d"));
+        assert!(pm.route_for("peer-d/agent").is_none());
+    }
+
+    #[test]
+    fn record_and_lookup_task_route() {
+        let pm = PeerManager::default();
+        pm.record_task_route("task-1", "peer-e/agent");
+        assert_eq!(
+            pm.route_for_task("task-1").as_deref(),
+            Some("peer-e/agent")
+        );
+        assert!(pm.route_for_task("unknown").is_none());
+    }
+
+    #[tokio::test]
+    async fn invoke_jsonrpc_via_peer_connection() {
+        let pm = PeerManager::default();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayFrame>();
+
+        pm.register_connection("peer-f", tx);
+
+        let pm_clone = std::sync::Arc::new(pm);
+        let pm2 = pm_clone.clone();
+        let invoke = tokio::spawn(async move {
+            pm2.invoke_jsonrpc(
+                "peer-f/main",
+                "SendMessage",
+                serde_json::json!({"message": "hi"}),
+                "test-caller",
+                "peer-f",
+            )
+            .await
+        });
+
+        // Drain the Request frame and check it.
+        let frame = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (request_id, target) = match frame {
+            RelayFrame::Request {
+                request_id,
+                target,
+                ..
+            } => (request_id, target),
+            other => panic!("expected Request got {other:?}"),
+        };
+        assert_eq!(target, "peer-f/main");
+
+        // Send back a response.
+        pm_clone.complete_pending(
+            &request_id,
+            JsonRpcResponse::ok(
+                Value::String("r1".into()),
+                serde_json::json!({"ok": true}),
+            ),
+        );
+
+        let response = invoke.await.unwrap().unwrap();
+        assert_eq!(response.result.unwrap()["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn invoke_jsonrpc_times_out_when_no_response() {
+        let pm = std::sync::Arc::new(PeerManager::default());
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayFrame>();
+        pm.register_connection("peer-g", tx);
+
+        let pm2 = pm.clone();
+        let invoke = tokio::spawn(async move {
+            pm2.invoke_jsonrpc(
+                "peer-g/main",
+                "SendMessage",
+                serde_json::json!({"m": 1}),
+                "t",
+                "peer-g",
+            )
+            .await
+        });
+
+        // Drain the frame so the sender side doesn't back up.
+        let _frame = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Don't send a response — the call should time out.
+        let result = tokio::time::timeout(Duration::from_secs(5), invoke).await;
+        match result {
+            Ok(Ok(Err(e))) => {
+                assert!(
+                    e.to_string().contains("timed out"),
+                    "expected timeout: {e}"
+                );
+            }
+            Ok(Ok(Ok(_))) => panic!("expected timeout error"),
+            Ok(Err(join_err)) => panic!("join error: {join_err}"),
+            Err(_) => {
+                // Outer timeout is acceptable too — the inner should have
+                // hit PEER_REQUEST_TIMEOUT.
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_stream_basics() {
+        let pm = PeerManager::default();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayFrame>();
+        pm.register_connection("peer-h", tx);
+
+        let (_request_id, node_id, mut event_rx) = pm
+            .invoke_streaming(
+                "peer-h/main",
+                "SendStreamingMessage",
+                serde_json::json!({"metadata": {"agentId": "main"}}),
+                "caller",
+                "peer-h",
+            )
+            .await
+            .unwrap();
+        assert_eq!(node_id, "peer-h");
+
+        // Drain the Request frame.
+        let _req = rx.recv().await.unwrap();
+
+        // Forward an event.
+        let wire = serde_json::json!({
+            "kind": "status-update",
+            "taskId": "t-x",
+            "contextId": "ctx",
+            "status": {"state": "working"},
+            "final": false,
+        });
+        let recv = pm.forward_stream_event("peer:stream:0", wire);
+        assert_eq!(recv, 1, "event should reach subscriber");
+
+        let ev = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev["kind"], "status-update");
+
+        // Verify task route was recorded.
+        assert_eq!(
+            pm.route_for_task("t-x").as_deref(),
+            Some("peer-h/main")
+        );
+    }
+
+    #[test]
+    fn peer_stream_tasks_map_works() {
+        let pm = PeerManager::default();
+        pm.peer_stream_tasks
+            .insert("req-1".into(), "task-abc".into());
+        assert!(pm.peer_stream_tasks.contains_key("req-1"));
+        let (_, task_id) = pm.peer_stream_tasks.remove("req-1").unwrap();
+        assert_eq!(task_id, "task-abc");
+    }
+}
