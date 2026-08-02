@@ -50,27 +50,58 @@ impl DeviceStore {
     }
 
     pub async fn is_valid_device_token(&self, token: &str) -> bool {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         self.tokens
             .read()
             .await
             .values()
-            .any(|r| r.device_token == token)
+            .any(|r| {
+                r.device_token == token
+                    && r.expires_at.is_none_or(|exp| now < exp)
+            })
     }
+
+    /// Device token lifetime: 30 days. Long enough for interactive sessions,
+    /// short enough to limit exposure of leaked tokens.
+    const DEVICE_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
     pub async fn issue_token(&self, device_id: Option<String>) -> String {
         let token = uuid::Uuid::new_v4().to_string();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let record = DeviceRecord {
             device_token: token.clone(),
             device_id: device_id.clone(),
-            created_at: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            created_at: now,
+            expires_at: Some(now + Self::DEVICE_TOKEN_TTL_SECS),
         };
         let key = device_id.unwrap_or_else(|| token.clone());
         self.tokens.write().await.insert(key, record);
         self.persist().await;
         token
+    }
+
+    /// Revoke a device token by its value. Returns `true` if a token was
+    /// removed.
+    pub async fn revoke_token(&self, token: &str) -> bool {
+        let mut guard = self.tokens.write().await;
+        let key_to_remove = guard
+            .iter()
+            .find(|(_, r)| r.device_token == token)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = key_to_remove {
+            guard.remove(&key);
+            drop(guard);
+            self.persist().await;
+            true
+        } else {
+            false
+        }
     }
 
     async fn persist(&self) {
@@ -101,14 +132,16 @@ impl DeviceStore {
 pub async fn ws_handler(
     ws: axum::extract::ws::WebSocketUpgrade,
     axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, peer))
 }
 
 /// Combined handler for root "/": WS upgrade if requested, otherwise info page.
 pub async fn root_or_ws_handler(
     headers: axum::http::HeaderMap,
     axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
     // Check if this is a WebSocket upgrade request
@@ -121,7 +154,7 @@ pub async fn root_or_ws_handler(
             Ok(ws) => ws,
             Err(e) => return e.into_response(),
         };
-        ws.on_upgrade(move |socket| handle_socket(socket, state))
+        ws.on_upgrade(move |socket| handle_socket(socket, state, peer))
             .into_response()
     } else {
         root_handler().await.into_response()
@@ -145,7 +178,7 @@ pub async fn root_handler() -> impl IntoResponse {
 // handle_socket — full connection lifecycle
 // ---------------------------------------------------------------------------
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, peer: std::net::SocketAddr) {
     let (mut write_half, mut read_half) = socket.split();
 
     // Outbound channel: handlers and broadcast tasks send serialized JSON here;
@@ -355,7 +388,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // 7. Register this connection in the ConnRegistry.
     let conn_id: ConnId = uuid::Uuid::new_v4().to_string();
-    let mut handle = ConnHandle::new(conn_id.clone(), outbound_tx.clone());
+    let mut handle = ConnHandle::new(conn_id.clone(), outbound_tx.clone(), peer);
     handle.client_info = connect_params.client.clone();
     let conn = Arc::new(RwLock::new(handle));
     state.ws_conns.register(Arc::clone(&conn)).await;

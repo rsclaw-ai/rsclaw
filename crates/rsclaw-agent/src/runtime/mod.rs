@@ -67,8 +67,8 @@ use rsclaw_config::{live_config::LiveConfig, runtime::RuntimeConfig};
 use rsclaw_events::AgentEvent;
 use rsclaw_plugin::PluginRegistry;
 use rsclaw_provider::{
-    AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, RecallBundle, Role,
-    StreamEvent, ToolDef, failover::FailoverManager, registry::ProviderRegistry,
+    AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, RecallBundle, RetryConfig,
+    Role, StreamEvent, ToolDef, failover::FailoverManager, registry::ProviderRegistry,
 };
 use rsclaw_skill::SkillRegistry;
 use rsclaw_store::Store;
@@ -805,11 +805,23 @@ impl AgentRuntime {
         // they consult `self.model_health` directly. Same `Arc` so
         // FailoverManager and the tools see one source of truth.
         let model_health_for_tools = model_health.clone();
+        let retry_config = config
+            .model
+            .retry
+            .as_ref()
+            .map(|r| RetryConfig {
+                attempts: r.attempts.unwrap_or(3),
+                min_delay_ms: r.min_delay_ms.unwrap_or(400),
+                max_delay_ms: r.max_delay_ms.unwrap_or(30_000),
+                jitter: r.jitter.unwrap_or(0.1),
+            })
+            .unwrap_or_default();
         let failover = FailoverManager::new(
             auth_order,
             std::collections::HashMap::new(),
             fallback_models,
             model_health,
+            retry_config,
         );
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
         let live_status = Arc::clone(&handle.live_status);

@@ -618,17 +618,34 @@ pub async fn update_run(_ctx: MethodCtx) -> MethodResult {
     Ok(serde_json::json!({ "error": "self-update not supported" }))
 }
 
-/// Require an auth token for destructive system operations. When the gateway
-/// has a token configured, every connection reaching the handler has already
-/// passed the handshake auth check, so the connection is inherently trusted.
-/// In open-gateway mode (no token), WS clients cannot trigger shutdown/restart
-/// — use the HTTP endpoints instead (which enforce loopback-only).
+/// Require auth or loopback for destructive system operations.
+/// - When the gateway has a token configured, every connection reaching the
+///   handler has already passed the handshake auth check — the connection is
+///   inherently trusted.
+/// - When the gateway is in open-gateway mode (no token), only loopback
+///   connections can trigger shutdown/restart — matching the HTTP endpoints'
+///   `is_loopback` enforcement.
 fn require_auth_for_destructive(ctx: &MethodCtx) -> bool {
-    ctx.state
+    let has_token = ctx
+        .state
         .live
         .gateway
         .try_read()
-        .is_ok_and(|g| g.auth_token.is_some())
+        .is_ok_and(|g| g.auth_token.is_some());
+    if has_token {
+        return true;
+    }
+    // Open-gateway mode: allow only loopback connections.
+    let is_loopback = ctx
+        .conn
+        .try_read()
+        .is_ok_and(|c| c.peer_addr.ip().is_loopback());
+    if !is_loopback {
+        tracing::warn!(
+            "destructive WS operation rejected: open-gateway mode + non-loopback connection"
+        );
+    }
+    is_loopback
 }
 
 pub async fn system_shutdown(ctx: MethodCtx) -> MethodResult {

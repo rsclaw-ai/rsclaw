@@ -72,6 +72,7 @@ fn minimal_config(port: u16) -> RuntimeConfig {
         model: ModelRuntime {
             models: None,
             auth: None,
+            retry: None,
         },
         ext: ExtRuntime {
             tools: None,

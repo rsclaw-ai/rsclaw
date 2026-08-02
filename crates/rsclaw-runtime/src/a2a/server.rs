@@ -570,10 +570,16 @@ async fn handle_send_message(
         }
         rsclaw_agent::registry::ReplyOutcome::Error => {
             if let Some(ref outcome) = pending_outcome {
-                let _ = state.task_store.attach_outcome_metadata(&task_id, outcome);
+                if let Err(e) = state.task_store.attach_outcome_metadata(&task_id, outcome) {
+                    tracing::warn!(task_id, error = %e, "A2A: failed to attach outcome metadata on error path");
+                }
             }
-            let _ = state.task_store.set_status(&task_id, TaskState::Failed);
-            let _ = state.task_store.delete_push_configs_for_task(&task_id);
+            if let Err(e) = state.task_store.set_status(&task_id, TaskState::Failed) {
+                tracing::warn!(task_id, error = %e, "A2A: failed to set status=Failed on error path");
+            }
+            if let Err(e) = state.task_store.delete_push_configs_for_task(&task_id) {
+                tracing::warn!(task_id, error = %e, "A2A: failed to delete push configs on error path");
+            }
             state.task_cancels.remove(&task_id);
             state
                 .task_event_bus
@@ -750,8 +756,12 @@ async fn handle_cancel_task(
     match state.task_cancels.remove(&params.id) {
         Some((_, token)) => {
             token.cancel();
-            let _ = state.task_store.set_status(&params.id, TaskState::Canceled);
-            let _ = state.task_store.delete_push_configs_for_task(&params.id);
+            if let Err(e) = state.task_store.set_status(&params.id, TaskState::Canceled) {
+                tracing::warn!(task_id = %params.id, error = %e, "A2A: failed to set status=Canceled");
+            }
+            if let Err(e) = state.task_store.delete_push_configs_for_task(&params.id) {
+                tracing::warn!(task_id = %params.id, error = %e, "A2A: failed to delete push configs on cancel");
+            }
             // Publish a terminal Canceled status so any SSE subscriber sees it.
             let ctx = state
                 .task_store
@@ -1056,8 +1066,12 @@ pub(crate) fn spawn_input_request_listener(
                 // path, `.remove` returns None and we do nothing. Only if
                 // the suspension is still live do we tear it down.
                 if state_t.suspended_tasks.remove(&task_id_t).is_some() {
-                    let _ = state_t.task_store.set_status(&task_id_t, TaskState::Failed);
-                    let _ = state_t.task_store.delete_push_configs_for_task(&task_id_t);
+                    if let Err(e) = state_t.task_store.set_status(&task_id_t, TaskState::Failed) {
+                        tracing::warn!(task_id = %task_id_t, error = %e, "A2A: failed to set status=Failed on input timeout");
+                    }
+                    if let Err(e) = state_t.task_store.delete_push_configs_for_task(&task_id_t) {
+                        tracing::warn!(task_id = %task_id_t, error = %e, "A2A: failed to delete push configs on input timeout");
+                    }
                     state_t.task_cancels.remove(&task_id_t);
                     state_t.task_event_bus.publish(
                         rsclaw_a2a_types::event::AgentEvent::Status {
@@ -1109,8 +1123,12 @@ async fn resolve_agent_workspace(state: &AppState, agent_id: Option<&str>) -> st
 /// (GetTask/ListTasks would surface it as stuck) and so the cancel token
 /// + broadcast channel don't leak.
 fn finalize_failed_task(state: &AppState, task_id: &str, context_id: &str) {
-    let _ = state.task_store.set_status(task_id, TaskState::Failed);
-    let _ = state.task_store.delete_push_configs_for_task(task_id);
+    if let Err(e) = state.task_store.set_status(task_id, TaskState::Failed) {
+        tracing::warn!(task_id, error = %e, "A2A: failed to set status=Failed in finalize");
+    }
+    if let Err(e) = state.task_store.delete_push_configs_for_task(task_id) {
+        tracing::warn!(task_id, error = %e, "A2A: failed to delete push configs in finalize");
+    }
     state.task_cancels.remove(task_id);
     state
         .task_event_bus

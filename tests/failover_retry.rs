@@ -164,6 +164,7 @@ async fn test_failover_on_429() {
         api_keys,
         fallbacks,
         rsclaw::provider::health::ProviderHealthRegistry::new(),
+        RetryConfig::default(),
     );
 
     let req = simple_request("primary/claude-3-sonnet");
@@ -243,6 +244,7 @@ async fn test_cooldown_respected() {
         api_keys,
         fallbacks,
         rsclaw::provider::health::ProviderHealthRegistry::new(),
+        RetryConfig::default(),
     );
 
     // First call: should fail (rate-limited) and put "prof-a" into cooldown.
@@ -288,6 +290,7 @@ async fn test_all_providers_exhausted() {
         api_keys,
         fallbacks,
         rsclaw::provider::health::ProviderHealthRegistry::new(),
+        RetryConfig::default(),
     );
 
     let req = simple_request("p1/claude");
@@ -353,6 +356,7 @@ async fn test_transient_error_advances_chain() {
         api_keys,
         fallbacks,
         rsclaw::provider::health::ProviderHealthRegistry::new(),
+        RetryConfig::default(),
     );
 
     let req = simple_request("primary/model");
@@ -396,6 +400,7 @@ async fn test_multiple_profiles_tried_in_order() {
         api_keys,
         fallbacks,
         rsclaw::provider::health::ProviderHealthRegistry::new(),
+        RetryConfig::default(),
     );
 
     let req = simple_request("multi/model");
@@ -497,6 +502,7 @@ async fn test_error_classification_rate_limit_variants() {
             api_keys,
             fallbacks,
             rsclaw::provider::health::ProviderHealthRegistry::new(),
+        RetryConfig::default(),
         );
 
         let req = simple_request(&format!("{provider_name}/model"));
@@ -553,6 +559,7 @@ async fn test_error_classification_auth_variants() {
             api_keys,
             fallbacks,
             rsclaw::provider::health::ProviderHealthRegistry::new(),
+        RetryConfig::default(),
         );
 
         let req = simple_request(&format!("{provider_name}/model"));
@@ -589,6 +596,7 @@ async fn test_empty_fallback_list() {
         api_keys,
         fallbacks,
         rsclaw::provider::health::ProviderHealthRegistry::new(),
+        RetryConfig::default(),
     );
 
     let req = simple_request("primary/model");

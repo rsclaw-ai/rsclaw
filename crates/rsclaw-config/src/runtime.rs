@@ -19,8 +19,8 @@ use anyhow::Result;
 use super::schema::{
     A2aPeerConfig, A2aRelayMode, A2aRelayStrategy, AgentDefaults, AgentEntry, AuthConfig, BindMode,
     BindingConfig, ChannelsConfig, Config, CronConfig, DmScope, GatewayMode, HooksConfig,
-    LoggingConfig, ModelsConfig, PluginsConfig, ReloadMode, SandboxConfig, SecretOrString,
-    SecretsConfig, SessionConfig, SkillsConfig, ToolsConfig,
+    LoggingConfig, ModelsConfig, PluginsConfig, ReloadMode, RetryConfig, SandboxConfig,
+    SecretOrString, SecretsConfig, SessionConfig, SkillsConfig, ToolsConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -198,6 +198,10 @@ pub struct ChannelRuntime {
 pub struct ModelRuntime {
     pub models: Option<ModelsConfig>,
     pub auth: Option<AuthConfig>,
+    /// Resolved provider-level retry configuration (from `models.retry`).
+    /// Stored as the schema type; callers convert to the provider crate's
+    /// `RetryConfig` at the point of use.
+    pub retry: Option<RetryConfig>,
 }
 
 /// Skills, plugins, tools.  Reload triggers skill/plugin re-scan only.
@@ -269,29 +273,29 @@ impl IntoRuntime for Config {
 
         // Resolve auth token before consuming `gw`.
         let token_ref = gw.auth.as_ref().and_then(|a| a.token.as_ref());
+        let secrets_cfg = self.secrets.as_ref();
         let auth_token_configured = token_ref.is_some()
             || std::env::var("RSCLAW_AUTH_TOKEN").is_ok()
             || std::env::var("OPENCLAW_GATEWAY_TOKEN").is_ok();
         let auth_token_is_plaintext = token_ref
             .map(|t| matches!(t, SecretOrString::Plain(_)))
             .unwrap_or(false);
-        // Use resolve_early() so SecretRef::Env tokens are resolved inline;
-        // File/Exec refs return None here and must be resolved later via
-        // SecretsManager.
-        // Fallback: RSCLAW_AUTH_TOKEN or OPENCLAW_GATEWAY_TOKEN env vars.
+        // Use resolve_full() so File/Exec tokens are also resolved at startup
+        // (using the secrets.providers config). Fallback: RSCLAW_AUTH_TOKEN or
+        // OPENCLAW_GATEWAY_TOKEN env vars.
         let auth_token = token_ref
-            .and_then(|t| t.resolve_early())
+            .and_then(|t| t.resolve_full(secrets_cfg))
             .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
             .or_else(|| std::env::var("OPENCLAW_GATEWAY_TOKEN").ok());
 
-        // Warn if token_ref exists but couldn't resolve early (likely File/Exec
-        // ref). The gateway will start unauthenticated — this is a misconfig
+        // Warn if token_ref exists but couldn't be resolved.
+        // The gateway will start unauthenticated — this is a misconfig
         // that's easy to miss otherwise.
         if auth_token.is_none() && token_ref.is_some() {
             tracing::warn!(
-                "gateway.auth.token is set but could not be resolved from ENV. \
-                 File/Exec-based secrets require `secrets.providers` config, \
-                 and are not yet integrated with the early-resolve path. \
+                "gateway.auth.token is set but could not be resolved. \
+                 Check that secrets.providers is configured correctly and the \
+                 referenced file/command is accessible. \
                  The gateway will start WITHOUT authentication."
             );
         }
@@ -483,6 +487,7 @@ impl IntoRuntime for Config {
                 session: self.session.unwrap_or_else(default_session),
             },
             model: ModelRuntime {
+                retry: self.models.as_ref().and_then(|m| m.retry.clone()),
                 models: self.models,
                 auth: self.auth,
             },

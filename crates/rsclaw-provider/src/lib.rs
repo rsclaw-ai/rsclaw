@@ -526,12 +526,10 @@ pub trait LlmProvider: Send + Sync {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct RetryConfig {
-    /// Maximum retry attempts per model in the chain.  Currently wired only
-    /// for the `backoff_delay` calculation; the per-model retry loop in
-    /// `FailoverManager` uses a compile-time constant (`TRANSIENT_RETRY_MAX`).
-    /// The `attempts` field is reserved for a future config-driven retry
-    /// strategy and does NOT yet control actual retry behavior.
-    pub attempts: u32,     // default 3
+    /// Maximum transient-error retry attempts per model in the chain before
+    /// advancing to the next model. Controls the in-place retry loop in
+    /// `FailoverManager::try_model_with_profiles`. Default 3.
+    pub attempts: u32,
     pub min_delay_ms: u64, // default 400
     pub max_delay_ms: u64, // default 30_000
     pub jitter: f64,       // default 0.1

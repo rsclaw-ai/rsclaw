@@ -32,7 +32,22 @@ pub const LEGACY_REDB_UPGRADE_HELPER_ENV: &str = "RSCLAW_INTERNAL_REDB_LEGACY_UP
 /// Session metadata: session_key → JSON string.
 const SESSION_META: TableDefinition<&str, &str> = TableDefinition::new("session_meta");
 
-/// Message store: "<session_key>:<seq>" → JSON string.
+/// Message store: "<session_key>\0<seq>" → JSON string.
+///
+/// The separator is `\0` (NUL) instead of `:` because session keys
+/// themselves contain `:` (e.g. `agent:main:telegram:direct:u1`). Using
+/// `:` as the composite-key separator creates prefix-scan collisions:
+/// session `X` and session `X:extra` share the `X:` prefix, so
+/// `load_messages("X")` or `delete_session("X")` would also match `X:extra`'s
+/// messages. `\0` never appears in a session key, eliminating the ambiguity.
+///
+/// **Compatibility:** databases written before this change use `:` as the
+/// separator. Read functions scan BOTH `\0` and `:` prefixes to maintain
+/// backward compatibility. Writes always use `\0`.
+const KEY_SEP: &str = "\0";
+const LEGACY_KEY_SEP: &str = ":";
+
+/// Message store: "<session_key><KEY_SEP><seq>" → JSON string.
 const MESSAGES: TableDefinition<&str, &str> = TableDefinition::new("messages");
 
 /// Pairing state: "<channel>:<peer_id>" → JSON string.
@@ -291,6 +306,43 @@ fn run_legacy_redb_upgrade_child(path: &Path) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Composite message-key helpers (MESSAGES table)
+//
+// Keys come in two flavors:
+//   new    `"<session_key>\0<seq:016>"` / `"archive\0<sk>\0gen<N>\0<seq:016>"`
+//   legacy `"<session_key>:<seq:016>"`   / `"archive:<sk>:gen<N>:<seq:016>"`
+// Read paths scan both; these helpers parse either.
+// ---------------------------------------------------------------------------
+
+/// Extract the sequence number from an active (non-archive) message key.
+/// Handles both `\0` and `:` separators. Returns `None` if the key does not
+/// start with `session_key` followed by a valid separator + seq.
+fn seq_from_message_key(key: &str, session_key: &str) -> Option<u64> {
+    for sep in [KEY_SEP, LEGACY_KEY_SEP] {
+        if let Some(rest) = key.strip_prefix(&format!("{session_key}{sep}")) {
+            if let Ok(seq) = rest.parse::<u64>() {
+                return Some(seq);
+            }
+        }
+    }
+    None
+}
+
+/// Parse an archive key of shape `archive<sep><session_key><sep>gen<N><sep><seq>`
+/// (separator `\0` or `:`) into `(generation, seq)`. Returns `None` for keys
+/// that don't match the shape or whose numbers don't parse.
+fn parse_archive_key(key: &str, session_key: &str) -> Option<(u32, u64)> {
+    for sep in [KEY_SEP, LEGACY_KEY_SEP] {
+        let after = key.strip_prefix(&format!("archive{sep}{session_key}{sep}gen"))?;
+        let (gen_str, seq_str) = after.split_once(sep)?;
+        let generation = gen_str.parse::<u32>().ok()?;
+        let seq = seq_str.parse::<u64>().ok()?;
+        return Some((generation, seq));
+    }
+    None
+}
+
 impl RedbStore {
     /// Open (or create) the redb database at `path`.
     pub fn open(path: &Path, tier: MemoryTier) -> Result<Self> {
@@ -365,18 +417,24 @@ impl RedbStore {
         {
             let mut meta = write.open_table(SESSION_META)?;
             meta.remove(session_key)?;
-            // Also remove all messages for this session.
+            // Also remove all messages for this session. Scan both `\0` (new)
+            // and `:` (legacy) separator prefixes.
             let mut msgs = write.open_table(MESSAGES)?;
-            let prefix = format!("{session_key}:");
-            let keys: Vec<String> = msgs
-                .range(prefix.as_str()..)?
-                .take_while(|r| {
-                    r.as_ref()
-                        .map(|(k, _)| k.value().starts_with(&prefix))
-                        .unwrap_or(false)
+            let keys: Vec<String> = [KEY_SEP, LEGACY_KEY_SEP]
+                .iter()
+                .flat_map(|sep| {
+                    let prefix = format!("{session_key}{sep}");
+                    msgs.range(prefix.as_str()..)
+                        .unwrap()
+                        .take_while(|r| {
+                            r.as_ref()
+                                .map(|(k, _)| k.value().starts_with(&prefix))
+                                .unwrap_or(false)
+                        })
+                        .filter_map(|r| r.ok())
+                        .map(|(k, _)| k.value().to_owned())
+                        .collect::<Vec<_>>()
                 })
-                .filter_map(|r| r.ok())
-                .map(|(k, _)| k.value().to_owned())
                 .collect();
             for key in &keys {
                 msgs.remove(key.as_str())?;
@@ -419,16 +477,22 @@ impl RedbStore {
         let write = self.db.begin_write()?;
         {
             let mut msgs = write.open_table(MESSAGES)?;
-            let prefix = format!("{session_key}:");
-            let keys: Vec<String> = msgs
-                .range(prefix.as_str()..)?
-                .take_while(|r| {
-                    r.as_ref()
-                        .map(|(k, _)| k.value().starts_with(&prefix))
-                        .unwrap_or(false)
+            // Scan both `\0` (new) and `:` (legacy) separator prefixes.
+            let keys: Vec<String> = [KEY_SEP, LEGACY_KEY_SEP]
+                .iter()
+                .flat_map(|sep| {
+                    let prefix = format!("{session_key}{sep}");
+                    msgs.range(prefix.as_str()..)
+                        .unwrap()
+                        .take_while(|r| {
+                            r.as_ref()
+                                .map(|(k, _)| k.value().starts_with(&prefix))
+                                .unwrap_or(false)
+                        })
+                        .filter_map(|r| r.ok())
+                        .map(|(k, _)| k.value().to_owned())
+                        .collect::<Vec<_>>()
                 })
-                .filter_map(|r| r.ok())
-                .map(|(k, _)| k.value().to_owned())
                 .collect();
             for key in &keys {
                 msgs.remove(key.as_str())?;
@@ -490,8 +554,8 @@ impl RedbStore {
             (seq, meta.generation)
         };
 
-        let msg_key = format!("{session_key}:{seq:016}");
-        let archive_key = format!("archive:{session_key}:gen{generation}:{seq:016}");
+        let msg_key = format!("{session_key}{KEY_SEP}{seq:016}");
+        let archive_key = format!("archive{KEY_SEP}{session_key}{KEY_SEP}gen{generation}{KEY_SEP}{seq:016}");
 
         {
             let mut msgs = write.open_table(MESSAGES)?;
@@ -511,21 +575,34 @@ impl RedbStore {
     pub fn load_messages(&self, session_key: &str) -> Result<Vec<serde_json::Value>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(MESSAGES)?;
-        let prefix = format!("{session_key}:");
 
-        let messages: Vec<(String, serde_json::Value)> = table
-            .range(prefix.as_str()..)?
-            .take_while(|r| {
-                r.as_ref()
-                    .map(|(k, _)| k.value().starts_with(&prefix))
-                    .unwrap_or(false)
-            })
-            .filter_map(|r| r.ok())
-            .filter_map(|(k, v)| {
-                let val: serde_json::Value = serde_json::from_str(v.value()).ok()?;
-                Some((k.value().to_owned(), val))
+        // Scan BOTH `\0` (new) and `:` (legacy) separator prefixes and merge.
+        // The key carries the separator, so a backfill round-trip below can
+        // re-derive it from the key itself (no need to remember which prefix
+        // a row came from).
+        let mut messages: Vec<(String, serde_json::Value)> = [KEY_SEP, LEGACY_KEY_SEP]
+            .iter()
+            .flat_map(|sep| {
+                let prefix = format!("{session_key}{sep}");
+                table
+                    .range(prefix.as_str()..)
+                    .unwrap()
+                    .take_while(|r| {
+                        r.as_ref()
+                            .map(|(k, _)| k.value().starts_with(&prefix))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|r| r.ok())
+                    .filter_map(|(k, v)| {
+                        let val: serde_json::Value = serde_json::from_str(v.value()).ok()?;
+                        Some((k.value().to_owned(), val))
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
+        // Merge order is per-prefix (all `\0` rows then all `:` rows); sort
+        // by seq so the final ordering is chronological regardless.
+        messages.sort_by_key(|(k, _)| seq_from_message_key(k, session_key).unwrap_or(0));
 
         if messages.is_empty() {
             return Ok(vec![]);
@@ -533,15 +610,20 @@ impl RedbStore {
 
         // Backfill archive for pre-upgrade sessions: if no archive entries
         // exist yet, copy all active messages to archive:...:gen1:... keys.
-        let archive_prefix = format!("archive:{session_key}:");
-        let has_archive = table
-            .range(archive_prefix.as_str()..)?
-            .next()
-            .is_some_and(|r| {
-                r.as_ref()
-                    .map(|(k, _)| k.value().starts_with(&archive_prefix))
-                    .unwrap_or(false)
-            });
+        // Detect archive rows under BOTH separators so sessions whose archive
+        // predates the `\0` migration aren't re-backfilled.
+        let has_archive = [KEY_SEP, LEGACY_KEY_SEP].iter().any(|sep| {
+            let archive_prefix = format!("archive{sep}{session_key}{sep}");
+            table
+                .range(archive_prefix.as_str()..)
+                .unwrap()
+                .next()
+                .is_some_and(|r| {
+                    r.as_ref()
+                        .map(|(k, _)| k.value().starts_with(&archive_prefix))
+                        .unwrap_or(false)
+                })
+        });
 
         if !has_archive {
             drop(table);
@@ -549,9 +631,15 @@ impl RedbStore {
             if let Ok(write) = self.db.begin_write() {
                 if let Ok(mut msgs_table) = write.open_table(MESSAGES) {
                     for (key, val) in &messages {
-                        // Pre-upgrade: no generation info, default to gen1.
-                        let suffix = key.strip_prefix(&format!("{session_key}:")).unwrap_or("0");
-                        let archive_key = format!("archive:{session_key}:gen1:{suffix}");
+                        // Pre-upgrade: no generation info, default to gen1. The
+                        // new write always uses KEY_SEP; the seq is re-derived
+                        // from the (possibly legacy) active key.
+                        let suffix = seq_from_message_key(key, session_key)
+                            .unwrap_or(0)
+                            .to_string();
+                        let archive_key = format!(
+                            "archive{KEY_SEP}{session_key}{KEY_SEP}gen1{KEY_SEP}{suffix}"
+                        );
                         let json_str = serde_json::to_string(val).unwrap_or_default();
                         if let Err(e) = msgs_table.insert(archive_key.as_str(), json_str.as_str()) {
                             tracing::error!(error = %e, key = %archive_key, "failed to insert archive entry");
@@ -594,36 +682,30 @@ impl RedbStore {
     ) -> Result<Vec<(u64, u32, serde_json::Value)>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(MESSAGES)?;
-        let prefix = match generation {
-            Some(g) => format!("archive:{session_key}:gen{g}:"),
-            None => format!("archive:{session_key}:"),
+        let prefixes = match generation {
+            Some(g) => [KEY_SEP, LEGACY_KEY_SEP]
+                .map(|sep| format!("archive{sep}{session_key}{sep}gen{g}{sep}")),
+            None => [KEY_SEP, LEGACY_KEY_SEP]
+                .map(|sep| format!("archive{sep}{session_key}{sep}")),
         };
         let mut out = Vec::new();
-        for entry in table.range(prefix.as_str()..)? {
-            let (k, v) = entry?;
-            let key = k.value();
-            if !key.starts_with(&prefix) {
-                break;
+        for prefix in prefixes {
+            for entry in table.range(prefix.as_str()..)? {
+                let (k, v) = entry?;
+                let key = k.value();
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                // Key shape: archive:<sk>:gen<N>:<seq16> — separator may be
+                // `\0` (new) or `:` (legacy).
+                let Some((generation, seq)) = parse_archive_key(key, session_key) else {
+                    continue;
+                };
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(v.value()) else {
+                    continue;
+                };
+                out.push((seq, generation, msg));
             }
-            // Key shape: archive:<sk>:gen<N>:<seq16>
-            let after = match key.strip_prefix(&format!("archive:{session_key}:gen")) {
-                Some(s) => s,
-                None => continue,
-            };
-            let (gen_str, seq_str) = match after.split_once(':') {
-                Some(pair) => pair,
-                None => continue,
-            };
-            let Ok(generation) = gen_str.parse::<u32>() else {
-                continue;
-            };
-            let Ok(seq) = seq_str.parse::<u64>() else {
-                continue;
-            };
-            let Ok(msg) = serde_json::from_str::<serde_json::Value>(v.value()) else {
-                continue;
-            };
-            out.push((seq, generation, msg));
         }
         // Keys range in lexicographic order, so `gen10` sorts between `gen1`
         // and `gen2`. Re-sort by (generation, seq) so head/tail/seq modes see

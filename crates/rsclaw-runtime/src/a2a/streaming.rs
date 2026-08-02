@@ -269,7 +269,9 @@ pub(crate) async fn spawn_streaming_task(
     // §7.5: stamp the creating principal so only it (or the operator token)
     // can later read / cancel / subscribe to this streaming task.
     if let Some(c) = caller.as_ref() {
-        let _ = state.task_store.put_owner(&task_id, &c.id);
+        if let Err(e) = state.task_store.put_owner(&task_id, &c.id) {
+            tracing::warn!(task_id, error = %e, "A2A streaming: failed to put_owner");
+        }
     }
 
     // CRITICAL: subscribe BEFORE any publish so the SSE consumer sees

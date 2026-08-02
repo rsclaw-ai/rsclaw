@@ -2057,6 +2057,32 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "de" => "Verarbeitung läuft, bitte warten...",
     );
 
+    msg!("chat_reply_timeout",
+        "en" => "The agent did not respond in time. Your message may not have been processed — please try again.",
+        "zh" => "代理未及时响应，消息可能未被处理，请重试。",
+        "ja" => "エージェントが時間内に応答しませんでした。メッセージが処理されていない可能性があります。再試行してください。",
+        "ko" => "에이전트가 시간 내에 응답하지 않았습니다. 메시지가 처리되지 않았을 수 있습니다. 다시 시도해 주세요.",
+        "fr" => "L'agent n'a pas répondu à temps. Votre message n'a peut-être pas été traité — veuillez réessayer.",
+        "de" => "Der Agent hat nicht rechtzeitig geantwortet. Ihre Nachricht wurde möglicherweise nicht verarbeitet — bitte versuchen Sie es erneut.",
+        "th" => "เอเจนต์ไม่ตอบกลับในเวลาที่กำหนด ข้อความของคุณอาจไม่ถูกประมวลผล กรุณาลองอีกครั้ง",
+        "vi" => "Tac nhan khong phan hoi kip thoi. Tin nhan cua ban co the chua duoc xu ly - vui long thu lai.",
+        "es" => "El agente no respondió a tiempo. Es posible que su mensaje no haya sido procesado — inténtelo de nuevo.",
+        "ru" => "Агент не ответил вовремя. Ваше сообщение могло быть не обработано — попробуйте снова.",
+    );
+
+    msg!("chat_reply_error",
+        "en" => "An error occurred while processing your message. Please try again.",
+        "zh" => "处理消息时发生错误，请重试。",
+        "ja" => "メッセージの処理中にエラーが発生しました。再試行してください。",
+        "ko" => "메시지 처리 중 오류가 발생했습니다. 다시 시도해 주세요.",
+        "fr" => "Une erreur s'est produite lors du traitement de votre message. Veuillez réessayer.",
+        "de" => "Bei der Verarbeitung Ihrer Nachricht ist ein Fehler aufgetreten. Bitte versuchen Sie es erneut.",
+        "th" => "เกิดข้อผิดพลาดขณะประมวลผลข้อความของคุณ กรุณาลองอีกครั้ง",
+        "vi" => "Xay ra loi khi xu ly tin nhan cua ban. Vui long thu lai.",
+        "es" => "Ocurrió un error al procesar su mensaje. Inténtelo de nuevo.",
+        "ru" => "Произошла ошибка при обработке вашего сообщения. Попробуйте снова.",
+    );
+
     msg!("search_captcha_blocked",
         "en" => "All free search providers were blocked (CAPTCHA). Consider configuring an API key (serper, brave, or bing) in settings for reliable search.",
         "zh" => "所有免费搜索引擎被人机验证拦截。建议在设置中配置搜索 API 密钥（serper、brave 或 bing）以获得稳定的搜索服务。",

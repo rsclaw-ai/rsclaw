@@ -1436,14 +1436,15 @@ impl AgentRuntime {
                     tracing::warn!(path = %dir.display(), error = %e, "cannot create upload dir");
                 }
                 let saved = dir.join(&std_name);
-                if let Err(e) = std::fs::write(&saved, &f.data) {
-                    tracing::warn!(path = %saved.display(), error = %e, "cannot save upload");
+                let write_ok = std::fs::write(&saved, &f.data).is_ok();
+                if !write_ok {
+                    tracing::warn!(path = %saved.display(), "cannot save upload — source_path will be None");
                 }
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&f.data);
                 images.push(crate::registry::ImageAttachment {
                     data: format!("data:{};base64,{}", f.mime_type, b64),
                     mime_type: f.mime_type,
-                    source_path: Some(saved.to_string_lossy().into_owned()),
+                    source_path: write_ok.then(|| saved.to_string_lossy().into_owned()),
                 });
             }
         }
@@ -1542,8 +1543,9 @@ impl AgentRuntime {
                 }
                 let dest = target_dir.join(&std_name);
                 let size = file.data.len();
-                if let Err(e) = std::fs::write(&dest, &file.data) {
-                    tracing::warn!(path = %dest.display(), error = %e, "cannot save uploaded file");
+                let file_write_ok = std::fs::write(&dest, &file.data).is_ok();
+                if !file_write_ok {
+                    tracing::warn!(path = %dest.display(), "cannot save uploaded file — disk path will be invalid");
                 }
 
                 // Images: mark as vision-analyzable. Video/audio: binary.
@@ -1573,7 +1575,9 @@ impl AgentRuntime {
                 } else {
                     let path =
                         std::env::temp_dir().join(format!("rsclaw_pending_{}.bin", Uuid::new_v4()));
-                    let _ = std::fs::write(&path, &file.data);
+                    if let Err(e) = std::fs::write(&path, &file.data) {
+                        tracing::warn!(path = %path.display(), error = %e, "cannot write pending file to temp dir");
+                    }
                     let stage = if let Some(ext_text) = extracted {
                         PendingStage::TokenConfirm {
                             extracted_text: ext_text,

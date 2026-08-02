@@ -413,6 +413,7 @@ mod tests {
             model: ModelRuntime {
                 models: None,
                 auth: None,
+                retry: None,
             },
             ext: ExtRuntime {
                 tools: None,
@@ -469,6 +470,7 @@ mod tests {
             model: ModelRuntime {
                 models: None,
                 auth: None,
+                retry: None,
             },
             ext: ExtRuntime {
                 tools: None,

@@ -189,6 +189,10 @@ pub struct DeviceRecord {
     pub device_token: String,
     pub device_id: Option<String>,
     pub created_at: u64,
+    /// Unix-epoch seconds when this token expires. `None` means no expiry
+    /// (only for legacy tokens loaded from disk before the expiry feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
