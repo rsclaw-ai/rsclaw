@@ -93,6 +93,8 @@ pub struct PeerManager {
     pub(crate) peer_stream_tasks: DashMap<String, String>,
     /// Request counter for generating unique request IDs.
     request_counter: AtomicU64,
+    /// Metrics counters for the peer direct channel (ADR 0002).
+    pub metrics: super::relay::RelayMetrics,
 }
 
 impl Default for PeerManager {
@@ -106,6 +108,7 @@ impl Default for PeerManager {
             task_routes: DashMap::new(),
             peer_stream_tasks: DashMap::new(),
             request_counter: AtomicU64::new(0),
+            metrics: super::relay::RelayMetrics::default(),
         }
     }
 }
@@ -143,7 +146,7 @@ impl PeerManager {
         for key in stale {
             self.routes.remove(&key);
         }
-        // Resolve pending waiters.
+        // Resolve pending sync RPC waiters.
         let pending_keys: Vec<String> = self
             .pending
             .iter()
@@ -157,6 +160,36 @@ impl PeerManager {
                     format!("peer '{peer_node_id}' disconnected"),
                 ));
             }
+        }
+        // Force-terminate in-flight streaming RPCs for this peer.
+        let stream_keys: Vec<String> = self
+            .stream_pending
+            .iter()
+            .filter(|e| e.value().node_id == peer_node_id)
+            .map(|e| e.key().clone())
+            .collect();
+        for request_id in &stream_keys {
+            let synthetic = serde_json::json!({
+                "kind": "status-update",
+                "taskId": "",
+                "contextId": "",
+                "status": {
+                    "state": "failed",
+                    "message": {
+                        "role": "agent",
+                        "messageId": format!("peer-loss-{}", uuid::Uuid::new_v4()),
+                        "parts": [{
+                            "kind": "text",
+                            "text": format!("peer direct connection lost: '{peer_node_id}' disconnected"),
+                        }],
+                    }
+                },
+                "final": true,
+            });
+            self.forward_stream_event(request_id, synthetic);
+            self.stream_pending.remove(request_id);
+            // Also clean up the peer_stream_tasks entry for this request.
+            self.peer_stream_tasks.remove(request_id);
         }
         info!(peer = %peer_node_id, "peer direct connection unregistered");
     }
@@ -195,14 +228,16 @@ impl PeerManager {
     /// Look up the route for an agent_ref. Checks direct peer routes first,
     /// then falls back to (external) relay hub routes.
     pub fn route_for(&self, agent_ref: &str) -> Option<super::relay::RouteEntry> {
-        self.routes.get(agent_ref).map(|entry| {
-            if entry.expires_at <= Instant::now() {
-                drop(entry);
-                self.routes.remove(agent_ref);
-                return None;
-            }
-            Some(entry.clone())
-        })?
+        let entry = self.routes.get(agent_ref)?;
+        if entry.expires_at <= Instant::now() {
+            // Clone nothing — drop the guard before removing to avoid
+            // DashMap "already borrowed" panic (DashMap guards are not
+            // reentrant; calling remove while a get guard is alive panics).
+            drop(entry);
+            self.routes.remove(agent_ref);
+            return None;
+        }
+        Some(entry.clone())
     }
 
     /// Register a route via direct peer connection.
@@ -267,14 +302,20 @@ impl PeerManager {
             anyhow::bail!("peer send to '{}' failed", peer_node_id);
         }
         drop(conn);
-        match tokio::time::timeout(PEER_REQUEST_TIMEOUT, rx).await {
+        self.metrics.request_count.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let result = match tokio::time::timeout(PEER_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err(anyhow::anyhow!("peer response channel closed")),
             Err(_) => {
                 self.pending.remove(&request_id);
                 Err(anyhow::anyhow!("peer request timed out"))
             }
-        }
+        };
+        self.metrics
+            .request_latency_ms_total
+            .fetch_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        result
     }
 
     /// Complete a pending JSON-RPC call (called by the inbound frame handler).
@@ -356,6 +397,82 @@ impl PeerManager {
         };
         let _ = conn.tx.send(frame);
     }
+
+    /// Walk `stream_pending` and force-terminate any entry past its deadline.
+    /// Emits a synthetic terminal status-update so SSE consumers observe a
+    /// clean failure, then drops the entry. Called from the gateway-wide
+    /// sweeper loop in `startup.rs` alongside `RelayHub::sweep_expired_streams`.
+    pub fn sweep_expired_streams(&self) -> usize {
+        let now = Instant::now();
+        let expired: Vec<(String, String)> = self
+            .stream_pending
+            .iter()
+            .filter(|e| e.value().deadline <= now)
+            .map(|e| (e.key().clone(), e.value().node_id.clone()))
+            .collect();
+        for (request_id, node_id) in &expired {
+            let synthetic = serde_json::json!({
+                "kind": "status-update",
+                "taskId": "",
+                "contextId": "",
+                "status": {
+                    "state": "failed",
+                    "message": {
+                        "role": "agent",
+                        "messageId": format!("peer-deadline-{}", uuid::Uuid::new_v4()),
+                        "parts": [{
+                            "kind": "text",
+                            "text": format!(
+                                "peer stream exceeded lifetime cap; aborting"
+                            ),
+                        }],
+                    }
+                },
+                "final": true,
+            });
+            self.forward_stream_event(request_id, synthetic);
+            self.stream_pending.remove(request_id);
+            self.send_cancel_to(node_id, request_id);
+            warn!(
+                request_id = %request_id,
+                node_id = %node_id,
+                "peer stream hit deadline — synthetic failure emitted"
+            );
+        }
+        expired.len()
+    }
+}
+
+/// Lifecycle guard for peer-direct relay streams. Held by the SSE response
+/// so that when the consumer disconnects (stream is dropped), we send a
+/// `Cancel` frame to the peer and drop the `stream_pending` entry.
+pub struct PeerStreamGuard {
+    peer_manager: std::sync::Arc<PeerManager>,
+    peer_node_id: String,
+    request_id: String,
+}
+
+impl PeerStreamGuard {
+    pub fn new(
+        peer_manager: std::sync::Arc<PeerManager>,
+        peer_node_id: String,
+        request_id: String,
+    ) -> Self {
+        Self {
+            peer_manager,
+            peer_node_id,
+            request_id,
+        }
+    }
+}
+
+impl Drop for PeerStreamGuard {
+    fn drop(&mut self) {
+        if self.peer_manager.complete_streaming(&self.request_id) {
+            self.peer_manager
+                .send_cancel_to(&self.peer_node_id, &self.request_id);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -378,11 +495,12 @@ pub(crate) async fn try_hole_punch(
     let mut sorted: Vec<&Candidate> = candidates.iter().collect();
     sorted.sort_by_key(|c| std::cmp::Reverse(c.priority));
 
-    // If there's already a direct connection, skip.
+    // If there's already a direct connection, treat as success (idempotent).
+    // Both sides may initiate hole-punching simultaneously (ADR 0002 §Step 4);
+    // whichever completes first registers the connection, and the other's
+    // attempt should not be treated as a failure.
     if state.peer_manager.has_direct_connection(target_node) {
-        return Err(anyhow::anyhow!(
-            "already directly connected to '{target_node}'"
-        ));
+        return Ok("already connected".to_owned());
     }
 
     let node_id = state
@@ -808,14 +926,22 @@ pub fn collect_candidates(
     }
 
     // 2. srflx candidates from STUN.
+    // STUN returns the NAT-mapped UDP port, but our WS listener is on
+    // `host_port` (TCP). For TCP/WS hole-punching, the NAT may or may not
+    // preserve the port mapping. We use `host_port` for the srflx URL
+    // because that's where our WS server actually listens — the STUN
+    // query is used only to discover the public IP, not the port.
+    // (ADR 0002 §Risk 3: WS-over-TCP punching is less reliable than UDP;
+    //  srflx candidates are best-effort and will fail for Symmetric NAT,
+    //  where the hub relay path is the fallback.)
     let srflx = super::stun::gather_srflx_candidates(
         stun_urls,
         std::time::Duration::from_secs(2),
     );
-    for (public_ip, public_port) in srflx {
+    for (public_ip, _nat_port) in srflx {
         candidates.push(Candidate {
             kind: CandidateKind::Srflx,
-            url: format!("ws://{public_ip}:{public_port}/a2a/peer/ws"),
+            url: format!("ws://{public_ip}:{host_port}/a2a/peer/ws"),
             priority: 90,
         });
     }
@@ -848,7 +974,8 @@ pub(crate) async fn peer_ws_handler(
 ) -> Response {
     let relay = &state.config.gateway.a2a_relay;
 
-    // Only spoke-mode nodes accept direct peer connections.
+    // Only spoke-mode nodes that have explicitly enabled P2P accept direct
+    // peer connections.
     let is_spoke = matches!(
         relay.mode,
         rsclaw_config::runtime::A2aRelayModeRuntime::Spoke
@@ -857,9 +984,20 @@ pub(crate) async fn peer_ws_handler(
         return axum::http::StatusCode::NOT_FOUND.into_response();
     }
 
+    // Gate on peer.enabled (ADR 0002 §配置). Without this, any spoke-mode
+    // gateway exposes the peer WS endpoint even when P2P is not configured.
+    let peer_enabled = relay
+        .peer
+        .as_ref()
+        .is_some_and(|p| p.enabled);
+    if !peer_enabled {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
+
     // Peer WS auth: the remote spoke must present a token matching our
-    // own relay token (shared secret). node_id identifies the caller
-    // but is not verified against a node list (spokes don't have one).
+    // own relay token (shared secret). The node_id is verified against the
+    // configured peer list if one exists; otherwise it is trusted (token
+    // possession is the auth gate).
     let presented = query
         .token
         .as_deref()
@@ -878,6 +1016,20 @@ pub(crate) async fn peer_ws_handler(
             "peer WS auth rejected: token mismatch or not configured"
         );
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    // If a peer node list is configured (relay.nodes), verify that the
+    // claimed node_id is known and not revoked. Without this, any token
+    // holder can claim an arbitrary node_id and register routes for it.
+    if !relay.nodes.is_empty() {
+        let known = relay.nodes.iter().any(|n| n.node_id == query.node_id);
+        if !known {
+            tracing::warn!(
+                peer_node = %query.node_id,
+                "peer WS auth rejected: node_id not in configured nodes list"
+            );
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
     }
 
     ws.on_upgrade(move |socket| handle_peer_socket(socket, state, query.node_id))
@@ -928,6 +1080,30 @@ async fn handle_peer_socket(socket: WebSocket, state: AppState, peer_node_id: St
     // Writer: RelayFrame → WS Text.
     let writer_peer = peer_node_id.clone();
     let peer_mgr_w = state.peer_manager.clone();
+    let ping_sink = peer_mgr_w.clone();
+    let ping_peer = peer_node_id.clone();
+    tokio::spawn(async move {
+        // Periodic WS Ping so NAT/firewall idle counters reset (mirrors
+        // relay.rs spoke pinger). Without this, residential NAT entries
+        // expire after ~9min of idle and the connection silently drops.
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        interval.tick().await; // skip immediate tick
+        loop {
+            interval.tick().await;
+            // Send app-level Ping frame through the RelayFrame channel.
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if let Some(conn) = ping_sink.direct_connections.get(&ping_peer) {
+                if conn.tx.send(RelayFrame::Ping { ts }).is_err() {
+                    break;
+                }
+            } else {
+                break; // connection gone
+            }
+        }
+    });
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             let Ok(text) = serde_json::to_string(&frame) else {

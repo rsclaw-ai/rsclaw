@@ -329,6 +329,26 @@ impl RelayHub {
 
     /// Set route mode to Direct for all routes hosted by `node_id` (ADR 0002 §PeerConnected).
     /// Returns the number of routes updated.
+    ///
+    /// **Note:** This is informational only — the hub's forwarding path
+    /// (`try_forward_jsonrpc`) checks `RouteMode::Direct` to *skip* hub
+    /// forwarding, delegating to the caller's own `PeerManager`. The hub does
+    /// not track which source node has a direct connection to `node_id`;
+    /// each spoke maintains its own `PeerManager` routes independently.
+    /// When a spoke reports `PeerConnected { peer_node }`, it means *that
+    /// spoke* can reach `peer_node` directly. Other spokes may not have a
+    /// direct connection and will still use hub relay.
+    ///
+    /// **Known limitation:** marking the route Direct on the hub causes *all*
+    /// spokes' forwarding through the hub to be skipped for that target (B1
+    /// fix). This is overly aggressive — only the reporting spoke should skip
+    /// hub relay. A proper fix requires per-(source, target) direct-route
+    /// tracking, which is deferred to Phase 5. For now, the PeerManager check
+    /// in `try_forward_jsonrpc` runs first; if it finds a direct route, the
+    /// hub is never consulted. If PeerManager doesn't find one, the Direct
+    /// flag causes a fall-through to HTTP, which is a safe (if suboptimal)
+    /// degradation for spokes that don't have a direct connection to the
+    /// target.
     pub fn set_routes_direct(&self, node_id: &str) -> usize {
         let mut updated = 0usize;
         for mut entry in self.routes.iter_mut() {
@@ -1296,7 +1316,14 @@ pub async fn try_forward_jsonrpc(
         return forward_via_peer(state, caller, req, &target, &peer_node_id).await;
     }
 
-    if state.relay_hub.route_for(&target).is_none() {
+    // Check hub route — but skip if the route is marked Direct (the caller
+    // should have used PeerManager; if PeerManager didn't find it, the direct
+    // connection may have dropped, so fall through to HTTP by returning None).
+    let hub_route = state.relay_hub.route_for(&target)?;
+    if hub_route.mode == RouteMode::Direct {
+        // Direct connection exists according to hub but PeerManager doesn't
+        // have it — the direct link likely dropped. Return None so the caller
+        // falls back to HTTP rather than needlessly forwarding through the hub.
         return None;
     }
     forward_via_hub(state, caller, req, &target).await

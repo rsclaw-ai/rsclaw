@@ -1119,6 +1119,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // spoke + healthy WS + slow consumer could pin entries forever.
     {
         let relay_hub = Arc::clone(&state.relay_hub);
+        let peer_mgr = Arc::clone(&state.peer_manager);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1127,6 +1128,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 let swept = relay_hub.sweep_expired_streams();
                 if swept > 0 {
                     tracing::info!(swept, "relay stream deadline sweeper");
+                }
+                // Also sweep peer direct-connection streams (ADR 0002).
+                let peer_swept = peer_mgr.sweep_expired_streams();
+                if peer_swept > 0 {
+                    tracing::info!(swept = peer_swept, "peer stream deadline sweeper");
                 }
             }
         });

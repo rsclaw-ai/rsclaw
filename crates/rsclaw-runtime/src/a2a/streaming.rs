@@ -73,9 +73,15 @@ pub async fn handle_streaming_rpc(
                 .await
             {
                 Ok((_request_id, _node_id, event_rx)) => {
+                    let guard = crate::a2a::peer::PeerStreamGuard::new(
+                        state.peer_manager.clone(),
+                        _node_id,
+                        _request_id,
+                    );
                     let stream =
                         tokio_stream::wrappers::BroadcastStream::new(event_rx).filter_map(
                             move |result| {
+                                let _ = &guard;
                                 let req_id = req_id.clone();
                                 async move {
                                     match result {
@@ -110,75 +116,92 @@ pub async fn handle_streaming_rpc(
         }
 
         // Fall back to hub relay.
-        if state.relay_hub.route_for(target).is_some() {
-            if !crate::a2a::relay::can_invoke(caller.as_ref(), target) {
-                state
-                    .relay_hub
-                    .metrics
-                    .acl_denials
-                    .fetch_add(1, Ordering::Relaxed);
-                let relay_id = state.config.gateway.a2a_relay.relay_id.as_str();
-                let target_node = target.split('/').next().unwrap_or("");
-                audit_relay(
-                    "deny",
-                    principal,
-                    "invoke",
-                    &format!("agent:{target}"),
-                    relay_id,
-                    target_node,
-                    None,
-                    Some("a2a:invoke scope missing"),
-                );
-                return sse_jsonrpc_error(
-                    Some(req_id),
-                    -32003,
-                    format!("not authorized to invoke {target}"),
-                );
-            }
-            let mut params = req.params.clone();
-            crate::a2a::relay::rewrite_target_agent_for_spoke(&mut params, target);
-            match state
+        // Skip hub relay if the route is marked Direct (the peer direct link
+        // may have dropped; return HTTP fallback rather than needlessly
+        // forwarding through the hub).
+        let hub_route = match state.relay_hub.route_for(target) {
+            Some(r) => r,
+            None => return sse_jsonrpc_error(
+                Some(req_id),
+                -32004,
+                format!("no route for {target} (peer direct and hub relay both unavailable)"),
+            ),
+        };
+        if hub_route.mode == crate::a2a::relay::RouteMode::Direct {
+            return sse_jsonrpc_error(
+                Some(req_id),
+                -32004,
+                format!("direct P2P route for {target} unavailable and hub route is marked Direct (link may have dropped)"),
+            );
+        }
+
+        if !crate::a2a::relay::can_invoke(caller.as_ref(), target) {
+            state
                 .relay_hub
-                .invoke_streaming(target, &req.method, params, principal)
-                .await
-            {
-                Ok((request_id, node_id, event_rx)) => {
-                    let guard = crate::a2a::relay::RelayStreamGuard::new(
-                        state.relay_hub.clone(),
-                        node_id,
-                        request_id,
-                    );
-                    let stream = tokio_stream::wrappers::BroadcastStream::new(event_rx).filter_map(
-                        move |result| {
-                            let _ = &guard;
-                            let req_id = req_id.clone();
-                            async move {
-                                match result {
-                                    Ok(value) => {
-                                        let payload = json!({
-                                            "jsonrpc": "2.0",
-                                            "id": req_id,
-                                            "result": value,
-                                        });
-                                        Some(Ok::<_, Infallible>(
-                                            Event::default().json_data(payload).unwrap_or_default(),
-                                        ))
-                                    }
-                                    Err(BroadcastStreamRecvError::Lagged(n)) => {
-                                        warn!(lagged = n, "SSE relay consumer lagged");
-                                        None
-                                    }
+                .metrics
+                .acl_denials
+                .fetch_add(1, Ordering::Relaxed);
+            let relay_id = state.config.gateway.a2a_relay.relay_id.as_str();
+            let target_node = target.split('/').next().unwrap_or("");
+            audit_relay(
+                "deny",
+                principal,
+                "invoke",
+                &format!("agent:{target}"),
+                relay_id,
+                target_node,
+                None,
+                Some("a2a:invoke scope missing"),
+            );
+            return sse_jsonrpc_error(
+                Some(req_id),
+                -32003,
+                format!("not authorized to invoke {target}"),
+            );
+        }
+        let mut params = req.params.clone();
+        crate::a2a::relay::rewrite_target_agent_for_spoke(&mut params, target);
+        match state
+            .relay_hub
+            .invoke_streaming(target, &req.method, params, principal)
+            .await
+        {
+            Ok((request_id, node_id, event_rx)) => {
+                let guard = crate::a2a::relay::RelayStreamGuard::new(
+                    state.relay_hub.clone(),
+                    node_id,
+                    request_id,
+                );
+                let stream = tokio_stream::wrappers::BroadcastStream::new(event_rx).filter_map(
+                    move |result| {
+                        let _ = &guard;
+                        let req_id = req_id.clone();
+                        async move {
+                            match result {
+                                Ok(value) => {
+                                    let payload = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req_id,
+                                        "result": value,
+                                    });
+                                    Some(Ok::<_, Infallible>(
+                                        Event::default().json_data(payload).unwrap_or_default(),
+                                    ))
+                                }
+                                Err(BroadcastStreamRecvError::Lagged(n)) => {
+                                    warn!(lagged = n, "SSE relay consumer lagged");
+                                    None
                                 }
                             }
-                        },
-                    );
-                    return Sse::new(stream)
-                        .keep_alive(KeepAlive::new())
-                        .into_response();
-                }
-                Err(e) => {
-                    warn!(error = %e, "relay streaming failed, falling back");
-                }
+                        }
+                    },
+                );
+                return Sse::new(stream)
+                    .keep_alive(KeepAlive::new())
+                    .into_response();
+            }
+            Err(e) => {
+                warn!(error = %e, "relay streaming failed, falling back");
             }
         }
     }
