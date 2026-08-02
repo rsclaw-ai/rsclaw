@@ -1101,6 +1101,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         task_store: a2a_task_store,
         push_dispatcher: a2a_push_dispatcher,
         relay_hub: a2a_relay_hub,
+        peer_manager: std::sync::Arc::new(crate::a2a::peer::PeerManager::default()),
         knowledge: knowledge_svc,
         memory: memory.clone(),
         model_health: model_health.clone(),

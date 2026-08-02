@@ -277,6 +277,35 @@ pub struct A2aRelayConfig {
     pub revoked_nodes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<A2aRelayNodeConfig>>,
+    /// P2P hole-punch configuration (ADR 0002). When enabled, spoke nodes
+    /// collect NAT candidates and attempt direct peer-to-peer connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<A2aPeerRelayConfig>,
+}
+
+/// P2P hole-punch configuration for the relay overlay (ADR 0002).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aPeerRelayConfig {
+    /// Enable P2P hole-punching. Default false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// STUN server URLs for gathering server-reflexive candidates.
+    /// e.g. ["stun:stun.l.google.com:19302"]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun_urls: Option<Vec<String>>,
+    /// Optional TURN server URLs for Symmetric NAT fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_urls: Option<Vec<String>>,
+    /// TURN username (required when turnUrls is set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_username: Option<String>,
+    /// TURN credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_credential: Option<SecretOrString>,
+    /// Peer WS listen port. Defaults to gateway.port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -381,6 +410,17 @@ pub struct A2aPeerConfig {
     /// unset (back-compat with older configs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// P2P mode (ADR 0002). When set to "peer", this agent participates in
+    /// the P2P hole-punch overlay. nodeId identifies which relay spoke node
+    /// hosts this agent on the remote gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Node ID on the relay overlay that hosts this agent (for P2P routing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Base64 Ed25519 public key of the remote peer node (for P2P auth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

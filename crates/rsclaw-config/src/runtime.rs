@@ -111,6 +111,19 @@ pub struct A2aRelayRuntime {
     /// Hub-side revocation list — node_ids whose connections are refused.
     pub revoked_nodes: Vec<String>,
     pub nodes: Vec<A2aRelayNodeRuntime>,
+    /// P2P hole-punch configuration (ADR 0002). None if disabled.
+    pub peer: Option<A2aPeerRelayRuntime>,
+}
+
+/// Resolved P2P hole-punch configuration (ADR 0002).
+#[derive(Debug, Clone)]
+pub struct A2aPeerRelayRuntime {
+    pub enabled: bool,
+    pub stun_urls: Vec<String>,
+    pub turn_urls: Vec<String>,
+    pub turn_username: Option<String>,
+    pub turn_credential: Option<String>,
+    pub listen_port: u16,
 }
 
 /// Network / auth / channel-health knobs.  Swappable without restart.
@@ -431,6 +444,19 @@ impl IntoRuntime for Config {
                             }
                         })
                     });
+                let peer = relay.peer.as_ref().map(|p| {
+                    A2aPeerRelayRuntime {
+                        enabled: p.enabled,
+                        stun_urls: p.stun_urls.clone().unwrap_or_default(),
+                        turn_urls: p.turn_urls.clone().unwrap_or_default(),
+                        turn_username: p.turn_username.clone(),
+                        turn_credential: p
+                            .turn_credential
+                            .as_ref()
+                            .and_then(|c| c.resolve_early()),
+                        listen_port: p.listen_port.unwrap_or(0),
+                    }
+                });
                 A2aRelayRuntime {
                     mode,
                     relay_id,
@@ -446,6 +472,7 @@ impl IntoRuntime for Config {
                     private_key,
                     revoked_nodes: relay.revoked_nodes.clone().unwrap_or_default(),
                     nodes,
+                    peer,
                 }
             })
             .unwrap_or_default();

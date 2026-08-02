@@ -42,19 +42,75 @@ pub async fn handle_streaming_rpc(
 ) -> Response {
     let req_id = req.id.clone();
 
-    // Relay forwarding: if the request targets a spoke node, route through the
-    // relay hub instead of creating a local streaming task. Targets may be
-    // explicit (metadata.agentId) or implicit via a known task_id route.
+    // Relay forwarding: if the request targets a spoke node, try PeerManager
+    // (direct P2P) first, then relay hub, then local fallback (ADR 0002 §Route Decision).
     let relay_target = relay_target_from_params(&req.params).or_else(|| {
         crate::a2a::relay::task_id_from_params(&req.params)
             .and_then(|tid| state.relay_hub.route_for_task(tid))
     });
     if let Some(ref target) = relay_target {
+        let principal = caller
+            .as_ref()
+            .map(|id| id.id.as_str())
+            .unwrap_or("anonymous-dev");
+
+        // Try peer direct first.
+        let peer_route =
+            crate::a2a::relay::resolve_peer_route(&state.peer_manager, target);
+        if let Some((peer_node_id, _route)) = peer_route {
+            if !crate::a2a::relay::can_invoke(caller.as_ref(), target) {
+                return sse_jsonrpc_error(
+                    Some(req_id),
+                    -32003,
+                    format!("not authorized to invoke {target}"),
+                );
+            }
+            let mut params = req.params.clone();
+            crate::a2a::relay::rewrite_target_agent_for_spoke(&mut params, target);
+            match state
+                .peer_manager
+                .invoke_streaming(target, &req.method, params, principal, &peer_node_id)
+                .await
+            {
+                Ok((_request_id, _node_id, event_rx)) => {
+                    let stream =
+                        tokio_stream::wrappers::BroadcastStream::new(event_rx).filter_map(
+                            move |result| {
+                                let req_id = req_id.clone();
+                                async move {
+                                    match result {
+                                        Ok(value) => {
+                                            let payload = json!({
+                                                "jsonrpc": "2.0",
+                                                "id": req_id,
+                                                "result": value,
+                                            });
+                                            Some(Ok::<_, Infallible>(
+                                                Event::default()
+                                                    .json_data(payload)
+                                                    .unwrap_or_default(),
+                                            ))
+                                        }
+                                        Err(BroadcastStreamRecvError::Lagged(n)) => {
+                                            warn!(lagged = n, "SSE peer consumer lagged");
+                                            None
+                                        }
+                                    }
+                                }
+                            },
+                        );
+                    return Sse::new(stream)
+                        .keep_alive(KeepAlive::new())
+                        .into_response();
+                }
+                Err(e) => {
+                    warn!(error = %e, "peer streaming failed, trying hub relay");
+                }
+            }
+        }
+
+        // Fall back to hub relay.
         if state.relay_hub.route_for(target).is_some() {
-            let principal = caller
-                .as_ref()
-                .map(|id| id.id.as_str())
-                .unwrap_or("anonymous-dev");
             if !crate::a2a::relay::can_invoke(caller.as_ref(), target) {
                 state
                     .relay_hub
@@ -94,8 +150,6 @@ pub async fn handle_streaming_rpc(
                     );
                     let stream = tokio_stream::wrappers::BroadcastStream::new(event_rx).filter_map(
                         move |result| {
-                            // Force capture so guard.Drop fires when the SSE
-                            // stream is dropped (consumer disconnect).
                             let _ = &guard;
                             let req_id = req_id.clone();
                             async move {
