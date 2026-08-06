@@ -269,7 +269,7 @@ pub fn write_skill(skills_dir: &Path, slug: &str, content: &str) -> Result<PathB
 /// # Examples
 ///
 /// ```
-/// # use rsclaw::skill::crystallizer::slugify;
+/// # use rsclaw_skill::crystallizer::slugify;
 /// assert_eq!(slugify("Web Search Pattern"), "web-search-pattern");
 /// assert_eq!(slugify("  LLM--Retry  Logic! "), "llm-retry-logic");
 /// ```

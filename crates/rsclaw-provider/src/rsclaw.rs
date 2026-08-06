@@ -4196,8 +4196,11 @@ data: {"type":"block_stop","index":0}
         // base_url where leading/trailing whitespace breaks URL parse.
         // (The wire-side "drop empty bearer so we never emit a bare
         // `Authorization: Bearer `" guard now lives in `FleetHttp`.)
+        // Post-0f3b3c3d: base_url is the `/v1` root; the provider prepends
+        // the `/agent` protocol mount itself, so a `/agent` suffix is
+        // stripped to avoid doubling it.
         let p = RsclawProvider::new("  http://x:8090/v1/agent/  ", Some("  sk-abc\n  ".into()));
-        assert_eq!(p.base_url, "http://x:8090/v1/agent");
+        assert_eq!(p.base_url, "http://x:8090/v1");
         assert_eq!(p.bearer.as_deref(), Some("sk-abc"));
     }
 
@@ -6152,7 +6155,7 @@ data: {"type":"block_stop","index":0}
         let session_id = "rs_w7_abc";
 
         Mock::given(method("POST"))
-            .and(path(format!("/sessions/{}/compact", session_id)))
+            .and(path(format!("/agent/sessions/{}/compact", session_id)))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "session_id": session_id,
                 "msgs_count": 13,
@@ -6228,7 +6231,7 @@ data: {"type":"block_stop","index":0}
 
         let mock_server = MockServer::start().await;
         let session_id = "rs_w7_retry";
-        let compact_path = format!("/sessions/{}/compact", session_id);
+        let compact_path = format!("/agent/sessions/{}/compact", session_id);
 
         // First call: 409 with the server's authoritative current=52.
         Mock::given(method("POST"))

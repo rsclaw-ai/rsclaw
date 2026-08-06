@@ -7,7 +7,7 @@ use rsclaw::computer::{
     operator::Operator,
     operators::native::NativeOperator,
     parser::{CoordFormat, parse_vlm_response},
-    prompt::{PromptInputs, build_system_prompt},
+    prompt::{PlatformKind, PromptInputs, build_system_prompt},
 };
 
 // xcap::Monitor::all needs a real display (X11/Wayland/Quartz). GitHub
@@ -64,6 +64,7 @@ fn prompt_includes_all_sections() {
         action_spaces: &action_spaces,
         matched_rules: &matched,
         screen_size: Some((2880, 1800)),
+        platform: PlatformKind::Desktop,
     });
 
     println!("--- generated prompt ({} chars) ---", prompt.len());
