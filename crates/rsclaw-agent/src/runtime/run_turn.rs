@@ -1432,14 +1432,19 @@ impl AgentRuntime {
                 let subdir = rsclaw_channel::upload_subdir(&f.mime_type, &f.filename);
                 let std_name = rsclaw_channel::upload_filename(&f.mime_type, &f.filename);
                 let dir = uploads.join(subdir);
-                let _ = std::fs::create_dir_all(&dir);
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    tracing::warn!(path = %dir.display(), error = %e, "cannot create upload dir");
+                }
                 let saved = dir.join(&std_name);
-                let _ = std::fs::write(&saved, &f.data);
+                let write_ok = std::fs::write(&saved, &f.data).is_ok();
+                if !write_ok {
+                    tracing::warn!(path = %saved.display(), "cannot save upload — source_path will be None");
+                }
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&f.data);
                 images.push(crate::registry::ImageAttachment {
                     data: format!("data:{};base64,{}", f.mime_type, b64),
                     mime_type: f.mime_type,
-                    source_path: Some(saved.to_string_lossy().into_owned()),
+                    source_path: write_ok.then(|| saved.to_string_lossy().into_owned()),
                 });
             }
         }
@@ -1453,7 +1458,9 @@ impl AgentRuntime {
                 .map(expand_tilde)
                 .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"));
             let uploads = ws.join("uploads");
-            let _ = std::fs::create_dir_all(&uploads);
+            if let Err(e) = std::fs::create_dir_all(&uploads) {
+                tracing::warn!(path = %uploads.display(), error = %e, "cannot create upload dir");
+            }
 
             // Check file size limits
             let upload_cfg = self
@@ -1531,10 +1538,15 @@ impl AgentRuntime {
                 let subdir = rsclaw_channel::upload_subdir(&file.mime_type, &file.filename);
                 let std_name = rsclaw_channel::upload_filename(&file.mime_type, &file.filename);
                 let target_dir = uploads.join(subdir);
-                let _ = std::fs::create_dir_all(&target_dir);
+                if let Err(e) = std::fs::create_dir_all(&target_dir) {
+                    tracing::warn!(path = %target_dir.display(), error = %e, "cannot create upload subdir");
+                }
                 let dest = target_dir.join(&std_name);
                 let size = file.data.len();
-                let _ = std::fs::write(&dest, &file.data);
+                let file_write_ok = std::fs::write(&dest, &file.data).is_ok();
+                if !file_write_ok {
+                    tracing::warn!(path = %dest.display(), "cannot save uploaded file — disk path will be invalid");
+                }
 
                 // Images: mark as vision-analyzable. Video/audio: binary.
                 // Others: try text extraction.
@@ -1563,7 +1575,9 @@ impl AgentRuntime {
                 } else {
                     let path =
                         std::env::temp_dir().join(format!("rsclaw_pending_{}.bin", Uuid::new_v4()));
-                    let _ = std::fs::write(&path, &file.data);
+                    if let Err(e) = std::fs::write(&path, &file.data) {
+                        tracing::warn!(path = %path.display(), error = %e, "cannot write pending file to temp dir");
+                    }
                     let stage = if let Some(ext_text) = extracted {
                         PendingStage::TokenConfirm {
                             extracted_text: ext_text,

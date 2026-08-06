@@ -214,7 +214,9 @@ pub async fn clear(mem: &Arc<Mutex<MemoryStore>>, session_key: &str) -> Result<(
     }
     let mut store = mem.lock().await;
     for id in to_delete {
-        let _ = store.delete(&id).await;
+        if let Err(e) = store.delete(&id).await {
+            tracing::warn!(goal_id = %id, err = %e, "goal: delete failed");
+        }
     }
     Ok(())
 }
@@ -237,7 +239,9 @@ async fn bump_iter(
         return Ok(());
     };
     let mut store = mem.lock().await;
-    let _ = store.delete(&old_id).await;
+    if let Err(e) = store.delete(&old_id).await {
+        tracing::warn!(old_goal_id = %old_id, err = %e, "goal: replace delete failed");
+    }
     let doc = MemoryDoc {
         id: uuid::Uuid::new_v4().to_string(),
         scope: session_key.to_owned(),

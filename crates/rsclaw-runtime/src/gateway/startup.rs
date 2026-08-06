@@ -260,13 +260,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // 4. Load skills.
     let global_skills = base_dir.join("skills");
-    let skills = Arc::new(
+    let mut skills_registry =
         load_skills(&global_skills, None, config.ext.skills.as_ref()).unwrap_or_else(|e| {
             warn!("failed to load skills: {e:#}");
             SkillRegistry::new()
-        }),
-    );
-    info!("{} skill(s) loaded", skills.len());
+        });
+    info!("{} skill(s) loaded", skills_registry.len());
 
     // Auto-install allowlist (security gate for the skill_install tool): load
     // the local cache now so the gate has data immediately, then refresh from
@@ -440,12 +439,41 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         let _ = plugin_registry.slots.set_memory(Arc::new(slot), "built-in");
     }
     info!(
-        "{} plugin(s) loaded (js={}, wasm={}), memory slot: {}",
+        "{} plugin(s) loaded (js={}, wasm={}, codex={}), memory slot: {}",
         plugin_registry.len(),
         plugin_registry.js_count(),
         plugin_registry.wasm_count(),
+        plugin_registry.codex_count(),
         plugin_registry.slots.has_memory()
     );
+
+    // Merge codex plugin skills into the skill registry.
+    let codex_mcp_servers: Vec<rsclaw_config::schema::McpServerConfig> = plugin_registry
+        .codex_all()
+        .iter()
+        .flat_map(|cp| cp.mcp_servers.clone())
+        .collect();
+    for cp in plugin_registry.codex_all() {
+        for skill in &cp.skills {
+            let manifest = rsclaw_skill::SkillManifest {
+                name: skill.name.clone(),
+                description: if skill.description.is_empty() {
+                    None
+                } else {
+                    Some(skill.description.clone())
+                },
+                version: None,
+                requires_rsclaw: None,
+                tools: Vec::new(),
+                extra: Default::default(),
+                dir: cp.dir.clone(),
+                prompt: skill.template.clone(),
+            };
+            skills_registry.insert(manifest);
+        }
+    }
+    let skills = Arc::new(skills_registry);
+    info!("{} total skill(s) (including codex)", skills.len());
 
     let wasm_plugins = Arc::new(plugin_registry.take_wasm_plugins());
     let plugins = Arc::new(plugin_registry);
@@ -513,7 +541,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // Spawn MCP servers and discover tools (before agent tasks so tools are
     // available).
     let mcp_registry = Arc::new(rsclaw_mcp::McpRegistry::new());
-    spawn_mcp_servers(&config, Arc::clone(&mcp_registry)).await;
+    spawn_mcp_servers(&config, &codex_mcp_servers, Arc::clone(&mcp_registry)).await;
 
     // Clone memory before passing to agent tasks so heartbeat can also use it.
     let heartbeat_memory = memory.clone();
@@ -678,58 +706,74 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         let mut rx = notification_rx;
         tokio::spawn(async move {
             info!("notification router started");
-            while let Ok(msg) = rx.recv().await {
-                if let Some(ref ch_name) = msg.channel {
-                    // Try per-account sender first (wechat/acct → wechat),
-                    // same pattern as task_queue::channel_tx_for.
-                    let tx = {
-                        let senders_guard =
-                            senders.read().expect("channel_senders RwLock poisoned");
-                        msg.account
-                            .as_ref()
-                            .filter(|a| !a.is_empty())
-                            .and_then(|acct| {
-                                let key = format!("{ch_name}/{acct}");
-                                senders_guard.get(&key).cloned()
-                            })
-                            .or_else(|| senders_guard.get(ch_name).cloned())
-                    };
-                    if let Some(tx) = tx {
-                        info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
-                        if let Err(e) = tx.send(msg.clone()).await {
-                            tracing::warn!(error = %e, "notification send failed");
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        if let Some(ref ch_name) = msg.channel {
+                            // Try per-account sender first (wechat/acct → wechat),
+                            // same pattern as task_queue::channel_tx_for.
+                            let tx = {
+                                let senders_guard =
+                                    senders.read().expect("channel_senders RwLock poisoned");
+                                msg.account
+                                    .as_ref()
+                                    .filter(|a| !a.is_empty())
+                                    .and_then(|acct| {
+                                        let key = format!("{ch_name}/{acct}");
+                                        senders_guard.get(&key).cloned()
+                                    })
+                                    .or_else(|| senders_guard.get(ch_name).cloned())
+                            };
+                            if let Some(tx) = tx {
+                                info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
+                                if let Err(e) = tx.send(msg.clone()).await {
+                                    tracing::warn!(error = %e, "notification send failed");
+                                }
+                            } else if is_sync_only_channel(ch_name) {
+                                // sync-only channels (HTTP /api/v1/message, future stdio
+                                // MCP, etc.) carry their reply back through their own
+                                // transport — the oneshot reply_tx on the AgentMessage,
+                                // an SSE byte stream, etc. The notification fan-out
+                                // here is a fire-and-forget event-bus emit for
+                                // observers (UI, telemetry) and the absence of a
+                                // registered sender is by design, not a misconfig.
+                                // Surface at debug so operators can still see the
+                                // dispatch path without flooding logs on every API
+                                // call.
+                                tracing::debug!(
+                                    channel = %ch_name,
+                                    "notification: sync-only channel, no sender expected"
+                                );
+                            } else {
+                                warn!(channel = %ch_name, "no channel sender registered for notification");
+                            }
+                        } else {
+                            // No channel specified — send to first registered channel (default)
+                            let first = {
+                                let guard = senders.read().expect("channel_senders RwLock poisoned");
+                                guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
+                            };
+                            if let Some((ch_name, tx)) = first {
+                                info!(channel = %ch_name, "routing notification to default channel");
+                                if let Err(e) = tx.send(msg.clone()).await {
+                                    tracing::warn!(error = %e, "notification send failed");
+                                }
+                            } else {
+                                warn!("notification: no channels registered");
+                            }
                         }
-                    } else if is_sync_only_channel(ch_name) {
-                        // sync-only channels (HTTP /api/v1/message, future stdio
-                        // MCP, etc.) carry their reply back through their own
-                        // transport — the oneshot reply_tx on the AgentMessage,
-                        // an SSE byte stream, etc. The notification fan-out
-                        // here is a fire-and-forget event-bus emit for
-                        // observers (UI, telemetry) and the absence of a
-                        // registered sender is by design, not a misconfig.
-                        // Surface at debug so operators can still see the
-                        // dispatch path without flooding logs on every API
-                        // call.
-                        tracing::debug!(
-                            channel = %ch_name,
-                            "notification: sync-only channel, no sender expected"
-                        );
-                    } else {
-                        warn!(channel = %ch_name, "no channel sender registered for notification");
                     }
-                } else {
-                    // No channel specified — send to first registered channel (default)
-                    let first = {
-                        let guard = senders.read().expect("channel_senders RwLock poisoned");
-                        guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
-                    };
-                    if let Some((ch_name, tx)) = first {
-                        info!(channel = %ch_name, "routing notification to default channel");
-                        if let Err(e) = tx.send(msg.clone()).await {
-                            tracing::warn!(error = %e, "notification send failed");
-                        }
-                    } else {
-                        warn!("notification: no channels registered");
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // A burst overflowed the channel buffer. The notification
+                        // router is best-effort — skip the missed messages and
+                        // keep running so fan-out doesn't die for the rest of
+                        // the process lifetime.
+                        tracing::warn!(skipped = n, "notification router: lagged, skipping missed messages");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("notification router: channel closed, exiting");
+                        break;
                     }
                 }
             }
@@ -969,7 +1013,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let a2a_bus = crate::a2a::event::TaskEventBus::new();
     let a2a_task_store = {
         let path = rsclaw_config::loader::base_dir().join("var/data/a2a/tasks.redb");
-        Arc::new(crate::a2a::store::TaskStore::open(&path).expect("open A2A task store"))
+        match crate::a2a::store::TaskStore::open(&path) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                return Err(e).context("failed to open A2A task store");
+            }
+        }
     };
     let a2a_push_dispatcher = Arc::new(crate::a2a::push::PushDispatcher::new(
         Arc::clone(&a2a_task_store),
@@ -1052,6 +1101,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         task_store: a2a_task_store,
         push_dispatcher: a2a_push_dispatcher,
         relay_hub: a2a_relay_hub,
+        peer_manager: std::sync::Arc::new(crate::a2a::peer::PeerManager::default()),
         knowledge: knowledge_svc,
         memory: memory.clone(),
         model_health: model_health.clone(),
@@ -1069,6 +1119,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // spoke + healthy WS + slow consumer could pin entries forever.
     {
         let relay_hub = Arc::clone(&state.relay_hub);
+        let peer_mgr = Arc::clone(&state.peer_manager);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1077,6 +1128,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 let swept = relay_hub.sweep_expired_streams();
                 if swept > 0 {
                     tracing::info!(swept, "relay stream deadline sweeper");
+                }
+                // Also sweep peer direct-connection streams (ADR 0002).
+                let peer_swept = peer_mgr.sweep_expired_streams();
+                if peer_swept > 0 {
+                    tracing::info!(swept = peer_swept, "peer stream deadline sweeper");
                 }
             }
         });
@@ -2362,25 +2418,33 @@ fn resolve_bind_addr(config: &RuntimeConfig) -> SocketAddr {
 // MCP server process management
 // ---------------------------------------------------------------------------
 
-async fn spawn_mcp_servers(config: &RuntimeConfig, registry: Arc<rsclaw_mcp::McpRegistry>) {
-    let mcp = match config.raw.mcp.as_ref() {
-        Some(m) => m,
-        None => return,
-    };
+async fn spawn_mcp_servers(
+    config: &RuntimeConfig,
+    codex_servers: &[rsclaw_config::schema::McpServerConfig],
+    registry: Arc<rsclaw_mcp::McpRegistry>,
+) {
+    let config_enabled = config
+        .raw
+        .mcp
+        .as_ref()
+        .map(|m| m.enabled != Some(false))
+        .unwrap_or(true);
 
-    if mcp.enabled == Some(false) {
+    if !config_enabled {
         return;
     }
 
-    let servers = match mcp.servers.as_ref() {
-        Some(s) => s,
-        None => return,
-    };
+    let config_servers = config
+        .raw
+        .mcp
+        .as_ref()
+        .and_then(|m| m.servers.as_ref())
+        .map(|s| s.as_slice())
+        .unwrap_or_default();
 
-    for server_cfg in servers {
+    for server_cfg in config_servers.iter().chain(codex_servers.iter()) {
         match rsclaw_mcp::McpClient::spawn(server_cfg).await {
             Ok(mut client) => {
-                // Initialize + discover tools.
                 if let Err(e) = client.initialize().await {
                     error!(name = %server_cfg.name, error = %e, "MCP initialize failed");
                     continue;

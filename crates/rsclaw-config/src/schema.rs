@@ -1,5 +1,11 @@
 //! rsclaw JSON5 config schema — full field coverage.
-//! Unknown fields cause deserialization to fail (deny_unknown_fields).
+//! Unknown fields on most structs are silently tolerated (retained in the raw
+//! config and written back on save). This is a deliberate trade-off: the only
+//! struct that rejects unknown fields is `KbOcrConfig` (because unrecognized
+//! OCR params are likely misconfiguration). Future hardening may extend
+//! `deny_unknown_fields` to more structs, but this must be done carefully to
+//! avoid breaking existing deployments that have extra keys from prior
+//! versions or manual edits.
 
 use std::collections::HashMap;
 
@@ -271,6 +277,35 @@ pub struct A2aRelayConfig {
     pub revoked_nodes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<A2aRelayNodeConfig>>,
+    /// P2P hole-punch configuration (ADR 0002). When enabled, spoke nodes
+    /// collect NAT candidates and attempt direct peer-to-peer connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<A2aPeerRelayConfig>,
+}
+
+/// P2P hole-punch configuration for the relay overlay (ADR 0002).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aPeerRelayConfig {
+    /// Enable P2P hole-punching. Default false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// STUN server URLs for gathering server-reflexive candidates.
+    /// e.g. ["stun:stun.l.google.com:19302"]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun_urls: Option<Vec<String>>,
+    /// Optional TURN server URLs for Symmetric NAT fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_urls: Option<Vec<String>>,
+    /// TURN username (required when turnUrls is set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_username: Option<String>,
+    /// TURN credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_credential: Option<SecretOrString>,
+    /// Peer WS listen port. Defaults to gateway.port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -375,6 +410,17 @@ pub struct A2aPeerConfig {
     /// unset (back-compat with older configs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// P2P mode (ADR 0002). When set to "peer", this agent participates in
+    /// the P2P hole-punch overlay. nodeId identifies which relay spoke node
+    /// hosts this agent on the remote gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Node ID on the relay overlay that hosts this agent (for P2P routing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Base64 Ed25519 public key of the remote peer node (for P2P auth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -1096,6 +1142,12 @@ pub struct AgentSandboxConfig {
 pub struct ModelsConfig {
     pub mode: Option<ModelsMode>,
     pub providers: HashMap<String, ProviderConfig>,
+    /// Provider-level retry configuration for the LLM failover manager.
+    /// Controls transient-error retries (timeouts, 5xx, connection blips)
+    /// per model in the chain before advancing to the next model.
+    /// When omitted, defaults to 3 attempts, 400ms min delay, 30s max delay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -2363,6 +2415,28 @@ impl SecretOrString {
             SecretOrString::Ref(_) => None,
         }
     }
+
+    /// Resolve the secret, including File/Exec refs, using the provided
+    /// `SecretsConfig`. This is the full-resolution path — use when
+    /// `secrets.providers` is available (i.e. after the schema is loaded).
+    /// Falls back to `resolve_early()` for Env refs and plain strings.
+    pub fn resolve_full(&self, secrets: Option<&SecretsConfig>) -> Option<String> {
+        match self {
+            SecretOrString::Plain(s) => {
+                let expanded = crate::loader::expand_env_vars(s);
+                Some(expanded)
+            }
+            SecretOrString::Ref(r) if r.source == SecretSource::Env => {
+                std::env::var(&r.id).ok()
+            }
+            SecretOrString::Ref(r)
+                if r.source == SecretSource::File || r.source == SecretSource::Exec =>
+            {
+                resolve_secret_ref(r, secrets)
+            }
+            SecretOrString::Ref(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2371,6 +2445,107 @@ pub struct SecretRef {
     pub source: SecretSource,
     pub provider: Option<String>,
     pub id: String,
+}
+
+/// Resolve a File or Exec secret ref using the provided `SecretsConfig`.
+/// Returns `None` on any error (with a `tracing::warn!`).
+fn resolve_secret_ref(r: &SecretRef, secrets: Option<&SecretsConfig>) -> Option<String> {
+    let secrets_cfg = match secrets {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                source = ?r.source,
+                id = %r.id,
+                "secret ref cannot be resolved: secrets.providers is not configured"
+            );
+            return None;
+        }
+    };
+    let provider_name = r.provider.as_deref().unwrap_or("default");
+    let provider = match secrets_cfg.providers.get(provider_name) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                source = ?r.source,
+                id = %r.id,
+                provider = provider_name,
+                "secret ref cannot be resolved: provider not found in secrets.providers"
+            );
+            return None;
+        }
+    };
+    match r.source {
+        SecretSource::File => {
+            let file_path = match provider.file.as_deref() {
+                Some(f) => f,
+                None => {
+                    tracing::warn!(
+                        provider = provider_name,
+                        "secret provider has type=file but no `file` path"
+                    );
+                    return None;
+                }
+            };
+            let raw = match std::fs::read_to_string(file_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(path = file_path, error = %e, "cannot read secrets file");
+                    return None;
+                }
+            };
+            // JSON Pointer extraction (RFC 6901)
+            let pointer = &r.id;
+            if pointer.is_empty() || pointer == "/" {
+                return Some(raw.trim().to_owned());
+            }
+            let json: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(path = file_path, error = %e, "secrets file is not valid JSON");
+                    return None;
+                }
+            };
+            json.pointer(pointer)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+                .or_else(|| {
+                    tracing::warn!(path = file_path, pointer = pointer, "JSON pointer not found in secrets file");
+                    None
+                })
+        }
+        SecretSource::Exec => {
+            let cmd = match provider.command.as_deref() {
+                Some(c) => c,
+                None => {
+                    tracing::warn!(provider = provider_name, "secret provider has type=exec but no `command`");
+                    return None;
+                }
+            };
+            let args = provider.args.as_deref().unwrap_or(&[]);
+            let mut full_cmd = std::process::Command::new(cmd);
+            full_cmd.args(args);
+            full_cmd.arg(&r.id);
+            match full_cmd.output() {
+                Ok(out) if out.status.success() => {
+                    Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+                }
+                Ok(out) => {
+                    tracing::warn!(
+                        provider = provider_name,
+                        code = ?out.status.code(),
+                        stderr = %String::from_utf8_lossy(&out.stderr),
+                        "exec secret provider returned non-zero exit"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(command = cmd, error = %e, "cannot execute secret provider");
+                    None
+                }
+            }
+        }
+        SecretSource::Env => std::env::var(&r.id).ok(),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

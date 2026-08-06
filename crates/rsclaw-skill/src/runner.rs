@@ -83,6 +83,10 @@ async fn do_run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
 
     // Inject extra env vars.
     for (k, v) in &opts.env {

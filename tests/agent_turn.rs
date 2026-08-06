@@ -93,6 +93,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
         model: ModelRuntime {
             models: None,
             auth: None,
+            retry: None,
         },
         ext: ExtRuntime {
             tools: None,

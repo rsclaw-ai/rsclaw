@@ -9,7 +9,7 @@
 //! Loading pipeline:
 //!   detect config source
 //!     → load + env-expand + $include resolve (JSON5)
-//!       → schema deserialize (deny_unknown_fields)
+//!       → schema deserialize (tolerates unknown fields on most structs)
 //!         → cross-field validate
 //!           → into_runtime (unified RuntimeConfig)
 

@@ -273,7 +273,13 @@ pub fn collect_ancestor_agents_md(
             if candidate.is_file() && !seen.contains(&candidate) {
                 if let Ok(content) = std::fs::read_to_string(&candidate) {
                     let trimmed = if content.len() > MAX_BYTES {
-                        let mut s = content[..MAX_BYTES].to_owned();
+                        // Snap to a UTF-8 char boundary so this never panics
+                        // on multi-byte content (CJK, emoji, etc.).
+                        let mut end = MAX_BYTES;
+                        while end > 0 && !content.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        let mut s = content[..end].to_owned();
                         s.push_str("\n\n[…truncated…]");
                         s
                     } else {

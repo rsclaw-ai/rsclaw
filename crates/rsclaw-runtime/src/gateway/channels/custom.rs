@@ -301,25 +301,66 @@ fn start_custom_webhook(
                         if handle.tx.send(msg).await.is_err() {
                             return;
                         }
-                        if let Ok(Ok(r)) =
-                            tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            reply_rx,
+                        )
+                        .await
                         {
-                            if !r.is_empty {
-                                if let Err(e) = tx
+                            Ok(Ok(r)) => {
+                                if !r.is_empty {
+                                    if let Err(e) = tx
+                                        .send(OutboundMessage {
+                                            target_id: reply_target,
+                                            is_group,
+                                            text: r.text,
+                                            reply_to: None,
+                                            images: r.images,
+                                            files: r.files,
+                                            channel: None,
+                                            account: None,
+                                        })
+                                        .await
+                                    {
+                                        tracing::warn!("failed to send message: {e}");
+                                    }
+                                }
+                            }
+                            Ok(Err(_)) => {
+                                warn!("custom: chat-mode agent reply error");
+                                let _ = tx
                                     .send(OutboundMessage {
-                                        target_id: reply_target,
+                                        target_id: reply_target.clone(),
                                         is_group,
-                                        text: r.text,
+                                        text: rsclaw_i18n::t(
+                                            "chat_reply_error",
+                                            rsclaw_i18n::default_lang(),
+                                        ),
                                         reply_to: None,
-                                        images: r.images,
-                                        files: r.files,
+                                        images: vec![],
+                                        files: vec![],
                                         channel: None,
                                         account: None,
                                     })
-                                    .await
-                                {
-                                    tracing::warn!("failed to send message: {e}");
-                                }
+                                    .await;
+                            }
+                            Err(_) => {
+                                warn!("custom: chat-mode agent reply timed out");
+                                let _ = tx
+                                    .send(OutboundMessage {
+                                        target_id: reply_target.clone(),
+                                        is_group,
+                                        text: rsclaw_i18n::t(
+                                            "chat_reply_timeout",
+                                            rsclaw_i18n::default_lang(),
+                                        ),
+                                        reply_to: None,
+                                        images: vec![],
+                                        files: vec![],
+                                        channel: None,
+                                        account: None,
+                                    })
+                                    .await;
                             }
                         }
                     });
@@ -370,35 +411,73 @@ fn start_custom_webhook(
                 if handle.tx.send(msg).await.is_err() {
                     return;
                 }
-                if let Ok(Ok(r)) = tokio::time::timeout(Duration::from_secs(120), reply_rx).await {
-                    let pending = r.pending_analysis;
-                    if !r.is_empty {
-                        if let Err(e) = tx
+                match tokio::time::timeout(Duration::from_secs(120), reply_rx).await {
+                    Ok(Ok(r)) => {
+                        let pending = r.pending_analysis;
+                        if !r.is_empty {
+                            if let Err(e) = tx
+                                .send(OutboundMessage {
+                                    target_id: reply_target.clone(),
+                                    is_group,
+                                    text: r.text,
+                                    reply_to: None,
+                                    images: r.images,
+                                    files: r.files,
+                                    account: None,
+                                    channel: None,
+                                })
+                                .await
+                            {
+                                tracing::warn!("failed to send message: {e}");
+                            }
+                        }
+                        if let Some(analysis) = pending {
+                            crate::gateway::startup::handle_pending_analysis(
+                                analysis,
+                                Arc::clone(&handle),
+                                &tx,
+                                reply_target,
+                                is_group,
+                                &cfg,
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        warn!("custom: chat-mode agent reply error");
+                        let _ = tx
                             .send(OutboundMessage {
                                 target_id: reply_target.clone(),
                                 is_group,
-                                text: r.text,
+                                text: rsclaw_i18n::t(
+                                    "chat_reply_error",
+                                    rsclaw_i18n::default_lang(),
+                                ),
                                 reply_to: None,
-                                images: r.images,
-                                files: r.files,
+                                images: vec![],
+                                files: vec![],
                                 account: None,
                                 channel: None,
                             })
-                            .await
-                        {
-                            tracing::warn!("failed to send message: {e}");
-                        }
+                            .await;
                     }
-                    if let Some(analysis) = pending {
-                        crate::gateway::startup::handle_pending_analysis(
-                            analysis,
-                            Arc::clone(&handle),
-                            &tx,
-                            reply_target,
-                            is_group,
-                            &cfg,
-                        )
-                        .await;
+                    Err(_) => {
+                        warn!("custom: chat-mode agent reply timed out");
+                        let _ = tx
+                            .send(OutboundMessage {
+                                target_id: reply_target.clone(),
+                                is_group,
+                                text: rsclaw_i18n::t(
+                                    "chat_reply_timeout",
+                                    rsclaw_i18n::default_lang(),
+                                ),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                account: None,
+                                channel: None,
+                            })
+                            .await;
                     }
                 }
             });
@@ -675,25 +754,66 @@ fn start_custom_websocket(
                         if handle.tx.send(msg).await.is_err() {
                             return;
                         }
-                        if let Ok(Ok(r)) =
-                            tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            reply_rx,
+                        )
+                        .await
                         {
-                            if !r.is_empty {
-                                if let Err(e) = tx
+                            Ok(Ok(r)) => {
+                                if !r.is_empty {
+                                    if let Err(e) = tx
+                                        .send(OutboundMessage {
+                                            target_id: reply_target,
+                                            is_group,
+                                            text: r.text,
+                                            reply_to: None,
+                                            images: r.images,
+                                            files: r.files,
+                                            channel: None,
+                                            account: None,
+                                        })
+                                        .await
+                                    {
+                                        tracing::warn!("failed to send message: {e}");
+                                    }
+                                }
+                            }
+                            Ok(Err(_)) => {
+                                warn!("custom: chat-mode agent reply error");
+                                let _ = tx
                                     .send(OutboundMessage {
-                                        target_id: reply_target,
+                                        target_id: reply_target.clone(),
                                         is_group,
-                                        text: r.text,
+                                        text: rsclaw_i18n::t(
+                                            "chat_reply_error",
+                                            rsclaw_i18n::default_lang(),
+                                        ),
                                         reply_to: None,
-                                        images: r.images,
-                                        files: r.files,
+                                        images: vec![],
+                                        files: vec![],
                                         channel: None,
                                         account: None,
                                     })
-                                    .await
-                                {
-                                    tracing::warn!("failed to send message: {e}");
-                                }
+                                    .await;
+                            }
+                            Err(_) => {
+                                warn!("custom: chat-mode agent reply timed out");
+                                let _ = tx
+                                    .send(OutboundMessage {
+                                        target_id: reply_target.clone(),
+                                        is_group,
+                                        text: rsclaw_i18n::t(
+                                            "chat_reply_timeout",
+                                            rsclaw_i18n::default_lang(),
+                                        ),
+                                        reply_to: None,
+                                        images: vec![],
+                                        files: vec![],
+                                        channel: None,
+                                        account: None,
+                                    })
+                                    .await;
                             }
                         }
                     });
@@ -744,35 +864,73 @@ fn start_custom_websocket(
                 if handle.tx.send(msg).await.is_err() {
                     return;
                 }
-                if let Ok(Ok(r)) = tokio::time::timeout(Duration::from_secs(120), reply_rx).await {
-                    let pending = r.pending_analysis;
-                    if !r.is_empty {
-                        if let Err(e) = tx
+                match tokio::time::timeout(Duration::from_secs(120), reply_rx).await {
+                    Ok(Ok(r)) => {
+                        let pending = r.pending_analysis;
+                        if !r.is_empty {
+                            if let Err(e) = tx
+                                .send(OutboundMessage {
+                                    target_id: reply_target.clone(),
+                                    is_group,
+                                    text: r.text,
+                                    reply_to: None,
+                                    images: r.images,
+                                    files: r.files,
+                                    account: None,
+                                    channel: None,
+                                })
+                                .await
+                            {
+                                tracing::warn!("failed to send message: {e}");
+                            }
+                        }
+                        if let Some(analysis) = pending {
+                            crate::gateway::startup::handle_pending_analysis(
+                                analysis,
+                                Arc::clone(&handle),
+                                &tx,
+                                reply_target,
+                                is_group,
+                                &cfg,
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        warn!("custom: chat-mode agent reply error");
+                        let _ = tx
                             .send(OutboundMessage {
                                 target_id: reply_target.clone(),
                                 is_group,
-                                text: r.text,
+                                text: rsclaw_i18n::t(
+                                    "chat_reply_error",
+                                    rsclaw_i18n::default_lang(),
+                                ),
                                 reply_to: None,
-                                images: r.images,
-                                files: r.files,
+                                images: vec![],
+                                files: vec![],
                                 account: None,
                                 channel: None,
                             })
-                            .await
-                        {
-                            tracing::warn!("failed to send message: {e}");
-                        }
+                            .await;
                     }
-                    if let Some(analysis) = pending {
-                        crate::gateway::startup::handle_pending_analysis(
-                            analysis,
-                            Arc::clone(&handle),
-                            &tx,
-                            reply_target,
-                            is_group,
-                            &cfg,
-                        )
-                        .await;
+                    Err(_) => {
+                        warn!("custom: chat-mode agent reply timed out");
+                        let _ = tx
+                            .send(OutboundMessage {
+                                target_id: reply_target.clone(),
+                                is_group,
+                                text: rsclaw_i18n::t(
+                                    "chat_reply_timeout",
+                                    rsclaw_i18n::default_lang(),
+                                ),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                account: None,
+                                channel: None,
+                            })
+                            .await;
                     }
                 }
             });

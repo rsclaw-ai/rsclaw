@@ -456,26 +456,66 @@ pub(crate) fn start_wechat_personal_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(Ok(r)) =
-                                tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
-                                    .await
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                reply_rx,
+                            )
+                            .await
                             {
-                                if !r.is_empty {
-                                    if let Err(e) = tx
-                                        .send(OutboundMessage {
-                                            target_id: from_user,
-                                            is_group: false,
-                                            text: r.text,
-                                            reply_to: None,
-                                            images: r.images,
-                                            files: r.files,
-                                            channel: None,
-                                            account: Some(w_acct),
-                                        })
-                                        .await
-                                    {
-                                        tracing::warn!("failed to send message: {e}");
+                                Ok(Ok(r)) => {
+                                    if !r.is_empty {
+                                        if let Err(e) = tx
+                                            .send(OutboundMessage {
+                                                target_id: from_user,
+                                                is_group: false,
+                                                text: r.text,
+                                                reply_to: None,
+                                                images: r.images,
+                                                files: r.files,
+                                                channel: None,
+                                                account: Some(w_acct),
+                                            })
+                                            .await
+                                        {
+                                            tracing::warn!("failed to send message: {e}");
+                                        }
                                     }
+                                }
+                                Ok(Err(_)) => {
+                                    warn!("wechat: chat-mode agent reply error");
+                                    let _ = tx
+                                        .send(OutboundMessage {
+                                            target_id: from_user.clone(),
+                                            is_group: false,
+                                            text: rsclaw_i18n::t(
+                                                "chat_reply_error",
+                                                rsclaw_i18n::default_lang(),
+                                            ),
+                                            reply_to: None,
+                                            images: vec![],
+                                            files: vec![],
+                                            channel: None,
+                                            account: Some(w_acct.clone()),
+                                        })
+                                        .await;
+                                }
+                                Err(_) => {
+                                    warn!("wechat: chat-mode agent reply timed out");
+                                    let _ = tx
+                                        .send(OutboundMessage {
+                                            target_id: from_user.clone(),
+                                            is_group: false,
+                                            text: rsclaw_i18n::t(
+                                                "chat_reply_timeout",
+                                                rsclaw_i18n::default_lang(),
+                                            ),
+                                            reply_to: None,
+                                            images: vec![],
+                                            files: vec![],
+                                            channel: None,
+                                            account: Some(w_acct.clone()),
+                                        })
+                                        .await;
                                 }
                             }
                         });

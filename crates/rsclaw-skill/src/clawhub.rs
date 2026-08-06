@@ -601,6 +601,21 @@ impl ClawhubClient {
             let path = file["path"].as_str().unwrap_or("SKILL.md");
             let contents = file["contents"].as_str().unwrap_or("");
 
+            // Path traversal guard: reject paths that escape the install
+            // directory (e.g. "../", absolute paths, or symlink-relative).
+            // The zip/tarball paths already have this guard; this path is for
+            // the skills.sh HTTP API which returns flat JSON file arrays.
+            let path_os = std::path::Path::new(path);
+            let components: Vec<_> = path_os.components().collect();
+            let safe = components.iter().all(|c| match c {
+                std::path::Component::Normal(_) => true,
+                _ => false,
+            }) && !path_os.is_absolute();
+            if !safe {
+                tracing::warn!(skill_id, path, "skills.sh: file path escapes install directory, skipping");
+                continue;
+            }
+
             let dest = install_dir.join(path);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;

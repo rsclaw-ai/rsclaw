@@ -2218,11 +2218,23 @@ pub(crate) async fn btw_direct_call(
     // /btw uses an ephemeral failover with a fresh health table — its calls
     // are one-shot bypass queries that shouldn't poison the agent's
     // long-lived chain state.
+    let retry_config = config
+        .model
+        .retry
+        .as_ref()
+        .map(|r| rsclaw_provider::RetryConfig {
+            attempts: r.attempts.unwrap_or(3),
+            min_delay_ms: r.min_delay_ms.unwrap_or(400),
+            max_delay_ms: r.max_delay_ms.unwrap_or(30_000),
+            jitter: r.jitter.unwrap_or(0.1),
+        })
+        .unwrap_or_default();
     let mut failover = FailoverManager::new(
         auth_order,
         std::collections::HashMap::new(),
         vec![],
         rsclaw_provider::health::ProviderHealthRegistry::new(),
+        retry_config,
     );
 
     let mut stream = match failover.call(req, &providers).await {
