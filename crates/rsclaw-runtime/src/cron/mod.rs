@@ -82,7 +82,13 @@ pub struct CronRunner {
     jobs: Vec<CronJob>,
     agents: Arc<AgentRegistry>,
     /// Optional direct WASM plugin access for deterministic cron preflights.
-    wasm_plugins: Option<Arc<Vec<rsclaw_plugin::WasmPlugin>>>,
+    /// Shares the same live cell as `AppState.wasm_plugins` (not a snapshot
+    /// captured at scheduler construction) so `rsclaw gateway reload --scope
+    /// plugins` takes effect on the next preflight tick instead of requiring
+    /// a full gateway restart — plugin-preflight jobs call the WASM plugin
+    /// directly and never go through AgentRuntime::run_turn's per-turn
+    /// wasm_plugins refresh, which is what every other tool-call path uses.
+    wasm_plugins: Option<Arc<tokio::sync::RwLock<Arc<Vec<rsclaw_plugin::WasmPlugin>>>>>,
     /// Agent IDs whose cron turns run without a timeout (daemon loops).
     daemon_agent_ids: Vec<String>,
     channels: Arc<ChannelManager>,
@@ -175,9 +181,13 @@ impl CronRunner {
     }
 
     /// Enable deterministic WASM preflights for jobs that opt in through
-    /// `wakeMode`.
+    /// `wakeMode`. `plugins` must be the same live cell `AppState.wasm_plugins`
+    /// holds — see the field doc comment for why this can't be a snapshot.
     #[must_use]
-    pub fn with_wasm_plugins(mut self, plugins: Arc<Vec<rsclaw_plugin::WasmPlugin>>) -> Self {
+    pub fn with_wasm_plugins(
+        mut self,
+        plugins: Arc<tokio::sync::RwLock<Arc<Vec<rsclaw_plugin::WasmPlugin>>>>,
+    ) -> Self {
         self.wasm_plugins = Some(plugins);
         self
     }
@@ -897,7 +907,16 @@ impl CronRunner {
 
                     let preflight_result = match parse_plugin_preflight(job.wake_mode.as_deref()) {
                         Ok(Some(preflight)) => {
-                            match run_plugin_preflight(wasm_plugins.as_deref(), &preflight).await {
+                            // Read the CURRENT plugin registry at dispatch
+                            // time, not whatever was live when the cron
+                            // scheduler was constructed.
+                            let wasm_plugins_now = match &wasm_plugins {
+                                Some(lock) => Some(lock.read().await.clone()),
+                                None => None,
+                            };
+                            match run_plugin_preflight(wasm_plugins_now.as_deref(), &preflight)
+                                .await
+                            {
                                 Ok(outcome) if !outcome.should_run => {
                                     Some(Ok("plugin preflight: no work".to_string()))
                                 }

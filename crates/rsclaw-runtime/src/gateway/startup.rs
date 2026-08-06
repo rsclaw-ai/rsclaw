@@ -476,6 +476,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     info!("{} total skill(s) (including codex)", skills.len());
 
     let wasm_plugins = Arc::new(plugin_registry.take_wasm_plugins());
+    // Shared live cell: this exact Arc is handed to both AppState (below)
+    // and the cron scheduler's plugin-preflight dispatch (see
+    // CronRunner::with_wasm_plugins), so a `rsclaw gateway reload --scope
+    // plugins` write into AppState.wasm_plugins is immediately visible to
+    // cron preflight jobs too, instead of only to AgentHandle-based tool
+    // dispatch (which already refreshes per-turn via wasm_plugins_snapshot).
+    let wasm_plugins_live = Arc::new(tokio::sync::RwLock::new(Arc::clone(&wasm_plugins)));
     let plugins = Arc::new(plugin_registry);
     for handle in registry.all() {
         handle.set_wasm_plugins(Arc::clone(&wasm_plugins));
@@ -998,7 +1005,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 Some(shutdown.clone()),
             )
             .with_daemon_agent_ids(config.agents.daemon_agent_ids())
-            .with_wasm_plugins(Arc::clone(&wasm_plugins));
+            .with_wasm_plugins(Arc::clone(&wasm_plugins_live));
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
                     error!("cron runner error: {e:#}");
@@ -1084,7 +1091,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         custom_webhooks: Arc::clone(&custom_webhooks),
         cron_reload: cron_reload_tx,
         notification_tx: notification_tx.clone(),
-        wasm_plugins: Arc::new(tokio::sync::RwLock::new(Arc::clone(&wasm_plugins))),
+        wasm_plugins: Arc::clone(&wasm_plugins_live),
         plugins: Arc::new(tokio::sync::RwLock::new(Arc::clone(&plugins))),
         skills: Arc::new(tokio::sync::RwLock::new(Arc::clone(&skills))),
         mcp: Arc::clone(&mcp_registry),
