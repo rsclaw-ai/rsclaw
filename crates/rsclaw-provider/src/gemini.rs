@@ -5,7 +5,7 @@
 //! and streaming returns JSON lines with `candidates[0].content.parts[0].text`.
 
 use anyhow::{Context, Result};
-use futures::{StreamExt, TryStreamExt, future::BoxFuture};
+use futures::{StreamExt, future::BoxFuture};
 use reqwest::Client;
 use serde_json::{Value, json};
 
@@ -82,6 +82,7 @@ impl LlmProvider for GeminiProvider {
                         .as_deref()
                         .unwrap_or(super::DEFAULT_USER_AGENT),
                 )
+                .timeout(std::time::Duration::from_secs(120))
                 .json(&body)
                 .send()
                 .await
@@ -94,9 +95,19 @@ impl LlmProvider for GeminiProvider {
             }
 
             let byte_stream = resp.bytes_stream();
+            let byte_stream = tokio_stream::StreamExt::timeout(
+                byte_stream,
+                std::time::Duration::from_secs(120),
+            );
             let line_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
-            let event_stream = byte_stream
-                .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
+            let mapped = byte_stream.map(move |r| match r {
+                    Ok(Ok(bytes)) => Ok(bytes),
+                    Ok(Err(e)) => Err(anyhow::anyhow!("Gemini stream read error: {e}")),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Gemini stream idle for 120s (server stalled mid-generation)"
+                    )),
+                });
+            let event_stream = mapped
                 .then(move |chunk| {
                     let line_buffer = line_buffer.clone();
                     async move { parse_sse_chunk_buffered(chunk, &line_buffer).await }
@@ -149,7 +160,9 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     }
 
     // Generation config.
-    let gen_cfg = body["generationConfig"].as_object_mut().unwrap();
+    let gen_cfg = body["generationConfig"]
+        .as_object_mut()
+        .expect("generationConfig field constructed above");
     if let Some(max) = req.max_tokens {
         gen_cfg.insert("maxOutputTokens".to_owned(), json!(max));
     }

@@ -31,6 +31,10 @@ impl TaskStore {
         // half-migrated format the legacy upgrader couldn't fix — move it aside
         // and recreate fresh rather than crashing the gateway on boot. The bad
         // file is preserved as `.broken-<ts>` for recovery, never deleted.
+        //
+        // BUT: transient I/O errors (permission, disk full, temporary lock)
+        // should NOT trigger a reset. We retry once after a short delay; only
+        // if the second attempt also fails do we move aside + recreate.
         let builder = Database::builder();
         let db = match rsclaw_store::create_with_lock_retry(&builder, path) {
             Ok(db) => db,
@@ -45,23 +49,38 @@ impl TaskStore {
                     path.display()
                 );
             }
-            Err(e) => {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let aside = path.with_extension(format!("redb.broken-{ts}"));
-                tracing::error!(
+            Err(first_err) => {
+                // Retry once after 500ms — the error may be transient (disk
+                // hiccup, OS file lock release race).
+                tracing::warn!(
                     path = %path.display(),
-                    moved_to = %aside.display(),
-                    error = %e,
-                    "a2a task store unopenable; moving aside and recreating (task history reset)"
+                    error = %first_err,
+                    "a2a task store open failed, retrying in 500ms"
                 );
-                if path.exists() {
-                    std::fs::rename(path, &aside)
-                        .context("move aside unopenable a2a task store")?;
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                match rsclaw_store::create_with_lock_retry(&builder, path) {
+                    Ok(db) => db,
+                    Err(_second_err) => {
+                        // Two consecutive failures — treat as corruption and
+                        // move aside rather than crashing the gateway.
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let aside = path.with_extension(format!("redb.broken-{ts}"));
+                        tracing::error!(
+                            path = %path.display(),
+                            moved_to = %aside.display(),
+                            first_error = %first_err,
+                            "a2a task store unopenable after retry; moving aside and recreating (task history reset)"
+                        );
+                        if path.exists() {
+                            std::fs::rename(path, &aside)
+                                .context("move aside unopenable a2a task store")?;
+                        }
+                        Database::create(path).context("recreate a2a task redb")?
+                    }
                 }
-                Database::create(path).context("recreate a2a task redb")?
             }
         };
         let txn = db.begin_write()?;

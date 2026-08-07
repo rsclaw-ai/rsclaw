@@ -1050,11 +1050,11 @@ fn validate_plugin_sql(sql: &str, kind: PluginSqlKind) -> std::result::Result<()
             "create" => {
                 let second = tokens.get(1).copied();
                 let third = tokens.get(2).copied();
-                if second != Some("table")
-                    && !(matches!(second, Some("temp" | "temporary")) && third == Some("table"))
-                    && second != Some("index")
-                    && !(second == Some("unique") && third == Some("index"))
-                {
+                let creates_table = second == Some("table")
+                    || (matches!(second, Some("temp" | "temporary")) && third == Some("table"));
+                let creates_index =
+                    second == Some("index") || (second == Some("unique") && third == Some("index"));
+                if !creates_table && !creates_index {
                     return Err("sql_execute only allows CREATE TABLE or CREATE INDEX".to_owned());
                 }
             }
@@ -2139,6 +2139,35 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
 // host-vlm trait implementation
 // ---------------------------------------------------------------------------
 
+/// Save the exact badge-crop payload sent to the vision provider for diagnosis.
+///
+/// This intentionally overwrites one `/tmp` file and is best-effort: diagnostic
+/// I/O must not affect a plugin's vision request.
+fn save_monitor_badge_vision_payload(prompt: &str, image_data_uri: &str) {
+    if !prompt.contains("这是微信底部导航栏截图。看“微信”和“通讯录”图标右上角") {
+        return;
+    }
+    let Some((header, encoded)) = image_data_uri.split_once(";base64,") else {
+        return;
+    };
+    let extension = match header.strip_prefix("data:").unwrap_or_default() {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => "png",
+    };
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(error = %error, "cannot decode vision payload for local diagnosis");
+            return;
+        }
+    };
+    let path = std::env::temp_dir().join(format!("rsclaw-monitor-tab-badge.{extension}"));
+    if let Err(error) = std::fs::write(&path, bytes) {
+        tracing::warn!(path = %path.display(), error = %error, "cannot save vision payload for local diagnosis");
+    }
+}
+
 impl rsclaw::plugin::host_vlm::Host for HostState {
     async fn vlm_parse(
         &mut self,
@@ -2184,6 +2213,8 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             })
             .unwrap_or(image_data_uri);
 
+        save_monitor_badge_vision_payload(&prompt, &image_data_uri);
+
         let messages = vec![rsclaw_provider::Message {
             role: rsclaw_provider::Role::User,
             content: rsclaw_provider::MessageContent::Parts(vec![
@@ -2213,28 +2244,32 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             recall: None,
         };
 
-        // Bound both connection setup and streaming so one visual read cannot
-        // consume more than roughly half of a one-minute monitor interval.
-        // Callers retry on a later tick instead of holding the device UI.
+        // Bound both connection setup and streaming. The rsclaw-vision cluster
+        // occasionally queues under load and can take well over 15s to start
+        // returning tokens even for a fast, minimal prompt (a 15s ceiling was
+        // observed failing twice in a row on a prompt that otherwise finished
+        // in ~5s via direct CLI timing) — 60s gives real requests room to
+        // finish instead of failing on transient contention. Callers still
+        // retry on a later tick instead of holding the device UI indefinitely.
         let mut stream =
-            match tokio::time::timeout(Duration::from_secs(15), provider.stream(req)).await {
+            match tokio::time::timeout(Duration::from_secs(60), provider.stream(req)).await {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(e)) => return Ok(Err(format!("vlm_parse provider error: {e}"))),
                 Err(_) => {
                     return Ok(Err(
-                        "vlm_parse provider setup timed out after 15s".to_string()
+                        "vlm_parse provider setup timed out after 60s".to_string()
                     ));
                 }
             };
         {
             let mut text = String::new();
             let mut reasoning = String::new();
-            let stream_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            let stream_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             use futures::StreamExt;
             loop {
                 let event = match tokio::time::timeout_at(stream_deadline, stream.next()).await {
                     Ok(event) => event,
-                    Err(_) => return Ok(Err("vlm_parse stream timed out after 15s".to_string())),
+                    Err(_) => return Ok(Err("vlm_parse stream timed out after 60s".to_string())),
                 };
                 let Some(event) = event else { break };
                 match event {
@@ -3267,6 +3302,20 @@ mod android_helper_tests {
         );
         assert!(
             validate_plugin_sql(
+                "create index if not exists idx_quotes_code on quotes(code)",
+                PluginSqlKind::Execute
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_sql(
+                "create unique index idx_quotes_code on quotes(code)",
+                PluginSqlKind::Execute
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_sql(
                 "insert into quotes (code, price) values (?1, ?2)",
                 PluginSqlKind::Execute
             )
@@ -3320,7 +3369,6 @@ mod android_helper_tests {
         }
         for sql in [
             "delete from kv where key = ?1",
-            "create index idx_quotes_code on quotes(code)",
             "alter table quotes add column x text",
             "vacuum",
         ] {

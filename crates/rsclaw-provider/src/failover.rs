@@ -90,6 +90,7 @@ impl FailoverManager {
         api_keys: HashMap<String, String>,
         fallbacks: Vec<String>,
         model_health: ProviderHealthRegistry,
+        retry: RetryConfig,
     ) -> Self {
         Self {
             order,
@@ -97,7 +98,7 @@ impl FailoverManager {
             fallbacks,
             cooldowns: HashMap::new(),
             failure_counts: HashMap::new(),
-            retry: RetryConfig::default(),
+            retry,
             model_health,
         }
     }
@@ -256,11 +257,9 @@ impl FailoverManager {
             // shouldn't take the only model in a chain out of rotation
             // — that surfaces as user-visible "LLM chain exhausted" on a
             // recoverable hiccup. Retry the SAME (provider, profile) up to
-            // TRANSIENT_RETRY_MAX times with TRANSIENT_RETRY_BACKOFFS
-            // before classifying as TryNextModel.
-            const TRANSIENT_RETRY_MAX: u32 = 2;
-            const TRANSIENT_RETRY_BACKOFFS: [Duration; 2] =
-                [Duration::from_millis(500), Duration::from_secs(2)];
+            // `self.retry.attempts` times with exponential back-off derived
+            // from the retry config before classifying as TryNextModel.
+            let transient_retry_max = self.retry.attempts;
             let mut transient_attempts: u32 = 0;
             loop {
                 match provider.stream(req.clone()).await {
@@ -324,15 +323,15 @@ impl FailoverManager {
                         // Single-model chains otherwise exhaust on the first
                         // 10s network hiccup.
                         if matches!(kind, ErrorKind::Transient | ErrorKind::Unknown)
-                            && transient_attempts < TRANSIENT_RETRY_MAX
+                            && transient_attempts < transient_retry_max
                         {
-                            let delay = TRANSIENT_RETRY_BACKOFFS[transient_attempts as usize];
+                            let delay = backoff_delay(transient_attempts, &self.retry);
                             warn!(
                                 provider = provider_name,
                                 api = provider_api,
                                 profile = profile_id,
                                 attempt = transient_attempts + 1,
-                                max_attempts = TRANSIENT_RETRY_MAX,
+                                max_attempts = transient_retry_max,
                                 delay_ms = delay.as_millis() as u64,
                                 kind = ?kind,
                                 error = %e,
@@ -534,6 +533,7 @@ mod tests {
             HashMap::new(),
             vec![],
             crate::health::ProviderHealthRegistry::default(),
+            RetryConfig::default(),
         );
         mgr.set_cooldown("kimi", "default", Duration::from_secs(60));
         assert!(
@@ -557,6 +557,7 @@ mod tests {
             HashMap::new(),
             vec![],
             crate::health::ProviderHealthRegistry::default(),
+            RetryConfig::default(),
         );
         mgr.set_cooldown("kimi", "default", Duration::from_millis(1));
         mgr.set_cooldown("kimi", "default", Duration::from_millis(1));
@@ -575,6 +576,7 @@ mod tests {
             HashMap::new(),
             vec![],
             crate::health::ProviderHealthRegistry::default(),
+            RetryConfig::default(),
         );
         mgr.set_cooldown("kimi", "default", Duration::from_secs(60));
         mgr.set_cooldown("deepseek", "default", Duration::ZERO);

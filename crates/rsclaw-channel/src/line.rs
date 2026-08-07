@@ -310,13 +310,16 @@ impl LineChannel {
                 "previewImageUrl": image_url
             }]
         });
-        let _ = self
+        if let Err(e) = self
             .client
             .post(&url)
             .bearer_auth(&self.channel_access_token)
             .json(&body)
             .send()
-            .await;
+            .await
+        {
+            tracing::warn!(target_id = %to, err = %e, "line: send_image failed");
+        }
         Ok(())
     }
 }

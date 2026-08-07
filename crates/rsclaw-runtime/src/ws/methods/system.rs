@@ -293,10 +293,19 @@ pub async fn logs_tail(ctx: MethodCtx) -> MethodResult {
             let all: Vec<&str> = content.lines().collect();
             let start = all.len().saturating_sub(limit);
             let tail: Vec<&str> = all[start..].to_vec();
+            // Redact common secret patterns in log lines before sending
+            // over WS, matching the HTTP /api/v1/logs endpoint behavior.
+            let redact_re = regex::Regex::new(
+                r"(?i)(?:bearer |api[_-]?key[=:]\s*|sk-|token[=:]\s*)[a-zA-Z0-9_-]{16,}",
+            )
+            .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
             let entries: Vec<serde_json::Value> = tail
                 .iter()
                 .enumerate()
-                .map(|(i, line)| serde_json::json!({ "index": start + i, "line": line }))
+                .map(|(i, line)| {
+                    let redacted = redact_re.replace_all(line, "[REDACTED]");
+                    serde_json::json!({ "index": start + i, "line": redacted })
+                })
                 .collect();
             return Ok(serde_json::json!({ "lines": tail, "entries": entries, "source": path }));
         }
@@ -609,7 +618,40 @@ pub async fn update_run(_ctx: MethodCtx) -> MethodResult {
     Ok(serde_json::json!({ "error": "self-update not supported" }))
 }
 
-pub async fn system_shutdown(_ctx: MethodCtx) -> MethodResult {
+/// Require auth or loopback for destructive system operations.
+/// - When the gateway has a token configured, every connection reaching the
+///   handler has already passed the handshake auth check — the connection is
+///   inherently trusted.
+/// - When the gateway is in open-gateway mode (no token), only loopback
+///   connections can trigger shutdown/restart — matching the HTTP endpoints'
+///   `is_loopback` enforcement.
+fn require_auth_for_destructive(ctx: &MethodCtx) -> bool {
+    let has_token = ctx
+        .state
+        .live
+        .gateway
+        .try_read()
+        .is_ok_and(|g| g.auth_token.is_some());
+    if has_token {
+        return true;
+    }
+    // Open-gateway mode: allow only loopback connections.
+    let is_loopback = ctx
+        .conn
+        .try_read()
+        .is_ok_and(|c| c.peer_addr.ip().is_loopback());
+    if !is_loopback {
+        tracing::warn!(
+            "destructive WS operation rejected: open-gateway mode + non-loopback connection"
+        );
+    }
+    is_loopback
+}
+
+pub async fn system_shutdown(ctx: MethodCtx) -> MethodResult {
+    if !require_auth_for_destructive(&ctx) {
+        return Err(ErrorShape::unauthorized("authentication required for system.shutdown"));
+    }
     // Exit the gateway process cleanly. We spawn the exit on a delay so the
     // caller's WS frame has time to flush. Clients (tray Quit, CLI) use this
     // instead of sending signals, so it works uniformly on every platform.
@@ -628,6 +670,9 @@ pub async fn system_shutdown(_ctx: MethodCtx) -> MethodResult {
 /// after `axum::serve()` returns guarantees the parent has already released
 /// the listener, so the child cannot lose the bind() race against itself.
 pub async fn system_restart(ctx: MethodCtx) -> MethodResult {
+    if !require_auth_for_destructive(&ctx) {
+        return Err(ErrorShape::unauthorized("authentication required for system.restart"));
+    }
     tracing::warn!("system.restart requested via WS");
     ctx.state.shutdown.request_restart();
     Ok(serde_json::json!({ "restarting": true }))

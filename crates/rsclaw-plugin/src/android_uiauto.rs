@@ -1,9 +1,9 @@
-//! CLS tunnel transport for Android agent and UIAutomator2 host imports.
+//! CLS tunnel transport for Android host imports.
 //!
-//! The gateway never opens ADB or the CLS AccessibilityService. Every device
-//! operation goes through the tunneled UIAutomator2/WebDriver server. Native
-//! request JSON uses a mode-0600 temporary file so message bodies and selectors
-//! are not exposed in the process argument list.
+//! The gateway never opens ADB or the CLS AccessibilityService directly. Device
+//! operations go through CLS; raw WebDriver requests use a mode-0600 temporary
+//! file so message bodies and selectors are not exposed in the process argument
+//! list.
 
 use std::{
     collections::VecDeque,
@@ -33,9 +33,6 @@ const SEND_BUTTON_COMMAND: &str = "send-button";
 const LATEST_MESSAGE_BUBBLE_COMMAND: &str = "latest-message-bubble";
 const INPUT_TEXT_COMMAND: &str = "input-text";
 const OCR_REGION_COMMAND: &str = "ocr-region";
-const PASTE_KEYCODE: u16 = 279;
-const CLIPBOARD_LABEL: &str = "rsclaw";
-const WAKEUP_KEYCODE: u16 = 224;
 const WAKEUP_SCREEN_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(500),
     Duration::from_millis(750),
@@ -87,6 +84,7 @@ const LAUNCH_ARGS: &[ArgSpec] = &[
     ArgSpec::new("package", "--package", ArgKind::String, true),
     ArgSpec::new("activity", "--activity", ArgKind::String, false),
 ];
+const RELAUNCH_ARGS: &[ArgSpec] = LAUNCH_ARGS;
 const LONG_PRESS_ARGS: &[ArgSpec] = &[
     ArgSpec::new("x", "--x", ArgKind::Integer, true),
     ArgSpec::new("y", "--y", ArgKind::Integer, true),
@@ -201,40 +199,57 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         return detect_latest_message_bubble(&config).await;
     }
     if command == INPUT_TEXT_COMMAND {
-        return input_text(args_json).await;
+        return input_text(args_json, &config).await;
     }
     if command == OCR_REGION_COMMAND {
         return ocr_region(args_json, &config).await;
+    }
+    if command == "foreground-package" {
+        validate_no_args(command, args_json)?;
+        return foreground_package(&config).await;
+    }
+    if command == "keyevent" {
+        let keycode = keyevent_keycode(args_json)?;
+        let mut args = uiauto_base_args(&config, "key");
+        args.push("--keycode".to_string());
+        args.push(keycode.to_string());
+        return run_cls(&config.cls_bin, &args, Duration::from_secs(15)).await;
     }
     let args = build_call_args(&config, command, args_json)?;
     if command == "screenshot" {
         return screenshot_with_wakeup(&config).await;
     }
+    if command == "relaunch" {
+        return relaunch_with_adb_foreground_fallback(&config, &args).await;
+    }
     run_cls(&config.cls_bin, &args, deadline_for(command)).await
 }
 
-async fn input_text(args_json: &str) -> Result<String, String> {
-    let text = input_text_value(args_json)?;
-    let session = uiauto_session_id().await?;
-    let clipboard = serde_json::json!({
-        "content": base64::engine::general_purpose::STANDARD.encode(text.as_bytes()),
-        "contentType": "plaintext",
-        "label": CLIPBOARD_LABEL,
-    })
-    .to_string();
-    raw(
-        "POST",
-        &format!("/session/{session}/appium/device/set_clipboard"),
-        Some(&clipboard),
-    )
-    .await?;
-    let paste = serde_json::json!({ "keycode": PASTE_KEYCODE }).to_string();
-    raw(
-        "POST",
-        &format!("/session/{session}/appium/device/press_keycode"),
-        Some(&paste),
-    )
-    .await
+/// Type through CLS's native text path, optionally focusing a visual-only
+/// field.
+async fn input_text(args_json: &str, config: &Config) -> Result<String, String> {
+    let input = input_text_value(args_json)?;
+    let args = input_text_args(config, input);
+    run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InputText {
+    text: String,
+    point: Option<(u32, u32)>,
+}
+
+fn input_text_args(config: &Config, input: InputText) -> Vec<String> {
+    let mut args = uiauto_base_args(config, "text");
+    if let Some((x, y)) = input.point {
+        args.push("--x".to_string());
+        args.push(x.to_string());
+        args.push("--y".to_string());
+        args.push(y.to_string());
+    }
+    args.push("--text".to_string());
+    args.push(input.text);
+    args
 }
 
 /// Host-side local OCR for the plugin's fast UI-confirmation path. The plugin
@@ -260,14 +275,17 @@ async fn ocr_region(args_json: &str, config: &Config) -> Result<String, String> 
         .map_err(|e| format!("android uiauto: ocr-region join: {e}"))?
 }
 
-fn input_text_value(args_json: &str) -> Result<String, String> {
+fn input_text_value(args_json: &str) -> Result<InputText, String> {
     let value: Value = serde_json::from_str(args_json)
         .map_err(|error| format!("android uiauto: invalid args JSON: {error}"))?;
     let object = value
         .as_object()
         .ok_or_else(|| "android uiauto: args JSON must be an object".to_string())?;
-    if object.len() != 1 || !object.contains_key("text") {
-        return Err("android uiauto: `input-text` requires exactly `text`".to_string());
+    if !object
+        .keys()
+        .all(|key| matches!(key.as_str(), "text" | "x" | "y"))
+    {
+        return Err("android uiauto: `input-text` accepts only `text`, `x`, and `y`".to_string());
     }
     let text = object
         .get("text")
@@ -278,44 +296,43 @@ fn input_text_value(args_json: &str) -> Result<String, String> {
             "android uiauto: `text` must be 1-{MAX_INPUT_TEXT_BYTES} bytes without NUL"
         ));
     }
-    Ok(text.to_string())
-}
-
-async fn uiauto_session_id() -> Result<String, String> {
-    let sessions = raw("GET", "/sessions", None).await?;
-    if let Some(session) = session_id_from_response(&sessions) {
-        return Ok(session);
-    }
-    let body = serde_json::json!({
-        "capabilities": {
-            "alwaysMatch": {
-                "platformName": "Android",
-                "appium:automationName": "UiAutomator2",
-                "appium:noReset": true,
-                "appium:newCommandTimeout": 300,
-            }
+    let point = match (object.get("x"), object.get("y")) {
+        (None, None) => None,
+        (Some(x), Some(y)) => {
+            let x = x
+                .as_u64()
+                .filter(|value| *value <= u64::from(u32::MAX))
+                .ok_or_else(|| "android uiauto: `x` must be a u32".to_string())?;
+            let y = y
+                .as_u64()
+                .filter(|value| *value <= u64::from(u32::MAX))
+                .ok_or_else(|| "android uiauto: `y` must be a u32".to_string())?;
+            Some((x as u32, y as u32))
         }
+        _ => return Err("android uiauto: `x` and `y` must be supplied together".to_string()),
+    };
+    Ok(InputText {
+        text: text.to_string(),
+        point,
     })
-    .to_string();
-    let created = raw("POST", "/session", Some(&body)).await?;
-    session_id_from_response(&created)
-        .ok_or_else(|| "android uiauto: session response missing sessionId".to_string())
 }
 
-fn session_id_from_response(raw: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(raw).ok()?;
-    value
-        .get("value")
-        .and_then(|value| {
-            value.get("sessionId").or_else(|| {
-                let row = value.as_array().and_then(|rows| rows.first())?;
-                row.get("sessionId").or_else(|| row.get("id"))
-            })
-        })
-        .or_else(|| value.get("sessionId"))
-        .and_then(Value::as_str)
-        .filter(|session| !session.is_empty())
-        .map(str::to_string)
+fn keyevent_keycode(args_json: &str) -> Result<i32, String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android uiauto: invalid keyevent args: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "android uiauto: keyevent args must be an object".to_string())?;
+    let keycode = object
+        .get("keycode")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "android uiauto: keyevent requires integer `keycode`".to_string())?;
+    if !(0..=i32::MAX as i64).contains(&keycode) {
+        return Err(format!(
+            "android uiauto: keyevent keycode {keycode} out of range"
+        ));
+    }
+    Ok(keycode as i32)
 }
 
 async fn detect_contact_badge(config: &Config) -> Result<String, String> {
@@ -852,12 +869,10 @@ async fn screenshot_with_wakeup(config: &Config) -> Result<String, String> {
 
     tracing::info!(
         node = %config.node,
-        "Android screenshot is black; waking the device through UIAutomator2"
+        "Android screenshot is black; waking the device through CLS power control"
     );
-    let mut wake_args = uiauto_base_args(config, "key");
-    wake_args.push("--keycode".to_string());
-    wake_args.push(WAKEUP_KEYCODE.to_string());
-    run_cls(&config.cls_bin, &wake_args, deadline_for("key")).await?;
+    let wake_args = power_base_args(config, "wake");
+    run_cls(&config.cls_bin, &wake_args, Duration::from_secs(20)).await?;
 
     for (index, delay) in WAKEUP_SCREEN_RETRY_DELAYS.iter().enumerate() {
         tokio::time::sleep(*delay).await;
@@ -874,7 +889,7 @@ async fn screenshot_with_wakeup(config: &Config) -> Result<String, String> {
     }
 
     Err(
-        "android uiauto: screenshot remains black after UIAutomator2 wakeup retries; device may be locked or its display unavailable"
+        "android uiauto: screenshot remains black after CLS power-wake retries; device may be locked or its display unavailable"
             .to_string(),
     )
 }
@@ -1129,7 +1144,10 @@ pub(crate) async fn raw(
 pub(crate) async fn stage_file(local_path: &Path, media_kind: &str) -> Result<String, String> {
     let config = Config::from_env()?;
     let metadata = std::fs::metadata(local_path).map_err(|error| {
-        format!("android stage: cannot read {}: {error}", local_path.display())
+        format!(
+            "android stage: cannot read {}: {error}",
+            local_path.display()
+        )
     })?;
     if !metadata.is_file() {
         return Err(format!(
@@ -1156,7 +1174,10 @@ pub(crate) async fn stage_file(local_path: &Path, media_kind: &str) -> Result<St
                 .extension()
                 .map(|value| value.to_string_lossy().to_ascii_lowercase())
                 .filter(|value| {
-                    matches!(value.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp")
+                    matches!(
+                        value.as_str(),
+                        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
+                    )
                 })
                 .unwrap_or_else(|| "jpg".to_string());
             format!(
@@ -1165,7 +1186,11 @@ pub(crate) async fn stage_file(local_path: &Path, media_kind: &str) -> Result<St
             )
         }
         "file" | "audio" => format!("/sdcard/Download/{filename}"),
-        _ => return Err(format!("android stage: unsupported media kind `{media_kind}`")),
+        _ => {
+            return Err(format!(
+                "android stage: unsupported media kind `{media_kind}`"
+            ));
+        }
     };
 
     let mut push_args = adb_base_args(&config, "push");
@@ -1206,6 +1231,119 @@ fn adb_base_args(config: &Config, subcommand: &str) -> Vec<String> {
         "-n".to_string(),
         config.node.clone(),
     ]
+}
+
+/// Relaunch an app through CLS, recovering with a controlled ADB launcher
+/// intent when CLS cannot verify its foreground window on a device.
+async fn relaunch_with_adb_foreground_fallback(
+    config: &Config,
+    relaunch_args: &[String],
+) -> Result<String, String> {
+    let package = command_option(relaunch_args, "--package")?;
+    let cls_result = run_cls(&config.cls_bin, relaunch_args, Duration::from_secs(20)).await;
+    // On this device CLS can complete the start but report an empty current
+    // window. The activity manager is the authoritative foreground signal.
+    if wait_for_foreground_package(config, package).await? {
+        return Ok(cls_result.unwrap_or_else(|_| {
+            serde_json::json!({ "relaunch": "cls-verified-by-adb", "package": package })
+                .to_string()
+        }));
+    }
+
+    let cls_error = cls_result.err();
+    let activity = command_option(relaunch_args, "--activity")?;
+    let component = format!("{package}/{activity}");
+    let mut launch_args = adb_base_args(config, "shell");
+    launch_args.extend([
+        "am".to_string(),
+        "start".to_string(),
+        "-n".to_string(),
+        component,
+    ]);
+    run_cls_process(&config.cls_bin, &launch_args, Duration::from_secs(20)).await?;
+
+    for delay in [Duration::from_millis(500), Duration::from_millis(750)] {
+        if foreground_package_matches(config, package).await? {
+            return Ok(
+                serde_json::json!({ "relaunch": "adb-fallback", "package": package }).to_string(),
+            );
+        }
+        tokio::time::sleep(delay).await;
+    }
+    if foreground_package_matches(config, package).await? {
+        return Ok(serde_json::json!({ "relaunch": "adb-fallback", "package": package }).to_string());
+    }
+
+    let cls_context = cls_error
+        .map(|error| format!("; CLS relaunch result: {error}"))
+        .unwrap_or_default();
+    Err(format!(
+        "android uiauto: relaunch fallback did not foreground `{package}`{cls_context}"
+    ))
+}
+
+/// Return the value following an option from an internally built CLS command.
+fn command_option<'a>(args: &'a [String], option: &str) -> Result<&'a str, String> {
+    args.windows(2)
+        .find_map(|pair| (pair[0] == option).then_some(pair[1].as_str()))
+        .ok_or_else(|| format!("android uiauto: internally built command is missing `{option}`"))
+}
+
+/// Return the package owning Android's resumed activity or focused window.
+async fn foreground_package(config: &Config) -> Result<String, String> {
+    let output = foreground_activity_dump(config).await?;
+    foreground_package_from_dump(&output)
+        .map(|package| serde_json::json!({ "package": package }).to_string())
+        .ok_or_else(|| "android uiauto: foreground package is unavailable".to_string())
+}
+
+/// Wait briefly for Android to report the target as foreground.
+async fn wait_for_foreground_package(config: &Config, package: &str) -> Result<bool, String> {
+    for delay in [
+        Duration::ZERO,
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(4),
+    ] {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if foreground_package_matches(config, package).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Verify the target package owns Android's resumed activity or focused window.
+async fn foreground_package_matches(config: &Config, package: &str) -> Result<bool, String> {
+    Ok(foreground_package_from_dump(&foreground_activity_dump(config).await?)
+        .as_deref()
+        == Some(package))
+}
+
+/// Read Android's current resumed/focused activity through the CLS ADB relay.
+async fn foreground_activity_dump(config: &Config) -> Result<String, String> {
+    let mut args = adb_base_args(config, "shell");
+    args.extend([
+        "dumpsys".to_string(),
+        "activity".to_string(),
+        "activities".to_string(),
+    ]);
+    let output = run_cls_process(&config.cls_bin, &args, Duration::from_secs(20)).await?;
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+/// Extract the package from Android's resumed activity or focused window line.
+fn foreground_package_from_dump(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find(|line| line.contains("topResumedActivity") || line.contains("mCurrentFocus"))
+        .and_then(|line| line.split_once(" u0 ").map(|(_, component)| component))
+        .and_then(|component| component.split('/').next())
+        .map(str::trim)
+        .filter(|package| !package.is_empty())
+        .map(str::to_string)
 }
 
 fn staged_timestamp_ms() -> Result<u128, String> {
@@ -1259,7 +1397,11 @@ fn build_call_args(config: &Config, command: &str, args_json: &str) -> Result<Ve
     validate_object_keys(command, object, specs)?;
     validate_command_requirements(command, object, specs)?;
 
-    let mut args = uiauto_base_args(config, command);
+    let mut args = if command == "relaunch" {
+        relaunch_base_args(config)
+    } else {
+        uiauto_base_args(config, command)
+    };
     for spec in specs {
         let Some(value) = object.get(spec.key) else {
             continue;
@@ -1281,6 +1423,28 @@ fn uiauto_base_args(config: &Config, command: &str) -> Vec<String> {
     ]
 }
 
+/// Build CLS's high-level app relaunch command without a UIAutomator2 port.
+fn relaunch_base_args(config: &Config) -> Vec<String> {
+    vec![
+        "android".to_string(),
+        "uiauto".to_string(),
+        "relaunch".to_string(),
+        "--node".to_string(),
+        config.node.clone(),
+    ]
+}
+
+/// Build a CLS display-power command without involving UIAutomator2.
+fn power_base_args(config: &Config, command: &str) -> Vec<String> {
+    vec![
+        "android".to_string(),
+        "power".to_string(),
+        command.to_string(),
+        "-n".to_string(),
+        config.node.clone(),
+    ]
+}
+
 fn command_specs(command: &str) -> Option<&'static [ArgSpec]> {
     match command {
         "status" | "screenshot" => Some(NO_ARGS),
@@ -1288,6 +1452,7 @@ fn command_specs(command: &str) -> Option<&'static [ArgSpec]> {
         "tap" => Some(TAP_ARGS),
         "swipe" => Some(SWIPE_ARGS),
         "launch" => Some(LAUNCH_ARGS),
+        "relaunch" => Some(RELAUNCH_ARGS),
         "long-press" => Some(LONG_PRESS_ARGS),
         "double-tap" => Some(DOUBLE_TAP_ARGS),
         "drag" => Some(DRAG_ARGS),
@@ -2025,30 +2190,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_text_value_keeps_utf8_for_clipboard_paste() {
-        let text = input_text_value(r#"{"text":"你好\n宝宝"}"#).expect("valid input text");
-        assert_eq!(text, "你好\n宝宝");
+    fn input_text_value_keeps_utf8_for_native_text_entry() {
+        let input = input_text_value(r#"{"text":"你好\n宝宝"}"#).expect("valid input text");
+        assert_eq!(input.text, "你好\n宝宝");
+        assert_eq!(input.point, None);
     }
 
     #[test]
-    fn input_text_value_rejects_missing_extra_empty_and_nul_values() {
+    fn input_text_uses_cls_native_text_command() {
+        assert_eq!(
+            input_text_args(
+                &config(),
+                InputText {
+                    text: "你好".to_string(),
+                    point: Some((123, 456)),
+                },
+            ),
+            [
+                "android",
+                "uiauto",
+                "text",
+                "-n",
+                "android-dev",
+                "--port",
+                "6790",
+                "--x",
+                "123",
+                "--y",
+                "456",
+                "--text",
+                "你好",
+            ]
+        );
+    }
+
+    #[test]
+    fn input_text_value_accepts_only_complete_optional_coordinates() {
+        let input = input_text_value(r#"{"text":"ok","x":123,"y":456}"#)
+            .expect("valid coordinate text entry");
+        assert_eq!(input.point, Some((123, 456)));
         assert!(input_text_value("{}").is_err());
         assert!(input_text_value(r#"{"text":"ok","extra":true}"#).is_err());
+        assert!(input_text_value(r#"{"text":"ok","x":123}"#).is_err());
+        assert!(input_text_value(r#"{"text":"ok","x":-1,"y":456}"#).is_err());
         assert!(input_text_value(r#"{"text":""}"#).is_err());
         assert!(input_text_value("{\"text\":\"a\\u0000b\"}").is_err());
-    }
-
-    #[test]
-    fn parses_existing_and_new_uiautomator2_session_ids() {
-        assert_eq!(
-            session_id_from_response(r#"{"value":[{"sessionId":"existing"}]}"#).as_deref(),
-            Some("existing")
-        );
-        assert_eq!(
-            session_id_from_response(r#"{"value":{"sessionId":"created"}}"#).as_deref(),
-            Some("created")
-        );
-        assert_eq!(session_id_from_response(r#"{"value":[]}"#), None);
     }
 
     #[test]
@@ -2280,10 +2466,90 @@ mod tests {
     }
 
     #[test]
+    fn builds_cls_power_wake_args_without_uiautomator() {
+        assert_eq!(
+            power_base_args(&config(), "wake"),
+            ["android", "power", "wake", "-n", "android-dev"]
+        );
+    }
+
+    #[test]
+    fn launch_forwards_dynamic_package_to_cls_uiautomator() {
+        assert_eq!(
+            build_call_args(&config(), "launch", r#"{"package":"org.example.app"}"#)
+                .expect("launch arguments"),
+            [
+                "android",
+                "uiauto",
+                "launch",
+                "-n",
+                "android-dev",
+                "--port",
+                "6790",
+                "--package",
+                "org.example.app",
+            ]
+        );
+    }
+
+    #[test]
+    fn relaunch_uses_cls_high_level_command_without_uiautomator_port() {
+        assert_eq!(
+            build_call_args(&config(), "relaunch", r#"{"package":"org.example.app"}"#)
+                .expect("relaunch arguments"),
+            [
+                "android",
+                "uiauto",
+                "relaunch",
+                "--node",
+                "android-dev",
+                "--package",
+                "org.example.app",
+            ]
+        );
+        assert_eq!(
+            build_call_args(
+                &config(),
+                "relaunch",
+                r#"{"package":"org.example.app","activity":".MainActivity"}"#
+            )
+            .expect("relaunch activity arguments"),
+            [
+                "android",
+                "uiauto",
+                "relaunch",
+                "--node",
+                "android-dev",
+                "--package",
+                "org.example.app",
+                "--activity",
+                ".MainActivity",
+            ]
+        );
+    }
+
+    #[test]
+    fn foreground_package_extracts_resumed_or_focused_app() {
+        assert_eq!(
+            foreground_package_from_dump(
+                "topResumedActivity=ActivityRecord{abc u0 com.tencent.mm/.ui.LauncherUI}"
+            ),
+            Some("com.tencent.mm".to_string())
+        );
+        assert_eq!(
+            foreground_package_from_dump(
+                "mCurrentFocus=Window{abc u0 com.miui.home/com.miui.home.launcher.Launcher}"
+            ),
+            Some("com.miui.home".to_string())
+        );
+        assert_eq!(foreground_package_from_dump("Window{abc u0 com.tencent.mm/.ui.LauncherUI}"), None);
+    }
+
+    #[test]
     fn rejects_unknown_commands_and_options() {
         assert!(build_call_args(&config(), "stop", "{}").is_err());
         assert!(
-            build_call_args(&config(), "app-state", r#"{"package":"com.tencent.mm"}"#).is_err()
+            build_call_args(&config(), "app-state", r#"{"package":"org.example.app"}"#).is_err()
         );
         assert!(build_call_args(&config(), "screenshot", r#"{"output":"/tmp/x"}"#).is_err());
     }
@@ -2361,7 +2627,7 @@ mod tests {
             validate_raw_request(
                 "POST",
                 "/session/abc/appium/device/app_state",
-                Some(r#"{"appId":"com.tencent.mm"}"#),
+                Some(r#"{"appId":"org.example.app"}"#),
             )
             .is_err()
         );
@@ -2441,7 +2707,7 @@ mod tests {
             validate_raw_request(
                 "POST",
                 "/session/abc/appium/device/activate_app",
-                Some(r#"{"appId":"com.tencent.mm"}"#),
+                Some(r#"{"appId":"org.example.app"}"#),
             )
             .is_ok()
         );
@@ -2449,7 +2715,7 @@ mod tests {
             validate_raw_request(
                 "POST",
                 "/session/abc/appium/device/start_activity",
-                Some(r#"{"appPackage":"com.tencent.mm","appActivity":".ui.LauncherUI"}"#),
+                Some(r#"{"appPackage":"org.example.app","appActivity":".ExampleActivity"}"#),
             )
             .is_ok()
         );

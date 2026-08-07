@@ -126,37 +126,78 @@ pub(crate) fn start_channels(
                 if handle.tx.send(msg).await.is_err() {
                     return;
                 }
-                if let Ok(Ok(reply)) =
-                    tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    reply_rx,
+                )
+                .await
                 {
-                    let pending = reply.pending_analysis;
-                    if !reply.is_empty {
-                        if let Err(e) = tx
+                    Ok(Ok(reply)) => {
+                        let pending = reply.pending_analysis;
+                        if !reply.is_empty {
+                            if let Err(e) = tx
+                                .send(OutboundMessage {
+                                    target_id: "local".to_string(),
+                                    is_group: false,
+                                    text: reply.text,
+                                    reply_to: None,
+                                    images: reply.images,
+                                    channel: None,
+                                    files: reply.files,
+                                    account: None,
+                                })
+                                .await
+                            {
+                                tracing::warn!("failed to send message: {e}");
+                            }
+                        }
+                        if let Some(analysis) = pending {
+                            handle_pending_analysis(
+                                analysis,
+                                Arc::clone(&handle),
+                                &tx,
+                                "local".to_string(),
+                                false,
+                                &cfg,
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        warn!("cli: chat-mode agent reply error");
+                        let _ = tx
                             .send(OutboundMessage {
                                 target_id: "local".to_string(),
                                 is_group: false,
-                                text: reply.text,
+                                text: rsclaw_i18n::t(
+                                    "chat_reply_error",
+                                    rsclaw_i18n::default_lang(),
+                                ),
                                 reply_to: None,
-                                images: reply.images,
+                                images: vec![],
+                                files: vec![],
                                 channel: None,
-                                files: reply.files,
                                 account: None,
                             })
-                            .await
-                        {
-                            tracing::warn!("failed to send message: {e}");
-                        }
+                            .await;
                     }
-                    if let Some(analysis) = pending {
-                        handle_pending_analysis(
-                            analysis,
-                            Arc::clone(&handle),
-                            &tx,
-                            "local".to_string(),
-                            false,
-                            &cfg,
-                        )
-                        .await;
+                    Err(_) => {
+                        warn!("cli: chat-mode agent reply timed out");
+                        let _ = tx
+                            .send(OutboundMessage {
+                                target_id: "local".to_string(),
+                                is_group: false,
+                                text: rsclaw_i18n::t(
+                                    "chat_reply_timeout",
+                                    rsclaw_i18n::default_lang(),
+                                ),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                channel: None,
+                                account: None,
+                            })
+                            .await;
                     }
                 }
             });

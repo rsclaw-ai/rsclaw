@@ -459,6 +459,7 @@ fn build_config_with_models(
         models: Some(ModelsConfig {
             mode: None,
             providers,
+            retry: None,
         }),
         ..Config::default()
     }

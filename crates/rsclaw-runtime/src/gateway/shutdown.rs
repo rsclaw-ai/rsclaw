@@ -20,23 +20,38 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 /// Coordinates graceful shutdown across the HTTP server, task queue worker,
 /// and channel handlers. Cheap to clone (single `Arc`).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ShutdownCoordinator {
     inner: Arc<ShutdownInner>,
 }
 
-#[derive(Default)]
+impl Default for ShutdownCoordinator {
+    fn default() -> Self {
+        let (tx, _) = watch::channel(false);
+        Self {
+            inner: Arc::new(ShutdownInner {
+                draining: AtomicBool::new(false),
+                notify_tx: tx,
+                inflight: AtomicUsize::new(0),
+                restart_requested: AtomicBool::new(false),
+            }),
+        }
+    }
+}
+
 struct ShutdownInner {
     /// Set to true when graceful shutdown begins. Workers check this before
     /// pulling new work; HTTP server stops accepting new connections.
     draining: AtomicBool,
     /// Wakes up `axum::serve(...).with_graceful_shutdown(future)` and any
     /// other awaiter that wants to be notified the moment drain begins.
-    notify: Notify,
+    /// Uses a watch channel instead of Notify so every subscriber (current
+    /// and future) sees the drain signal — a watch send is durable.
+    notify_tx: watch::Sender<bool>,
     /// Number of in-flight units of work (HTTP requests, agent turns,
     /// task queue entries) currently being processed. Restart waits for
     /// this to drop to zero (with a timeout) before terminating the process.
@@ -65,27 +80,30 @@ impl ShutdownCoordinator {
     /// Idempotent — calling twice is safe.
     pub fn begin_drain(&self) {
         self.inner.draining.store(true, Ordering::Release);
-        self.inner.notify.notify_waiters();
+        // watch: send false→true; durable, so every subscriber (past + future)
+        // sees it immediately. Ignore error: only happens when all receivers
+        // are dropped, which means nobody is waiting — fine.
+        let _ = self.inner.notify_tx.send(true);
     }
 
-    /// Wait for `begin_drain` to be called. If drain has already begun, this
-    /// awaits the next call (so subscribers that arrive late should check
-    /// `is_draining` first if they need a one-shot guarantee).
+    /// Wait for `begin_drain` to be called. If drain has already begun,
+    /// returns immediately. Unlike the old Notify-based implementation, a
+    /// watch channel is durable — late subscribers see the current value
+    /// instantly, so there is no multi-waiter race.
     ///
     /// Intended for `axum::serve(...).with_graceful_shutdown(future)`.
     pub async fn notified(&self) {
-        // Fast path — already draining.
         if self.is_draining() {
             return;
         }
-        // Slow path — wait for begin_drain.
-        let waiter = self.inner.notify.notified();
-        // Re-check after subscribing to close the race where drain happens
-        // between our first check and `notified.await`.
+        let mut rx = self.inner.notify_tx.subscribe();
         if self.is_draining() {
             return;
         }
-        waiter.await;
+        // Wait for the value to become true. Changed() returns Ok when tx
+        // sends, Err when tx is dropped. Either way: if drain has begun,
+        // *rx.borrow() is true and we return.
+        let _ = rx.wait_for(|v| *v).await;
     }
 
     /// Increment the in-flight counter. Pair with `complete()` in a guard.

@@ -39,11 +39,13 @@ pub struct ConnHandle {
     pub client_info: Option<super::types::ClientInfo>,
     /// When this connection was established.
     pub connected_at: std::time::Instant,
+    /// Peer socket address (for loopback checks on destructive operations).
+    pub peer_addr: std::net::SocketAddr,
 }
 
 impl ConnHandle {
     /// Create a new connection handle.
-    pub fn new(id: ConnId, event_tx: OutboundTx) -> Self {
+    pub fn new(id: ConnId, event_tx: OutboundTx, peer_addr: std::net::SocketAddr) -> Self {
         Self {
             id,
             event_tx,
@@ -51,6 +53,7 @@ impl ConnHandle {
             seq: 0,
             client_info: None,
             connected_at: std::time::Instant::now(),
+            peer_addr,
         }
     }
 

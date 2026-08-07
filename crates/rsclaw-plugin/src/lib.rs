@@ -16,6 +16,7 @@
 
 mod android_uiauto;
 mod android_vlm;
+pub mod codex;
 pub mod host_methods;
 pub mod js_runtime;
 pub mod manifest;
@@ -34,6 +35,7 @@ pub use manifest::{
     LEGACY_MANIFEST_FILE, MANIFEST_FILE, PluginManifest, PluginSlashCommand, PluginToolDef,
     load_manifest, scan_plugins,
 };
+pub use codex::{CodexManifest, CodexPlugin, CodexSkill};
 pub use slots::{ContextEngineSlot, MemoryItem, MemorySlot, MemoryStoreSlot, SlotRegistry};
 use tracing::{info, warn};
 
@@ -196,6 +198,8 @@ pub struct PluginRegistry {
     plugins: HashMap<String, Plugin>,
     /// WASM plugins (wasmtime).
     wasm_plugins: Vec<WasmPlugin>,
+    /// Codex plugins (static content bundles: skills + MCP specs).
+    codex_plugins: Vec<CodexPlugin>,
     pub slots: SlotRegistry,
 }
 
@@ -204,6 +208,7 @@ impl PluginRegistry {
         Self {
             plugins: HashMap::new(),
             wasm_plugins: Vec::new(),
+            codex_plugins: Vec::new(),
             slots: SlotRegistry::new(),
         }
     }
@@ -230,13 +235,13 @@ impl PluginRegistry {
         &self.wasm_plugins
     }
 
-    /// Total number of loaded plugins (JS + WASM).
+    /// Total number of loaded plugins (JS + WASM + Codex).
     pub fn len(&self) -> usize {
-        self.plugins.len() + self.wasm_plugins.len()
+        self.plugins.len() + self.wasm_plugins.len() + self.codex_plugins.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.plugins.is_empty() && self.wasm_plugins.is_empty()
+        self.plugins.is_empty() && self.wasm_plugins.is_empty() && self.codex_plugins.is_empty()
     }
 
     /// Number of JS plugins.
@@ -247,6 +252,21 @@ impl PluginRegistry {
     /// Number of WASM plugins.
     pub fn wasm_count(&self) -> usize {
         self.wasm_plugins.len()
+    }
+
+    /// Number of Codex plugins.
+    pub fn codex_count(&self) -> usize {
+        self.codex_plugins.len()
+    }
+
+    /// Get all loaded Codex plugins.
+    pub fn codex_all(&self) -> &[CodexPlugin] {
+        &self.codex_plugins
+    }
+
+    /// Take Codex plugins out of the registry as a Vec.
+    pub fn take_codex_plugins(&mut self) -> Vec<CodexPlugin> {
+        std::mem::take(&mut self.codex_plugins)
     }
 
     /// Take WASM plugins out of the registry as a Vec.
@@ -363,10 +383,46 @@ pub async fn load_all_plugins(
         }
     }
 
+    // Scan for Codex plugins (identified by .codex-plugin/plugin.json).
+    if plugins_dir.exists() {
+        if let Ok(rd) = std::fs::read_dir(plugins_dir) {
+            for entry in rd.flatten() {
+                let dir = entry.path();
+                if !dir.is_dir() || !CodexPlugin::is_codex_plugin(&dir) {
+                    continue;
+                }
+                match CodexPlugin::load(&dir) {
+                    Ok(plugin) => {
+                        let enabled = config
+                            .and_then(|c| c.entries.as_ref())
+                            .and_then(|e| e.get(&plugin.manifest.name))
+                            .and_then(|e| e.enabled)
+                            .unwrap_or(true);
+                        if !enabled {
+                            info!(plugin = %plugin.manifest.name, "codex plugin disabled via config");
+                            continue;
+                        }
+                        info!(
+                            plugin = %plugin.manifest.name,
+                            skills = plugin.skills.len(),
+                            mcp_servers = plugin.mcp_servers.len(),
+                            "Codex plugin loaded"
+                        );
+                        registry.codex_plugins.push(plugin);
+                    }
+                    Err(e) => {
+                        warn!(path = %dir.display(), "failed to load Codex plugin: {e:#}");
+                    }
+                }
+            }
+        }
+    }
+
     info!(
         total = registry.len(),
         js = registry.js_count(),
         wasm = registry.wasm_count(),
+        codex = registry.codex_count(),
         "plugins loaded"
     );
     Ok(registry)

@@ -144,10 +144,11 @@ pub async fn dispatch_a2a(
     peer_id: &str,
     registry: &AgentRegistry,
 ) -> Result<Value> {
+    let args_str = args.to_string();
     let message = args
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| args.to_string().as_str().to_owned().leak()); // fallback: full JSON
+        .unwrap_or(&args_str); // fallback: full JSON
 
     // Use a child session key so A2A calls don't pollute the parent session.
     let child_session_key = format!("{session_key}:a2a:{agent_id}");
@@ -324,6 +325,7 @@ mod tests {
             model: ModelRuntime {
                 models: None,
                 auth: None,
+                retry: None,
             },
             ext: ExtRuntime {
                 tools: None,

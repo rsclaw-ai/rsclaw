@@ -817,7 +817,12 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
             );
         }
         // Fallback to pdftotext CLI
-        let tmp = std::env::temp_dir().join(format!("rsclaw_discord_{filename}"));
+        // Sanitize filename to prevent path traversal / collision from
+        // untrusted remote filenames containing '/' or '..'.
+        let safe_name: String = filename.chars().filter(|&c| c != '/' && c != '\\').collect();
+        let safe_name = safe_name.trim_matches('.').trim();
+        let safe_name = if safe_name.is_empty() { "attachment" } else { safe_name };
+        let tmp = std::env::temp_dir().join(format!("rsclaw_discord_{safe_name}"));
         if std::fs::write(&tmp, bytes).is_ok() {
             let mut cmd = std::process::Command::new("pdftotext");
             cmd.args([tmp.to_str().unwrap_or(""), "-"]);
