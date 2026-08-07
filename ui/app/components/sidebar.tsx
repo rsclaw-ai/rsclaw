@@ -30,7 +30,7 @@ import clsx from "clsx";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 import { SidebarAccountChip } from "./sidebar-account-chip";
 import { toast } from "../lib/toast";
-import { getAgents, getHealth } from "../lib/rsclaw-api";
+import { getAgents, getHealth, reloadConfig, restartGateway } from "../lib/rsclaw-api";
 import {
   isGatewayRestarting,
   setGatewayRestarting,
@@ -290,9 +290,23 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
-        await tauriInvoke("stop_gateway");
-        await new Promise((r) => setTimeout(r, 500));
-        await tauriInvoke("start_gateway");
+        // Prefer the gateway's own graceful re-exec: it flags for restart,
+        // lets axum drain in-flight requests, releases the listener and only
+        // then spawns the replacement. `stop_gateway` + fixed 500ms sleep
+        // kills mid-flight work and races the port release, so it is only the
+        // fallback for a gateway too wedged to answer HTTP.
+        let graceful = false;
+        try {
+          await restartGateway();
+          graceful = true;
+        } catch {
+          graceful = false;
+        }
+        if (!graceful) {
+          await tauriInvoke("stop_gateway");
+          await new Promise((r) => setTimeout(r, 500));
+          await tauriInvoke("start_gateway");
+        }
       }
       // Patient poll (~60s) instead of a single 1s check — a restarted
       // gateway cold-boots just like a fresh launch (DB, registry, first-run
@@ -330,6 +344,31 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     }
   };
   doRestartRef.current = doRestart;
+
+  // Apply a config change via a scoped in-process reload instead of a full
+  // restart. Rebuilds only the components that snapshotted the changed values
+  // (agent handles, provider/skill/plugin/mcp registries) — the listener,
+  // channel connections and the store stay up, so this is ~1s instead of the
+  // 30-60s cold boot doRestart pays.
+  const [applying, setApplying] = React.useState(false);
+  const doApplyReload = async () => {
+    const scopes = restartReq.payload?.reload_scopes ?? [];
+    setApplying(true);
+    try {
+      await reloadConfig(scopes.length ? scopes : undefined);
+      restartReq.dismiss();
+    } catch (e) {
+      // Reload failed — leave the banner up so the user can retry or fall
+      // back to a restart rather than silently pretending it applied.
+      setErrorMsg(
+        zh
+          ? "应用配置失败，可尝试重启网关"
+          : "Failed to apply config. Try restarting the gateway.",
+      );
+    } finally {
+      setApplying(false);
+    }
+  };
 
   const doDiagnose = async () => {
     navigate(Path.RsClawPanel + "?tab=doctor");
@@ -445,9 +484,16 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
   // restartReq.dismiss() (flips banner.visible to false → effect cleans up).
   // Web/non-Tauri builds skip auto-restart since the desktop shell owns the
   // gateway sidecar.
+  //
+  // Reload-remedy events are NEVER auto-applied: rebuilding an agent cancels
+  // its in-flight turns, and a config save should not silently kill the
+  // conversation the user is in the middle of. They wait for an explicit
+  // "Apply" click. Only unavoidable restarts keep the countdown.
   const restartInflight = restartReq.payload?.inflight ?? 0;
+  const isReloadRemedy = restartReq.payload?.remedy === "reload";
   React.useEffect(() => {
     if (!restartReq.visible || status !== "online" || !isTauri) return;
+    if (isReloadRemedy) return;
     if (restartInflight === 0) {
       void doRestartRef.current();
       return;
@@ -464,7 +510,7 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, [restartReq.visible, status, restartInflight]);
+  }, [restartReq.visible, status, restartInflight, isReloadRemedy]);
 
   const isOnline = status === "online";
   const isFailed = status === "failed";
@@ -481,7 +527,11 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     : isOnline ? "#2dd4a0"
     : (isStarting || isChecking) ? "#f5a623"
     : isFailed ? "#d95f5f" : "#d95f5f";
-  const label = restartPending ? Locale.RsClawPanel.RestartPending.Label(restartSecondsLeft)
+  const label = restartPending && isReloadRemedy
+      // No countdown: reload is never auto-applied, so a "restarting in Ns"
+      // label would be a lie. State the pending change instead.
+      ? (zh ? "\u914D\u7F6E\u5F85\u5E94\u7528" : "Config change pending")
+    : restartPending ? Locale.RsClawPanel.RestartPending.Label(restartSecondsLeft)
     : globalRestarting ? (zh ? "\u91CD\u542F\u4E2D..." : "Restarting...")
     : isOnline ? Locale.RsClawPanel.Running
     : isStarting ? (zh ? "\u542F\u52A8\u4E2D..." : "Starting...")
@@ -532,12 +582,20 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
                 <>
                   <button
                     onClick={() => {
+                      // A pending change that a scoped reload can satisfy is
+                      // applied in-process (~1s, keeps channels connected)
+                      // rather than paying a full cold-boot restart.
+                      if (restartPending && isReloadRemedy) {
+                        void doApplyReload();
+                        return;
+                      }
                       // When the gateway has signalled a restart is required,
                       // skip the confirm modal — the user has already been
                       // told what's about to happen via the inline countdown.
                       if (restartPending) doRestart();
                       else setConfirmAction("restart");
                     }}
+                    disabled={applying}
                     style={{
                       padding: "2px 8px", borderRadius: 5, fontSize: 11, fontFamily: "inherit",
                       border: restartPending
@@ -554,9 +612,13 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
                       ? "rgba(245,166,35,.95)"
                       : "rgba(255,255,255,.4)")}
                   >
-                    {restartPending
-                      ? Locale.RsClawPanel.RestartPending.RestartNow
-                      : (zh ? "\u91CD\u542F" : "Restart")}
+                    {applying
+                      ? (zh ? "\u5E94\u7528\u4E2D..." : "Applying...")
+                      : restartPending && isReloadRemedy
+                        ? (zh ? "\u5E94\u7528\u53D8\u66F4" : "Apply changes")
+                        : restartPending
+                          ? Locale.RsClawPanel.RestartPending.RestartNow
+                          : (zh ? "\u91CD\u542F" : "Restart")}
                   </button>
                   {isOnline ? (
                     <button

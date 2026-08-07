@@ -2628,8 +2628,20 @@ async fn http_reload(
                     let model_changed = serde_json::to_value(&handle.config.model)
                         .unwrap_or_default()
                         != serde_json::to_value(&entry.model).unwrap_or_default();
+                    // flashModel is snapshotted into AgentHandle.config just like
+                    // model, so it needs the same diff — without it, editing
+                    // flashModel had NO path to take effect short of a full
+                    // gateway restart (it is also stripped from the hot-reload
+                    // diff, so the file watcher stays silent about it too).
+                    let flash_model_changed = serde_json::to_value(&handle.config.flash_model)
+                        .unwrap_or_default()
+                        != serde_json::to_value(&entry.flash_model).unwrap_or_default();
                     let system_changed = handle.config.system != entry.system;
-                    if model_changed || system_changed || defaults_model_changed {
+                    if model_changed
+                        || flash_model_changed
+                        || system_changed
+                        || defaults_model_changed
+                    {
                         // Cancel in-flight turns.
                         if let Ok(tokens) = handle.cancel_tokens.read() {
                             for (_sk, tok) in tokens.iter() {

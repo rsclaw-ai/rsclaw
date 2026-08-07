@@ -145,6 +145,20 @@ export type RestartRequiredPayload = {
    * Optional for backward compatibility with older gateways.
    */
   inflight?: number;
+  /**
+   * Whether a scoped in-process reload applies the change, or a full process
+   * restart is unavoidable (socket rebind / store reopen).
+   *
+   * A reload takes ~1s and keeps the listener and channel connections up; a
+   * restart cold-boots the gateway (DB, registries, first-run KB index) and
+   * costs 30-60s on desktop. Absent on older gateways — treat as "restart".
+   */
+  remedy?: "reload" | "restart";
+  /**
+   * `/api/v1/reload?scope=` values that apply the change when
+   * `remedy === "reload"`.
+   */
+  reload_scopes?: string[];
 };
 
 class RsClawWsClient {
