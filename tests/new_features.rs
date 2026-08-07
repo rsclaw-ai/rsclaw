@@ -113,7 +113,7 @@ fn user_agent_none_when_no_config() {
 
 #[test]
 fn tool_cap_registered_in_tool_builder() {
-    let source = include_str!("../src/agent/tools_builder.rs");
+    let source = include_str!("../crates/rsclaw-agent/src/tools_builder.rs");
     assert!(
         source.contains(r#"name: "cap".to_owned()"#),
         "tool_cap should be registered in tools_builder.rs"
@@ -128,7 +128,7 @@ fn tool_cap_registered_in_tool_builder() {
 
 #[test]
 fn tool_cap_dispatched_in_runtime() {
-    let source = include_str!("../src/agent/runtime.rs");
+    let source = include_str!("../crates/rsclaw-agent/src/runtime/dispatch.rs");
     assert!(
         source.contains(r#""cap" => return self.tool_cap(ctx, args).await"#),
         "tool_cap should be dispatched in runtime"
@@ -168,7 +168,7 @@ fn tool_cap_drives_cap_agent_manager() {
     // tool_cap goes through CapAgentManager::dispatch_async rather
     // than directly poking an AcpClient. Behavioural coverage lives in
     // cap::* unit tests (run_turn_*, bridge::tests, permission::tests).
-    let source = include_str!("../src/agent/tools_cap.rs");
+    let source = include_str!("../crates/rsclaw-agent/src/tools_cap.rs");
     assert!(
         source.contains("CapAgentManager"),
         "tool_cap should reference CapAgentManager"

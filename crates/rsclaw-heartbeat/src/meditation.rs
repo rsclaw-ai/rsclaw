@@ -319,8 +319,9 @@ Follow them unless the user says otherwise.\n\n{}\n",
 mod lessons_tests {
     use rsclaw_memory::{MemDocTier, MemoryDoc, MemoryStore};
 
+    use rsclaw_platform::MemoryTier;
+
     use super::*;
-    use crate::MemoryTier;
 
     fn lesson(id: &str, text: &str, importance: f32) -> MemoryDoc {
         MemoryDoc {

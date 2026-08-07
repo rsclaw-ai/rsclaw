@@ -24,3 +24,6 @@ rsclaw-evolution = { path = "../rsclaw-evolution", version = "0.1.0" }
 rsclaw-platform = { path = "../rsclaw-platform", version = "0.1.0" }
 redb = "4.1"
 hnsw_rs = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

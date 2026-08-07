@@ -334,11 +334,15 @@ fn seq_from_message_key(key: &str, session_key: &str) -> Option<u64> {
 /// that don't match the shape or whose numbers don't parse.
 fn parse_archive_key(key: &str, session_key: &str) -> Option<(u32, u64)> {
     for sep in [KEY_SEP, LEGACY_KEY_SEP] {
-        let after = key.strip_prefix(&format!("archive{sep}{session_key}{sep}gen"))?;
-        let (gen_str, seq_str) = after.split_once(sep)?;
-        let generation = gen_str.parse::<u32>().ok()?;
-        let seq = seq_str.parse::<u64>().ok()?;
-        return Some((generation, seq));
+        if let Some(after) = key.strip_prefix(&format!("archive{sep}{session_key}{sep}gen")) {
+            if let Some((gen_str, seq_str)) = after.split_once(sep) {
+                if let (Ok(generation), Ok(seq)) =
+                    (gen_str.parse::<u32>(), seq_str.parse::<u64>())
+                {
+                    return Some((generation, seq));
+                }
+            }
+        }
     }
     None
 }

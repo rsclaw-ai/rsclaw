@@ -112,6 +112,10 @@ async fn start_server(addr: SocketAddr) {
         tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
+    let spawner_store = Arc::clone(&store);
+    let spawner_config = Arc::clone(&config);
+    let spawner_live = Arc::clone(&live);
+    let spawner_event_tx = event_tx.clone();
     let state = AppState {
         config,
         live,
@@ -138,8 +142,10 @@ async fn start_server(addr: SocketAddr) {
         )),
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
-        wasm_plugins: Arc::new(Vec::new()),
-        plugins: Arc::new(rsclaw::plugin::PluginRegistry::default()),
+        wasm_plugins: Arc::new(tokio::sync::RwLock::new(Arc::new(Vec::new()))),
+        plugins: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw::plugin::PluginRegistry::default(),
+        ))),
         restart_request_tx: broadcast::channel(16).0,
         pending_restart: Arc::new(std::sync::RwLock::new(None)),
         shutdown: rsclaw::gateway::ShutdownCoordinator::new(),
@@ -161,9 +167,45 @@ async fn start_server(addr: SocketAddr) {
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
         relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
+        peer_manager: Arc::new(rsclaw::a2a::peer::PeerManager::default()),
         knowledge: None,
         memory: None,
         model_health: rsclaw::provider::health::ProviderHealthRegistry::new(),
+        skills: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw_skill::SkillRegistry::new(),
+        ))),
+        mcp: Arc::new(rsclaw_mcp::McpRegistry::new()),
+        channel_manager: Arc::new(rsclaw_channel::ChannelManager::new(MemoryTier::Low)),
+        channel_senders: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        agent_spawner: rsclaw_agent::AgentSpawner::new_arc(
+            Arc::new(rsclaw_agent::AgentRegistry::new()),
+            Arc::new(std::sync::RwLock::new(Arc::clone(&spawner_config))),
+            Arc::clone(&spawner_live),
+            Arc::new(std::sync::RwLock::new(Arc::new(
+                rsclaw_provider::registry::ProviderRegistry::new(),
+            ))),
+            Arc::new(rsclaw_skill::SkillRegistry::new()),
+            Arc::clone(&spawner_store),
+            None,
+            spawner_event_tx,
+            None,
+            rsclaw::provider::health::ProviderHealthRegistry::new(),
+            None,
+            None,
+        ),
+        task_queue: Arc::new(rsclaw::gateway::task_queue::TaskQueueManager::new(Arc::new(
+            rsclaw_store::redb_store::RedbStore::open(
+                &std::env::temp_dir().join(format!("rsclaw-test-tq-{}.redb", std::process::id())),
+                MemoryTier::Low,
+            )
+            .expect("task queue store"),
+        ))),
+        providers: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw_provider::registry::ProviderRegistry::new(),
+        ))),
+        wasm_browser: Arc::new(tokio::sync::Mutex::new(None)),
+        rate_limiter: Arc::new(rsclaw::server::RateLimiter::new()),
+        reload_mutex: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // Leak the tempdir so the store stays valid for the lifetime of the server.
@@ -231,6 +273,10 @@ async fn bare_health_alias_returns_200_without_auth() {
     let computer_runs: Arc<
         tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let spawner_store = Arc::clone(&store);
+    let spawner_config = Arc::clone(&config);
+    let spawner_live = Arc::clone(&live);
+    let spawner_event_tx = event_tx.clone();
     let state = AppState {
         config,
         live,
@@ -257,8 +303,10 @@ async fn bare_health_alias_returns_200_without_auth() {
         )),
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
-        wasm_plugins: Arc::new(Vec::new()),
-        plugins: Arc::new(rsclaw::plugin::PluginRegistry::default()),
+        wasm_plugins: Arc::new(tokio::sync::RwLock::new(Arc::new(Vec::new()))),
+        plugins: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw::plugin::PluginRegistry::default(),
+        ))),
         restart_request_tx: broadcast::channel(16).0,
         pending_restart: Arc::new(std::sync::RwLock::new(None)),
         shutdown: rsclaw::gateway::ShutdownCoordinator::new(),
@@ -280,9 +328,45 @@ async fn bare_health_alias_returns_200_without_auth() {
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
         relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
+        peer_manager: Arc::new(rsclaw::a2a::peer::PeerManager::default()),
         knowledge: None,
         memory: None,
         model_health: rsclaw::provider::health::ProviderHealthRegistry::new(),
+        skills: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw_skill::SkillRegistry::new(),
+        ))),
+        mcp: Arc::new(rsclaw_mcp::McpRegistry::new()),
+        channel_manager: Arc::new(rsclaw_channel::ChannelManager::new(MemoryTier::Low)),
+        channel_senders: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        agent_spawner: rsclaw_agent::AgentSpawner::new_arc(
+            Arc::new(rsclaw_agent::AgentRegistry::new()),
+            Arc::new(std::sync::RwLock::new(Arc::clone(&spawner_config))),
+            Arc::clone(&spawner_live),
+            Arc::new(std::sync::RwLock::new(Arc::new(
+                rsclaw_provider::registry::ProviderRegistry::new(),
+            ))),
+            Arc::new(rsclaw_skill::SkillRegistry::new()),
+            Arc::clone(&spawner_store),
+            None,
+            spawner_event_tx,
+            None,
+            rsclaw::provider::health::ProviderHealthRegistry::new(),
+            None,
+            None,
+        ),
+        task_queue: Arc::new(rsclaw::gateway::task_queue::TaskQueueManager::new(Arc::new(
+            rsclaw_store::redb_store::RedbStore::open(
+                &std::env::temp_dir().join(format!("rsclaw-test-tq-{}.redb", std::process::id())),
+                MemoryTier::Low,
+            )
+            .expect("task queue store"),
+        ))),
+        providers: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw_provider::registry::ProviderRegistry::new(),
+        ))),
+        wasm_browser: Arc::new(tokio::sync::Mutex::new(None)),
+        rate_limiter: Arc::new(rsclaw::server::RateLimiter::new()),
+        reload_mutex: Arc::new(tokio::sync::Mutex::new(())),
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });
@@ -367,6 +451,10 @@ async fn auth_token_gates_non_health_endpoints() {
     let computer_runs: Arc<
         tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let spawner_store = Arc::clone(&store);
+    let spawner_config = Arc::clone(&config);
+    let spawner_live = Arc::clone(&live);
+    let spawner_event_tx = event_tx.clone();
     let state = AppState {
         config,
         live,
@@ -393,8 +481,10 @@ async fn auth_token_gates_non_health_endpoints() {
         )),
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
-        wasm_plugins: Arc::new(Vec::new()),
-        plugins: Arc::new(rsclaw::plugin::PluginRegistry::default()),
+        wasm_plugins: Arc::new(tokio::sync::RwLock::new(Arc::new(Vec::new()))),
+        plugins: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw::plugin::PluginRegistry::default(),
+        ))),
         restart_request_tx: broadcast::channel(16).0,
         pending_restart: Arc::new(std::sync::RwLock::new(None)),
         shutdown: rsclaw::gateway::ShutdownCoordinator::new(),
@@ -416,9 +506,45 @@ async fn auth_token_gates_non_health_endpoints() {
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
         relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
+        peer_manager: Arc::new(rsclaw::a2a::peer::PeerManager::default()),
         knowledge: None,
         memory: None,
         model_health: rsclaw::provider::health::ProviderHealthRegistry::new(),
+        skills: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw_skill::SkillRegistry::new(),
+        ))),
+        mcp: Arc::new(rsclaw_mcp::McpRegistry::new()),
+        channel_manager: Arc::new(rsclaw_channel::ChannelManager::new(MemoryTier::Low)),
+        channel_senders: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        agent_spawner: rsclaw_agent::AgentSpawner::new_arc(
+            Arc::new(rsclaw_agent::AgentRegistry::new()),
+            Arc::new(std::sync::RwLock::new(Arc::clone(&spawner_config))),
+            Arc::clone(&spawner_live),
+            Arc::new(std::sync::RwLock::new(Arc::new(
+                rsclaw_provider::registry::ProviderRegistry::new(),
+            ))),
+            Arc::new(rsclaw_skill::SkillRegistry::new()),
+            Arc::clone(&spawner_store),
+            None,
+            spawner_event_tx,
+            None,
+            rsclaw::provider::health::ProviderHealthRegistry::new(),
+            None,
+            None,
+        ),
+        task_queue: Arc::new(rsclaw::gateway::task_queue::TaskQueueManager::new(Arc::new(
+            rsclaw_store::redb_store::RedbStore::open(
+                &std::env::temp_dir().join(format!("rsclaw-test-tq-{}.redb", std::process::id())),
+                MemoryTier::Low,
+            )
+            .expect("task queue store"),
+        ))),
+        providers: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw_provider::registry::ProviderRegistry::new(),
+        ))),
+        wasm_browser: Arc::new(tokio::sync::Mutex::new(None)),
+        rate_limiter: Arc::new(rsclaw::server::RateLimiter::new()),
+        reload_mutex: Arc::new(tokio::sync::Mutex::new(())),
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });

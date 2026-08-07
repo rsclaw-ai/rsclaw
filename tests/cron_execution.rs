@@ -90,6 +90,8 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
             list: vec![AgentEntry {
                 id: agent_id.to_owned(),
                 default: Some(true),
+                description: None,
+                daemon: false,
                 workspace: None,
                 model: None,
                 lane: None,

@@ -125,6 +125,23 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
     let agents = Arc::new(AgentRegistry::from_config(&config));
     let (event_tx, _) = broadcast::channel(16);
 
+    // Shared slots the AppState and AgentSpawner both need. Production wires
+    // these in `gateway::startup`; tests build empty equivalents.
+    let skills = Arc::new(rsclaw_skill::SkillRegistry::new());
+    let provider_slot: Arc<
+        std::sync::RwLock<Arc<rsclaw_provider::registry::ProviderRegistry>>,
+    > = Arc::new(std::sync::RwLock::new(Arc::new(
+        rsclaw_provider::registry::ProviderRegistry::new(),
+    )));
+    let model_health = rsclaw::provider::health::ProviderHealthRegistry::new();
+    let queue_store = Arc::new(
+        rsclaw_store::redb_store::RedbStore::open(
+            &data_dir.path().join("task-queue.redb"),
+            MemoryTier::Low,
+        )
+        .expect("task queue store"),
+    );
+
     let restart_request_tx: broadcast::Sender<RestartRequest> = broadcast::channel(16).0;
     let pending_restart: Arc<std::sync::RwLock<Option<RestartRequest>>> =
         Arc::new(std::sync::RwLock::new(None));
@@ -158,11 +175,11 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
     > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
     let state = AppState {
-        config,
-        live,
-        agents,
-        store,
-        event_bus: event_tx,
+        config: Arc::clone(&config),
+        live: Arc::clone(&live),
+        agents: Arc::clone(&agents),
+        store: Arc::clone(&store),
+        event_bus: event_tx.clone(),
         computer_permission,
         computer_permission_tx,
         computer_status_tx,
@@ -181,8 +198,10 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
         )),
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
-        wasm_plugins: Arc::new(Vec::new()),
-        plugins: Arc::new(rsclaw::plugin::PluginRegistry::default()),
+        wasm_plugins: Arc::new(tokio::sync::RwLock::new(Arc::new(Vec::new()))),
+        plugins: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw::plugin::PluginRegistry::default(),
+        ))),
         restart_request_tx: restart_request_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
@@ -204,9 +223,38 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
         relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
+        peer_manager: Arc::new(rsclaw::a2a::peer::PeerManager::default()),
         knowledge: None,
         memory: None,
-        model_health: rsclaw::provider::health::ProviderHealthRegistry::new(),
+        model_health: model_health.clone(),
+        skills: Arc::new(tokio::sync::RwLock::new(Arc::clone(&skills))),
+        mcp: Arc::new(rsclaw_mcp::McpRegistry::new()),
+        channel_manager: Arc::new(rsclaw_channel::ChannelManager::new(MemoryTier::Low)),
+        channel_senders: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        agent_spawner: rsclaw_agent::AgentSpawner::new_arc(
+            Arc::clone(&agents),
+            Arc::new(std::sync::RwLock::new(Arc::clone(&config))),
+            Arc::clone(&live),
+            Arc::clone(&provider_slot),
+            Arc::clone(&skills),
+            Arc::clone(&store),
+            None,
+            event_tx.clone(),
+            None,
+            model_health.clone(),
+            None,
+            None,
+        ),
+        task_queue: Arc::new(rsclaw::gateway::task_queue::TaskQueueManager::new(
+            Arc::clone(&queue_store),
+        )),
+        // AppState uses a tokio RwLock here; AgentSpawner takes a std one.
+        providers: Arc::new(tokio::sync::RwLock::new(Arc::new(
+            rsclaw_provider::registry::ProviderRegistry::new(),
+        ))),
+        wasm_browser: Arc::new(tokio::sync::Mutex::new(None)),
+        rate_limiter: Arc::new(rsclaw::server::RateLimiter::new()),
+        reload_mutex: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.

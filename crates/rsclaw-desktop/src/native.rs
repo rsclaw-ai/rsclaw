@@ -1882,7 +1882,9 @@ end tell"#,
             #[cfg(not(target_os = "macos"))]
             {
                 let mut enigo = new_enigo()?;
-                let axis = Axis::Vertical;
+                // Fully qualified: this branch is compiled out on macOS, so a
+                // top-level `use enigo::Axis` would be an unused import there.
+                let axis = enigo::Axis::Vertical;
                 enigo
                     .scroll(clicks, axis)
                     .map_err(|e| format!("scroll: {e}"))?;

@@ -35,8 +35,8 @@ reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocki
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 dirs-next = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
-wasmtime = { version = "36.0.10", features = ["async"] }
-wasmtime-wasi = "36.0.10"
+wasmtime = { version = "36.0.13", features = ["async"] }
+wasmtime-wasi = "36.0.13"
 chrono = { version = "0.4", features = ["serde"] }
 which = "7"
 rand = "0.9"

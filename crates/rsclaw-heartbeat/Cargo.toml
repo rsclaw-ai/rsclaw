@@ -24,3 +24,6 @@ rsclaw-store = { path = "../rsclaw-store", version = "0.1.0" }
 
 [dev-dependencies]
 tempfile = "3"
+# meditation.rs tests construct a MemoryStore, whose `open` takes a
+# MemoryTier. rsclaw-memory uses that type but does not re-export it.
+rsclaw-platform = { path = "../rsclaw-platform", version = "0.1.0" }
