@@ -17,3 +17,7 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # xcb's build script and wayland-scanner's proc macro parse only
+          # protocol descriptions bundled in checksummed crates. Neither
+          # quick-xml instance is shipped or processes runtime user input.
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195

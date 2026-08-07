@@ -33,4 +33,10 @@ ignore = [
     "RUSTSEC-2026-0097",   # indirect dep
     "RUSTSEC-2026-0098",   # indirect dep
     "RUSTSEC-2026-0099",   # indirect dep
+    # `quick-xml` 0.30/0.39 are compile-only through xcb's build script and
+    # wayland-scanner's proc macro. They parse checked-in protocol files from
+    # checksummed crates, never user input in the shipped gateway. Runtime XML
+    # parsers use quick-xml 0.41 through calamine/docx-rs.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
