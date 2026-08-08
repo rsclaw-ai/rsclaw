@@ -198,6 +198,11 @@ fn reload_scope_for(section: &str) -> Option<&'static str> {
         "config.agents" => Some("agents"),
         // ProviderRegistry is rebuilt wholesale.
         "config.models" | "config.auth" => Some("providers"),
+        // Channel handlers are rebuilt from the fresh config: added/removed by
+        // diff, and an already-running channel whose block changed (rotated
+        // token, dmPolicy edit) is unregistered so the hot-add step restarts
+        // it. Custom channels are torn down and restarted wholesale.
+        "config.channels" => Some("channels"),
         "config.skills" | "config.skill_registries" => Some("skills"),
         "config.plugins" => Some("plugins"),
         "config.mcp" => Some("mcp"),
@@ -627,6 +632,30 @@ mod tests {
                 assert_eq!(scopes, vec!["agents".to_owned()]);
             }
             other => panic!("agent model should be reload-able, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_channel_change_needs_reload_not_restart() {
+        // `--scope channels` diffs add/remove and restarts built-ins whose
+        // block changed, so a channel edit must not cost a full restart.
+        let old = empty_runtime_config();
+        let mut new = old.clone();
+        new.raw.channels = Some(
+            serde_json::from_value(serde_json::json!({
+                "telegram": { "botToken": "rotated" }
+            }))
+            .expect("channels block"),
+        );
+        match classify_change(&old, &new) {
+            ChangeImpact::NeedsReload { sections, scopes } => {
+                assert!(
+                    sections.contains(&"config.channels".to_owned()),
+                    "{sections:?}"
+                );
+                assert_eq!(scopes, vec!["channels".to_owned()]);
+            }
+            other => panic!("channel change should be reload-able, got {other:?}"),
         }
     }
 
