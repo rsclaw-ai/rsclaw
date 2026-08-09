@@ -43,10 +43,26 @@ impl ActionOutput {
 /// the runtime picks the platform impl at startup).
 pub type ActionFut<'a> = Pin<Box<dyn Future<Output = Result<ActionOutput>> + Send + 'a>>;
 pub type ScreenshotFut<'a> = Pin<Box<dyn Future<Output = Result<Screenshot>> + Send + 'a>>;
+pub type FrontmostFut<'a> = Pin<Box<dyn Future<Output = Result<Option<String>>> + Send + 'a>>;
 
 pub trait Operator: Send + Sync {
     /// Stable name for logging / telemetry: "native", "browser", "adb".
     fn name(&self) -> &'static str;
+
+    /// Display name of the application currently receiving input, e.g.
+    /// `"WeChat"`. `Ok(None)` means "this operator cannot tell" — the
+    /// caller must then treat the target as unverified rather than
+    /// assuming it matches.
+    ///
+    /// This is the permission gate's ground truth. Keying consent on a
+    /// label guessed from the user's instruction text is unsound: the
+    /// user approves "control WeChat" while the loop is free to drive
+    /// whatever happens to be focused. Implementations that genuinely
+    /// cannot introspect focus should keep the default `Ok(None)` and
+    /// let the caller fail closed.
+    fn frontmost_app(&self) -> FrontmostFut<'_> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Self-described capabilities — fed into the system prompt by
     /// `prompt::build_system_prompt`. Different operators may expose

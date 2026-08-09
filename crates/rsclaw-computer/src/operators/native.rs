@@ -28,7 +28,7 @@ use tracing::{debug, warn};
 
 use crate::{
     action::{Action, ActionSpec, ExecCtx, MouseButton, Screenshot, ScrollDir},
-    operator::{ActionFut, ActionOutput, Operator, ScreenshotFut},
+    operator::{ActionFut, ActionOutput, FrontmostFut, Operator, ScreenshotFut},
 };
 
 const ACTIVATE_DELAY_MS: u64 = 400;
@@ -86,6 +86,14 @@ impl Operator for NativeOperator {
                 "# Submit and call user when stuck or need help",
             ),
         ]
+    }
+
+    fn frontmost_app(&self) -> FrontmostFut<'_> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(frontmost_app_blocking)
+                .await
+                .context("frontmost_app blocking task join failed")?
+        })
     }
 
     fn screenshot(&self) -> ScreenshotFut<'_> {
@@ -688,6 +696,114 @@ fn activate_app_blocking_non_macos(app: &str) -> ActionOutput {
     }
 }
 
+/// Display name of the app currently receiving input, or `None` when the
+/// platform cannot be queried.
+///
+/// Used by the permission gate to verify that what the loop is actually
+/// driving matches what the user consented to. A `None` here is not
+/// "allow" — callers treat an unverifiable target as unverified.
+fn frontmost_app_blocking() -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        // `name of first application process whose frontmost is true`
+        // returns the localized display name ("微信"), which is what the
+        // user sees and therefore what consent should be keyed on.
+        let script = r#"tell application "System Events" to get name of first application process whose frontmost is true"#;
+        let out = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .context("osascript frontmost query")?;
+        if !out.status.success() {
+            // Most likely missing Accessibility permission. Report
+            // "unknown" rather than failing the whole run.
+            let err = String::from_utf8_lossy(&out.stderr);
+            warn!(stderr = %err.trim(), "frontmost_app: osascript failed");
+            return Ok(None);
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        return Ok(if name.is_empty() { None } else { Some(name) });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // GetForegroundWindow -> owning process -> MainWindowTitle is
+        // unreliable for UWP; the process name is stable enough for a
+        // consent check.
+        let ps = r#"
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class W {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int p);
+}
+"@
+$h = [W]::GetForegroundWindow()
+$pid = 0
+[void][W]::GetWindowThreadProcessId($h, [ref]$pid)
+(Get-Process -Id $pid).ProcessName
+"#;
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", ps]);
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let out = cmd.output().context("powershell frontmost query")?;
+        if !out.status.success() {
+            warn!("frontmost_app: powershell query failed");
+            return Ok(None);
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        return Ok(if name.is_empty() { None } else { Some(name) });
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // X11 only. Wayland deliberately denies this, and there is no
+        // portable replacement — those sessions stay unverifiable.
+        let out = Command::new("xdotool")
+            .args(["getactivewindow", "getwindowclassname"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let name = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+                Ok(if name.is_empty() { None } else { Some(name) })
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+    {
+        Ok(None)
+    }
+}
+
+/// Case- and alias-insensitive comparison of two app labels.
+///
+/// The frontmost app reports a localized display name ("微信") while the
+/// consent record may hold whatever label the grant was created with
+/// ("WeChat"). `macos_app_candidates` already encodes those aliases, so
+/// two labels match when either side appears in the other's candidate set.
+pub fn app_labels_match(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let a_cands = macos_app_candidates(a);
+        let b_cands = macos_app_candidates(b);
+        return a_cands
+            .iter()
+            .any(|x| b_cands.iter().any(|y| x.eq_ignore_ascii_case(y)));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn macos_app_candidates(app: &str) -> Vec<String> {
     let trimmed = app.trim();
@@ -764,6 +880,61 @@ end tell"#
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- app_labels_match ------------------------------------------------
+    //
+    // This decides whether the app that currently has keyboard focus is
+    // the one the user consented to. A false positive here IS the security
+    // hole the frontmost check exists to close, so both directions matter.
+
+    #[test]
+    fn app_labels_match_is_reflexive_and_case_insensitive() {
+        assert!(app_labels_match("WeChat", "WeChat"));
+        assert!(app_labels_match("wechat", "WECHAT"));
+        assert!(app_labels_match("  Safari  ", "Safari"));
+    }
+
+    #[test]
+    fn app_labels_match_resolves_localized_aliases() {
+        // macOS reports the localized display name, while the stored grant
+        // may hold the English label the run was started with. Treating
+        // these as different apps would re-prompt on every keystroke.
+        #[cfg(target_os = "macos")]
+        {
+            assert!(app_labels_match("WeChat", "微信"));
+            assert!(app_labels_match("微信", "WeChat"));
+            assert!(app_labels_match("doubao", "豆包"));
+        }
+    }
+
+    #[test]
+    fn app_labels_match_rejects_different_apps() {
+        // The cases that must never pass: consenting to one app must not
+        // clear another, including near-misses and substrings.
+        assert!(!app_labels_match("WeChat", "Mail"));
+        assert!(!app_labels_match("Safari", "Google Chrome"));
+        assert!(!app_labels_match("Notes", "Notion"));
+        assert!(!app_labels_match("Terminal", "Term"));
+        assert!(!app_labels_match("1Password", "WeChat"));
+        #[cfg(target_os = "macos")]
+        assert!(!app_labels_match("微信", "豆包"));
+    }
+
+    #[test]
+    fn app_labels_match_empty_does_not_clear_a_named_app() {
+        // An unknown/blank frontmost label must not act as a wildcard.
+        assert!(!app_labels_match("", "WeChat"));
+        assert!(!app_labels_match("WeChat", ""));
+    }
+
+    #[test]
+    fn frontmost_app_query_is_infallible_shape() {
+        // Contract: never Err on a supported desktop; Ok(None) is the
+        // "cannot tell" signal callers fail closed on. Value depends on
+        // the machine, so only the shape is asserted.
+        let got = frontmost_app_blocking();
+        assert!(got.is_ok(), "frontmost query must not error: {got:?}");
+    }
 
     #[test]
     fn default_constructs() {

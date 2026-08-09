@@ -231,16 +231,19 @@ impl RedbPermissionStore {
         Ok(out)
     }
 
-    /// Register a oneshot for a pending UI request. Called by the code
-    /// that emits the `PermissionRequest` event right before awaiting
-    /// the user's decision.
+    /// Register a oneshot for a pending UI request.
     ///
-    /// TODO: wire this from the driver — the driver should:
-    ///   1. mint a `request_id`
-    ///   2. call `register_pending_request(request_id) -> Receiver`
-    ///   3. emit the `PermissionRequest` event on the gateway bus
-    ///   4. `.await` the receiver
-    ///   5. call `record(...)` with the decision
+    /// NOTE: no production caller registers. `VlmDriver::ensure_consent`
+    /// deliberately polls `check()` with backoff instead (see the comment
+    /// at its await loop) — user-decision latency is human-scale, and
+    /// polling avoids threading a receiver through the driver. Consent
+    /// therefore flows entirely through `record()`.
+    ///
+    /// Consequence: because nothing registers,
+    /// `resolve_pending_request` finds no entry and reports `false` even
+    /// when the decision was applied. Only the `resolved` field of the
+    /// WS/HTTP response is affected; the decision itself still lands via
+    /// `record()`. Exercised by tests only.
     pub async fn register_pending_request(
         &self,
         request_id: &str,
@@ -258,7 +261,11 @@ impl RedbPermissionStore {
     /// Returns true if the request_id was found and resolved, false if
     /// it was unknown (race with timeout / duplicate response).
     ///
-    /// TODO: wire this from the WS dispatcher in `src/ws/`.
+    /// Wired from `ws::methods::chat::chat_permission_response` and the
+    /// HTTP `computer-use/permissions/respond` handler. Both call
+    /// `record()` first, which is what actually applies the decision —
+    /// see `register_pending_request` for why this returns false in
+    /// practice.
     pub async fn resolve_pending_request(
         &self,
         request_id: &str,
