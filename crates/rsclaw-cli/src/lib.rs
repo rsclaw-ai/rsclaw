@@ -326,12 +326,6 @@ pub enum Command {
     #[command(subcommand)]
     Daemon(DaemonCommand),
 
-    /// Search live documentation.
-    Docs {
-        /// Search query terms.
-        query: Vec<String>,
-    },
-
     /// Generate app pairing QR code.
     Qr(QrArgs),
 

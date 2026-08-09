@@ -102,6 +102,21 @@ impl super::runtime::AgentRuntime {
             // ---- Operator-backed actions ---------------------------------
             "mouse_move" | "mouse_click" | "left_click" | "double_click" | "right_click"
             | "middle_click" | "drag" | "scroll" | "type" | "key" | "hold_key" | "wait" => {
+                // Input synthesis without grounding is how a run ends up
+                // typing into the wrong window: the model reads a
+                // screenshot, guesses pixel coordinates, and fires blind.
+                // `vlm_drive` at least runs the permission gate and the
+                // frontmost re-check; these raw actions bypass both.
+                //
+                // Rule: an action may skip `vlm_drive` only when the UI
+                // tree is obtainable, because that is what makes the
+                // target verifiable (role + label + bounds from the
+                // accessibility API). Where it is not, the model must go
+                // through `vlm_drive`.
+                if is_input_synthesis(action_str) {
+                    ensure_ui_tree_grounding(action_str).await?;
+                }
+                audit_direct_action(action_str, &args);
                 dispatch_via_native_operator(action_str, &args).await
             }
 
@@ -968,6 +983,98 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
 // Free helpers
 // ---------------------------------------------------------------------------
 
+/// True for actions that synthesize real keyboard/mouse input, i.e. the ones
+/// that can act on the wrong target. `wait` and `scroll` are excluded:
+/// `wait` has no side effect, and `scroll` cannot enter data or activate a
+/// control.
+fn is_input_synthesis(action: &str) -> bool {
+    matches!(
+        action,
+        "mouse_click"
+            | "left_click"
+            | "double_click"
+            | "right_click"
+            | "middle_click"
+            | "drag"
+            | "type"
+            | "key"
+            | "hold_key"
+    )
+}
+
+/// Cached answer to "can this host produce a UI tree?".
+///
+/// The probe costs ~1s (the macOS path compiles a Swift snippet), which is
+/// far too slow to repeat before every click, and the answer only changes
+/// when the user grants or revokes Accessibility — a restart-shaped event.
+static UI_TREE_GROUNDING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Gate raw input synthesis on the availability of UI-tree grounding.
+///
+/// A direct `type`/`click` carries no evidence about what it will hit: the
+/// coordinates are whatever the model inferred from a screenshot, and
+/// keystrokes go wherever focus happens to be. The accessibility tree is
+/// what makes a target checkable (role, label, bounds), so where it cannot
+/// be read the model must fall back to `vlm_drive`, which runs the
+/// permission gate and re-verifies the frontmost app.
+async fn ensure_ui_tree_grounding(action: &str) -> Result<()> {
+    if let Some(ok) = UI_TREE_GROUNDING.get() {
+        if *ok {
+            return Ok(());
+        }
+        return Err(grounding_error(action));
+    }
+
+    let available = ui_tree().await.is_ok();
+    let _ = UI_TREE_GROUNDING.set(available);
+    if available {
+        tracing::info!("computer_use: UI-tree grounding available; direct actions permitted");
+        Ok(())
+    } else {
+        tracing::warn!(
+            action,
+            "computer_use: no UI-tree grounding; refusing blind input synthesis"
+        );
+        Err(grounding_error(action))
+    }
+}
+
+fn grounding_error(action: &str) -> anyhow::Error {
+    anyhow!(
+        "computer_use: `{action}` refused — this host cannot read the UI tree, so a raw \
+         coordinate/keystroke cannot be verified against a real target. Use \
+         `action=\"vlm_drive\"` with a plain-language instruction instead; it runs the \
+         permission gate and checks the focused app before typing. (On macOS, granting \
+         Accessibility to the rsclaw binary also restores direct actions.)"
+    )
+}
+
+/// Record what a direct action is about to do.
+///
+/// Without this the log shows only `dispatching tool call tool=computer_use`,
+/// so after an incident there is no way to reconstruct which coordinates were
+/// clicked or what text was typed. Typed text is truncated and length-tagged
+/// rather than dropped, since the content is usually the thing under dispute.
+fn audit_direct_action(action: &str, args: &Value) {
+    let target = match action {
+        "type" => {
+            let text = args["text"].as_str().unwrap_or_default();
+            format!(
+                "text_len={} text={:?}",
+                text.chars().count(),
+                rsclaw_util::truncate_str(text, 120)
+            )
+        }
+        "key" | "hold_key" => format!("keys={:?}", args["key"].as_str().unwrap_or_default()),
+        _ => format!(
+            "x={} y={}",
+            args["x"].as_f64().unwrap_or(0.0),
+            args["y"].as_f64().unwrap_or(0.0)
+        ),
+    };
+    tracing::info!(action, %target, "computer_use: direct action");
+}
+
 /// Translate a JSON tool-call arg map to an `Action` and execute it on a
 /// `NativeOperator`. Returns the legacy JSON shape `{action, ok}`.
 async fn dispatch_via_native_operator(action: &str, args: &Value) -> Result<Value> {
@@ -1480,4 +1587,59 @@ fn derive_app_label(instruction: &str) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Which actions are gated decides whether a run can fire blind input.
+    // Getting this list wrong silently re-opens the path that typed into
+    // the wrong window, so pin it both ways.
+
+    #[test]
+    fn input_synthesis_covers_every_action_that_can_act_on_a_target() {
+        for a in [
+            "mouse_click",
+            "left_click",
+            "double_click",
+            "right_click",
+            "middle_click",
+            "drag",
+            "type",
+            "key",
+            "hold_key",
+        ] {
+            assert!(is_input_synthesis(a), "`{a}` must be gated");
+        }
+    }
+
+    #[test]
+    fn side_effect_free_actions_are_not_gated() {
+        // Gating these would cost a ~1s accessibility probe for no safety
+        // gain — `wait` does nothing and `scroll` cannot enter data or
+        // activate a control.
+        for a in ["wait", "scroll", "mouse_move", "screenshot", "ui_tree"] {
+            assert!(!is_input_synthesis(a), "`{a}` should not be gated");
+        }
+    }
+
+    #[test]
+    fn grounding_error_points_at_the_supported_path() {
+        // The model reads this string and has to recover from it, so it
+        // must name the alternative rather than just refusing.
+        let msg = grounding_error("type").to_string();
+        assert!(msg.contains("vlm_drive"), "got: {msg}");
+        assert!(msg.contains("type"), "should name the refused action: {msg}");
+    }
+
+    #[test]
+    fn audit_of_typed_text_is_multibyte_safe() {
+        // Truncation runs on CJK input constantly; a byte-slice would
+        // panic mid-character and take the whole run down.
+        let long = "旭日，你好！".repeat(60);
+        audit_direct_action("type", &json!({ "text": long }));
+        audit_direct_action("left_click", &json!({ "x": 12.0, "y": 34.0 }));
+        audit_direct_action("key", &json!({ "key": "cmd v" }));
+    }
 }

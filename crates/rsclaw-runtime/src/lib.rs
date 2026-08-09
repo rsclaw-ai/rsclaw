@@ -105,7 +105,7 @@ use clap::Parser;
 use cmd::{
     cmd_agent_turn, cmd_agents, cmd_anycli, cmd_approvals, cmd_backup, cmd_browser, cmd_channels,
     cmd_completion, cmd_config, cmd_configure, cmd_cron, cmd_daemon, cmd_dashboard, cmd_debug,
-    cmd_devices, cmd_directory, cmd_dns, cmd_docs, cmd_doctor, cmd_env, cmd_gateway, cmd_health,
+    cmd_devices, cmd_directory, cmd_dns, cmd_doctor, cmd_env, cmd_gateway, cmd_health,
     cmd_hooks, cmd_image, cmd_kb, cmd_logs, cmd_memory, cmd_message, cmd_migrate, cmd_models,
     cmd_onboard, cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox, cmd_secrets, cmd_security,
     cmd_sessions, cmd_setup, cmd_skills, cmd_status, cmd_system, cmd_tools, cmd_tray, cmd_tui,
@@ -331,7 +331,6 @@ pub async fn run() -> Result<()> {
         Command::Completion(args) => cmd_completion(args).await,
         Command::Dashboard { no_open } => cmd_dashboard(no_open).await,
         Command::Daemon(sub) => cmd_daemon(sub).await,
-        Command::Docs { query } => cmd_docs(query).await,
         Command::Qr(args) => cmd_qr(args).await,
         Command::Uninstall(args) => cmd_uninstall(args).await,
         Command::Webhooks(sub) => cmd_webhooks(sub).await,
