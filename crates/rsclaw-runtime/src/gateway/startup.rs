@@ -839,7 +839,6 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         tokio::spawn(async move { watcher.run().await });
         let live_reload = Arc::clone(&live);
         let watcher_reload_mutex = Arc::clone(&reload_mutex);
-        let (restart_tx, _) = broadcast::channel::<Vec<String>>(8);
         let bridge_tx = restart_request_tx.clone();
         let bridge_pending = Arc::clone(&pending_restart);
         let bridge_shutdown = shutdown.clone();
@@ -864,7 +863,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             let old = live_reload.snapshot().await;
                             rsclaw_config::live_config::classify_change(&old, &new_owned)
                         };
-                        live_reload.apply(new_owned, &restart_tx).await;
+                        live_reload.apply(new_owned).await;
                         drop(guard);
 
                         match impact {

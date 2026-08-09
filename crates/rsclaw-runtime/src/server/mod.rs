@@ -867,6 +867,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reload_scope_default_is_all() {
+        assert_eq!(parse_reload_scopes("all").unwrap(), vec!["all"]);
+    }
+
+    #[test]
+    fn reload_scope_accepts_singular_and_plural() {
+        assert_eq!(parse_reload_scopes("skill").unwrap(), vec!["skills"]);
+        assert_eq!(parse_reload_scopes("skills").unwrap(), vec!["skills"]);
+        assert_eq!(parse_reload_scopes("model").unwrap(), vec!["providers"]);
+    }
+
+    #[test]
+    fn reload_scope_parses_comma_list_and_dedupes() {
+        assert_eq!(
+            parse_reload_scopes("skills, plugins ,skill").unwrap(),
+            vec!["skills", "plugins"]
+        );
+    }
+
+    #[test]
+    fn reload_scope_rejects_unknown_instead_of_silently_doing_nothing() {
+        // A typo used to match no scope, run nothing, and still report
+        // `reloaded: true`.
+        let err = parse_reload_scopes("modl").unwrap_err();
+        assert_eq!(err, vec!["modl".to_owned()]);
+    }
+
+    #[test]
+    fn reload_scope_does_not_substring_match_all() {
+        // `contains("all")` fired on any value containing those letters, so
+        // `install` silently triggered a FULL reload of every subsystem.
+        let err = parse_reload_scopes("install").unwrap_err();
+        assert_eq!(err, vec!["install".to_owned()]);
+    }
+
+    #[test]
     fn reload_reports_failed_scopes() {
         let details = serde_json::Map::from_iter([
             ("plugins".to_owned(), serde_json::json!({"reloaded": false})),
@@ -1915,17 +1951,83 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// POST /api/v1/config/reload — validate that the on-disk config still parses.
+///
+/// This does NOT reload anything: it neither writes `LiveConfig` nor rebuilds
+/// any component. `POST /api/v1/reload?scope=…` is the endpoint that applies a
+/// change. Kept under the old path for compatibility, but the response now
+/// says `validated` instead of claiming `reloaded: true` — the previous
+/// wording made a pure parse check look like a successful apply.
 async fn config_reload(State(_state): State<AppState>) -> impl IntoResponse {
-    // Re-load config from disk and broadcast a reload event.
-    // Full hot-reload wiring is completed in the gateway startup path;
-    // here we just validate the config is still parseable.
     match rsclaw_config::load() {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"reloaded": true}))).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e.to_string()})),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "validated": true,
+                "reloaded": false,
+                "hint": "config parses; POST /api/v1/reload?scope=… to apply it",
+            })),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"validated": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Scope names accepted by `POST /api/v1/reload`.
+pub const KNOWN_RELOAD_SCOPES: [&str; 7] = [
+    "all",
+    "skills",
+    "plugins",
+    "providers",
+    "mcp",
+    "channels",
+    "agents",
+];
+
+/// Parse a comma-separated `?scope=` value into canonical scope names.
+///
+/// Exact matching, not substring: the previous `scope.contains("all")` fired
+/// on any value that happened to contain those letters (`install`,
+/// `callback`, …) and silently ran a full reload, while a misspelled scope
+/// (`modl`) matched nothing yet still reported `reloaded: true`. Singular and
+/// plural spellings are both accepted because the CLI and older callers mix
+/// them.
+///
+/// Returns `Err(unknown)` listing every unrecognised entry so the caller can
+/// reject the request instead of silently doing nothing.
+fn parse_reload_scopes(scope: &str) -> Result<Vec<&'static str>, Vec<String>> {
+    let mut selected: Vec<&'static str> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+
+    for raw in scope.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let canonical = match raw {
+            "all" => Some("all"),
+            "skill" | "skills" => Some("skills"),
+            "plugin" | "plugins" => Some("plugins"),
+            "provider" | "providers" | "model" | "models" => Some("providers"),
+            "mcp" => Some("mcp"),
+            "channel" | "channels" => Some("channels"),
+            "agent" | "agents" => Some("agents"),
+            _ => None,
+        };
+        match canonical {
+            Some(s) => {
+                if !selected.contains(&s) {
+                    selected.push(s);
+                }
+            }
+            None => unknown.push(raw.to_owned()),
+        }
+    }
+
+    if unknown.is_empty() {
+        Ok(selected)
+    } else {
+        Err(unknown)
     }
 }
 
@@ -1941,10 +2043,26 @@ async fn http_reload(
         .get("scope")
         .map(|s| s.to_lowercase())
         .unwrap_or_else(|| "all".to_owned());
-    let reload_skills = scope.contains("all") || scope.contains("skill");
-    let reload_plugins = scope.contains("all") || scope.contains("plugin");
-    let reload_providers = scope.contains("all") || scope.contains("provider");
-    let reload_mcp = scope.contains("all") || scope.contains("mcp");
+    let selected = match parse_reload_scopes(&scope) {
+        Ok(s) => s,
+        Err(unknown) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "reloaded": false,
+                    "error": format!("unknown scope(s): {}", unknown.join(", ")),
+                    "known_scopes": KNOWN_RELOAD_SCOPES,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let has = |s: &str| selected.iter().any(|x| *x == "all" || *x == s);
+    let reload_skills = has("skills");
+    let reload_plugins = has("plugins");
+    let reload_providers = has("providers");
+    let reload_mcp = has("mcp");
 
     // Serialize concurrent reload requests to prevent double-spawn races.
     let _reload_guard = state.reload_mutex.lock().await;
@@ -1983,8 +2101,7 @@ async fn http_reload(
     // into LiveConfig — same as the file watcher does. Without this, HTTP
     // reload reports success while live reads stay stale.
     {
-        let (restart_tx, _) = tokio::sync::broadcast::channel::<Vec<String>>(1);
-        let restart_fields = state.live.apply(fresh_config.clone(), &restart_tx).await;
+        let restart_fields = state.live.apply(fresh_config.clone()).await;
         if !restart_fields.is_empty() {
             details.insert(
                 "restart_recommended".to_owned(),
@@ -2208,7 +2325,7 @@ async fn http_reload(
     }
 
     // --- Channels: remove deconfigured channels, hot-add new ones ---
-    let reload_channels = scope.contains("all") || scope.contains("channel");
+    let reload_channels = has("channels");
     if reload_channels {
         let configured_channels = fresh_config
             .raw
@@ -2628,7 +2745,7 @@ async fn http_reload(
 
     // --- Agents: diff config vs registry, spawn new / remove old / restart changed
     // ---
-    let reload_agents = scope.contains("all") || scope.contains("agent");
+    let reload_agents = has("agents");
     if reload_agents {
         // Detect whether agents.defaults.model changed BEFORE swapping the slot.
         let defaults_model_changed = {
