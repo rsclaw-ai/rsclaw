@@ -1,8 +1,0 @@
-{
-  // copy to ~/.rsclaw/profiles/<name>/profile.json5
-  name: "me",
-  persona: "30岁科技博主，口吻轻松、爱用短句、偶尔玩梗",
-  // voice_id: 留空则用 voice.wav 现场克隆；填了则用预置音色
-  voice_id: "",
-  default_aspect: "9:16",
-}

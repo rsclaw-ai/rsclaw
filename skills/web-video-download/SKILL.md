@@ -10,6 +10,17 @@ author: "@rsclaw"
 
 3 steps only. Works with Douyin, Bilibili, Kuaishou, Xiaohongshu, YouTube, TikTok, etc.
 
+> **Usage notice / 使用声明**
+>
+> Intended for content you own or are authorised to access — your own
+> uploads, licensed material, or content the rights holder permits you to
+> save. You are responsible for complying with each platform's terms of
+> service and with applicable copyright law. Do not redistribute
+> third-party content without permission.
+>
+> 本技能仅用于下载您自有或已获授权访问的内容。请遵守各平台服务条款及著作权
+> 法律法规；未经许可请勿转载或传播他人作品。
+
 ## Step 1: Capture video URLs
 
 ```json
