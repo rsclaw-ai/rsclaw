@@ -41,6 +41,23 @@ pub enum RestartUrgency {
     Required,
 }
 
+/// What the UI should offer to make a pending config change take effect.
+///
+/// A full restart costs a cold boot (DB open, provider registry, first-run
+/// KB/tantivy index — 30-60s on desktop) and drops every channel connection.
+/// Most changes only need the owning component rebuilt, which
+/// `POST /api/v1/reload?scope=…` does in-process in about a second. This
+/// tells the banner which of the two to offer.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemedyKind {
+    /// Scoped in-process reload — cheap, keeps the listener and channels up.
+    Reload,
+    /// Full process restart — the only way to rebind a socket or reopen the
+    /// store.
+    Restart,
+}
+
 /// Published by any source that wants the user to restart the gateway.
 /// Latched in `AppState::pending_restart` so late-connecting UIs see it.
 #[derive(Debug, Clone, Serialize)]
@@ -58,11 +75,20 @@ pub struct RestartRequest {
     /// short-circuits the countdown.
     #[serde(default)]
     pub inflight: u64,
+    /// Whether a scoped reload suffices, or a full restart is unavoidable.
+    /// Defaults to `Restart` so any publisher that has not been taught the
+    /// distinction keeps the old, conservative behaviour.
+    pub remedy: RemedyKind,
+    /// `/api/v1/reload?scope=` values that apply the change when `remedy` is
+    /// [`RemedyKind::Reload`]. Empty for restart-only requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reload_scopes: Vec<String>,
 }
 
 impl RestartRequest {
-    /// Construct a new request stamped with `now`. `inflight` defaults to 0;
-    /// `publish_restart` overwrites it with the live count before broadcast.
+    /// Construct a new restart-required request stamped with `now`.
+    /// `inflight` defaults to 0; `publish_restart` overwrites it with the
+    /// live count before broadcast.
     pub fn new(reason: RestartReason, urgency: RestartUrgency, message: String) -> Self {
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -74,6 +100,23 @@ impl RestartRequest {
             urgency,
             message,
             inflight: 0,
+            remedy: RemedyKind::Restart,
+            reload_scopes: Vec::new(),
+        }
+    }
+
+    /// Construct a request that a scoped reload can satisfy.
+    ///
+    /// `scopes` are `/api/v1/reload?scope=` values; the UI posts them instead
+    /// of restarting the process.
+    pub fn new_reload(reason: RestartReason, message: String, scopes: Vec<String>) -> Self {
+        Self {
+            remedy: RemedyKind::Reload,
+            reload_scopes: scopes,
+            // A reload is cheap and non-disruptive to the listener, so it
+            // never escalates past "recommended".
+            urgency: RestartUrgency::Recommended,
+            ..Self::new(reason, RestartUrgency::Recommended, message)
         }
     }
 }

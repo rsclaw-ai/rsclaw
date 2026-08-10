@@ -126,6 +126,144 @@ impl LiveConfig {
 // Restart-required diff
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Change impact classification
+// ---------------------------------------------------------------------------
+
+/// How a config change can be applied.
+///
+/// Three tiers, decided by *where the value is read* rather than by how
+/// important the field looks:
+///
+///   * [`ChangeImpact::Hot`] — every read site goes through a `LiveConfig`
+///     lock, so `apply` already wrote the new value and nothing else is
+///     needed.
+///   * [`ChangeImpact::NeedsReload`] — the value is snapshotted inside a
+///     component (agent handle, provider registry, skill/plugin registry),
+///     so the component must be rebuilt. That is exactly what
+///     `POST /api/v1/reload?scope=…` does: seconds of work at worst, no
+///     dropped listener, no cold DB/KB re-index.
+///   * [`ChangeImpact::NeedsRestart`] — the value is bound to an OS resource
+///     owned by the process (listening socket, redb file handle + mmap), so
+///     only a fresh process can pick it up.
+///
+/// Before this existed, everything that was not `Hot` surfaced a restart
+/// banner, which meant editing a provider key or a skill cost a full
+/// cold boot (30-60s on desktop) even though a scoped reload would have
+/// done the job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeImpact {
+    /// Already applied by `LiveConfig::apply`; no further action.
+    Hot,
+    /// Rebuildable in-process. Carries the changed section names plus the
+    /// `/api/v1/reload` scopes that cover them.
+    NeedsReload {
+        sections: Vec<String>,
+        scopes: Vec<String>,
+    },
+    /// Requires a fresh process. Carries the changed section names.
+    ///
+    /// When a single edit touches both tiers the restart wins (it strictly
+    /// dominates a reload), but the reload-able sections are still listed so
+    /// the UI can explain everything that changed.
+    NeedsRestart { sections: Vec<String> },
+}
+
+impl ChangeImpact {
+    /// True when nothing beyond the live locks needs to happen.
+    pub fn is_hot(&self) -> bool {
+        matches!(self, ChangeImpact::Hot)
+    }
+
+    /// All changed section names, whatever the tier.
+    pub fn sections(&self) -> &[String] {
+        match self {
+            ChangeImpact::Hot => &[],
+            ChangeImpact::NeedsReload { sections, .. } => sections,
+            ChangeImpact::NeedsRestart { sections } => sections,
+        }
+    }
+}
+
+/// Map a changed section name to the `/api/v1/reload?scope=` value that
+/// rebuilds it, or `None` when no scope can (the caller must then treat the
+/// section as restart-only).
+///
+/// Keys are the section names produced by [`diff_restart_sections`], i.e.
+/// `config.<top-level-key>` plus the granular `gateway.*` entries.
+fn reload_scope_for(section: &str) -> Option<&'static str> {
+    match section {
+        // `agents.list[i].{model,flashModel,system}` are snapshotted into
+        // AgentHandle.config; `--scope agents` diffs and re-spawns them.
+        "config.agents" => Some("agents"),
+        // ProviderRegistry is rebuilt wholesale.
+        "config.models" | "config.auth" => Some("providers"),
+        // Channel handlers are rebuilt from the fresh config: added/removed by
+        // diff, and an already-running channel whose block changed (rotated
+        // token, dmPolicy edit) is unregistered so the hot-add step restarts
+        // it. Custom channels are torn down and restarted wholesale.
+        "config.channels" => Some("channels"),
+        "config.skills" | "config.skill_registries" => Some("skills"),
+        "config.plugins" => Some("plugins"),
+        "config.mcp" => Some("mcp"),
+        _ => None,
+    }
+}
+
+/// Sections that are bound to OS resources acquired at process start and
+/// therefore cannot be rebuilt in-process.
+///
+/// Everything not listed here and not covered by [`reload_scope_for`] is
+/// treated as restart-required too — the conservative default for anything
+/// not yet audited.
+fn is_restart_only(section: &str) -> bool {
+    matches!(
+        section,
+        // Listening socket is already bound.
+        "gateway.port" | "gateway.bind" | "gateway.reload"
+            // redb file handle + mmap and the tantivy/HNSW index are opened
+            // once at boot with a tier-derived cache size.
+            | "config.memory"
+            | "config.memory_search"
+            | "config.kb"
+    )
+}
+
+/// Classify a config change into [`ChangeImpact`].
+///
+/// Runs [`diff_restart_sections`] and then buckets each changed section:
+/// restart-only sections win, otherwise every section that maps to a reload
+/// scope becomes a `NeedsReload`. Sections with neither classification are
+/// conservatively treated as restart-required.
+pub fn classify_change(old: &RuntimeConfig, new: &RuntimeConfig) -> ChangeImpact {
+    let sections = diff_restart_sections(old, new);
+    if sections.is_empty() {
+        return ChangeImpact::Hot;
+    }
+
+    let mut scopes: Vec<String> = Vec::new();
+    let mut restart_needed = false;
+    for section in &sections {
+        if is_restart_only(section) {
+            restart_needed = true;
+        } else if let Some(scope) = reload_scope_for(section) {
+            let scope = scope.to_owned();
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        } else {
+            // Unaudited section — assume the worst.
+            restart_needed = true;
+        }
+    }
+
+    if restart_needed {
+        ChangeImpact::NeedsRestart { sections }
+    } else {
+        ChangeImpact::NeedsReload { sections, scopes }
+    }
+}
+
 /// Fields that cannot be changed without restarting the gateway.
 pub fn detect_restart_fields(old: &GatewayRuntime, new: &GatewayRuntime) -> Vec<String> {
     let mut fields = Vec::new();
@@ -257,12 +395,22 @@ fn strip_live_fields(v: &mut serde_json::Value) {
         if let Some(list) = agents.get_mut("list").and_then(|l| l.as_array_mut()) {
             for entry in list {
                 if let Some(obj) = entry.as_object_mut() {
-                    // Per-agent overrides — hot-reloadable via
-                    // `rsclaw reload --scope agents` (remove + re-spawn).
-                    // KV-cache invalidates on model change anyway.
-                    for key in ["temperature", "model", "flashModel", "system"] {
-                        obj.remove(key);
-                    }
+                    // Only `temperature` is genuinely live: agent_loop reads it
+                    // per-turn via `self.live.agents.read()`.
+                    //
+                    // `model` / `flashModel` / `system` are NOT stripped, even
+                    // though they used to be. They are snapshotted into
+                    // `AgentHandle.config` (an owned `AgentEntry`) at spawn and
+                    // read from there by dispatch/run_turn, so writing the live
+                    // lock changes nothing — the running agent keeps the old
+                    // value. Stripping them made the diff empty, which made the
+                    // watcher log "hot-reload applied" and stay silent while the
+                    // change silently did not take effect.
+                    //
+                    // Left in the diff they now surface as `config.agents`,
+                    // which `classify_change` maps to `NeedsReload{scope=agents}`
+                    // — a re-spawn that actually applies them.
+                    obj.remove("temperature");
                 }
             }
         }
@@ -442,6 +590,110 @@ mod tests {
             live.gateway.read().await.auth_token.as_deref(),
             Some("rotated")
         );
+    }
+
+    // -- ChangeImpact classification -------------------------------------
+
+    #[test]
+    fn classify_no_change_is_hot() {
+        let cfg = empty_runtime_config();
+        assert_eq!(classify_change(&cfg, &cfg), ChangeImpact::Hot);
+    }
+
+    #[test]
+    fn classify_port_change_needs_restart() {
+        let old = empty_runtime_config();
+        let mut new = old.clone();
+        new.gateway.port = 19999;
+        match classify_change(&old, &new) {
+            ChangeImpact::NeedsRestart { sections } => {
+                assert!(sections.contains(&"gateway.port".to_owned()), "{sections:?}");
+            }
+            other => panic!("port must be restart-only, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_agent_model_needs_reload_not_restart() {
+        // Regression: `agents.list[i].model` used to be stripped from the diff
+        // as "hot-safe", so editing a model logged "hot-reload applied" while
+        // the running agent kept the old one — a silent no-op. It must now
+        // surface as a reload-able change carrying the `agents` scope.
+        let old = empty_runtime_config();
+        let mut new = old.clone();
+        new.raw.agents = Some(serde_json::from_value(serde_json::json!({
+            "list": [{ "id": "main", "model": { "primary": "gpt-5" } }]
+        }))
+        .expect("agents block"));
+
+        match classify_change(&old, &new) {
+            ChangeImpact::NeedsReload { sections, scopes } => {
+                assert!(sections.contains(&"config.agents".to_owned()), "{sections:?}");
+                assert_eq!(scopes, vec!["agents".to_owned()]);
+            }
+            other => panic!("agent model should be reload-able, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_channel_change_needs_reload_not_restart() {
+        // `--scope channels` diffs add/remove and restarts built-ins whose
+        // block changed, so a channel edit must not cost a full restart.
+        let old = empty_runtime_config();
+        let mut new = old.clone();
+        new.raw.channels = Some(
+            serde_json::from_value(serde_json::json!({
+                "telegram": { "botToken": "rotated" }
+            }))
+            .expect("channels block"),
+        );
+        match classify_change(&old, &new) {
+            ChangeImpact::NeedsReload { sections, scopes } => {
+                assert!(
+                    sections.contains(&"config.channels".to_owned()),
+                    "{sections:?}"
+                );
+                assert_eq!(scopes, vec!["channels".to_owned()]);
+            }
+            other => panic!("channel change should be reload-able, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_restart_wins_over_reload_when_both_change() {
+        let old = empty_runtime_config();
+        let mut new = old.clone();
+        new.gateway.port = 19999;
+        new.raw.agents = Some(
+            serde_json::from_value(serde_json::json!({
+                "list": [{ "id": "main", "model": { "primary": "gpt-5" } }]
+            }))
+            .expect("agents block"),
+        );
+        match classify_change(&old, &new) {
+            ChangeImpact::NeedsRestart { sections } => {
+                // Both are reported so the UI can explain everything that
+                // changed, but the remedy is the strictly dominant one.
+                assert!(sections.contains(&"gateway.port".to_owned()), "{sections:?}");
+                assert!(sections.contains(&"config.agents".to_owned()), "{sections:?}");
+            }
+            other => panic!("restart must dominate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_temperature_only_stays_hot() {
+        // agents.defaults.temperature is read live per-turn — it must not
+        // surface any banner.
+        let old = empty_runtime_config();
+        let mut new = old.clone();
+        new.raw.agents = Some(
+            serde_json::from_value(serde_json::json!({
+                "defaults": { "temperature": 0.9 }
+            }))
+            .expect("agents block"),
+        );
+        assert_eq!(classify_change(&old, &new), ChangeImpact::Hot);
     }
 
     fn empty_runtime_config() -> RuntimeConfig {

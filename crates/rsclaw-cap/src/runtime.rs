@@ -957,14 +957,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_turn_pushes_tool_call_progress_to_notif() {
+    async fn run_turn_does_not_push_tool_call_progress_to_notif() {
+        // Since 6a76c369 (crate-split) the bridge deliberately does NOT push
+        // per-tool-call progress to IM — one dispatch can fire dozens of inner
+        // tool calls, which drowns the user and hammers rate-limited channels
+        // (wechat ret=-2). The cap completion notification carries the final
+        // state. Assert: run_turn completes, no tool-call notif is emitted.
         let mut driver = FakeDriver::new(vec![
             AgentEvent::ToolCallStart {
                 call_id: "c1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "/etc/hosts"}),
             },
-            text("done reading"),
+            text("read done"),
             done(),
         ]);
         let (bus, _rx) = broadcast::channel(8);
@@ -987,9 +992,12 @@ mod tests {
         )
         .await
         .unwrap();
-        // Bridge should have pushed at least one OutboundMessage for the
-        // ToolCallStart.
-        let m = notif_rx.try_recv().expect("expected tool-call notif");
-        assert!(m.text.contains("read_file"), "got notif: {:?}", m.text);
+        assert_eq!(reply, "read done");
+        // No per-tool-call notification may be emitted for ToolCallStart.
+        match notif_rx.try_recv() {
+            Ok(m) => panic!("expected no tool-call notif, got: {:?}", m.text),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            Err(e) => panic!("unexpected recv error: {e}"),
+        }
     }
 }

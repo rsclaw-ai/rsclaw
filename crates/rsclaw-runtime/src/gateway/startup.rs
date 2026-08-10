@@ -476,6 +476,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     info!("{} total skill(s) (including codex)", skills.len());
 
     let wasm_plugins = Arc::new(plugin_registry.take_wasm_plugins());
+    // Shared live cell: this exact Arc is handed to both AppState (below)
+    // and the cron scheduler's plugin-preflight dispatch (see
+    // CronRunner::with_wasm_plugins), so a `rsclaw gateway reload --scope
+    // plugins` write into AppState.wasm_plugins is immediately visible to
+    // cron preflight jobs too, instead of only to AgentHandle-based tool
+    // dispatch (which already refreshes per-turn via wasm_plugins_snapshot).
+    let wasm_plugins_live = Arc::new(tokio::sync::RwLock::new(Arc::clone(&wasm_plugins)));
     let plugins = Arc::new(plugin_registry);
     for handle in registry.all() {
         handle.set_wasm_plugins(Arc::clone(&wasm_plugins));
@@ -819,11 +826,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     }
     info!(pid, "gateway PID written to {}", pid_file.display());
 
+    // Serializes config application. Shared with `AppState.reload_mutex` so the
+    // file watcher and `POST /api/v1/reload` cannot interleave: both re-read
+    // the config from disk and write the same live locks / agent registry, so
+    // a UI "save config" (watcher) racing a UI "apply" (HTTP) would otherwise
+    // double-apply.
+    let reload_mutex = Arc::new(tokio::sync::Mutex::new(()));
+
     // 12. Start config hot-reload watcher (if config file is detectable).
     if let Some(config_path) = config::loader::detect_config_path() {
         let (mut watcher, mut reload_rx) = FileWatcher::new(config_path);
         tokio::spawn(async move { watcher.run().await });
         let live_reload = Arc::clone(&live);
+        let watcher_reload_mutex = Arc::clone(&reload_mutex);
         let (restart_tx, _) = broadcast::channel::<Vec<String>>(8);
         let bridge_tx = restart_request_tx.clone();
         let bridge_pending = Arc::clone(&pending_restart);
@@ -839,32 +854,66 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             loop {
                 match reload_rx.recv().await {
                     Ok(ConfigChange::FullReload(new_cfg)) => {
-                        // `apply` now uses `diff_restart_sections` as the
-                        // single source of truth: empty = hot-safe (already
-                        // written into live locks); non-empty = a restart is
-                        // recommended for the listed sections.
                         let new_owned = (*new_cfg).clone();
-                        let needs_restart = live_reload.apply(new_owned, &restart_tx).await;
-                        if needs_restart.is_empty() {
-                            info!("config hot-reload applied (hot-safe fields only)");
-                        } else {
-                            warn!(?needs_restart, "config change requires gateway restart");
-                            // FullReload doesn't fully propagate to running
-                            // agents/channels (providers/prompts/credentials
-                            // are snapshotted at spawn). Surface a Recommended
-                            // banner so the user can apply changes cleanly.
-                            publish_restart(
-                                &bridge_tx,
-                                &bridge_pending,
-                                &bridge_shutdown,
-                                rsclaw_events::RestartRequest::new(
-                                    rsclaw_events::RestartReason::ConfigChanged {
-                                        sections: needs_restart,
-                                    },
-                                    rsclaw_events::RestartUrgency::Recommended,
-                                    rsclaw_i18n::t("restart_required_config_changed", &lang),
-                                ),
-                            );
+                        // Classify BEFORE `apply`, which overwrites the live
+                        // locks that `snapshot()` reads as the "old" side.
+                        // Held across apply so a concurrent HTTP reload can't
+                        // interleave between the diff and the write.
+                        let guard = watcher_reload_mutex.lock().await;
+                        let impact = {
+                            let old = live_reload.snapshot().await;
+                            rsclaw_config::live_config::classify_change(&old, &new_owned)
+                        };
+                        live_reload.apply(new_owned, &restart_tx).await;
+                        drop(guard);
+
+                        match impact {
+                            rsclaw_config::live_config::ChangeImpact::Hot => {
+                                info!("config hot-reload applied (hot-safe fields only)");
+                            }
+                            // Snapshotted inside components (agent handles,
+                            // provider/skill/plugin registries) — a scoped
+                            // in-process reload rebuilds them in about a
+                            // second, no cold boot and no dropped listener.
+                            // Offered rather than auto-applied: re-spawning an
+                            // agent cancels its in-flight turns, and saving a
+                            // config file should not silently kill the
+                            // conversation the user is in the middle of.
+                            rsclaw_config::live_config::ChangeImpact::NeedsReload {
+                                sections,
+                                scopes,
+                            } => {
+                                info!(
+                                    ?sections,
+                                    ?scopes,
+                                    "config change needs a scoped reload — offering it"
+                                );
+                                publish_restart(
+                                    &bridge_tx,
+                                    &bridge_pending,
+                                    &bridge_shutdown,
+                                    rsclaw_events::RestartRequest::new_reload(
+                                        rsclaw_events::RestartReason::ConfigChanged { sections },
+                                        rsclaw_i18n::t("reload_available_config_changed", &lang),
+                                        scopes,
+                                    ),
+                                );
+                            }
+                            rsclaw_config::live_config::ChangeImpact::NeedsRestart {
+                                sections,
+                            } => {
+                                warn!(?sections, "config change requires gateway restart");
+                                publish_restart(
+                                    &bridge_tx,
+                                    &bridge_pending,
+                                    &bridge_shutdown,
+                                    rsclaw_events::RestartRequest::new(
+                                        rsclaw_events::RestartReason::ConfigChanged { sections },
+                                        rsclaw_events::RestartUrgency::Recommended,
+                                        rsclaw_i18n::t("restart_required_config_changed", &lang),
+                                    ),
+                                );
+                            }
                         }
                     }
                     Ok(ConfigChange::RequiresRestart(fields)) => {
@@ -998,7 +1047,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 Some(shutdown.clone()),
             )
             .with_daemon_agent_ids(config.agents.daemon_agent_ids())
-            .with_wasm_plugins(Arc::clone(&wasm_plugins));
+            .with_wasm_plugins(Arc::clone(&wasm_plugins_live));
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
                     error!("cron runner error: {e:#}");
@@ -1084,7 +1133,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         custom_webhooks: Arc::clone(&custom_webhooks),
         cron_reload: cron_reload_tx,
         notification_tx: notification_tx.clone(),
-        wasm_plugins: Arc::new(tokio::sync::RwLock::new(Arc::clone(&wasm_plugins))),
+        wasm_plugins: Arc::clone(&wasm_plugins_live),
         plugins: Arc::new(tokio::sync::RwLock::new(Arc::clone(&plugins))),
         skills: Arc::new(tokio::sync::RwLock::new(Arc::clone(&skills))),
         mcp: Arc::clone(&mcp_registry),
@@ -1108,7 +1157,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         providers: Arc::new(tokio::sync::RwLock::new(Arc::clone(&providers))),
         wasm_browser: Arc::clone(&wasm_browser),
         rate_limiter: Arc::new(crate::server::RateLimiter::new()),
-        reload_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        // Same cell the file watcher holds — see its definition above.
+        reload_mutex: Arc::clone(&reload_mutex),
     };
     crate::a2a::relay::start_spoke_if_configured(state.clone());
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));

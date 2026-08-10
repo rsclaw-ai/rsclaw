@@ -39,9 +39,9 @@ base64 = "0.22"
 tempfile = "3"
 dirs-next = "2"
 # Canonicalizers: spreadsheets / OOXML / PDF / HTML / email
-calamine = "0.26"
+calamine = "0.36"
 zip = "2"
-pdf-extract = "0.10"
+pdf-extract = "0.12"
 lol_html = "1.2"
 mailparse = "0.16.1"
 

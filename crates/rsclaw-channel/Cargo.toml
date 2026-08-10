@@ -65,3 +65,8 @@ rsclaw-embed = { path = "../rsclaw-embed", version = "0.1.0" }
 
 [features]
 channel-matrix = ["dep:matrix-sdk"]
+
+[dev-dependencies]
+# Tests call rustls::crypto::aws_lc_rs::default_provider() to install a
+# process-wide crypto provider. Features mirror the root manifest's entry.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }

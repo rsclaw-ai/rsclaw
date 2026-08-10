@@ -2328,6 +2328,18 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "配置已更改，请重启 gateway 以生效。",
         "ja" => "設定が変更されました。ゲートウェイを再起動して適用してください。",
     );
+    msg!("reload_available_config_changed",
+        "en" => "Configuration changed. Apply now — no restart needed.",
+        "zh" => "配置已更改，可直接应用，无需重启。",
+        "ja" => "設定が変更されました。再起動なしで今すぐ適用できます。",
+        "ko" => "설정이 변경되었습니다. 재시작 없이 지금 적용할 수 있습니다.",
+        "th" => "การตั้งค่าเปลี่ยนแล้ว ใช้ได้ทันทีโดยไม่ต้องรีสตาร์ท",
+        "vi" => "Cau hinh da thay doi. Ap dung ngay, khong can khoi dong lai.",
+        "es" => "La configuración cambió. Aplícala ahora, sin reiniciar.",
+        "fr" => "Configuration modifiée. Appliquez-la maintenant, sans redémarrage.",
+        "de" => "Konfiguration geändert. Jetzt anwenden – kein Neustart nötig.",
+        "ru" => "Конфигурация изменена. Примените сейчас — перезапуск не нужен.",
+    );
     msg!("tool_missing",
         "en" => "[system] {tool} not found. Run `rsclaw tools install {tool}`, or download from https://gitfast.io",
         "zh" => "[系统] 未找到 {tool}，请运行 `rsclaw tools install {tool}` 或从 https://gitfast.io 下载安装",

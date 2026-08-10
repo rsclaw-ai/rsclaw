@@ -27,3 +27,6 @@ rsclaw-store = { path = "../rsclaw-store", version = "0.1.0" }
 
 [features]
 openclaw-migrate = ["rusqlite"]
+
+[dev-dependencies]
+tempfile = "3"

@@ -9,7 +9,10 @@ fn fresh_registry() -> Arc<WatchRegistry> {
 }
 
 #[tokio::test]
-async fn dedup_returns_already_running_for_user_origin() {
+async fn manual_reissue_restarts_single_watch() {
+    // Since 6dc53377 (crate-split) a MANUAL re-issue of the same source is
+    // the one-command recovery for a wedged zombie: stop the old watch and
+    // spawn a fresh one. Cron re-issues stay silent (see the cron test).
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dedup.log");
     tokio::fs::write(&path, "").await.unwrap();
@@ -25,19 +28,30 @@ async fn dedup_returns_already_running_for_user_origin() {
         .handle_command("cli", "user1", None, &src, Origin::User)
         .await;
 
-    match (&r1, &r2) {
+    let (id1, id2) = match (&r1, &r2) {
         (WatchCommandReply::Reply(a), WatchCommandReply::Reply(b)) => {
             assert!(a.starts_with("Watch started: w_"), "first call: {a}");
-            assert!(
-                b.contains("already running"),
-                "second call should be dedup hit, got: {b}"
-            );
+            assert!(b.starts_with("Watch started: w_"), "second call: {b}");
+            (extract_id(a), extract_id(b))
         }
         _ => panic!(
             "unexpected reply shapes: {:?} / {:?}",
             classify(&r1),
             classify(&r2)
         ),
+    };
+    assert_ne!(id1, id2, "re-issue must restart with a fresh id");
+
+    // Restart replaced the old entry — the registry holds exactly one watch.
+    let list = reg
+        .clone()
+        .handle_command("cli", "user1", None, "list", Origin::User)
+        .await;
+    match list {
+        WatchCommandReply::Reply(s) => {
+            assert!(s.contains("Active watches (1/5)"), "got: {s}");
+        }
+        _ => panic!("expected list reply"),
     }
 
     // Cleanup.
@@ -93,15 +107,31 @@ async fn dedup_keys_on_normalized_source() {
         .await;
 
     let started_id = match r1 {
-        WatchCommandReply::Reply(s) => s,
+        WatchCommandReply::Reply(s) => extract_id(&s),
         _ => panic!("expected Reply"),
     };
-    let dedup_msg = match r2 {
-        WatchCommandReply::Reply(s) => s,
+    assert!(started_id.starts_with('w'));
+    let reissued_id = match r2 {
+        WatchCommandReply::Reply(s) => extract_id(&s),
         _ => panic!("expected Reply"),
     };
-    assert!(started_id.starts_with("Watch started: w_"));
-    assert!(dedup_msg.contains("already running"), "got: {dedup_msg}");
+    assert_ne!(
+        reissued_id, started_id,
+        "normalized-equal source should hit the same dedup key (restart path)"
+    );
+
+    // src_b normalizes to the same key as src_a, so the re-issue replaced
+    // the old watch instead of double-spawning: exactly one active watch.
+    let list = reg
+        .clone()
+        .handle_command("cli", "user3", None, "list", Origin::User)
+        .await;
+    match list {
+        WatchCommandReply::Reply(s) => {
+            assert!(s.contains("Active watches (1/5)"), "got: {s}");
+        }
+        _ => panic!("expected list reply"),
+    }
 
     let _ = reg.stop_all_for("cli", "user3").await;
 }

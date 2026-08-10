@@ -1963,6 +1963,22 @@ async fn http_reload(
 
     let mut details = serde_json::Map::new();
 
+    // Snapshot the channel block BEFORE `live.apply` overwrites it — the
+    // channels branch below needs the old values to spot a credential change
+    // on an already-running channel (see its `changed` diff).
+    let old_channels_json: serde_json::Value = serde_json::to_value(
+        state
+            .live
+            .raw
+            .read()
+            .await
+            .channels
+            .as_ref()
+            .cloned()
+            .unwrap_or_default(),
+    )
+    .unwrap_or(serde_json::Value::Null);
+
     // Propagate hot-safe fields (temperature, auth, loop-detection, etc.)
     // into LiveConfig — same as the file watcher does. Without this, HTTP
     // reload reports success while live reads stay stale.
@@ -2256,6 +2272,54 @@ async fn http_reload(
         let mut removed = Vec::new();
         let mut added = Vec::new();
 
+        // Built-in channels whose config block changed while they kept running.
+        //
+        // The hot-add step below is guarded by `is_running`, so without this a
+        // rotated token / changed dmPolicy on an already-connected channel was
+        // silently ignored: reload reported success, the banner cleared, and
+        // the channel kept using the old credentials until a full restart.
+        // Unregistering them here makes the add step treat them as new and
+        // restart them against `fresh_config`. (Custom channels don't need
+        // this — they are torn down and restarted wholesale further below.)
+        let new_channels_json: serde_json::Value = serde_json::to_value(
+            fresh_config
+                .raw
+                .channels
+                .as_ref()
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .unwrap_or(serde_json::Value::Null);
+        let mut changed: Vec<String> = Vec::new();
+        for name in &configured_channels {
+            let old_block = old_channels_json.get(name.as_str());
+            let new_block = new_channels_json.get(name.as_str());
+            // Only meaningful for built-ins: a custom channel's name is not a
+            // key in the channels object.
+            if old_block.is_none() && new_block.is_none() {
+                continue;
+            }
+            if old_block != new_block
+                && running
+                    .iter()
+                    .any(|r| r == name || r.starts_with(&format!("{name}/")))
+            {
+                changed.push(name.clone());
+            }
+        }
+        for name in &changed {
+            for running_name in running
+                .iter()
+                .filter(|r| *r == name || r.starts_with(&format!("{name}/")))
+            {
+                state.channel_manager.unregister(running_name);
+                if let Ok(mut senders) = state.channel_senders.write() {
+                    senders.remove(running_name);
+                }
+            }
+            tracing::info!(channel = %name, "hot-reload: channel config changed — restarting");
+        }
+
         // Remove channels that are running but no longer configured.
         for name in &running {
             let base = name.split('/').next().unwrap_or(name);
@@ -2279,7 +2343,14 @@ async fn http_reload(
         }
 
         // Hot-add channels that are configured but not yet running.
+        //
+        // `running` is the pre-teardown snapshot, so a channel we just
+        // unregistered for a config change would still look running and get
+        // skipped. Exclude those explicitly — they must be re-added.
         let is_running = |name: &str| -> bool {
+            if changed.iter().any(|c| c == name) {
+                return false;
+            }
             running
                 .iter()
                 .any(|r| r == name || r.starts_with(&format!("{name}/")))
@@ -2536,8 +2607,13 @@ async fn http_reload(
         // Filter out channels that were "added" but weren't actually configured.
         added.retain(|name| configured_channels.iter().any(|c| c == name));
 
-        if !removed.is_empty() || !added.is_empty() {
-            tracing::info!(removed = ?removed, added = ?added, "hot-reload: channels updated");
+        if !removed.is_empty() || !added.is_empty() || !changed.is_empty() {
+            tracing::info!(
+                removed = ?removed,
+                added = ?added,
+                restarted = ?changed,
+                "hot-reload: channels updated"
+            );
         }
         details.insert(
             "channels".to_owned(),
@@ -2545,6 +2621,7 @@ async fn http_reload(
                 "reloaded": true,
                 "removed": removed,
                 "added": added,
+                "restarted": changed,
             }),
         );
     }
@@ -2628,8 +2705,20 @@ async fn http_reload(
                     let model_changed = serde_json::to_value(&handle.config.model)
                         .unwrap_or_default()
                         != serde_json::to_value(&entry.model).unwrap_or_default();
+                    // flashModel is snapshotted into AgentHandle.config just like
+                    // model, so it needs the same diff — without it, editing
+                    // flashModel had NO path to take effect short of a full
+                    // gateway restart (it is also stripped from the hot-reload
+                    // diff, so the file watcher stays silent about it too).
+                    let flash_model_changed = serde_json::to_value(&handle.config.flash_model)
+                        .unwrap_or_default()
+                        != serde_json::to_value(&entry.flash_model).unwrap_or_default();
                     let system_changed = handle.config.system != entry.system;
-                    if model_changed || system_changed || defaults_model_changed {
+                    if model_changed
+                        || flash_model_changed
+                        || system_changed
+                        || defaults_model_changed
+                    {
                         // Cancel in-flight turns.
                         if let Ok(tokens) = handle.cancel_tokens.read() {
                             for (_sk, tok) in tokens.iter() {

@@ -2662,7 +2662,7 @@ export function OnboardingPage() {
                               style={plainInputStyle}
                               value={ps.userAgent}
                               onChange={(e) => setProvUserAgent(activeId, e.target.value)}
-                              placeholder={pDef.defaultUserAgent || "Mozilla/5.0 (compatible; rsclaw/2026.7.1)"}
+                              placeholder={pDef.defaultUserAgent || "Mozilla/5.0 (compatible; rsclaw/2026.8.6)"}
                             />
                           </div>
                         )}
@@ -2701,7 +2701,7 @@ export function OnboardingPage() {
                           style={plainInputStyle}
                           value={ps.userAgent}
                           onChange={(e) => setProvUserAgent(activeId, e.target.value)}
-                          placeholder="e.g. rsclaw/2026.7.1"
+                          placeholder="e.g. rsclaw/2026.8.6"
                         />
                       </div>
                     )}
