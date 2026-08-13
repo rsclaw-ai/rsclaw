@@ -252,8 +252,8 @@ pub struct AppState {
     /// Private rsclaw A2A relay hub state. Empty/idle unless
     /// `gateway.a2a.relay.mode = "hub"`.
     pub relay_hub: Arc<crate::a2a::relay::RelayHub>,
-    /// Peer-to-peer direct connection manager (ADR 0002). Tracks direct WS
-    /// connections between spoke nodes after hole-punch succeeds.
+    /// Peer-to-peer direct connection manager (ADR 0002). Tracks authenticated
+    /// WebRTC DataChannels established through hub-assisted ICE signaling.
     pub peer_manager: std::sync::Arc<crate::a2a::peer::PeerManager>,
     /// User-managed RAG knowledge base (desktop `/api/v1/knowledge/*`).
     /// Collections are a tag veneer over the single KB store. `None` when
@@ -437,10 +437,6 @@ pub fn build_router(state: AppState) -> Router {
             "/a2a/relay/stats",
             get(crate::a2a::relay::relay_stats_handler),
         )
-        .route(
-            "/a2a/peer/ws",
-            get(crate::a2a::peer::peer_ws_handler),
-        )
         .route("/tools/execute", post(execute_tool))
         .route("/hub/catalog", get(hub_catalog))
         .route("/hub/skills", get(hub_skills))
@@ -609,7 +605,6 @@ async fn auth_middleware(
         // auth and any A2A v1.0 client following the spec would 401.
         || path == "/api/v1/a2a"
         || path == "/api/v1/a2a/relay/ws"
-        || path == "/api/v1/a2a/peer/ws"
     {
         return next.run(request).await;
     }
@@ -2273,7 +2268,12 @@ async fn http_reload(
                     "plugins".to_owned(),
                     serde_json::json!({"reloaded": true, "wasm": wasm_count, "js": js_count, "codex": codex_count}),
                 );
-                tracing::info!(wasm_count, js_count, codex_count, "hot-reload: plugins reloaded");
+                tracing::info!(
+                    wasm_count,
+                    js_count,
+                    codex_count,
+                    "hot-reload: plugins reloaded"
+                );
             }
             Err(e) => {
                 details.insert(
@@ -2317,7 +2317,8 @@ async fn http_reload(
                 tracing::info!(count = old_count, "hot-reload: cleared old MCP clients");
             }
         }
-        let spawned = respawn_mcp_servers(&fresh_config, &codex_mcp_for_reload, Arc::clone(&registry)).await;
+        let spawned =
+            respawn_mcp_servers(&fresh_config, &codex_mcp_for_reload, Arc::clone(&registry)).await;
         details.insert(
             "mcp".to_owned(),
             serde_json::json!({"reloaded": true, "servers": spawned}),

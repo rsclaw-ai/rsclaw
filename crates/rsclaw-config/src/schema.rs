@@ -277,17 +277,17 @@ pub struct A2aRelayConfig {
     pub revoked_nodes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<A2aRelayNodeConfig>>,
-    /// P2P hole-punch configuration (ADR 0002). When enabled, spoke nodes
-    /// collect NAT candidates and attempt direct peer-to-peer connections.
+    /// WebRTC direct-transport configuration (ADR 0002). Spokes exchange
+    /// authenticated SDP through the hub and use ICE/STUN/TURN for UDP paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer: Option<A2aPeerRelayConfig>,
 }
 
-/// P2P hole-punch configuration for the relay overlay (ADR 0002).
+/// WebRTC/ICE direct-transport configuration for the relay overlay (ADR 0002).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct A2aPeerRelayConfig {
-    /// Enable P2P hole-punching. Default false.
+    /// Enable authenticated WebRTC DataChannels. Default false.
     #[serde(default)]
     pub enabled: bool,
     /// STUN server URLs for gathering server-reflexive candidates.
@@ -303,7 +303,7 @@ pub struct A2aPeerRelayConfig {
     /// TURN credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_credential: Option<SecretOrString>,
-    /// Peer WS listen port. Defaults to gateway.port.
+    /// Local UDP port for ICE candidate gathering. `0` lets the OS choose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_port: Option<u16>,
 }
@@ -410,9 +410,8 @@ pub struct A2aPeerConfig {
     /// unset (back-compat with older configs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// P2P mode (ADR 0002). When set to "peer", this agent participates in
-    /// the P2P hole-punch overlay. nodeId identifies which relay spoke node
-    /// hosts this agent on the remote gateway.
+    /// Optional transport hint retained for config compatibility. Direct
+    /// routing is enabled by relay.peer.enabled plus nodeId, not by this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Node ID on the relay overlay that hosts this agent (for P2P routing).
@@ -421,6 +420,12 @@ pub struct A2aPeerConfig {
     /// Base64 Ed25519 public key of the remote peer node (for P2P auth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+    /// Local-agent targets this peer may invoke directly, expressed as
+    /// `a2a:invoke:<node>/<agent>` scopes. Omit this field for compatibility
+    /// with the hub's configured-node scopes; an explicit empty list denies
+    /// all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -2426,9 +2431,7 @@ impl SecretOrString {
                 let expanded = crate::loader::expand_env_vars(s);
                 Some(expanded)
             }
-            SecretOrString::Ref(r) if r.source == SecretSource::Env => {
-                std::env::var(&r.id).ok()
-            }
+            SecretOrString::Ref(r) if r.source == SecretSource::Env => std::env::var(&r.id).ok(),
             SecretOrString::Ref(r)
                 if r.source == SecretSource::File || r.source == SecretSource::Exec =>
             {
@@ -2509,7 +2512,11 @@ fn resolve_secret_ref(r: &SecretRef, secrets: Option<&SecretsConfig>) -> Option<
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_owned())
                 .or_else(|| {
-                    tracing::warn!(path = file_path, pointer = pointer, "JSON pointer not found in secrets file");
+                    tracing::warn!(
+                        path = file_path,
+                        pointer = pointer,
+                        "JSON pointer not found in secrets file"
+                    );
                     None
                 })
         }
@@ -2517,7 +2524,10 @@ fn resolve_secret_ref(r: &SecretRef, secrets: Option<&SecretsConfig>) -> Option<
             let cmd = match provider.command.as_deref() {
                 Some(c) => c,
                 None => {
-                    tracing::warn!(provider = provider_name, "secret provider has type=exec but no `command`");
+                    tracing::warn!(
+                        provider = provider_name,
+                        "secret provider has type=exec but no `command`"
+                    );
                     return None;
                 }
             };

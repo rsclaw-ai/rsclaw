@@ -14,8 +14,7 @@ use rsclaw_config::schema::BindMode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
-use tracing::info;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{

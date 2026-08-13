@@ -1,5 +1,6 @@
 //! Tool dispatch — routes tool calls to implementations.
 
+use anyhow::Context;
 use futures::StreamExt;
 use rsclaw_skill::{RunOptions, run_tool};
 
@@ -652,7 +653,8 @@ impl AgentRuntime {
             return Ok(Value::String(reply.text));
         }
 
-        // 2. Fall back to remote A2A gateway (Level 3).
+        // 2. Resolve the configured remote. Runtime-owned direct/relay routes
+        // and HTTP/SSE fallback use the same peer declaration.
         // Normalize: LLMs sometimes replace _ with - in tool names.
         let normalized_id = agent_id.replace('-', "_");
         if let Some(ext) = self
@@ -662,11 +664,35 @@ impl AgentRuntime {
             .iter()
             .find(|e| e.id == agent_id || e.id == normalized_id)
         {
+            // Prefer runtime-owned direct DataChannel, then authenticated hub
+            // relay. No route (`Ok(None)`) falls through to HTTP/SSE below.
+            if let (Some(host), Some(node_id)) =
+                (rsclaw_types::outbound_a2a_host(), ext.node_id.as_deref())
+            {
+                let remote_id = ext.remote_agent_id.as_deref().unwrap_or("main");
+                let target = format!("{node_id}/{remote_id}");
+                if let Some(reply) = host
+                    .try_send(rsclaw_types::OutboundA2aRequest {
+                        target,
+                        text: text.clone(),
+                        context_id: ctx.session_key.clone(),
+                        principal: ctx.agent_id.clone(),
+                    })
+                    .await
+                    .with_context(|| format!("A2A runtime transport `{agent_id}`"))?
+                {
+                    return Ok(Value::String(reply));
+                }
+            }
+
+            // 3. Fall back to the peer's public HTTP/SSE endpoint.
             use rsclaw_a2a_types::client::A2aClient;
             let client = A2aClient::new();
             // Use remote agent ID if configured, otherwise omit (uses remote default).
             let remote_id = ext.remote_agent_id.as_deref().unwrap_or("");
-            // Resolve the peer token (plain / ${ENV} / secret-ref) at call time.
+            // Resolve the peer token (plain / ${ENV}) at call time. File/exec
+            // secret providers require runtime secrets config and are not exposed
+            // across the agent/runtime dependency boundary.
             let peer_token = ext.auth_token.as_ref().and_then(|s| s.resolve_early());
             let stream = client
                 .send_streaming_message(

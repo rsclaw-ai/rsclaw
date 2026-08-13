@@ -751,10 +751,58 @@ pub trait TaskQueueHost: Send + Sync {
 static TASK_QUEUE_HOST: std::sync::OnceLock<std::sync::Arc<dyn TaskQueueHost>> =
     std::sync::OnceLock::new();
 
+/// Install the process-wide background task queue host.
 pub fn set_task_queue_host(host: std::sync::Arc<dyn TaskQueueHost>) {
     let _ = TASK_QUEUE_HOST.set(host);
 }
 
+/// Return the installed background task queue host, if any.
 pub fn task_queue_host() -> Option<std::sync::Arc<dyn TaskQueueHost>> {
     TASK_QUEUE_HOST.get().cloned()
+}
+
+// ============================================================================
+// OutboundA2aHost: runtime-owned direct/relay transport injection so
+// rsclaw-agent can route A2A calls without depending on rsclaw-runtime.
+// ============================================================================
+
+/// One outbound A2A message submitted to a runtime-owned transport.
+#[derive(Debug, Clone)]
+pub struct OutboundA2aRequest {
+    /// Canonical relay target in `node/agent` form.
+    pub target: String,
+    /// User text sent to the remote agent.
+    pub text: String,
+    /// Calling agent's session key, used as the remote A2A context ID.
+    pub context_id: String,
+    /// Calling agent identity used for relay audit attribution.
+    pub principal: String,
+}
+
+/// Host for optional runtime-owned A2A transports.
+///
+/// `Ok(Some(reply))` means direct or hub relay handled the request. `Ok(None)`
+/// means no runtime route exists and the caller should use HTTP/SSE fallback.
+pub trait OutboundA2aHost: Send + Sync {
+    /// Try direct peer transport, then authenticated hub relay.
+    fn try_send(
+        &self,
+        request: OutboundA2aRequest,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<Option<String>>>;
+}
+
+static OUTBOUND_A2A_HOST: std::sync::OnceLock<std::sync::Arc<dyn OutboundA2aHost>> =
+    std::sync::OnceLock::new();
+
+/// Install the process-wide runtime-owned outbound A2A transport host.
+///
+/// Returns `false` when a host was already installed, allowing startup to log
+/// that the process-global transport still points at an earlier gateway state.
+pub fn set_outbound_a2a_host(host: std::sync::Arc<dyn OutboundA2aHost>) -> bool {
+    OUTBOUND_A2A_HOST.set(host).is_ok()
+}
+
+/// Return the installed runtime-owned outbound A2A transport host, if any.
+pub fn outbound_a2a_host() -> Option<std::sync::Arc<dyn OutboundA2aHost>> {
+    OUTBOUND_A2A_HOST.get().cloned()
 }
