@@ -1,7 +1,7 @@
 # RsClaw
 
 > **เอ็นจิน AI agent ที่จดจำ เรียนรู้ และเราต์ข้ามเครื่อง.**
-> Rust binary ขนาด 15MB · A2A hub-spoke fleet · ความจำสามชั้น · Knowledge base vector + BM25 · 13 channels · 15 LLM providers · OpenClaw drop-in replacement.
+> Rust binary ขนาด 21MB · A2A hub-spoke fleet · ความจำสามชั้น · Knowledge base vector + BM25 · 13 channels · 15 LLM providers · OpenClaw drop-in replacement.
 
 [![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
 [![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
@@ -16,7 +16,7 @@
 
 AI agent ส่วนใหญ่เป็น stateless process ที่ถูกผูกติดกับ chat box. **RsClaw คือ fleet**: แต่ละ node เก็บ memory แบบ structured, index private knowledge base และพูด [Google A2A v1.0](https://a2a-protocol.org/). คำขอที่พิมพ์บน laptop ของคุณสามารถ fan out ไปยัง GPU spoke สำหรับสร้างภาพ, fleet node สำหรับ RAG และ remote partner agent สำหรับ specialist task — ทั้งหมดส่งกลับมาเป็น streamed answer หนึ่งเดียว.
 
-15 MB, ~20 MB RAM, single static binary. Rust ล้วนๆ. ไม่มี Node, ไม่มี Python.
+21 MB, ~28 MB RAM, single binary. Rust ล้วนๆ. ไม่มี Node, ไม่มี Python.
 
 💬 [เข้าร่วมคอมมูนิตี้](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 

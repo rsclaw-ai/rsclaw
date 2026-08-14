@@ -1,7 +1,7 @@
 # RsClaw
 
 > **Un motor de agentes de IA que recuerda, aprende y enruta entre máquinas.**
-> Binario Rust de 15MB · Flota A2A hub-spoke · Memoria de tres niveles · Base de conocimiento vector + BM25 · 13 canales · 15 proveedores LLM · Reemplazo drop-in de OpenClaw.
+> Binario Rust de 21MB · Flota A2A hub-spoke · Memoria de tres niveles · Base de conocimiento vector + BM25 · 13 canales · 15 proveedores LLM · Reemplazo drop-in de OpenClaw.
 
 [![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
 [![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
@@ -16,7 +16,7 @@
 
 La mayoría de los agentes IA son procesos sin estado pegados a una caja de chat. **RsClaw es una flota**: cada nodo persiste memoria estructurada, indexa una base de conocimiento privada y habla [Google A2A v1.0](https://a2a-protocol.org/). Una petición escrita en tu portátil puede expandirse a un spoke GPU para generación de imágenes, un nodo de flota para RAG y un agente remoto socio para una tarea especializada — todo regresando como un único flujo de respuesta.
 
-15 MB, ~20 MB RAM, binario estático único. Rust puro. Sin Node, sin Python.
+21 MB, ~28 MB RAM, binario único. Rust puro. Sin Node, sin Python.
 
 💬 [Únete a la comunidad](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 

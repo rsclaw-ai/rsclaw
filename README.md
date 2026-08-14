@@ -1,7 +1,7 @@
 # RsClaw
 
 > **An AI agent engine that remembers — and gets better the more you use it.**  
-> One 15MB binary · 13 channels · 15 LLM providers · Multi-backend agents · OpenCLI-ready · Built in pure Rust.
+> One binary, ~28MB idle RAM, ~26ms startup · No Node.js, no package manager, no cloud account · WhatsApp / LINE / Telegram / Discord / Zalo on official APIs · 15 LLM providers · Pure Rust.
 
 [![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
 [![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
@@ -20,7 +20,7 @@ Most AI agents forget everything between sessions. Every new conversation starts
 
 **RsClaw doesn't forget.**
 
-Built from scratch in Rust, RsClaw (Crab AI / 螃蟹 AI) persists every interaction through a three-layer memory store (redb + tantivy + hnsw_rs), learns from your usage patterns, and ships as a single 15MB binary running on ~20MB RAM. Four agent lifetime modes (Main/Named/Sub/Task), cap-protocol coding-agent integration (Claude Code/OpenClaude/OpenCode/Codex via `tool_cap`), 13 messaging channels, 15 LLM providers, A2A cross-machine orchestration — all without a line of Node.js. Drop-in OpenClaw replacement.
+Built from scratch in Rust, RsClaw (Crab AI / 螃蟹 AI) persists every interaction through a three-layer memory store (redb + tantivy + hnsw_rs), learns from your usage patterns, and ships as one binary (~21MB download) that idles at ~28MB RAM with no runtime to install. Four agent lifetime modes (Main/Named/Sub/Task), cap-protocol coding-agent integration (Claude Code/OpenClaude/OpenCode/Codex via `tool_cap`), 13 messaging channels, 15 LLM providers, A2A cross-machine orchestration — all without a line of Node.js. Drop-in OpenClaw replacement.
 
 💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 
@@ -31,7 +31,7 @@ Built from scratch in Rust, RsClaw (Crab AI / 螃蟹 AI) persists every interact
 - 🧠 **Three-layer persistent memory** — redb KV + tantivy full-text + hnsw_rs vector search, built in, fully local
 - 🔌 **Four agent backends in one gateway** — mix Native Rust, Claude Code, OpenCode, and any ACP-compatible agent in a single workflow
 - 🌐 **A2A v1.0 cross-machine orchestration** — full [Google A2A protocol v1.0](https://a2a-protocol.org/) (streaming, push notifications, task persistence, cancellation, INPUT_REQUIRED interrupts)
-- 🪶 **15MB binary, ~20MB idle RAM** — runs reliably on low-spec servers and edge devices
+- 🪶 **One binary, ~28MB idle RAM** — no Node.js, no package manager, no runtime to install; runs reliably on low-spec servers and edge devices
 - 🔒 **Local-first** — memory and data stay in `~/.rsclaw/`, never leave your machine
 
 ---
@@ -498,9 +498,10 @@ Import copies config, workspace, and sessions into `~/.rsclaw/`. OpenClaw data i
 
 | | RsClaw | OpenClaw |
 |---|---|---|
-| **Binary size** | ~15MB | ~300MB+ (node_modules) |
+| **Install** | one binary, ~21MB download | npm + node_modules, ~300MB+ |
+| **Runtime required** | none | Node.js |
 | **Startup** | ~26ms | 2–5s |
-| **Idle memory** | ~20MB | ~1000MB+ |
+| **Idle memory** | ~28MB | ~1000MB+ |
 | **Long-term memory** | Three-layer (redb + tantivy + hnsw_rs) | — |
 | **Self-learning** | Learns from your usage patterns | — |
 | **Multi-backend agents** | Native Rust / Claude Code / OpenCode / ACP | — |

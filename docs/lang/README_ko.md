@@ -1,7 +1,7 @@
 # RsClaw
 
 > **기억하고, 학습하고, 머신 간 라우팅하는 AI 에이전트 엔진.**
-> 15MB Rust 바이너리 · A2A hub-spoke 플릿 · 3-tier 메모리 · 벡터 + BM25 지식 베이스 · 13 채널 · 15 LLM 프로바이더 · OpenClaw drop-in 교체.
+> 21MB Rust 바이너리 · A2A hub-spoke 플릿 · 3-tier 메모리 · 벡터 + BM25 지식 베이스 · 13 채널 · 15 LLM 프로바이더 · OpenClaw drop-in 교체.
 
 [![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
 [![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
@@ -17,7 +17,7 @@
 
 대부분의 AI 에이전트는 채팅 박스에 묶인 stateless 프로세스입니다. **RsClaw는 플릿입니다**: 각 노드가 구조화된 메모리를 영속화하고, 프라이빗 지식 베이스를 인덱싱하며, [Google A2A v1.0](https://a2a-protocol.org/)를 구사합니다. 노트북에서 친 한 마디가 GPU spoke 이미지 생성, 플릿 노드의 RAG, 원격 파트너 에이전트의 전문 작업으로 동시에 팬-아웃되어 하나의 스트리밍 응답으로 돌아옵니다.
 
-15 MB, ~20 MB RAM, 단일 정적 바이너리. 순수 Rust. Node, Python 없음.
+21 MB, ~28 MB RAM, 단일 바이너리. 순수 Rust. Node, Python 없음.
 
 💬 [커뮤니티 참가](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 

@@ -1,7 +1,7 @@
 # RsClaw
 
 > **Một AI agent engine biết ghi nhớ, học hỏi và định tuyến giữa các máy.**
-> Rust binary 15MB · Cụm A2A hub-spoke · Bộ nhớ ba lớp · Knowledge base vector + BM25 · 13 kênh · 15 nhà cung cấp LLM · Thay thế drop-in cho OpenClaw.
+> Rust binary 21MB · Cụm A2A hub-spoke · Bộ nhớ ba lớp · Knowledge base vector + BM25 · 13 kênh · 15 nhà cung cấp LLM · Thay thế drop-in cho OpenClaw.
 
 [![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
 [![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
@@ -16,7 +16,7 @@
 
 Phần lớn AI agent là các process không trạng thái dán chặt vào hộp chat. **RsClaw là một cụm máy (fleet)**: mỗi node lưu trữ memory có cấu trúc, đánh index knowledge base riêng và nói [Google A2A v1.0](https://a2a-protocol.org/). Một yêu cầu gõ trên laptop của bạn có thể fan-out tới GPU spoke để tạo ảnh, fleet node để RAG và partner agent từ xa cho tác vụ chuyên biệt — tất cả trả về như một luồng streaming duy nhất.
 
-15 MB, ~20 MB RAM, binary tĩnh đơn lẻ. Rust thuần. Không Node, không Python.
+21 MB, ~28 MB RAM, binary đơn lẻ. Rust thuần. Không Node, không Python.
 
 💬 [Tham gia cộng đồng](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 

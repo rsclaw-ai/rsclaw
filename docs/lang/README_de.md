@@ -1,7 +1,7 @@
 # RsClaw
 
 > **Eine KI-Agenten-Engine, die sich erinnert, lernt und über Maschinen hinweg routet.**
-> 15MB Rust-Binary · A2A Hub-Spoke-Flotte · Dreistufiges Gedächtnis · Vektor + BM25 Wissensbasis · 13 Kanäle · 15 LLM-Anbieter · OpenClaw Drop-in-Ersatz.
+> 21MB Rust-Binary · A2A Hub-Spoke-Flotte · Dreistufiges Gedächtnis · Vektor + BM25 Wissensbasis · 13 Kanäle · 15 LLM-Anbieter · OpenClaw Drop-in-Ersatz.
 
 [![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
 [![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
@@ -16,7 +16,7 @@
 
 Die meisten KI-Agenten sind zustandslose Prozesse, die an einen Chat gebunden sind. **RsClaw ist eine Flotte**: Jeder Knoten speichert strukturiertes Gedächtnis, indiziert eine private Wissensbasis und spricht [Google A2A v1.0](https://a2a-protocol.org/). Eine Anfrage von Ihrem Laptop kann an einen GPU-Spoke für Bildgenerierung, einen Flottenknoten für RAG und einen Remote-Partner-Agent für Spezialaufgaben verteilt werden — alles als ein gestreamter Antwortstrom.
 
-15 MB, ~20 MB RAM, statisches Single-Binary. Reines Rust. Kein Node, kein Python.
+21 MB, ~28 MB RAM, Single-Binary. Reines Rust. Kein Node, kein Python.
 
 💬 [Community beitreten](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 
