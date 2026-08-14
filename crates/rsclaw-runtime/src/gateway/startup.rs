@@ -1171,10 +1171,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     crate::a2a::relay::start_spoke_if_configured(state.clone());
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
-    // Relay stream deadline sweeper. The hub-side `stream_pending`
-    // map has no end-to-end timeout (reqwest's was removed in b94c40f
-    // to support long video-gen flows). Without this loop a stuck
-    // spoke + healthy WS + slow consumer could pin entries forever.
+    // Relay deadline sweeper. Hub stream entries, spoke-request correlation,
+    // and signaling state all need periodic expiry; admission paths also sweep
+    // locally, but an otherwise idle gateway must not retain stale state.
     {
         let relay_hub = Arc::clone(&state.relay_hub);
         let peer_mgr = Arc::clone(&state.peer_manager);
@@ -1191,6 +1190,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 let peer_swept = peer_mgr.sweep_expired_streams();
                 if peer_swept > 0 {
                     tracing::info!(swept = peer_swept, "peer stream deadline sweeper");
+                }
+                let signaling_swept = peer_mgr.sweep_expired_sessions();
+                if signaling_swept > 0 {
+                    tracing::info!(swept = signaling_swept, "peer signaling session sweeper");
                 }
             }
         });

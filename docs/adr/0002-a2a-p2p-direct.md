@@ -93,7 +93,10 @@ The hub derives `source_node` from the already authenticated spoke connection;
 it never accepts a source identity from the frame. An offer session is bound to
 `(session_id, source_node, target_node)` for 60 seconds. Answers with an unknown,
 stale, reversed, or mismatched tuple are rejected. SDP is limited to 64 KiB.
-Duplicate session IDs are rejected.
+Duplicate session IDs are rejected. The hub and each peer retain bounded,
+60-second consumed-session tombstones so a completed session ID cannot be replayed
+within the signaling validity window. Active and consumed signaling tables are each
+limited to 1,024 entries; admission fails closed at capacity.
 
 Configured Ed25519 peers sign this exact payload:
 
@@ -102,7 +105,10 @@ rsclaw.a2a.webrtc.v1\n{session}\n{source}\n{target}\n{kind}\n{sdp}
 ```
 
 The receiver verifies the signature against the configured public key before
-applying SDP. Peers without a configured public key still rely on authenticated
+applying SDP. Because the canonical encoding is newline-delimited, session IDs
+and node IDs must be non-empty single-line values; peer, hub, and configuration
+validation reject CR/LF before signing, forwarding, or applying SDP. Peers
+without a configured public key still rely on authenticated
 hub identity and explicit `agents.a2a[].nodeId` allowlisting; that is a weaker
 compatibility mode because the hub can substitute signaling. Deployments that
 require end-to-end peer authentication configure Ed25519 keys on both peers.
@@ -122,10 +128,14 @@ counts, duplicate storage growth, or oversized frames are rejected.
 
 A direct connection is registered only after the DataChannel opens. Registration
 has a monotonically increasing generation, so teardown from an older connection
-cannot remove its replacement. Route leases received over the direct channel
+cannot remove its replacement. A replacement cancels and closes the superseded
+connection, and stale DataChannel tasks verify their generation before processing
+inbound frames. Route leases received over the direct channel
 must advertise only `peer_node/agent` references. Direct routes and pending
-requests are removed when the owning generation closes. Heartbeats use
-`RelayFrame::Ping/Pong`.
+requests are removed when the owning generation closes. Inbound streaming tasks
+are correlated with that connection generation; connection loss removes their
+mappings and fires their cancellation tokens without affecting replacement-owned
+tasks. Heartbeats use `RelayFrame::Ping/Pong`.
 
 Direct request identity is bound to the authenticated peer node. The untrusted
 `principal` string in a data frame is not used as the caller identity.
@@ -157,10 +167,19 @@ also support `SendStreamingMessage` and `SubscribeToTask`, and task follow-ups
 consult direct task routes before hub task routes. A future cross-crate stream
 host may preserve progress events without changing dependency direction.
 
-Automatic direct-to-hub retry occurs only when a direct frame was not queued. A
-response timeout or post-send channel loss has an unknown delivery outcome and
-is surfaced without retry, preventing duplicate execution of non-idempotent A2A
-methods.
+Automatic direct-to-hub retry occurs only when a direct frame was not queued,
+for both unary and streaming requests. A response timeout or post-send channel
+loss has an unknown delivery outcome and is surfaced without retry, preventing
+duplicate execution of non-idempotent A2A methods. Delivery provenance is typed
+internally; a delivered remote JSON-RPC
+error, including code `-32004`, is returned as the direct response and cannot be
+reclassified as an admission failure. Direct DataChannel writer queues are bounded
+to 128 frames and admission is non-blocking; saturation therefore reports
+unavailable before delivery and can safely use hub fallback. Direct and hub
+outbound streaming-correlation tables are each capped at 1,024 entries, while
+direct and hub outbound unary-correlation tables are each capped at 4,096 entries.
+Admission is checked before queueing a request; streaming's 30-minute lifetime
+sweeps and unary's 120-second response timeout are secondary cleanup bounds.
 
 ### Hub authorization
 
@@ -172,6 +191,25 @@ SDP, or outbound fallback requests before completing the challenge.
 Direct DataChannel requests are checked against the same configured source
 node `a2a:invoke:<target>` scopes; the frame's claimed principal cannot widen
 that authority.
+
+Hub and spoke WebSocket writer queues are bounded to 256 frames. A saturated hub
+writer is treated as a failed connection and triggers the normal route, pending
+request, and stream cleanup instead of accumulating unbounded memory. Spoke-side
+control queues likewise fail closed on saturation. Re-authenticating the same
+hub node ID replaces and closes the old socket; every inbound frame is fenced by
+the active connection epoch, so a superseded socket cannot retain node authority.
+Spoke-side streaming task mappings carry the authenticated control generation
+and the exact cancellation-token owner; direct mappings carry the equivalent
+connection generation and token owner. Cancel, worker cleanup, and disconnect
+teardown remove or cancel only the matching task incarnation, even if a client
+reuses the same task ID. INPUT_REQUIRED suspension entries carry the same owner,
+so a stale wait-input timeout cannot delete a replacement task's resume sender or
+cancellation token. Hub correlation for
+spoke-originated unary requests is capped at 4,096 entries. Each entry expires at
+the forwarded request deadline, clamped to the hub request-timeout ceiling; the
+periodic relay sweeper removes expired entries and returns a terminal timeout to
+the authenticated source when still connected. Capacity exhaustion rejects the
+request before forwarding, preserving at-most-once fallback semantics.
 
 The hub enforces:
 
@@ -240,6 +278,12 @@ claim is made without deployment measurements.
 }
 ```
 
+Enabled peer transport requires spoke mode, a non-blank node ID, at least one
+valid `ws://` or `wss://` hub endpoint, and relay token or private-key
+authentication. Every configured endpoint must be valid for its list: `stun:` or
+`stuns:` in `stunUrls`, and `turn:` or `turns:` in `turnUrls`. Configured TURN
+URLs additionally require non-blank resolved username and credential values.
+
 Hub node configuration must grant source spokes the desired
 `a2a:invoke:<node/agent>` scopes in addition to relay connect/advertise scopes.
 A local `agents.a2a` peer declaration may override that inbound direct grant
@@ -261,10 +305,15 @@ Required automated coverage includes:
 - unrelated source gateways retaining their hub route when another pair is
   direct;
 - task-ID follow-ups preferring direct task routes, then hub routes;
-- stale generation teardown preserving a replacement connection;
+- stale generation frame admission/teardown preserving a replacement connection;
 - frame chunk boundaries, the 8 MiB frame limit, and bounded aggregate
   reassembly memory;
-- HTTP/SSE fallback when neither direct nor hub route is available.
+- bounded direct and relay writer queues, bounded direct/hub stream correlation,
+  bounded/expiring hub unary request correlation, and overload fail-closed behavior;
+- direct connection loss cancelling only generation-owned inbound streaming tasks;
+- delivered remote errors never being reclassified as safe-to-retry admission failures;
+- HTTP/SSE fallback when the runtime direct/hub host reports no route, including
+  a real local HTTP SSE request and artifact event.
 
 Tests that merely connect in-process `mpsc` channels do not establish ICE,
 DTLS/SCTP, authenticated signaling, or NAT traversal and must be labelled as unit

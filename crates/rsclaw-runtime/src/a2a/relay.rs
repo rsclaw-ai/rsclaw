@@ -4,6 +4,7 @@
 //! outbound-WS transport that lets NAT/private nodes attach to a hub.
 
 use std::{
+    collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -78,6 +79,11 @@ const STREAM_MAX_LIFETIME: Duration = Duration::from_secs(1800);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_SIGNAL_TTL: Duration = Duration::from_secs(60);
 const MAX_PEER_SDP_BYTES: usize = 64 * 1024;
+const MAX_PEER_SIGNAL_SESSIONS: usize = 1024;
+const RELAY_WRITE_QUEUE_CAPACITY: usize = 256;
+const MAX_SPOKE_RELAY_REQUESTS: usize = 4096;
+const MAX_RELAY_STREAMS: usize = 1024;
+const MAX_RELAY_PENDING_REQUESTS: usize = 4096;
 /// Backoff cap when failing over between relays. Same envelope as the
 /// per-relay reconnect backoff but applied across the entire list.
 const FAILOVER_BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -198,7 +204,7 @@ pub enum RelayFrame {
 
 #[derive(Debug, Clone)]
 struct Connection {
-    tx: mpsc::UnboundedSender<AxumWsMessage>,
+    tx: mpsc::Sender<AxumWsMessage>,
     epoch: u64,
 }
 
@@ -211,7 +217,7 @@ struct PeerSignalSession {
 
 #[derive(Debug, Clone)]
 struct SpokeControl {
-    tx: mpsc::UnboundedSender<RelayFrame>,
+    tx: mpsc::Sender<RelayFrame>,
     generation: String,
 }
 
@@ -219,6 +225,15 @@ struct SpokeControl {
 struct SpokeRelayRequest {
     source_node: String,
     target_node: String,
+    expires_at: std::time::Instant,
+}
+
+/// Local relay stream task owned by one authenticated spoke-control generation.
+#[derive(Debug, Clone)]
+pub(crate) struct SpokeStreamTask {
+    task_id: String,
+    control_generation: String,
+    cancel_owner: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
 }
 
 #[derive(Debug, Clone)]
@@ -298,14 +313,16 @@ impl RelayMetrics {
 #[derive(Default)]
 pub struct RelayHub {
     connections: DashMap<String, Connection>,
+    connection_generation: AtomicU64,
     routes: DashMap<String, RouteEntry>,
     /// request_id → (waiter, target_node_id). We carry node_id so that
     /// when a connection drops we can resolve only its pending waiters
     /// instead of nuking every in-flight JSON-RPC call.
     pending: DashMap<String, (oneshot::Sender<JsonRpcResponse>, String)>,
+    pending_admission: std::sync::Mutex<()>,
     /// Hub-side request ID → authenticated source spoke for spoke-originated
     /// unary requests that the hub is relaying to another spoke.
-    spoke_request_sources: DashMap<String, SpokeRelayRequest>,
+    spoke_request_sources: std::sync::Mutex<HashMap<String, SpokeRelayRequest>>,
     /// Spoke-side active authenticated control connection used for hub
     /// fallback.
     spoke_control: std::sync::RwLock<Option<SpokeControl>>,
@@ -318,9 +335,10 @@ pub struct RelayHub {
     /// `RelayFrame::Response`, the SSE consumer disconnects, or the
     /// sweeper fires.
     stream_pending: DashMap<String, StreamPending>,
-    /// Spoke-side map of relay request_id → local task_id, so a `Cancel`
-    /// frame can find the local `CancellationToken` in `task_cancels`.
-    pub(crate) spoke_stream_tasks: DashMap<String, String>,
+    stream_admission: std::sync::Mutex<()>,
+    /// Spoke-side map of relay request ID to generation-owned local task, so
+    /// stale control teardown cannot cancel replacement-generation work.
+    pub(crate) spoke_stream_tasks: DashMap<String, SpokeStreamTask>,
     /// Hub-side cache of task_id → agent_ref ("node/agent"), populated by
     /// sniffing responses and streaming events as they pass through the
     /// hub. Lets follow-up task-bound RPCs (GetTask, CancelTask, push
@@ -329,7 +347,8 @@ pub struct RelayHub {
     task_routes: DashMap<String, String>,
     /// Hub-authorized offer sessions. Answers must match the authenticated
     /// source/target pair before the hub forwards them.
-    peer_signal_sessions: DashMap<String, PeerSignalSession>,
+    peer_signal_sessions: std::sync::Mutex<HashMap<String, PeerSignalSession>>,
+    consumed_peer_signal_sessions: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     pub metrics: RelayMetrics,
 }
 
@@ -367,16 +386,55 @@ impl RelayHub {
         Self::default()
     }
 
+    fn reserve_spoke_request(
+        &self,
+        request_id: &str,
+        source_node: &str,
+        target_node: &str,
+        deadline_ms: u64,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        let mut requests = self
+            .spoke_request_sources
+            .lock()
+            .expect("spoke relay request mutex poisoned");
+        requests.retain(|_, request| request.expires_at > now);
+        if requests.len() >= MAX_SPOKE_RELAY_REQUESTS || requests.contains_key(request_id) {
+            return false;
+        }
+        requests.insert(
+            request_id.to_owned(),
+            SpokeRelayRequest {
+                source_node: source_node.to_owned(),
+                target_node: target_node.to_owned(),
+                expires_at: now
+                    + Duration::from_millis(
+                        deadline_ms.clamp(1, REQUEST_TIMEOUT.as_millis() as u64),
+                    ),
+            },
+        );
+        true
+    }
+
     /// Send a `RelayFrame` to a connected node via its WS connection.
     /// Returns true if the node was connected and the frame was queued.
     pub fn send_to_node(&self, node_id: &str, frame: &RelayFrame) -> bool {
         let Some(conn) = self.connections.get(node_id) else {
             return false;
         };
+        let epoch = conn.epoch;
         let Ok(msg) = serde_json::to_string(frame) else {
             return false;
         };
-        conn.tx.send(AxumWsMessage::Text(msg.into())).is_ok()
+        match conn.tx.try_send(AxumWsMessage::Text(msg.into())) {
+            Ok(()) => true,
+            Err(error) => {
+                drop(conn);
+                warn!(node = %node_id, %error, "relay writer queue unavailable; disconnecting node");
+                self.unregister_connection(node_id, epoch);
+                false
+            }
+        }
     }
 
     /// Return the number of authenticated connected spokes.
@@ -450,6 +508,23 @@ impl RelayHub {
         Ok(())
     }
 
+    fn reserve_pending(
+        &self,
+        request_id: String,
+        tx: oneshot::Sender<JsonRpcResponse>,
+        node_id: String,
+    ) -> bool {
+        let _admission = self
+            .pending_admission
+            .lock()
+            .expect("relay request admission mutex poisoned");
+        if self.pending.len() >= MAX_RELAY_PENDING_REQUESTS {
+            return false;
+        }
+        self.pending.insert(request_id, (tx, node_id));
+        true
+    }
+
     pub async fn invoke_jsonrpc(
         &self,
         target: &str,
@@ -467,8 +542,9 @@ impl RelayHub {
         let request_id = format!("relay:{}", Uuid::new_v4());
         let (tx, rx) = oneshot::channel();
         let node_id = route.node_id.clone();
-        self.pending
-            .insert(request_id.clone(), (tx, node_id.clone()));
+        if !self.reserve_pending(request_id.clone(), tx, node_id.clone()) {
+            anyhow::bail!("relay request capacity exceeded");
+        }
         let frame = RelayFrame::Request {
             request_id: request_id.clone(),
             target: target.to_owned(),
@@ -478,7 +554,7 @@ impl RelayHub {
             deadline_ms: REQUEST_TIMEOUT.as_millis() as u64,
         };
         let msg = AxumWsMessage::Text(serde_json::to_string(&frame)?.into());
-        if let Err(e) = conn.tx.send(msg) {
+        if let Err(e) = conn.tx.try_send(msg) {
             self.pending.remove(&request_id);
             anyhow::bail!("relay send to node '{}' failed: {e}", node_id);
         }
@@ -519,8 +595,9 @@ impl RelayHub {
         };
         let request_id = format!("spoke:{}", Uuid::new_v4());
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .insert(request_id.clone(), (tx, target.to_owned()));
+        if !self.reserve_pending(request_id.clone(), tx, target.to_owned()) {
+            return Ok(None);
+        }
         let frame = RelayFrame::Request {
             request_id: request_id.clone(),
             target: target.to_owned(),
@@ -529,7 +606,7 @@ impl RelayHub {
             principal: principal.to_owned(),
             deadline_ms: REQUEST_TIMEOUT.as_millis() as u64,
         };
-        if control.tx.send(frame).is_err() {
+        if control.tx.try_send(frame).is_err() {
             self.pending.remove(&request_id);
             return Ok(None);
         }
@@ -550,11 +627,36 @@ impl RelayHub {
         result
     }
 
-    fn register_spoke_control(&self, tx: mpsc::UnboundedSender<RelayFrame>, generation: String) {
+    fn register_spoke_control(&self, tx: mpsc::Sender<RelayFrame>, generation: String) {
         match self.spoke_control.write() {
             Ok(mut control) => *control = Some(SpokeControl { tx, generation }),
             Err(error) => warn!(%error, "cannot register spoke control connection"),
         }
+    }
+
+    fn remove_spoke_stream_task(
+        &self,
+        request_id: &str,
+        control_generation: &str,
+    ) -> Option<SpokeStreamTask> {
+        self.spoke_stream_tasks
+            .remove_if(request_id, |_, task| {
+                task.control_generation == control_generation
+            })
+            .map(|(_, task)| task)
+    }
+
+    fn take_spoke_stream_tasks(&self, control_generation: &str) -> Vec<SpokeStreamTask> {
+        let request_ids: Vec<String> = self
+            .spoke_stream_tasks
+            .iter()
+            .filter(|entry| entry.control_generation == control_generation)
+            .map(|entry| entry.key().clone())
+            .collect();
+        request_ids
+            .into_iter()
+            .filter_map(|request_id| self.remove_spoke_stream_task(&request_id, control_generation))
+            .collect()
     }
 
     fn unregister_spoke_control(&self, generation: &str) {
@@ -573,23 +675,29 @@ impl RelayHub {
 
     /// Register a connected spoke node's WS sender.
     /// **For tests only** — production wiring is via the hub WS handler.
-    pub fn register_connection(
-        &self,
-        node_id: &str,
-        tx: mpsc::UnboundedSender<AxumWsMessage>,
-        epoch: u64,
-    ) {
+    pub fn register_connection(&self, node_id: &str, tx: mpsc::Sender<AxumWsMessage>, epoch: u64) {
+        if let Some(previous) = self
+            .connections
+            .insert(node_id.to_owned(), Connection { tx, epoch })
+            && previous.tx.try_send(AxumWsMessage::Close(None)).is_err()
+        {
+            debug!(node = %node_id, previous_epoch = previous.epoch, "superseded relay writer already closed");
+        }
+    }
+
+    fn owns_connection(&self, node_id: &str, epoch: u64) -> bool {
         self.connections
-            .insert(node_id.to_owned(), Connection { tx, epoch });
+            .get(node_id)
+            .is_some_and(|connection| connection.epoch == epoch)
     }
 
     fn unregister_connection(&self, node_id: &str, epoch: u64) {
-        if let Some(conn) = self.connections.get(node_id)
-            && conn.epoch != epoch
-        {
+        let removed = self
+            .connections
+            .remove_if(node_id, |_, connection| connection.epoch == epoch);
+        if removed.is_none() {
             return;
         }
-        self.connections.remove(node_id);
         let prefix = format!("{node_id}/");
         let stale: Vec<String> = self
             .routes
@@ -660,21 +768,22 @@ impl RelayHub {
                 debug!(request_id = %k, "relay response waiter already dropped");
             }
         }
-        let source_requests: Vec<String> = self
-            .spoke_request_sources
-            .iter()
-            .filter(|entry| entry.value().source_node == node_id)
-            .map(|entry| entry.key().clone())
-            .collect();
-        for request_id in source_requests {
-            self.spoke_request_sources.remove(&request_id);
-        }
-        let target_requests: Vec<(String, String)> = self
-            .spoke_request_sources
-            .iter()
-            .filter(|entry| entry.value().target_node == node_id)
-            .map(|entry| (entry.key().clone(), entry.value().source_node.clone()))
-            .collect();
+        let target_requests = {
+            let mut requests = self
+                .spoke_request_sources
+                .lock()
+                .expect("spoke relay request mutex poisoned");
+            requests.retain(|_, request| request.source_node != node_id);
+            let target_requests: Vec<(String, String)> = requests
+                .iter()
+                .filter(|(_, request)| request.target_node == node_id)
+                .map(|(request_id, request)| (request_id.clone(), request.source_node.clone()))
+                .collect();
+            for (request_id, _) in &target_requests {
+                requests.remove(request_id);
+            }
+            target_requests
+        };
         for (request_id, source_node) in target_requests {
             self.send_to_node(
                 &source_node,
@@ -687,7 +796,6 @@ impl RelayHub {
                     ),
                 },
             );
-            self.spoke_request_sources.remove(&request_id);
         }
     }
 
@@ -737,15 +845,24 @@ impl RelayHub {
             .ok_or_else(|| anyhow!("node '{}' is not connected", route.node_id))?;
         let request_id = format!("relay:stream:{}", Uuid::new_v4());
         let (event_tx, event_rx) = broadcast::channel(128);
-        self.stream_pending.insert(
-            request_id.clone(),
-            StreamPending {
-                tx: event_tx,
-                agent_ref: target.to_owned(),
-                node_id: route.node_id.clone(),
-                deadline: std::time::Instant::now() + STREAM_MAX_LIFETIME,
-            },
-        );
+        {
+            let _admission = self
+                .stream_admission
+                .lock()
+                .expect("relay stream admission mutex poisoned");
+            if self.stream_pending.len() >= MAX_RELAY_STREAMS {
+                anyhow::bail!("relay stream capacity exceeded");
+            }
+            self.stream_pending.insert(
+                request_id.clone(),
+                StreamPending {
+                    tx: event_tx,
+                    agent_ref: target.to_owned(),
+                    node_id: route.node_id.clone(),
+                    deadline: std::time::Instant::now() + STREAM_MAX_LIFETIME,
+                },
+            );
+        }
         let frame = RelayFrame::Request {
             request_id: request_id.clone(),
             target: target.to_owned(),
@@ -755,7 +872,7 @@ impl RelayHub {
             deadline_ms: REQUEST_TIMEOUT.as_millis() as u64,
         };
         let msg = AxumWsMessage::Text(serde_json::to_string(&frame)?.into());
-        if let Err(e) = conn.tx.send(msg) {
+        if let Err(e) = conn.tx.try_send(msg) {
             self.stream_pending.remove(&request_id);
             anyhow::bail!("relay send to node '{}' failed: {e}", route.node_id);
         }
@@ -778,7 +895,7 @@ impl RelayHub {
             Ok(serialized) => {
                 if conn
                     .tx
-                    .send(AxumWsMessage::Text(serialized.into()))
+                    .try_send(AxumWsMessage::Text(serialized.into()))
                     .is_err()
                 {
                     debug!(node = %node_id, %request_id, "relay cancel target disconnected");
@@ -823,14 +940,43 @@ impl RelayHub {
             .filter(|e| e.value().deadline <= now)
             .map(|e| (e.key().clone(), e.value().node_id.clone()))
             .collect();
-        let expired_signals: Vec<String> = self
-            .peer_signal_sessions
-            .iter()
-            .filter(|entry| entry.value().expires_at <= now)
-            .map(|entry| entry.key().clone())
-            .collect();
-        for session_id in expired_signals {
-            self.peer_signal_sessions.remove(&session_id);
+        self.peer_signal_sessions
+            .lock()
+            .expect("peer signaling session mutex poisoned")
+            .retain(|_, session| session.expires_at > now);
+        self.consumed_peer_signal_sessions
+            .lock()
+            .expect("consumed peer signaling session mutex poisoned")
+            .retain(|_, expires_at| *expires_at > now);
+        let expired_spoke_requests: Vec<(String, String)> = {
+            let mut requests = self
+                .spoke_request_sources
+                .lock()
+                .expect("spoke relay request mutex poisoned");
+            let expired: Vec<(String, String)> = requests
+                .iter()
+                .filter(|(_, request)| request.expires_at <= now)
+                .map(|(request_id, request)| (request_id.clone(), request.source_node.clone()))
+                .collect();
+            for (request_id, _) in &expired {
+                requests.remove(request_id);
+            }
+            expired
+        };
+        let expired_spoke_request_count = expired_spoke_requests.len();
+        for (request_id, source_node) in expired_spoke_requests {
+            self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
+            self.send_to_node(
+                &source_node,
+                &RelayFrame::Response {
+                    request_id,
+                    response: JsonRpcResponse::err(
+                        Value::Null,
+                        -32004,
+                        "relay request deadline exceeded",
+                    ),
+                },
+            );
         }
 
         for (request_id, node_id) in &expired {
@@ -864,7 +1010,7 @@ impl RelayHub {
                 "relay stream hit deadline — synthetic failure emitted"
             );
         }
-        expired.len()
+        expired.len() + expired_spoke_request_count
     }
 
     /// Record `task_id → agent_ref` so a follow-up RPC (GetTask, CancelTask,
@@ -1196,10 +1342,10 @@ where
 }
 
 async fn handle_hub_socket(socket: WebSocket, ctx: HubCtx, node: A2aRelayNodeRuntime) {
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
-        .unwrap_or(0);
+    let epoch = ctx
+        .hub
+        .connection_generation
+        .fetch_add(1, Ordering::Relaxed);
     let (mut sink, mut stream) = socket.split();
 
     // Keypair handshake. Performed BEFORE register_connection so a node
@@ -1245,7 +1391,7 @@ async fn handle_hub_socket(socket: WebSocket, ctx: HubCtx, node: A2aRelayNodeRun
         }
     }
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<AxumWsMessage>();
+    let (tx, mut rx) = mpsc::channel::<AxumWsMessage>(RELAY_WRITE_QUEUE_CAPACITY);
     let ping_tx = tx.clone();
     ctx.hub.register_connection(&node.node_id, tx, epoch);
     info!(node = %node.node_id, "a2a relay node connected");
@@ -1274,7 +1420,7 @@ async fn handle_hub_socket(socket: WebSocket, ctx: HubCtx, node: A2aRelayNodeRun
                 .unwrap_or(0);
             // 1. WS-level Ping — empty payload is sufficient.
             if ping_tx
-                .send(AxumWsMessage::Ping(Vec::new().into()))
+                .try_send(AxumWsMessage::Ping(Vec::new().into()))
                 .is_err()
             {
                 break;
@@ -1284,7 +1430,7 @@ async fn handle_hub_socket(socket: WebSocket, ctx: HubCtx, node: A2aRelayNodeRun
             // bookkeeping.
             let frame = RelayFrame::Ping { ts };
             if let Ok(msg) = serde_json::to_string(&frame) {
-                if ping_tx.send(AxumWsMessage::Text(msg.into())).is_err() {
+                if ping_tx.try_send(AxumWsMessage::Text(msg.into())).is_err() {
                     break;
                 }
             }
@@ -1298,6 +1444,10 @@ async fn handle_hub_socket(socket: WebSocket, ctx: HubCtx, node: A2aRelayNodeRun
         let AxumWsMessage::Text(text) = msg else {
             continue;
         };
+        if !ctx.hub.owns_connection(&node.node_id, epoch) {
+            warn!(node = %node.node_id, epoch, "superseded relay connection rejected");
+            break;
+        }
         match serde_json::from_str::<RelayFrame>(&text) {
             Ok(frame) => handle_hub_frame(&ctx, &node, frame).await,
             Err(e) => warn!(node = %node.node_id, error = %e, "invalid a2a relay frame"),
@@ -1386,15 +1536,27 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
         } => {
             // A response to a spoke-originated request returns to its authenticated
             // source connection. Otherwise this is a hub-originated request.
-            if let Some(request_route) = ctx.hub.spoke_request_sources.get(&request_id) {
-                if request_route.target_node != node.node_id {
-                    ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
-                    warn!(%request_id, expected = %request_route.target_node, actual = %node.node_id, "spoke relay response source mismatch");
-                    return;
+            let source_node = {
+                let mut requests = ctx
+                    .hub
+                    .spoke_request_sources
+                    .lock()
+                    .expect("spoke relay request mutex poisoned");
+                match requests.get(&request_id) {
+                    Some(request_route) if request_route.target_node == node.node_id => {
+                        let source_node = request_route.source_node.clone();
+                        requests.remove(&request_id);
+                        Some(source_node)
+                    }
+                    Some(request_route) => {
+                        ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
+                        warn!(%request_id, expected = %request_route.target_node, actual = %node.node_id, "spoke relay response source mismatch");
+                        return;
+                    }
+                    None => None,
                 }
-                let source_node = request_route.source_node.clone();
-                drop(request_route);
-                ctx.hub.spoke_request_sources.remove(&request_id);
+            };
+            if let Some(source_node) = source_node {
                 let frame = RelayFrame::Response {
                     request_id,
                     response,
@@ -1465,13 +1627,27 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
                 );
                 return;
             }
-            ctx.hub.spoke_request_sources.insert(
-                request_id.clone(),
-                SpokeRelayRequest {
-                    source_node: source_node.clone(),
-                    target_node: route.node_id.clone(),
-                },
+            let admitted = ctx.hub.reserve_spoke_request(
+                &request_id,
+                &source_node,
+                &route.node_id,
+                deadline_ms,
             );
+            if !admitted {
+                ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
+                ctx.hub.send_to_node(
+                    &source_node,
+                    &RelayFrame::Response {
+                        request_id,
+                        response: JsonRpcResponse::err(
+                            Value::Null,
+                            -32004,
+                            "relay request capacity exceeded",
+                        ),
+                    },
+                );
+                return;
+            }
             let forward = RelayFrame::Request {
                 request_id: request_id.clone(),
                 target,
@@ -1481,7 +1657,11 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
                 deadline_ms,
             };
             if !ctx.hub.send_to_node(&route.node_id, &forward) {
-                ctx.hub.spoke_request_sources.remove(&request_id);
+                ctx.hub
+                    .spoke_request_sources
+                    .lock()
+                    .expect("spoke relay request mutex poisoned")
+                    .remove(&request_id);
                 ctx.hub.send_to_node(
                     &source_node,
                     &RelayFrame::Response {
@@ -1510,8 +1690,9 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
             signature,
         } => {
             let source_node = node.node_id.clone();
-            if session_id.is_empty()
-                || session_id.len() > 128
+            if !crate::a2a::peer::valid_signaling_id(&session_id)
+                || !crate::a2a::peer::valid_signaling_node_id(&source_node)
+                || !crate::a2a::peer::valid_signaling_node_id(&target_node)
                 || sdp.is_empty()
                 || sdp.len() > MAX_PEER_SDP_BYTES
                 || target_node == source_node
@@ -1521,19 +1702,38 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
                 warn!(source = %source_node, target = %target_node, session = %session_id, "peer offer rejected");
                 return;
             }
-            if ctx.hub.peer_signal_sessions.contains_key(&session_id) {
-                ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
-                warn!(source = %source_node, target = %target_node, session = %session_id, "duplicate peer offer session rejected");
-                return;
+            {
+                let mut sessions = ctx
+                    .hub
+                    .peer_signal_sessions
+                    .lock()
+                    .expect("peer signaling session mutex poisoned");
+                if sessions.contains_key(&session_id)
+                    || ctx
+                        .hub
+                        .consumed_peer_signal_sessions
+                        .lock()
+                        .expect("consumed peer signaling session mutex poisoned")
+                        .contains_key(&session_id)
+                {
+                    ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
+                    warn!(source = %source_node, target = %target_node, session = %session_id, "duplicate peer offer session rejected");
+                    return;
+                }
+                if sessions.len() >= MAX_PEER_SIGNAL_SESSIONS {
+                    ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
+                    warn!(source = %source_node, target = %target_node, "peer signaling session capacity exceeded");
+                    return;
+                }
+                sessions.insert(
+                    session_id.clone(),
+                    PeerSignalSession {
+                        source_node: source_node.clone(),
+                        target_node: target_node.clone(),
+                        expires_at: std::time::Instant::now() + PEER_SIGNAL_TTL,
+                    },
+                );
             }
-            ctx.hub.peer_signal_sessions.insert(
-                session_id.clone(),
-                PeerSignalSession {
-                    source_node: source_node.clone(),
-                    target_node: target_node.clone(),
-                    expires_at: std::time::Instant::now() + PEER_SIGNAL_TTL,
-                },
-            );
             let forward = RelayFrame::PeerOfferRelay {
                 session_id: session_id.clone(),
                 source_node: source_node.clone(),
@@ -1541,7 +1741,11 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
                 signature,
             };
             if !ctx.hub.send_to_node(&target_node, &forward) {
-                ctx.hub.peer_signal_sessions.remove(&session_id);
+                ctx.hub
+                    .peer_signal_sessions
+                    .lock()
+                    .expect("peer signaling session mutex poisoned")
+                    .remove(&session_id);
                 debug!(source = %source_node, target = %target_node, "peer offer target disconnected");
             }
         }
@@ -1552,20 +1756,51 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
             signature,
         } => {
             let answer_source = node.node_id.clone();
-            let Some((_, session)) = ctx.hub.peer_signal_sessions.remove(&session_id) else {
-                ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
-                warn!(source = %answer_source, target = %target_node, session = %session_id, "unknown peer answer session rejected");
-                return;
+            let removed = {
+                let mut sessions = ctx
+                    .hub
+                    .peer_signal_sessions
+                    .lock()
+                    .expect("peer signaling session mutex poisoned");
+                let valid_session = crate::a2a::peer::valid_signaling_id(&session_id)
+                    && crate::a2a::peer::valid_signaling_node_id(&answer_source)
+                    && crate::a2a::peer::valid_signaling_node_id(&target_node)
+                    && sessions.get(&session_id).is_some_and(|session| {
+                        session.expires_at > std::time::Instant::now()
+                            && session.source_node == target_node
+                            && session.target_node == answer_source
+                            && !sdp.is_empty()
+                            && sdp.len() <= MAX_PEER_SDP_BYTES
+                    });
+                valid_session
+                    .then(|| sessions.remove(&session_id))
+                    .flatten()
             };
-            if session.expires_at <= std::time::Instant::now()
-                || session.source_node != target_node
-                || session.target_node != answer_source
-                || sdp.is_empty()
-                || sdp.len() > MAX_PEER_SDP_BYTES
-            {
+            if removed.is_none() {
                 ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
-                warn!(source = %answer_source, target = %target_node, session = %session_id, "mismatched peer answer rejected");
+                warn!(source = %answer_source, target = %target_node, session = %session_id, "unknown or mismatched peer answer rejected");
                 return;
+            }
+            {
+                let mut consumed = ctx
+                    .hub
+                    .consumed_peer_signal_sessions
+                    .lock()
+                    .expect("consumed peer signaling session mutex poisoned");
+                consumed.retain(|_, expires_at| *expires_at > std::time::Instant::now());
+                if consumed.len() >= MAX_PEER_SIGNAL_SESSIONS {
+                    let oldest = consumed
+                        .iter()
+                        .min_by_key(|(_, expires_at)| **expires_at)
+                        .map(|(session_id, _)| session_id.clone());
+                    if let Some(oldest) = oldest {
+                        consumed.remove(&oldest);
+                    }
+                }
+                consumed.insert(
+                    session_id.clone(),
+                    std::time::Instant::now() + PEER_SIGNAL_TTL,
+                );
             }
             let forward = RelayFrame::PeerAnswerRelay {
                 session_id,
@@ -1665,14 +1900,11 @@ pub async fn try_forward_jsonrpc(
 
     // Direct is an optimization, never an authority. A send failure (including
     // a concurrent disconnect) immediately falls through to the hub route.
-    if let Some((peer_node_id, _route)) = resolve_peer_route(&state.peer_manager, &target)
-        && let Some(response) = forward_via_peer(state, caller, req, &target, &peer_node_id).await
-        && response
-            .error
-            .as_ref()
-            .is_none_or(|error| error.code != -32004)
-    {
-        return Some(response);
+    if let Some((peer_node_id, _route)) = resolve_peer_route(&state.peer_manager, &target) {
+        match forward_via_peer(state, caller, req, &target, &peer_node_id).await {
+            PeerForwardResult::Handled(response) => return Some(response),
+            PeerForwardResult::Unavailable => {}
+        }
     }
 
     state.relay_hub.route_for(&target)?;
@@ -1692,6 +1924,27 @@ pub(crate) fn resolve_peer_route(
     Some((route.node_id.clone(), route))
 }
 
+enum PeerForwardResult {
+    Handled(JsonRpcResponse),
+    Unavailable,
+}
+
+fn classify_peer_forward_result(
+    request_id: &Value,
+    result: Result<JsonRpcResponse, crate::a2a::peer::PeerInvokeError>,
+) -> PeerForwardResult {
+    match result {
+        Ok(mut response) => {
+            response.id = request_id.clone();
+            PeerForwardResult::Handled(response)
+        }
+        Err(crate::a2a::peer::PeerInvokeError::Unavailable(_)) => PeerForwardResult::Unavailable,
+        Err(crate::a2a::peer::PeerInvokeError::DeliveryUnknown(error)) => {
+            PeerForwardResult::Handled(JsonRpcResponse::err(request_id.clone(), -32005, error))
+        }
+    }
+}
+
 /// Forward a JSON-RPC call via a direct WebRTC data channel.
 async fn forward_via_peer(
     state: &AppState,
@@ -1699,11 +1952,11 @@ async fn forward_via_peer(
     req: &JsonRpcRequest,
     target: &str,
     peer_node_id: &str,
-) -> Option<JsonRpcResponse> {
+) -> PeerForwardResult {
     let relay_id = state.config.gateway.a2a_relay.relay_id.as_str();
     let principal_id = caller.map(|id| id.id.as_str()).unwrap_or("anonymous-dev");
     if !can_invoke(caller, target) {
-        return Some(JsonRpcResponse::err(
+        return PeerForwardResult::Handled(JsonRpcResponse::err(
             req.id.clone(),
             -32003,
             format!("not authorized to invoke {target}"),
@@ -1722,30 +1975,23 @@ async fn forward_via_peer(
     let principal = principal_id;
     let mut params = req.params.clone();
     rewrite_target_agent_for_spoke(&mut params, target);
-    match state
-        .peer_manager
-        .invoke_jsonrpc(target, &req.method, params, principal, peer_node_id)
-        .await
+    let outcome = classify_peer_forward_result(
+        &req.id,
+        state
+            .peer_manager
+            .invoke_jsonrpc(target, &req.method, params, principal, peer_node_id)
+            .await,
+    );
+    if let PeerForwardResult::Handled(response) = &outcome
+        && let Some(task_id) = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("id"))
+            .and_then(Value::as_str)
     {
-        Ok(mut response) => {
-            response.id = req.id.clone();
-            if let Some(task_id) = response
-                .result
-                .as_ref()
-                .and_then(|r| r.get("id"))
-                .and_then(|v| v.as_str())
-            {
-                state.peer_manager.record_task_route(task_id, target);
-            }
-            Some(response)
-        }
-        Err(crate::a2a::peer::PeerInvokeError::Unavailable(error)) => {
-            Some(JsonRpcResponse::err(req.id.clone(), -32004, error))
-        }
-        Err(crate::a2a::peer::PeerInvokeError::DeliveryUnknown(error)) => {
-            Some(JsonRpcResponse::err(req.id.clone(), -32005, error))
-        }
+        state.peer_manager.record_task_route(task_id, target);
     }
+    outcome
 }
 
 /// Forward a JSON-RPC call via the relay hub (existing path).
@@ -2091,7 +2337,7 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
         Frame(RelayFrame),
         WsPing,
     }
-    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<SpokeWriteItem>();
+    let (write_tx, mut write_rx) = mpsc::channel::<SpokeWriteItem>(RELAY_WRITE_QUEUE_CAPACITY);
     let writer = tokio::spawn(async move {
         while let Some(item) = write_rx.recv().await {
             let result = match item {
@@ -2113,11 +2359,14 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
     // Adapter: every other component in this function — including
     // handle_spoke_request which takes a Sender<RelayFrame> — just sends
     // RelayFrame. A small forwarder converts those to SpokeWriteItem::Frame.
-    let (spoke_tx, mut frame_rx) = mpsc::unbounded_channel::<RelayFrame>();
+    let (spoke_tx, mut frame_rx) = mpsc::channel::<RelayFrame>(RELAY_WRITE_QUEUE_CAPACITY);
     let frame_adapter_tx = write_tx.clone();
     let frame_adapter = tokio::spawn(async move {
         while let Some(frame) = frame_rx.recv().await {
-            if frame_adapter_tx.send(SpokeWriteItem::Frame(frame)).is_err() {
+            if frame_adapter_tx
+                .try_send(SpokeWriteItem::Frame(frame))
+                .is_err()
+            {
                 break;
             }
         }
@@ -2127,20 +2376,36 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
         .as_ref()
         .map(|_| relay_identity::fresh_nonce_b64());
     spoke_tx
-        .send(spoke_hello(&state, node_id, nonce_node.clone()))
+        .try_send(spoke_hello(&state, node_id, nonce_node.clone()))
         .map_err(|_| anyhow!("spoke writer closed"))?;
     // RouteLease is sent AFTER the Auth round-trip when in keypair mode
     // so the hub doesn't drop us mid-handshake. Token-mode spokes send
     // it immediately because there's no handshake.
     let control_generation = Uuid::new_v4().to_string();
     if signing_key.is_none() {
+        if let Err(error) = spoke_tx
+            .try_send(spoke_route_lease(&state, node_id, 1))
+            .map_err(|_| anyhow!("spoke writer closed"))
+        {
+            writer.abort();
+            frame_adapter.abort();
+            return Err(error);
+        }
         state
             .relay_hub
             .register_spoke_control(spoke_tx.clone(), control_generation.clone());
-        spoke_tx
-            .send(spoke_route_lease(&state, node_id, 1))
-            .map_err(|_| anyhow!("spoke writer closed"))?;
-        start_peer_offers(&state, node_id, &spoke_tx).await?;
+        if let Err(error) = start_peer_offers(&state, node_id, &spoke_tx).await {
+            state
+                .relay_hub
+                .unregister_spoke_control(&control_generation);
+            state
+                .peer_manager
+                .drop_pending_sessions("peer offer startup failed")
+                .await;
+            writer.abort();
+            frame_adapter.abort();
+            return Err(error);
+        }
     }
 
     // WS-level Ping every 15s so NAT/firewall idle counters reset.
@@ -2150,7 +2415,7 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
         interval.tick().await; // skip immediate tick
         loop {
             interval.tick().await;
-            if ping_tx.send(SpokeWriteItem::WsPing).is_err() {
+            if ping_tx.try_send(SpokeWriteItem::WsPing).is_err() {
                 break;
             }
         }
@@ -2172,14 +2437,15 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
         loop {
             interval.tick().await;
             let frame = spoke_route_lease(&renew_state, &renew_node_id, epoch);
-            if renew_tx.send(frame).is_err() {
+            if renew_tx.try_send(frame).is_err() {
                 break;
             }
             epoch = epoch.saturating_add(1);
         }
     });
 
-    while let Some(msg) = read.next().await {
+    let connection_result = async {
+        while let Some(msg) = read.next().await {
         let msg = msg?;
         let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
             continue;
@@ -2198,14 +2464,14 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
                 };
                 let sig = relay_identity::sign_handshake(sk, node_id, &relay_id, nn, &nonce_relay);
                 spoke_tx
-                    .send(RelayFrame::Auth { signature: sig })
+                    .try_send(RelayFrame::Auth { signature: sig })
                     .map_err(|_| anyhow!("spoke writer closed"))?;
                 // Now safe to publish routes and outbound fallback — handshake done.
                 state
                     .relay_hub
                     .register_spoke_control(spoke_tx.clone(), control_generation.clone());
                 spoke_tx
-                    .send(spoke_route_lease(&state, node_id, 1))
+                    .try_send(spoke_route_lease(&state, node_id, 1))
                     .map_err(|_| anyhow!("spoke writer closed"))?;
                 start_peer_offers(&state, node_id, &spoke_tx).await?;
             }
@@ -2234,11 +2500,12 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
                     params,
                     principal,
                     spoke_tx.clone(),
+                    &control_generation,
                 )
                 .await;
                 if let Some(response) = response
                     && spoke_tx
-                        .send(RelayFrame::Response {
+                        .try_send(RelayFrame::Response {
                             request_id,
                             response,
                         })
@@ -2250,15 +2517,22 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
                 // spoke_tx and will send the terminal Response itself.
             }
             RelayFrame::Ping { ts } => {
-                if spoke_tx.send(RelayFrame::Pong { ts }).is_err() {
+                if spoke_tx.try_send(RelayFrame::Pong { ts }).is_err() {
                     debug!("spoke pong dropped because writer closed");
                 }
             }
             RelayFrame::Cancel { request_id, .. } => {
                 // Cancel the streaming task if it exists locally. `task_cancels`
                 // is keyed by local task_id, so resolve via the spoke-side map.
-                if let Some((_, task_id)) = state.relay_hub.spoke_stream_tasks.remove(&request_id)
-                    && let Some((_, token)) = state.task_cancels.remove(&task_id)
+                if let Some(task) = state
+                    .relay_hub
+                    .remove_spoke_stream_task(&request_id, &control_generation)
+                    && let Some(owner) = task.cancel_owner
+                    && let Some(token) = crate::server::remove_task_cancel_if_owner(
+                        &state.task_cancels,
+                        &task.task_id,
+                        &owner,
+                    )
                 {
                     token.cancel();
                 }
@@ -2278,9 +2552,13 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
             .await
             {
                 Ok(answer) => {
-                    spoke_tx
-                        .send(answer)
-                        .map_err(|_| anyhow!("spoke writer closed"))?;
+                    if spoke_tx.try_send(answer).is_err() {
+                        state
+                            .peer_manager
+                            .drop_session(&session_id, "spoke signaling channel closed")
+                            .await;
+                        anyhow::bail!("spoke writer closed");
+                    }
                 }
                 Err(error) => {
                     warn!(peer = %source_node, session = %session_id, %error, "peer WebRTC offer rejected");
@@ -2307,21 +2585,22 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
             RelayFrame::PeerConnected { .. } => {}
             _ => {}
         }
+        }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
 
     // WS drop reached: cancel every local streaming task we were
     // proxying so workers stop burning tokens for a stream that will
     // never reach the client. After reconnect, the hub will route new
     // requests through fresh task_ids; old request_ids are irrelevant.
-    let request_ids: Vec<String> = state
-        .relay_hub
-        .spoke_stream_tasks
-        .iter()
-        .map(|e| e.key().clone())
-        .collect();
-    for rid in request_ids {
-        if let Some((_, task_id)) = state.relay_hub.spoke_stream_tasks.remove(&rid)
-            && let Some((_, token)) = state.task_cancels.remove(&task_id)
+    for task in state.relay_hub.take_spoke_stream_tasks(&control_generation) {
+        if let Some(owner) = task.cancel_owner
+            && let Some(token) = crate::server::remove_task_cancel_if_owner(
+                &state.task_cancels,
+                &task.task_id,
+                &owner,
+            )
         {
             token.cancel();
         }
@@ -2329,17 +2608,21 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
     state
         .relay_hub
         .unregister_spoke_control(&control_generation);
+    state
+        .peer_manager
+        .drop_pending_sessions("relay control connection closed")
+        .await;
     writer.abort();
     renewer.abort();
     pinger.abort();
     frame_adapter.abort();
-    Ok(())
+    connection_result
 }
 
 async fn start_peer_offers(
     state: &AppState,
     node_id: &str,
-    spoke_tx: &mpsc::UnboundedSender<RelayFrame>,
+    spoke_tx: &mpsc::Sender<RelayFrame>,
 ) -> Result<()> {
     if !state
         .config
@@ -2363,7 +2646,7 @@ async fn start_peer_offers(
         match crate::a2a::peer::create_peer_offer(state, peer_node_id).await {
             Ok(frame) => {
                 spoke_tx
-                    .send(frame)
+                    .try_send(frame)
                     .map_err(|_| anyhow!("spoke writer closed"))?;
                 info!(node = %node_id, target = %peer_node_id, "sent peer WebRTC offer");
             }
@@ -2424,7 +2707,8 @@ async fn handle_spoke_request(
     method: &str,
     params: Value,
     principal: String,
-    spoke_tx: mpsc::UnboundedSender<RelayFrame>,
+    spoke_tx: mpsc::Sender<RelayFrame>,
+    control_generation: &str,
 ) -> Option<JsonRpcResponse> {
     let Some(local_agent) = local_agent_from_ref(target, node_id) else {
         return Some(JsonRpcResponse::err(
@@ -2444,17 +2728,24 @@ async fn handle_spoke_request(
             id: principal,
             scopes: Vec::new(),
         });
-        let (task_id, event_rx) = if method == "SubscribeToTask" {
-            crate::a2a::streaming::subscribe_to_task(state, &caller, &params)
+        let (task_id, event_rx, cancel_owner) = if method == "SubscribeToTask" {
+            let (task_id, event_rx) =
+                crate::a2a::streaming::subscribe_to_task(state, &caller, &params);
+            (task_id, event_rx, None)
         } else {
             crate::a2a::streaming::spawn_streaming_task(state.clone(), caller, params).await
         };
         let request_id_for_relay = request_id.to_owned();
-        state
-            .relay_hub
-            .spoke_stream_tasks
-            .insert(request_id_for_relay.clone(), task_id.clone());
+        state.relay_hub.spoke_stream_tasks.insert(
+            request_id_for_relay.clone(),
+            SpokeStreamTask {
+                task_id: task_id.clone(),
+                control_generation: control_generation.to_owned(),
+                cancel_owner,
+            },
+        );
         let relay_hub = state.relay_hub.clone();
+        let control_generation = control_generation.to_owned();
         tokio::spawn(async move {
             use futures::StreamExt;
             use tokio_stream::wrappers::BroadcastStream;
@@ -2466,7 +2757,7 @@ async fn handle_spoke_request(
                     Ok(event) => {
                         let wire = event.to_wire_event();
                         if spoke_tx
-                            .send(RelayFrame::Event {
+                            .try_send(RelayFrame::Event {
                                 request_id: request_id_for_relay.clone(),
                                 seq,
                                 result: wire,
@@ -2485,9 +2776,9 @@ async fn handle_spoke_request(
                     }
                 }
             }
-            relay_hub.spoke_stream_tasks.remove(&request_id_for_relay);
+            relay_hub.remove_spoke_stream_task(&request_id_for_relay, &control_generation);
             if spoke_tx
-                .send(RelayFrame::Response {
+                .try_send(RelayFrame::Response {
                     request_id: request_id_for_relay,
                     response: JsonRpcResponse::ok(
                         Value::String(task_id),
@@ -2521,7 +2812,86 @@ async fn handle_spoke_request(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    #[test]
+    fn peer_forward_classification_preserves_delivery_provenance() {
+        let request_id = Value::String("caller-id".to_owned());
+        let response =
+            JsonRpcResponse::err(Value::String("remote-id".to_owned()), -32004, "remote");
+        match classify_peer_forward_result(&request_id, Ok(response)) {
+            PeerForwardResult::Handled(response) => {
+                assert_eq!(response.id, request_id);
+                assert_eq!(response.error.expect("remote error").code, -32004);
+            }
+            PeerForwardResult::Unavailable => {
+                panic!("delivered response must not request fallback")
+            }
+        }
+
+        assert!(matches!(
+            classify_peer_forward_result(
+                &request_id,
+                Err(crate::a2a::peer::PeerInvokeError::Unavailable(
+                    "queue full".to_owned(),
+                )),
+            ),
+            PeerForwardResult::Unavailable
+        ));
+
+        match classify_peer_forward_result(
+            &request_id,
+            Err(crate::a2a::peer::PeerInvokeError::DeliveryUnknown(
+                "response lost".to_owned(),
+            )),
+        ) {
+            PeerForwardResult::Handled(response) => {
+                let error = response.error.expect("delivery-unknown error");
+                assert_eq!(error.code, -32005);
+                assert_eq!(error.message, "response lost");
+            }
+            PeerForwardResult::Unavailable => {
+                panic!("unknown delivery must not request fallback")
+            }
+        }
+    }
+
+    #[test]
+    fn spoke_request_correlation_is_bounded_and_expires() {
+        let hub = RelayHub::new();
+        for index in 0..MAX_SPOKE_RELAY_REQUESTS {
+            assert!(hub.reserve_spoke_request(
+                &format!("request-{index}"),
+                "source",
+                "target",
+                REQUEST_TIMEOUT.as_millis() as u64,
+            ));
+        }
+        assert!(!hub.reserve_spoke_request(
+            "request-over-capacity",
+            "source",
+            "target",
+            REQUEST_TIMEOUT.as_millis() as u64,
+        ));
+        for request in hub
+            .spoke_request_sources
+            .lock()
+            .expect("spoke relay request mutex poisoned")
+            .values_mut()
+        {
+            request.expires_at = std::time::Instant::now() - Duration::from_millis(1);
+        }
+
+        assert_eq!(hub.sweep_expired_streams(), MAX_SPOKE_RELAY_REQUESTS);
+        assert!(
+            hub.spoke_request_sources
+                .lock()
+                .expect("spoke relay request mutex poisoned")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn suffix_scopes_match_agent_children_only() {
@@ -2585,7 +2955,7 @@ mod tests {
     #[tokio::test]
     async fn hub_invocation_sends_request_and_returns_response() {
         let hub = std::sync::Arc::new(RelayHub::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
         hub.register_connection("a3", tx, 1);
         hub.apply_route_lease("a3", &["a3/main".to_owned()], 10_000, 1)
             .unwrap();
@@ -2638,7 +3008,7 @@ mod tests {
     #[tokio::test]
     async fn drop_guard_sends_cancel_when_stream_drops_early() {
         let hub = std::sync::Arc::new(RelayHub::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
         hub.register_connection("a3", tx, 1);
         hub.apply_route_lease("a3", &["a3/main".to_owned()], 10_000, 1)
             .unwrap();
@@ -2753,7 +3123,7 @@ mod tests {
         // terminal status-update with state=failed instead of hanging
         // until REQUEST_TIMEOUT.
         let hub = std::sync::Arc::new(RelayHub::new());
-        let (tx, mut _rx) = mpsc::unbounded_channel();
+        let (tx, mut _rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
         hub.register_connection("home-mac", tx, 1);
         hub.apply_route_lease("home-mac", &["home-mac/main".to_owned()], 10_000, 1)
             .unwrap();
@@ -2790,8 +3160,8 @@ mod tests {
         // Lose connection to node A — A's pending RPC must fail; B's
         // must stay untouched.
         let hub = std::sync::Arc::new(RelayHub::new());
-        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
-        let (tx_b, mut _rx_b) = mpsc::unbounded_channel();
+        let (tx_a, mut rx_a) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
+        let (tx_b, mut _rx_b) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
         hub.register_connection("a", tx_a, 1);
         hub.register_connection("b", tx_b, 1);
         hub.apply_route_lease("a", &["a/main".to_owned()], 10_000, 1)
@@ -2909,7 +3279,7 @@ mod tests {
     #[tokio::test]
     async fn drop_guard_no_cancel_after_normal_completion() {
         let hub = std::sync::Arc::new(RelayHub::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
         hub.register_connection("a3", tx, 1);
         hub.apply_route_lease("a3", &["a3/main".to_owned()], 10_000, 1)
             .unwrap();
@@ -2955,7 +3325,7 @@ mod tests {
     #[test]
     fn peer_connection_never_disables_hub_route() {
         let hub = RelayHub::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
         hub.register_connection("node-b", tx, 1);
         hub.apply_route_lease("node-b", &["node-b/agent2".to_owned()], 10_000, 1)
             .unwrap();
@@ -2967,7 +3337,7 @@ mod tests {
     #[test]
     fn send_to_node_queues_frame_on_connected_node() {
         let hub = RelayHub::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
         hub.register_connection("b", tx, 1);
 
         let frame = RelayFrame::Ping { ts: 42 };
@@ -2985,10 +3355,212 @@ mod tests {
     }
 
     #[test]
+    fn stale_spoke_control_cannot_remove_replacement_stream_tasks() {
+        let hub = RelayHub::new();
+        hub.spoke_stream_tasks.insert(
+            "old-request".to_owned(),
+            SpokeStreamTask {
+                task_id: "old-task".to_owned(),
+                control_generation: "old-control".to_owned(),
+                cancel_owner: None,
+            },
+        );
+        hub.spoke_stream_tasks.insert(
+            "replacement-request".to_owned(),
+            SpokeStreamTask {
+                task_id: "replacement-task".to_owned(),
+                control_generation: "replacement-control".to_owned(),
+                cancel_owner: None,
+            },
+        );
+
+        assert_eq!(
+            hub.take_spoke_stream_tasks("old-control")
+                .into_iter()
+                .map(|task| task.task_id)
+                .collect::<Vec<_>>(),
+            vec!["old-task".to_owned()]
+        );
+        assert!(hub.spoke_stream_tasks.get("old-request").is_none());
+        assert_eq!(
+            hub.spoke_stream_tasks
+                .get("replacement-request")
+                .expect("replacement stream must survive stale teardown")
+                .task_id,
+            "replacement-task"
+        );
+        assert!(
+            hub.remove_spoke_stream_task("replacement-request", "old-control")
+                .is_none()
+        );
+        assert!(hub.spoke_stream_tasks.contains_key("replacement-request"));
+
+        let task_cancels = DashMap::new();
+        let old_owner = Arc::new(tokio_util::sync::CancellationToken::new());
+        let replacement_owner = Arc::new(tokio_util::sync::CancellationToken::new());
+        task_cancels.insert("shared-task".to_owned(), replacement_owner.clone());
+        hub.spoke_stream_tasks.insert(
+            "old-shared-request".to_owned(),
+            SpokeStreamTask {
+                task_id: "shared-task".to_owned(),
+                control_generation: "old-control".to_owned(),
+                cancel_owner: Some(old_owner.clone()),
+            },
+        );
+        for task in hub.take_spoke_stream_tasks("old-control") {
+            if let Some(owner) = task.cancel_owner
+                && let Some(token) =
+                    crate::server::remove_task_cancel_if_owner(&task_cancels, &task.task_id, &owner)
+            {
+                token.cancel();
+            }
+        }
+        assert!(!old_owner.is_cancelled());
+        assert!(!replacement_owner.is_cancelled());
+        assert!(task_cancels.contains_key("shared-task"));
+    }
+
+    #[tokio::test]
+    async fn relay_unary_correlation_admission_is_bounded() {
+        let hub = RelayHub::new();
+        let (tx, _rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
+        hub.register_connection("node-b", tx, 1);
+        hub.apply_route_lease("node-b", &["node-b/main".to_owned()], 10_000, 1)
+            .expect("test route lease");
+        for index in 0..MAX_RELAY_PENDING_REQUESTS {
+            let (pending_tx, _pending_rx) = oneshot::channel();
+            hub.pending.insert(
+                format!("existing-{index}"),
+                (pending_tx, "node-b".to_owned()),
+            );
+        }
+
+        let result = hub
+            .invoke_jsonrpc(
+                "node-b/main",
+                "SendMessage",
+                serde_json::json!({}),
+                "caller",
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(hub.pending.len(), MAX_RELAY_PENDING_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn relay_stream_correlation_admission_is_bounded() {
+        let hub = RelayHub::new();
+        let (tx, _rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
+        hub.register_connection("node-b", tx, 1);
+        hub.apply_route_lease("node-b", &["node-b/main".to_owned()], 10_000, 1)
+            .expect("test route lease");
+        for index in 0..MAX_RELAY_STREAMS {
+            let (event_tx, _event_rx) = broadcast::channel(1);
+            hub.stream_pending.insert(
+                format!("existing-{index}"),
+                StreamPending {
+                    tx: event_tx,
+                    agent_ref: "node-b/main".to_owned(),
+                    node_id: "node-b".to_owned(),
+                    deadline: std::time::Instant::now() + STREAM_MAX_LIFETIME,
+                },
+            );
+        }
+
+        let result = hub
+            .invoke_streaming(
+                "node-b/main",
+                "SendStreamingMessage",
+                serde_json::json!({}),
+                "caller",
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(hub.stream_pending.len(), MAX_RELAY_STREAMS);
+    }
+
+    #[tokio::test]
+    async fn replacement_connection_revokes_previous_epoch() {
+        let hub = RelayHub::new();
+        let (old_tx, mut old_rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
+        let (new_tx, _new_rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
+
+        hub.register_connection("node-a", old_tx, 1);
+        assert!(hub.owns_connection("node-a", 1));
+        hub.register_connection("node-a", new_tx, 2);
+
+        assert!(!hub.owns_connection("node-a", 1));
+        assert!(hub.owns_connection("node-a", 2));
+        assert!(matches!(old_rx.recv().await, Some(AxumWsMessage::Close(_))));
+        hub.unregister_connection("node-a", 1);
+        assert!(hub.owns_connection("node-a", 2));
+    }
+
+    #[test]
+    fn send_to_node_disconnects_saturated_writer_queue() {
+        let hub = RelayHub::new();
+        let (tx, _rx) = mpsc::channel(1);
+        hub.register_connection("b", tx, 1);
+
+        assert!(hub.send_to_node("b", &RelayFrame::Ping { ts: 1 }));
+        assert!(!hub.send_to_node("b", &RelayFrame::Ping { ts: 2 }));
+        assert_eq!(hub.connection_count(), 0);
+    }
+
+    #[test]
     fn send_to_node_returns_false_for_unknown_node() {
         let hub = RelayHub::new();
         let frame = RelayFrame::Ping { ts: 42 };
         assert!(!hub.send_to_node("ghost", &frame));
+    }
+
+    #[tokio::test]
+    async fn hub_rejects_multiline_peer_signaling_identifiers() {
+        let hub = Arc::new(RelayHub::new());
+        let (target_tx, _target_rx) = mpsc::channel(1);
+        hub.register_connection("node-b", target_tx, 1);
+        let ctx = HubCtx {
+            hub: hub.clone(),
+            relay_id: "hub".to_owned(),
+            nodes: Arc::new(Vec::new()),
+        };
+        let source = A2aRelayNodeRuntime {
+            node_id: "node-a".to_owned(),
+            ..Default::default()
+        };
+
+        handle_hub_frame(
+            &ctx,
+            &source,
+            RelayFrame::PeerOffer {
+                session_id: "session-1\nnode-a".to_owned(),
+                target_node: "node-b".to_owned(),
+                sdp: "v=0\r\n".to_owned(),
+                signature: None,
+            },
+        )
+        .await;
+        handle_hub_frame(
+            &ctx,
+            &source,
+            RelayFrame::PeerOffer {
+                session_id: "session-2".to_owned(),
+                target_node: "node-b\rnode-c".to_owned(),
+                sdp: "v=0\r\n".to_owned(),
+                signature: None,
+            },
+        )
+        .await;
+
+        assert!(
+            hub.peer_signal_sessions
+                .lock()
+                .expect("peer signaling session mutex poisoned")
+                .is_empty()
+        );
+        assert_eq!(hub.metrics.acl_denials.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -3329,6 +3901,38 @@ mod tests {
             }
             other => panic!("expected PeerOfferRelay, got {other:?}"),
         }
+
+        rt_send(
+            &mut spoke_b,
+            &RelayFrame::PeerAnswer {
+                session_id: "session-1".into(),
+                target_node: RT_NODE_A.into(),
+                sdp: "v=0\r\na=answer\r\n".into(),
+                signature: Some("answer-signature".into()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            rt_recv(&mut spoke_a).await,
+            RelayFrame::PeerAnswerRelay { session_id, .. } if session_id == "session-1"
+        ));
+
+        rt_send(
+            &mut spoke_a,
+            &RelayFrame::PeerOffer {
+                session_id: "session-1".into(),
+                target_node: RT_NODE_B.into(),
+                sdp: "v=0\r\n".into(),
+                signature: Some("signature".into()),
+            },
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), spoke_b.next())
+                .await
+                .is_err(),
+            "completed peer offer replay must not be forwarded"
+        );
 
         drop(spoke_a);
         drop(spoke_b);

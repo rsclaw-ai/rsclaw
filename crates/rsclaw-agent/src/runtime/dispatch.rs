@@ -6,6 +6,39 @@ use rsclaw_skill::{RunOptions, run_tool};
 
 use super::*;
 
+enum OutboundA2aTransport {
+    Runtime(String),
+    Http(futures::stream::BoxStream<'static, anyhow::Result<Value>>),
+}
+
+async fn open_outbound_a2a_transport(
+    host: Option<Arc<dyn rsclaw_types::OutboundA2aHost>>,
+    runtime_target: Option<String>,
+    remote_agent_id: Option<&str>,
+    url: &str,
+    request: rsclaw_types::OutboundA2aRequest,
+    auth_token: Option<&str>,
+) -> anyhow::Result<OutboundA2aTransport> {
+    if let (Some(host), Some(target)) = (host, runtime_target) {
+        let mut runtime_request = request.clone();
+        runtime_request.target = target;
+        if let Some(reply) = host.try_send(runtime_request).await? {
+            return Ok(OutboundA2aTransport::Runtime(reply));
+        }
+    }
+
+    let stream = rsclaw_a2a_types::client::A2aClient::new()
+        .send_streaming_message(
+            url,
+            remote_agent_id.unwrap_or(""),
+            &request.text,
+            &request.context_id,
+            auth_token,
+        )
+        .await?;
+    Ok(OutboundA2aTransport::Http(stream.boxed()))
+}
+
 impl AgentRuntime {
     pub(super) fn allowed_tools_for_dispatch(&self) -> Option<std::collections::HashSet<String>> {
         let model_cfg = self.handle.config.model.as_ref()?;
@@ -666,44 +699,35 @@ impl AgentRuntime {
         {
             // Prefer runtime-owned direct DataChannel, then authenticated hub
             // relay. No route (`Ok(None)`) falls through to HTTP/SSE below.
-            if let (Some(host), Some(node_id)) =
-                (rsclaw_types::outbound_a2a_host(), ext.node_id.as_deref())
-            {
-                let remote_id = ext.remote_agent_id.as_deref().unwrap_or("main");
-                let target = format!("{node_id}/{remote_id}");
-                if let Some(reply) = host
-                    .try_send(rsclaw_types::OutboundA2aRequest {
-                        target,
-                        text: text.clone(),
-                        context_id: ctx.session_key.clone(),
-                        principal: ctx.agent_id.clone(),
-                    })
-                    .await
-                    .with_context(|| format!("A2A runtime transport `{agent_id}`"))?
-                {
-                    return Ok(Value::String(reply));
-                }
-            }
-
-            // 3. Fall back to the peer's public HTTP/SSE endpoint.
-            use rsclaw_a2a_types::client::A2aClient;
-            let client = A2aClient::new();
-            // Use remote agent ID if configured, otherwise omit (uses remote default).
-            let remote_id = ext.remote_agent_id.as_deref().unwrap_or("");
             // Resolve the peer token (plain / ${ENV}) at call time. File/exec
             // secret providers require runtime secrets config and are not exposed
             // across the agent/runtime dependency boundary.
             let peer_token = ext.auth_token.as_ref().and_then(|s| s.resolve_early());
-            let stream = client
-                .send_streaming_message(
-                    &ext.url,
-                    remote_id,
-                    &text,
-                    &ctx.session_key,
-                    peer_token.as_deref(),
+            let runtime_target = ext.node_id.as_deref().map(|node_id| {
+                format!(
+                    "{node_id}/{}",
+                    ext.remote_agent_id.as_deref().unwrap_or("main")
                 )
-                .await
-                .map_err(|e| anyhow!("A2A remote `{agent_id}`: {e}"))?;
+            });
+            let stream = match open_outbound_a2a_transport(
+                rsclaw_types::outbound_a2a_host(),
+                runtime_target,
+                ext.remote_agent_id.as_deref(),
+                &ext.url,
+                rsclaw_types::OutboundA2aRequest {
+                    target: String::new(),
+                    text,
+                    context_id: ctx.session_key.clone(),
+                    principal: ctx.agent_id.clone(),
+                },
+                peer_token.as_deref(),
+            )
+            .await
+            .with_context(|| format!("A2A remote `{agent_id}`"))?
+            {
+                OutboundA2aTransport::Runtime(reply) => return Ok(Value::String(reply)),
+                OutboundA2aTransport::Http(stream) => stream,
+            };
             tokio::pin!(stream);
 
             // Drain the SSE stream until the remote publishes a terminal
@@ -858,4 +882,93 @@ pub(super) fn inject_channel(mut args: Value, channel: &str) -> Value {
         obj.entry("channel").or_insert_with(|| json!(channel));
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    struct NoRouteHost {
+        calls: AtomicUsize,
+    }
+
+    impl rsclaw_types::OutboundA2aHost for NoRouteHost {
+        fn try_send(
+            &self,
+            _request: rsclaw_types::OutboundA2aRequest,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<Option<String>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_no_route_falls_back_to_http_sse() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let address = listener.local_addr().expect("test HTTP address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept test request");
+            let mut request = vec![0_u8; 8192];
+            let bytes = socket.read(&mut request).await.expect("read test request");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.starts_with("POST /api/v1/a2a HTTP/1.1"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("accept: text/event-stream")
+            );
+
+            let body = concat!(
+                "data: {\"jsonrpc\":\"2.0\",\"id\":\"test\",\"result\":",
+                "{\"kind\":\"artifact-update\",\"artifact\":{\"parts\":[",
+                "{\"type\":\"text\",\"text\":\"http fallback\"}]}}}\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write test response");
+        });
+        let host = Arc::new(NoRouteHost {
+            calls: AtomicUsize::new(0),
+        });
+
+        let transport = open_outbound_a2a_transport(
+            Some(host.clone()),
+            Some("node-b/main".to_owned()),
+            Some("main"),
+            &format!("http://{address}"),
+            rsclaw_types::OutboundA2aRequest {
+                target: String::new(),
+                text: "hello".to_owned(),
+                context_id: "context".to_owned(),
+                principal: "caller".to_owned(),
+            },
+            None,
+        )
+        .await
+        .expect("open HTTP fallback");
+        let OutboundA2aTransport::Http(mut stream) = transport else {
+            panic!("expected HTTP fallback transport");
+        };
+        let event = stream
+            .next()
+            .await
+            .expect("one SSE event")
+            .expect("valid SSE event");
+
+        assert_eq!(host.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(event["artifact"]["parts"][0]["text"], "http fallback");
+        server.await.expect("test HTTP server completed");
+    }
 }

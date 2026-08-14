@@ -136,6 +136,52 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 // AppState
 // ---------------------------------------------------------------------------
 
+/// Suspended runtime input owned by one exact A2A task incarnation.
+pub struct OwnedSuspendedTask {
+    /// Resume sender and task metadata consumed by the follow-up request.
+    pub task: rsclaw_a2a_types::event::SuspendedTask,
+    /// Exact cancellation token identifying the task incarnation.
+    pub cancel_owner: Arc<tokio_util::sync::CancellationToken>,
+}
+
+/// Remove suspended input for the currently registered task incarnation.
+pub(crate) fn take_current_suspended_task(
+    suspended_tasks: &dashmap::DashMap<String, OwnedSuspendedTask>,
+    task_cancels: &dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+    task_id: &str,
+) -> Option<OwnedSuspendedTask> {
+    // Keep the DashMap read guard alive through suspension removal so a
+    // replacement cannot change the current owner between lookup and consume.
+    let owner = task_cancels.get(task_id)?;
+    remove_suspended_task_if_owner(suspended_tasks, task_id, owner.value())
+}
+
+/// Remove suspended input only when it belongs to the expected task
+/// incarnation.
+pub(crate) fn remove_suspended_task_if_owner(
+    suspended_tasks: &dashmap::DashMap<String, OwnedSuspendedTask>,
+    task_id: &str,
+    owner: &Arc<tokio_util::sync::CancellationToken>,
+) -> Option<OwnedSuspendedTask> {
+    suspended_tasks
+        .remove_if(task_id, |_, suspended| {
+            Arc::ptr_eq(&suspended.cancel_owner, owner)
+        })
+        .map(|(_, suspended)| suspended)
+}
+
+/// Remove the current A2A cancellation token only when it is the expected task
+/// owner.
+pub(crate) fn remove_task_cancel_if_owner(
+    task_cancels: &dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+    task_id: &str,
+    owner: &Arc<tokio_util::sync::CancellationToken>,
+) -> Option<Arc<tokio_util::sync::CancellationToken>> {
+    task_cancels
+        .remove_if(task_id, |_, current| Arc::ptr_eq(current, owner))
+        .map(|(_, token)| token)
+}
+
 #[derive(Clone)]
 pub struct AppState {
     /// Static snapshot from startup — kept for backward-compatible handlers.
@@ -240,11 +286,11 @@ pub struct AppState {
     /// Cancellation tokens for in-flight A2A tasks, keyed by task_id.
     /// Inserted on SendMessage / SendStreamingMessage entry; fired by
     /// CancelTask.
-    pub task_cancels: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    pub task_cancels: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
     /// Tasks paused on TASK_STATE_INPUT_REQUIRED / AUTH_REQUIRED, keyed by
     /// task_id. Resumed when the client sends another SendMessage with the
     /// matching taskId.
-    pub suspended_tasks: Arc<dashmap::DashMap<String, crate::a2a::event::SuspendedTask>>,
+    pub suspended_tasks: Arc<dashmap::DashMap<String, OwnedSuspendedTask>>,
     /// Persistent A2A task / push-config store (redb).
     pub task_store: Arc<crate::a2a::store::TaskStore>,
     /// Push notification dispatcher (subscribes to event bus, signs payloads).
