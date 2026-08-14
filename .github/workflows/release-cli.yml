@@ -35,9 +35,26 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             archive: tar.gz
+            zig_target: x86_64-unknown-linux-gnu.2.34
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
             archive: tar.gz
+            zig_target: aarch64-unknown-linux-gnu.2.34
+          # Fully static musl builds — no glibc floor, no shared objects, so a
+          # single artifact runs on any Linux distro regardless of age. Added
+          # alongside (not replacing) the gnu targets: if a musl build breaks,
+          # the Linux release still ships. `zig_target` carries no glibc suffix
+          # because musl is linked statically.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            archive: tar.gz
+            zig_target: x86_64-unknown-linux-musl
+            cargo_features: mimalloc-allocator
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04-arm
+            archive: tar.gz
+            zig_target: aarch64-unknown-linux-musl
+            cargo_features: mimalloc-allocator
           - target: x86_64-apple-darwin
             os: macos-14
             archive: tar.gz
@@ -101,9 +118,15 @@ jobs:
           pip install --user ziglang
           cargo install --locked cargo-zigbuild
 
-      - name: Build (Linux, glibc-pinned via zigbuild)
+      # gnu targets pin the glibc floor via the `.2.34` suffix; musl targets
+      # link libc statically and take the bare triple. `matrix.zig_target`
+      # encodes that difference, and `cargo_features` turns on mimalloc for
+      # musl only.
+      - name: Build (Linux, via zigbuild)
         if: runner.os == 'Linux'
-        run: cargo zigbuild --release --target ${{ matrix.target }}.2.34
+        run: |
+          cargo zigbuild --release --target ${{ matrix.zig_target }} \
+            ${{ matrix.cargo_features && format('--features {0}', matrix.cargo_features) || '' }}
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
@@ -112,6 +135,25 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         run: cargo build --release --target ${{ matrix.target }}
+
+      # A musl artifact that silently picked up a shared-object dependency
+      # would defeat the whole point ("runs on any distro"), and the failure
+      # only surfaces on a user's machine. Fail the build here instead.
+      - name: Verify musl binary is fully static
+        if: contains(matrix.target, 'musl')
+        run: |
+          bin="target/${{ matrix.target }}/release/rsclaw"
+          file "$bin"
+          if readelf -d "$bin" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::musl build has dynamic dependencies:"
+            readelf -d "$bin" | grep 'NEEDED'
+            exit 1
+          fi
+          if readelf -l "$bin" 2>/dev/null | grep -q 'INTERP'; then
+            echo "::error::musl build still requests a dynamic loader"
+            exit 1
+          fi
+          echo "OK: no NEEDED entries, no INTERP segment"
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
