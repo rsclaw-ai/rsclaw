@@ -452,19 +452,13 @@ pub(crate) fn start_dingtalk_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(10),
-                                reply_rx,
-                            )
-                            .await
+                            match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+                                .await
                             {
                                 Ok(Ok(r)) => {
                                     if !r.is_empty {
-                                        let target = if is_group {
-                                            conversation_id
-                                        } else {
-                                            sender_id
-                                        };
+                                        let target =
+                                            if is_group { conversation_id } else { sender_id };
                                         if let Err(e) = tx
                                             .send(OutboundMessage {
                                                 target_id: target,

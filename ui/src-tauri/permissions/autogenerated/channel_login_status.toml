@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-channel-login-status"
+description = "Enables the channel_login_status command without any pre-configured scope."
+commands.allow = ["channel_login_status"]
+
+[[permission]]
+identifier = "deny-channel-login-status"
+description = "Denies the channel_login_status command without any pre-configured scope."
+commands.deny = ["channel_login_status"]

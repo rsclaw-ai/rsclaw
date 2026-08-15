@@ -78,7 +78,9 @@ fn a2a_p2p_hub_route_remains_relayed() {
 #[test]
 fn a2a_p2p_direct_route_is_local_to_peer_manager() {
     let peer_manager = PeerManager::default();
-    peer_manager.add_route("node-b/main", "node-b");
+    peer_manager
+        .replace_routes("node-b", &["node-b/main".to_owned()])
+        .expect("direct route lease");
     let route = peer_manager.route_for("node-b/main").expect("direct route");
     assert_eq!(route.mode, RouteMode::Direct);
     assert_eq!(route.node_id, "node-b");
@@ -91,7 +93,9 @@ fn a2a_p2p_stale_generation_cannot_remove_replacement() {
     let (second_tx, _second_rx) = mpsc::channel(4);
     let first = peer_manager.register_connection("node-b", "session-old", first_tx);
     let second = peer_manager.register_connection("node-b", "session-new", second_tx);
-    peer_manager.add_route("node-b/main", "node-b");
+    peer_manager
+        .replace_routes("node-b", &["node-b/main".to_owned()])
+        .expect("direct route lease");
 
     peer_manager.unregister_connection("node-b", first);
     assert!(peer_manager.has_direct_connection("node-b"));
@@ -105,7 +109,9 @@ fn a2a_p2p_stale_generation_cannot_remove_replacement() {
 #[test]
 fn a2a_p2p_task_route_is_recorded_for_follow_up() {
     let peer_manager = PeerManager::default();
-    peer_manager.record_task_route("task-42", "node-b/main");
+    peer_manager
+        .record_task_route("task-42", "node-b/main")
+        .expect("task route should be recorded");
     assert_eq!(
         peer_manager.route_for_task("task-42").as_deref(),
         Some("node-b/main")

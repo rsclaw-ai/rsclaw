@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/remote-schema.json",
+  "identifier": "rsclaw-console",
+  "description": "Narrow command capability for the hosted RsClaw console",
+  "windows": ["rsclaw-console"],
+  "remote": {
+    "urls": ["https://api.rsclaw.ai/*"]
+  },
+  "permissions": [
+    "allow-close-rsclaw-console",
+    "allow-rsclaw-console-install-key"
+  ]
+}

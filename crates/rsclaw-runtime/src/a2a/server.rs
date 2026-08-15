@@ -173,6 +173,19 @@ pub async fn a2a_rpc_handler_inner(
     req: JsonRpcRequest,
 ) -> Json<JsonRpcResponse> {
     let id = req.id.clone();
+    let default_agent = state.agents.default_agent().ok();
+    if !crate::a2a::auth::method_allowed_with_default(
+        caller.as_ref(),
+        &req.method,
+        &req.params,
+        default_agent.as_ref().map(|agent| agent.id.as_str()),
+    ) {
+        return Json(JsonRpcResponse::err(
+            id,
+            -32003,
+            format!("not authorized to call {}", req.method),
+        ));
+    }
     if let Some(response) =
         crate::a2a::relay::try_forward_jsonrpc(&state, caller.as_ref(), &req).await
     {
@@ -282,6 +295,15 @@ async fn handle_send_message(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Resume path: client is sending follow-up input to a paused task.
+    // Check ownership BEFORE consuming the suspended entry. Task ownership is
+    // immutable after atomic creation, so a different principal cannot steal a
+    // resume handle by supplying another caller's task ID.
+    if !caller_owns(&state.task_store, &caller, &task_id) {
+        return Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::not_found(format!("tasks/{task_id}")),
+        ));
+    }
     // Route the new text to the suspended runtime, then wait on the bus
     // for the resumed turn to reach a terminal state (or re-suspend with
     // another InputRequired). Without this wait, sync clients that don't
@@ -294,7 +316,17 @@ async fn handle_send_message(
         // Subscribe BEFORE firing the resume so we don't race past the
         // first events the bridged runtime emits.
         let mut bus_rx = state.task_event_bus.subscribe(&task_id);
-        let _ = suspended.task.resume_tx.send(text);
+        let suspended_context_id = suspended.task.context_id.clone();
+        if let Err(error) = deliver_resume_input(suspended.task.resume_tx, text) {
+            suspended.cancel_owner.cancel();
+            finalize_failed_task(
+                &state,
+                &task_id,
+                &suspended_context_id,
+                &suspended.cancel_owner,
+            );
+            return Json(JsonRpcResponse::err(id, -32004, error));
+        }
 
         let timeout_secs: u64 = std::env::var("RSCLAW_A2A_RESUME_TIMEOUT_SECS")
             .ok()
@@ -376,14 +408,30 @@ async fn handle_send_message(
         artifacts: vec![],
         metadata: None,
     };
-    if let Err(e) = state.task_store.put(&initial_task) {
-        warn!(err = %e, "failed to persist initial task");
-    }
-    // §7.5: record the creating principal so only it (or the operator token)
-    // can later read/cancel/configure this task.
-    if let Some(c) = caller.as_ref() {
-        if let Err(e) = state.task_store.put_owner(&task_id, &c.id) {
-            warn!(err = %e, task_id = %task_id, "failed to persist task owner");
+    // Persist task and owner in one transaction. A caller-supplied task ID may
+    // resume its existing suspended task above, but it may never overwrite an
+    // existing task or owner reservation.
+    match state.task_store.create_task(
+        &initial_task,
+        caller.as_ref().map(|identity| identity.id.as_str()),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            let error = if caller_owns(&state.task_store, &caller, &task_id) {
+                a2a_errors::invalid_argument(
+                    format!("task already exists: {task_id}"),
+                    "message.taskId",
+                )
+            } else {
+                a2a_errors::not_found(format!("tasks/{task_id}"))
+            };
+            return Json(JsonRpcResponse::err_struct(id, error));
+        }
+        Err(error) => {
+            return Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::internal(format!("cannot create task: {error}")),
+            ));
         }
     }
 
@@ -1154,6 +1202,15 @@ async fn resolve_agent_workspace(state: &AppState, agent_id: Option<&str>) -> st
         .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"))
 }
 
+fn deliver_resume_input(
+    resume_tx: tokio::sync::oneshot::Sender<String>,
+    text: String,
+) -> Result<(), String> {
+    resume_tx
+        .send(text)
+        .map_err(|_| "suspended task resume receiver closed".to_owned())
+}
+
 /// Mark a task as Failed and clean up its in-memory state.
 /// Used by every early-error return in `handle_send_message` so a task
 /// that never reached `Completed` doesn't linger as `Working` in the store
@@ -1251,6 +1308,17 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn closed_resume_receiver_is_reported_immediately() {
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        drop(resume_rx);
+
+        let error = deliver_resume_input(resume_tx, "follow-up".to_owned())
+            .expect_err("closed receiver must reject resume input");
+
+        assert_eq!(error, "suspended task resume receiver closed");
     }
 
     #[test]

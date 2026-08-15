@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-uninstall-skill"
+description = "Enables the uninstall_skill command without any pre-configured scope."
+commands.allow = ["uninstall_skill"]
+
+[[permission]]
+identifier = "deny-uninstall-skill"
+description = "Denies the uninstall_skill command without any pre-configured scope."
+commands.deny = ["uninstall_skill"]

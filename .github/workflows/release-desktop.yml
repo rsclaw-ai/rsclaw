@@ -15,7 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RSCLAW_BUILD_DATE: ${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   # RSCLAW_BUILD_VERSION is computed per-job below — we strip the `app-`
   # prefix from the desktop tag so the embedded `--version` string
   # matches what the CLI release (tagged `v*`) bakes in. Otherwise the
@@ -73,11 +73,39 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+
+      - name: Verify release source and paired tag provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^app-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${RELEASE_TAG#app-v}"
+          tag_ref="refs/tags/$RELEASE_TAG"
+          counterpart_ref="refs/tags/v$version"
+          git show-ref --verify --quiet "$tag_ref"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$tag_ref^{commit}")"
+
+          cargo_version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          ui_cargo_version="$(awk -F '"' '/^version = "/ { print $2; exit }' ui/src-tauri/Cargo.toml)"
+          tauri_version="$(node -p "require('./ui/src-tauri/tauri.conf.json').version")"
+          for declared in "$cargo_version" "$ui_cargo_version" "$tauri_version"; do
+            test "$declared" = "$version" || {
+              printf 'release tag version %s does not match declared version %s\n' "$version" "$declared" >&2
+              exit 1
+            }
+          done
+
+          git fetch --force --no-tags origin "$counterpart_ref:$counterpart_ref"
+          git show-ref --verify --quiet "$counterpart_ref"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$counterpart_ref^{commit}")"
+          echo "RSCLAW_BUILD_DATE=$(git show -s --format=%cI HEAD)" >> "$GITHUB_ENV"
 
       - name: Compute clean version
         shell: bash
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="$RELEASE_TAG"
           # Strip "app-" prefix so the binary's embedded version matches
           # what the CLI release pipeline (tagged `v*`) bakes in.
           echo "RSCLAW_BUILD_VERSION=${TAG#app-}" >> "$GITHUB_ENV"
@@ -194,7 +222,7 @@ jobs:
         shell: bash
         run: |
           # Strip "app-" prefix from tag for clean filename: app-v2026.4.6 -> v2026.4.6
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="$RELEASE_TAG"
           VERSION="${TAG#app-}"
           for f in ${{ matrix.bundle_path }}; do
             dir=$(dirname "$f")
@@ -213,9 +241,10 @@ jobs:
     name: Create Desktop Release
     runs-on: ubuntu-latest
     needs: desktop
-    if: always() && !cancelled()
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
 
       - uses: actions/download-artifact@v8
         with:
@@ -229,15 +258,36 @@ jobs:
             \( -name "*.dmg" -o -name "*.exe" -o -name "*.deb" \) \
             -exec mv {} artifacts/ \;
 
-      - name: Generate checksums
+      - name: Verify artifact set and generate checksums
+        shell: bash
         run: |
+          set -euo pipefail
           cd artifacts
-          sha256sum RsClaw-* 2>/dev/null > SHA256SUMS-desktop.txt || true
+          shopt -s nullglob
+          VERSION="${RELEASE_TAG#app-}"
+          expected=(
+            "RsClaw-${VERSION}-x86_64-unknown-linux-gnu.deb"
+            "RsClaw-${VERSION}-aarch64-unknown-linux-gnu.deb"
+            "RsClaw-${VERSION}-x86_64-apple-darwin.dmg"
+            "RsClaw-${VERSION}-aarch64-apple-darwin.dmg"
+            "RsClaw-${VERSION}-x86_64-pc-windows-msvc.exe"
+            "RsClaw-${VERSION}-aarch64-pc-windows-msvc.exe"
+          )
+          files=(RsClaw-*)
+          if [[ ${#files[@]} -ne ${#expected[@]} ]]; then
+            printf 'expected %s desktop artifacts, found %s\n' "${#expected[@]}" "${#files[@]}" >&2
+            printf 'artifact: %s\n' "${files[@]:-<none>}" >&2
+            exit 1
+          fi
+          for file in "${expected[@]}"; do
+            [[ -f "$file" ]] || { printf 'missing expected artifact: %s\n' "$file" >&2; exit 1; }
+          done
+          sha256sum "${expected[@]}" > SHA256SUMS-desktop.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           files: |
             artifacts/RsClaw-*

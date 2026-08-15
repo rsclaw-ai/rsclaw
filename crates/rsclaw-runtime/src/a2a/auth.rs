@@ -10,7 +10,8 @@
 //!
 //! On a successful match the resolved [`A2aIdentity`] (id + scopes, no secret)
 //! is inserted into the request extensions so downstream handlers can attribute
-//! and authorize the call (A2A spec §7.5; scope enforcement is a follow-up).
+//! and authorize the call. Standard inbound JSON-RPC methods enforce the
+//! principal's configured scopes before dispatch (A2A spec §7.5).
 //!
 //! When the pool is empty the middleware passes everything through (dev mode).
 
@@ -31,6 +32,87 @@ use crate::server::{AppState, constant_time_eq};
 pub struct A2aIdentity {
     pub id: String,
     pub scopes: Vec<String>,
+}
+
+/// Build the identity for an already-authenticated direct or relay transport.
+///
+/// Callers must perform the transport-specific node and target ACL checks
+/// before constructing this identity. The global grant prevents the standard
+/// HTTP authorization layer from rejecting the same request a second time.
+pub(crate) fn transport_authenticated_identity(id: String) -> A2aIdentity {
+    A2aIdentity {
+        id,
+        scopes: vec!["*".to_owned()],
+    }
+}
+
+/// Return whether a caller may dispatch one standard inbound A2A method.
+///
+/// Supported grants are the global `*`, `a2a:method:<Method>`, and action
+/// scopes: `a2a:invoke:<agent>`, `a2a:read:<resource>`,
+/// `a2a:cancel:<taskId>`, and `a2a:push:<taskId>`. Wildcard targets are
+/// accepted by the shared relay scope matcher. Dev/no-auth and the gateway
+/// operator remain unrestricted.
+pub(crate) fn method_allowed(
+    identity: Option<&A2aIdentity>,
+    method: &str,
+    params: &serde_json::Value,
+) -> bool {
+    method_allowed_with_default(identity, method, params, None)
+}
+
+/// Return whether a caller may dispatch an A2A method after resolving the
+/// server's default agent for requests that omit `metadata.agentId`.
+pub(crate) fn method_allowed_with_default(
+    identity: Option<&A2aIdentity>,
+    method: &str,
+    params: &serde_json::Value,
+    default_agent_id: Option<&str>,
+) -> bool {
+    let Some(identity) = identity else {
+        return true;
+    };
+    if identity.id == "gateway-auth"
+        || crate::a2a::relay::scope_allows(&identity.scopes, "a2a", "method", method)
+    {
+        return true;
+    }
+
+    let task_id = || {
+        params
+            .get("id")
+            .or_else(|| params.get("taskId"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("*")
+    };
+    match method {
+        "SendMessage" | "SendStreamingMessage" => {
+            let target = params
+                .get("metadata")
+                .and_then(|metadata| metadata.get("agentId"))
+                .and_then(serde_json::Value::as_str)
+                .or(default_agent_id)
+                .unwrap_or("*");
+            crate::a2a::relay::scope_allows(&identity.scopes, "a2a", "invoke", target)
+        }
+        "GetExtendedAgentCard" => {
+            crate::a2a::relay::scope_allows(&identity.scopes, "a2a", "read", "agent-card")
+        }
+        "GetTask" | "SubscribeToTask" => {
+            crate::a2a::relay::scope_allows(&identity.scopes, "a2a", "read", task_id())
+        }
+        "ListTasks" => crate::a2a::relay::scope_allows(&identity.scopes, "a2a", "read", "tasks"),
+        "CancelTask" => {
+            crate::a2a::relay::scope_allows(&identity.scopes, "a2a", "cancel", task_id())
+        }
+        "CreateTaskPushNotificationConfig"
+        | "GetTaskPushNotificationConfig"
+        | "ListTaskPushNotificationConfigs"
+        | "DeleteTaskPushNotificationConfig" => {
+            crate::a2a::relay::scope_allows(&identity.scopes, "a2a", "push", task_id())
+        }
+        _ => false,
+    }
 }
 
 /// Snapshot of accepted A2A credentials, materialised once per request.
@@ -192,6 +274,110 @@ mod tests {
         assert!(a.match_secret("wrong").is_none());
         // Length mismatch is rejected by constant_time_eq.
         assert!(a.match_secret("rightandmore").is_none());
+    }
+
+    #[test]
+    fn standard_method_scopes_are_enforced() {
+        let invoke = A2aIdentity {
+            id: "partner".to_owned(),
+            scopes: vec!["a2a:invoke:main".to_owned()],
+        };
+        let send = serde_json::json!({"metadata": {"agentId": "main"}});
+        assert!(method_allowed(Some(&invoke), "SendMessage", &send));
+        assert!(!method_allowed(
+            Some(&invoke),
+            "SendMessage",
+            &serde_json::json!({"metadata": {"agentId": "other"}})
+        ));
+        assert!(!method_allowed(
+            Some(&invoke),
+            "CancelTask",
+            &serde_json::json!({"id": "task-1"})
+        ));
+
+        let task = A2aIdentity {
+            id: "partner".to_owned(),
+            scopes: vec!["a2a:read:task-1".to_owned(), "a2a:cancel:task-1".to_owned()],
+        };
+        assert!(method_allowed(
+            Some(&task),
+            "GetTask",
+            &serde_json::json!({"id": "task-1"})
+        ));
+        assert!(method_allowed(
+            Some(&task),
+            "CancelTask",
+            &serde_json::json!({"id": "task-1"})
+        ));
+        assert!(!method_allowed(
+            Some(&task),
+            "GetTask",
+            &serde_json::json!({"id": "task-2"})
+        ));
+    }
+
+    #[test]
+    fn method_and_global_wildcards_are_explicit() {
+        let method = A2aIdentity {
+            id: "partner".to_owned(),
+            scopes: vec!["a2a:method:GetExtendedAgentCard".to_owned()],
+        };
+        assert!(method_allowed(
+            Some(&method),
+            "GetExtendedAgentCard",
+            &serde_json::json!({})
+        ));
+        assert!(!method_allowed(
+            Some(&method),
+            "ListTasks",
+            &serde_json::json!({})
+        ));
+
+        let all = A2aIdentity {
+            id: "legacy".to_owned(),
+            scopes: vec!["*".to_owned()],
+        };
+        assert!(method_allowed(
+            Some(&all),
+            "ListTasks",
+            &serde_json::json!({})
+        ));
+    }
+
+    #[test]
+    fn default_agent_scope_is_resolved_before_authorization() {
+        let invoke = A2aIdentity {
+            id: "partner".to_owned(),
+            scopes: vec!["a2a:invoke:main".to_owned()],
+        };
+        let params = serde_json::json!({"message": {"parts": []}});
+        assert!(method_allowed_with_default(
+            Some(&invoke),
+            "SendMessage",
+            &params,
+            Some("main")
+        ));
+        assert!(!method_allowed_with_default(
+            Some(&invoke),
+            "SendMessage",
+            &params,
+            Some("other")
+        ));
+    }
+
+    #[test]
+    fn transport_authenticated_identity_has_global_grant() {
+        let identity = transport_authenticated_identity("node:peer-a".to_owned());
+        assert!(method_allowed(
+            Some(&identity),
+            "SendMessage",
+            &serde_json::json!({"metadata": {"agentId": "main"}})
+        ));
+        assert!(method_allowed(
+            Some(&identity),
+            "GetTask",
+            &serde_json::json!({"id": "task-1"})
+        ));
     }
 
     #[test]

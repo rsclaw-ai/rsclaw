@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-scan-openclaw"
+description = "Enables the scan_openclaw command without any pre-configured scope."
+commands.allow = ["scan_openclaw"]
+
+[[permission]]
+identifier = "deny-scan-openclaw"
+description = "Denies the scan_openclaw command without any pre-configured scope."
+commands.deny = ["scan_openclaw"]

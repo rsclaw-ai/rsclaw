@@ -58,10 +58,7 @@ impl DeviceStore {
             .read()
             .await
             .values()
-            .any(|r| {
-                r.device_token == token
-                    && r.expires_at.is_none_or(|exp| now < exp)
-            })
+            .any(|r| r.device_token == token && r.expires_at.is_none_or(|exp| now < exp))
     }
 
     /// Device token lifetime: 30 days. Long enough for interactive sessions,

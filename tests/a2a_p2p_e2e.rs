@@ -6,7 +6,11 @@
 
 use std::{sync::Arc, time::Duration};
 
-use rsclaw::a2a::{peer::PeerManager, relay::RelayFrame, types::JsonRpcResponse};
+use rsclaw::a2a::{
+    peer::PeerManager,
+    relay::{RelayFrame, RelayStreamItem},
+    types::JsonRpcResponse,
+};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -18,7 +22,9 @@ async fn a2a_direct_pipeline_unary_response_is_correlated() {
     let manager = Arc::new(PeerManager::default());
     let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
     manager.register_connection(PEER_NODE, "session-unary", outbound_tx);
-    manager.add_route(PEER_AGENT, PEER_NODE);
+    manager
+        .replace_routes(PEER_NODE, &[PEER_AGENT.to_owned()])
+        .expect("direct route lease");
 
     let invoke_manager = Arc::clone(&manager);
     let invoke = tokio::spawn(async move {
@@ -46,9 +52,10 @@ async fn a2a_direct_pipeline_unary_response_is_correlated() {
         }
         other => panic!("expected Request, got {other:?}"),
     };
-    manager.complete_pending(
+    manager.complete_pending_from(
         &request_id,
         JsonRpcResponse::ok(Value::Null, json!({"id": "task-1"})),
+        PEER_NODE,
     );
 
     let response = tokio::time::timeout(Duration::from_secs(1), invoke)
@@ -64,7 +71,9 @@ async fn a2a_direct_pipeline_stream_event_records_task_route() {
     let manager = Arc::new(PeerManager::default());
     let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
     manager.register_connection(PEER_NODE, "session-stream", outbound_tx);
-    manager.add_route(PEER_AGENT, PEER_NODE);
+    manager
+        .replace_routes(PEER_NODE, &[PEER_AGENT.to_owned()])
+        .expect("direct route lease");
 
     let invoke_manager = Arc::clone(&manager);
     let invoke = tokio::spawn(async move {
@@ -91,8 +100,9 @@ async fn a2a_direct_pipeline_stream_event_records_task_route() {
         .expect("invoke task panicked")
         .expect("invoke stream");
 
-    let receivers = manager.forward_stream_event(
+    let receivers = manager.forward_stream_event_from(
         &request_id,
+        PEER_NODE,
         json!({
             "kind": "status-update",
             "taskId": "task-stream",
@@ -101,10 +111,13 @@ async fn a2a_direct_pipeline_stream_event_records_task_route() {
         }),
     );
     assert_eq!(receivers, 1);
-    let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+    let item = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
         .await
         .expect("stream event timeout")
         .expect("stream event channel closed");
+    let RelayStreamItem::Event(event) = item else {
+        panic!("remote event must not be reclassified as a transport error");
+    };
     assert_eq!(event["taskId"], "task-stream");
     assert_eq!(
         manager.route_for_task("task-stream").as_deref(),

@@ -8,9 +8,12 @@ extern crate objc;
 mod stream;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{Emitter, Manager};
-use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
-use tauri::tray::TrayIconBuilder;
+
+use tauri::{
+    Emitter, Manager,
+    menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
+    tray::TrayIconBuilder,
+};
 
 /// True when user has manually stopped gateway (close = quit instead of hide).
 static GATEWAY_USER_STOPPED: AtomicBool = AtomicBool::new(false);
@@ -70,9 +73,7 @@ fn tray_lang() -> &'static str {
     let cfg_path = rsclaw_base_dir().join("rsclaw.json5");
     if let Ok(body) = std::fs::read_to_string(&cfg_path)
         && let Ok(val) = json5::from_str::<serde_json::Value>(&body)
-        && let Some(lang) = val
-            .pointer("/gateway/language")
-            .and_then(|v| v.as_str())
+        && let Some(lang) = val.pointer("/gateway/language").and_then(|v| v.as_str())
     {
         return resolve_tray_lang(lang);
     }
@@ -124,8 +125,16 @@ fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let sidecar_result = exe_dir.as_ref().and_then(|dir| {
-        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
-        eprintln!("[cmd] sidecar path: {} exists={}", sidecar.display(), sidecar.exists());
+        let sidecar = dir.join(if cfg!(target_os = "windows") {
+            "rsclaw.exe"
+        } else {
+            "rsclaw"
+        });
+        eprintln!(
+            "[cmd] sidecar path: {} exists={}",
+            sidecar.display(),
+            sidecar.exists()
+        );
         if sidecar.exists() {
             hide_window(std::process::Command::new(&sidecar).args(args))
                 .output()
@@ -180,7 +189,11 @@ fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let (stdout, stderr, success) = match exe_dir.as_ref().and_then(|dir| {
-        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
+        let sidecar = dir.join(if cfg!(target_os = "windows") {
+            "rsclaw.exe"
+        } else {
+            "rsclaw"
+        });
         if sidecar.exists() {
             hide_window(std::process::Command::new(&sidecar).args(&str_args))
                 .output()
@@ -212,7 +225,8 @@ fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
     if success {
         Ok(combined)
     } else {
-        // Still return output even on failure (doctor may report issues as non-zero exit)
+        // Still return output even on failure (doctor may report issues as non-zero
+        // exit)
         Ok(combined)
     }
 }
@@ -225,7 +239,11 @@ fn start_gateway() -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     if let Some(dir) = &exe_dir {
-        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
+        let sidecar = dir.join(if cfg!(target_os = "windows") {
+            "rsclaw.exe"
+        } else {
+            "rsclaw"
+        });
         if sidecar.exists() {
             hide_window(
                 std::process::Command::new(&sidecar)
@@ -299,17 +317,13 @@ fn clear_webview_cache_dirs() -> Result<String, String> {
             webkit.join("EnhancedSecurity"),
             webkit.join("ServiceWorker"),
             webkit.join("CacheStorage"),
-            home.join("Library")
-                .join("Caches")
-                .join(identifier),
+            home.join("Library").join("Caches").join(identifier),
         ]
     } else if cfg!(target_os = "windows") {
         // WebView2 user-data directory; Tauri stores it under the app's
         // local appdata. We delete the cache subtrees only.
         let local = home.join("AppData").join("Local").join(identifier);
-        let edge = local
-            .join("EBWebView")
-            .join("Default");
+        let edge = local.join("EBWebView").join("Default");
         vec![
             edge.join("Cache"),
             edge.join("Code Cache"),
@@ -361,8 +375,8 @@ fn run_setup() -> Result<String, String> {
 /// It never overwrites an existing `rsclaw` — if the user already installed
 /// the CLI, we leave their copy alone.
 ///
-/// - macOS/Linux: symlink the sidecar into /usr/local/bin (standard PATH);
-///   fall back to ~/.local/bin if that dir isn't writable.
+/// - macOS/Linux: symlink the sidecar into /usr/local/bin (standard PATH); fall
+///   back to ~/.local/bin if that dir isn't writable.
 /// - Windows: append the sidecar's directory to the user PATH (HKCU) via
 ///   PowerShell, only if it isn't already present.
 fn ensure_rsclaw_on_path() {
@@ -443,15 +457,13 @@ fn ensure_rsclaw_on_path() {
              if (($p -split ';') -notcontains $d) {{ \
                [Environment]::SetEnvironmentVariable('PATH', ($d + ';' + $p), 'User') }}"
         );
-        let status = hide_window(
-            std::process::Command::new("powershell").args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &ps,
-            ]),
-        )
+        let status = hide_window(std::process::Command::new("powershell").args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &ps,
+        ]))
         .status();
         match status {
             Ok(s) if s.success() => {
@@ -530,9 +542,8 @@ fn seed_bundled_bge_model<R: tauri::Runtime>(
     for filename in ["config.json", "tokenizer.json", "model.safetensors"] {
         let src = res_dir.join(filename);
         let dst = staging.join(filename);
-        std::fs::copy(&src, &dst).map_err(|e| {
-            format!("copy {} -> {}: {e}", src.display(), dst.display())
-        })?;
+        std::fs::copy(&src, &dst)
+            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
     }
     // Sentinel content matches what the CLI writes — version + bundle
     // marker so a sentinel-aware tool can tell where the install came from.
@@ -552,13 +563,9 @@ fn seed_bundled_bge_model<R: tauri::Runtime>(
     if target.exists() {
         let _ = std::fs::remove_dir_all(&target);
     }
-    std::fs::rename(&staging, &target).map_err(|e| {
-        format!("rename {} -> {}: {e}", staging.display(), target.display())
-    })?;
-    eprintln!(
-        "[setup] seeded bundled BGE model -> {}",
-        target.display()
-    );
+    std::fs::rename(&staging, &target)
+        .map_err(|e| format!("rename {} -> {}: {e}", staging.display(), target.display()))?;
+    eprintln!("[setup] seeded bundled BGE model -> {}", target.display());
     Ok(())
 }
 
@@ -594,22 +601,50 @@ fn resolve_workspace_dir(agent_id: &str) -> std::path::PathBuf {
     base.join("workspace")
 }
 
-/// Write a file to an agent's workspace directory.
+const EDITABLE_WORKSPACE_FILES: &[&str] = &["SOUL.md", "USER.md"];
+
+fn workspace_file_path(agent_id: &str, file_name: &str) -> Result<std::path::PathBuf, String> {
+    if !EDITABLE_WORKSPACE_FILES.contains(&file_name) {
+        return Err(format!("workspace file is not editable: {file_name}"));
+    }
+    Ok(resolve_workspace_dir(agent_id).join(file_name))
+}
+
+/// Write a supported profile file to an agent's workspace directory.
 #[tauri::command]
-fn write_workspace_file(agent_id: String, file_name: String, content: String) -> Result<String, String> {
-    let ws_dir = resolve_workspace_dir(&agent_id);
-    let _ = std::fs::create_dir_all(&ws_dir);
-    let file_path = ws_dir.join(&file_name);
-    std::fs::write(&file_path, &content)
-        .map_err(|e| format!("write failed: {e}"))?;
+fn write_workspace_file(
+    agent_id: String,
+    file_name: String,
+    content: String,
+) -> Result<String, String> {
+    let file_path = workspace_file_path(&agent_id, &file_name)?;
+    let ws_dir = file_path
+        .parent()
+        .ok_or_else(|| "workspace file has no parent directory".to_owned())?;
+    std::fs::create_dir_all(ws_dir).map_err(|e| format!("create workspace failed: {e}"))?;
+    std::fs::write(&file_path, &content).map_err(|e| format!("write failed: {e}"))?;
     Ok(file_path.to_string_lossy().to_string())
 }
 
-/// Read a file from an agent's workspace directory.
+/// Read a supported profile file from an agent's workspace directory.
 #[tauri::command]
 fn read_workspace_file(agent_id: String, file_name: String) -> Result<String, String> {
-    let file_path = resolve_workspace_dir(&agent_id).join(&file_name);
+    let file_path = workspace_file_path(&agent_id, &file_name)?;
     std::fs::read_to_string(&file_path).map_err(|e| format!("read failed: {e}"))
+}
+
+#[cfg(test)]
+mod workspace_file_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_file_names_are_explicitly_bounded() {
+        assert!(workspace_file_path("default", "SOUL.md").is_ok());
+        assert!(workspace_file_path("default", "USER.md").is_ok());
+        assert!(workspace_file_path("default", "../rsclaw.json5").is_err());
+        assert!(workspace_file_path("default", "/tmp/escape").is_err());
+        assert!(workspace_file_path("default", "other.md").is_err());
+    }
 }
 
 /// Write config file to ~/.rsclaw/rsclaw.json5
@@ -626,8 +661,7 @@ fn write_config(content: String) -> Result<String, String> {
     if let Some(parent) = config_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(&config_path, &content)
-        .map_err(|e| format!("write failed: {e}"))?;
+    std::fs::write(&config_path, &content).map_err(|e| format!("write failed: {e}"))?;
     Ok(config_path.to_string_lossy().to_string())
 }
 
@@ -640,15 +674,18 @@ fn get_gateway_port() -> Result<serde_json::Value, String> {
     }
     let raw = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
     let val: serde_json::Value = json5::from_str(&raw).unwrap_or(serde_json::json!({}));
-    let port = val.pointer("/gateway/port")
+    let port = val
+        .pointer("/gateway/port")
         .and_then(|v| v.as_u64())
         .unwrap_or(18888);
-    let bind = val.pointer("/gateway/bind")
+    let bind = val
+        .pointer("/gateway/bind")
         .and_then(|v| v.as_str())
         .unwrap_or("loopback");
     let host = match bind {
         "loopback" | "auto" | "all" => "localhost",
-        "custom" => val.pointer("/gateway/bindAddress")
+        "custom" => val
+            .pointer("/gateway/bindAddress")
             .and_then(|v| v.as_str())
             .unwrap_or("localhost"),
         ip if ip.contains('.') || ip.contains(':') => ip,
@@ -658,7 +695,8 @@ fn get_gateway_port() -> Result<serde_json::Value, String> {
     // If missing, auto-generate one and write it to config.
     // Read-only: use token from config or env, never auto-generate.
     // If user wants auth they configure gateway.auth.token themselves.
-    let token = val.pointer("/gateway/auth/token")
+    let token = val
+        .pointer("/gateway/auth/token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned())
         .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
@@ -837,8 +875,8 @@ struct DefaultsCatalog {
 #[tauri::command]
 fn read_defaults_catalog() -> Result<String, String> {
     let user_path = rsclaw_base_dir().join("defaults.toml");
-    let toml_src = std::fs::read_to_string(&user_path)
-        .unwrap_or_else(|_| EMBEDDED_DEFAULTS_TOML.to_owned());
+    let toml_src =
+        std::fs::read_to_string(&user_path).unwrap_or_else(|_| EMBEDDED_DEFAULTS_TOML.to_owned());
 
     let catalog: DefaultsCatalog =
         toml::from_str(&toml_src).map_err(|e| format!("failed to parse defaults.toml: {e}"))?;
@@ -908,7 +946,7 @@ async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
         size.width, size.height, pos.x, pos.y
     );
 
-    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     let encoded = utf8_percent_encode(GLOW_OVERLAY_HTML, NON_ALPHANUMERIC).to_string();
     let html_url = format!("data:text/html;charset=utf-8,{encoded}");
     let parsed_url: url::Url = html_url
@@ -929,7 +967,10 @@ async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
         .inner_size(logical_w, logical_h)
         .position(logical_x, logical_y)
         .build()
-        .map_err(|e| { eprintln!("[glow] build FAILED: {e}"); format!("build glow window: {e}") })?;
+        .map_err(|e| {
+            eprintln!("[glow] build FAILED: {e}");
+            format!("build glow window: {e}")
+        })?;
 
     // Ignore cursor events so the overlay is fully click-through.
     window
@@ -1064,12 +1105,14 @@ fn rsclaw_console_init_script(allowed_origin: &str) -> String {
         r#"
 (function() {{
   try {{
-    // Only expose the channel when we're actually on the rsclaw.ai
-    // console. If the user navigates away (different origin) we don't
-    // want third-party pages getting it.
-    if (window.location.origin !== "{origin}") return;
-
+    // Capture then remove the broad bridge before any origin-dependent early
+    // return. If navigation ever reaches an unexpected origin, that page must
+    // not retain window.__TAURI__.
     var t = window.__TAURI__;
+    try {{ delete window.__TAURI__; }} catch (_) {{}}
+
+    // Only expose the narrow channel on the configured console origin.
+    if (window.location.origin !== "{origin}") return;
     if (!t) return;
     var invoke = (t.core && t.core.invoke) ? t.core.invoke.bind(t.core) : null;
     if (!invoke) return;
@@ -1092,9 +1135,6 @@ fn rsclaw_console_init_script(allowed_origin: &str) -> String {
       configurable: false
     }});
 
-    // Drop the broad surface so the page can't reach any other Tauri
-    // command. The two channels above are the entire contract.
-    try {{ delete window.__TAURI__; }} catch (_) {{}}
   }} catch (e) {{
     // Init failures shouldn't break the page — fall back to manual paste
     // (the desktop UI still has a paste field).
@@ -1109,16 +1149,81 @@ fn rsclaw_console_init_script(allowed_origin: &str) -> String {
     )
 }
 
+fn rsclaw_console_navigation_allowed(url: &url::Url, allowed_origin: &str) -> bool {
+    url.origin().ascii_serialization() == allowed_origin
+}
+
+fn rsclaw_console_command_source_allowed(label: &str, url: &url::Url) -> bool {
+    let Ok(configured_url) = RSCLAW_CONSOLE_BASE.parse::<url::Url>() else {
+        return false;
+    };
+    label == "rsclaw-console"
+        && rsclaw_console_navigation_allowed(url, &configured_url.origin().ascii_serialization())
+}
+
+#[cfg(test)]
+mod console_security_tests {
+    use super::*;
+
+    #[test]
+    fn console_navigation_is_restricted_to_exact_origin() {
+        let allowed = "https://api.rsclaw.ai";
+        assert!(rsclaw_console_navigation_allowed(
+            &"https://api.rsclaw.ai/console/keys"
+                .parse()
+                .expect("valid allowed URL"),
+            allowed,
+        ));
+        for denied in [
+            "http://api.rsclaw.ai/console",
+            "https://api.rsclaw.ai:444/console",
+            "https://evil.example/console",
+        ] {
+            assert!(!rsclaw_console_navigation_allowed(
+                &denied.parse().expect("valid denied URL"),
+                allowed,
+            ));
+        }
+    }
+
+    #[test]
+    fn console_commands_require_exact_label_and_origin() {
+        let allowed = "https://api.rsclaw.ai/console/keys"
+            .parse()
+            .expect("valid console URL");
+        assert!(rsclaw_console_command_source_allowed(
+            "rsclaw-console",
+            &allowed
+        ));
+        assert!(!rsclaw_console_command_source_allowed("main", &allowed));
+        assert!(!rsclaw_console_command_source_allowed(
+            "rsclaw-console",
+            &"https://evil.example/console"
+                .parse()
+                .expect("valid foreign URL")
+        ));
+    }
+
+    #[test]
+    fn console_init_removes_global_bridge_before_origin_check() {
+        let script = rsclaw_console_init_script("https://api.rsclaw.ai");
+        let removal = script
+            .find("delete window.__TAURI__")
+            .expect("init script must remove the broad bridge");
+        let origin_check = script
+            .find("window.location.origin !==")
+            .expect("init script must verify the console origin");
+        assert!(removal < origin_check);
+    }
+}
+
 /// Open (or focus, if already open) the rsclaw.ai console webview.
 ///
 /// `path` is appended to the configured `RSCLAW_CONSOLE_BASE` so callers
 /// can deep-link, e.g. `path = Some("/keys".into())` to land directly on
 /// the keys page. Defaults to the base URL when omitted.
 #[tauri::command]
-async fn open_rsclaw_console(
-    app: tauri::AppHandle,
-    path: Option<String>,
-) -> Result<(), String> {
+async fn open_rsclaw_console(app: tauri::AppHandle, path: Option<String>) -> Result<(), String> {
     use tauri::{WebviewUrl, WebviewWindowBuilder};
 
     // Focus existing window instead of stacking.
@@ -1151,6 +1256,7 @@ async fn open_rsclaw_console(
     let webview_url = WebviewUrl::External(parsed);
 
     let init_script = rsclaw_console_init_script(&origin);
+    let navigation_origin = origin.clone();
 
     WebviewWindowBuilder::new(&app, "rsclaw-console", webview_url)
         .title("rsclaw console")
@@ -1159,6 +1265,7 @@ async fn open_rsclaw_console(
         .center()
         .resizable(true)
         .focused(true)
+        .on_navigation(move |url| rsclaw_console_navigation_allowed(url, &navigation_origin))
         .initialization_script(&init_script)
         .build()
         .map_err(|e| format!("build console window: {e}"))?;
@@ -1171,7 +1278,18 @@ async fn open_rsclaw_console(
 /// injected `__RSCLAW_DESKTOP__.close()`) or directly by the desktop
 /// UI when the user cancels.
 #[tauri::command]
-async fn close_rsclaw_console(app: tauri::AppHandle) -> Result<(), String> {
+async fn close_rsclaw_console(
+    app: tauri::AppHandle,
+    source: tauri::WebviewWindow,
+) -> Result<(), String> {
+    let source_is_main = source.label() == "main";
+    let source_is_console = source
+        .url()
+        .ok()
+        .is_some_and(|url| rsclaw_console_command_source_allowed(source.label(), &url));
+    if !source_is_main && !source_is_console {
+        return Err("console close command rejected for this webview".to_owned());
+    }
     if let Some(window) = app.get_webview_window("rsclaw-console") {
         window
             .close()
@@ -1188,8 +1306,16 @@ async fn close_rsclaw_console(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn rsclaw_console_install_key(
     app: tauri::AppHandle,
+    source: tauri::WebviewWindow,
     data: serde_json::Value,
 ) -> Result<(), String> {
+    let source_allowed = source
+        .url()
+        .ok()
+        .is_some_and(|url| rsclaw_console_command_source_allowed(source.label(), &url));
+    if !source_allowed {
+        return Err("console key install command rejected for this webview".to_owned());
+    }
     app.emit("rsclaw:console-install-key", data)
         .map_err(|e| format!("emit install-key event: {e}"))?;
 
@@ -1289,9 +1415,7 @@ fn detect_openclaw() -> Result<Option<String>, String> {
     // 2. OPENCLAW_HOME -> direct dir.
     if let Ok(val) = std::env::var("OPENCLAW_HOME") {
         let dir = std::path::PathBuf::from(&val);
-        if dir.is_dir()
-            && (dir.join("openclaw.json").is_file() || dir.join("agents").is_dir())
-        {
+        if dir.is_dir() && (dir.join("openclaw.json").is_file() || dir.join("agents").is_dir()) {
             return Ok(Some(val));
         }
     }
@@ -1299,8 +1423,7 @@ fn detect_openclaw() -> Result<Option<String>, String> {
     if let Some(home) = dirs::home_dir() {
         for name in &[".openclaw", "bak.openclaw"] {
             let dir = home.join(name);
-            if dir.is_dir()
-                && (dir.join("openclaw.json").is_file() || dir.join("agents").is_dir())
+            if dir.is_dir() && (dir.join("openclaw.json").is_file() || dir.join("agents").is_dir())
             {
                 return Ok(Some(dir.to_string_lossy().to_string()));
             }
@@ -1319,7 +1442,9 @@ fn channel_login_start(channel: String) -> Result<String, String> {
 
     // Record config mtime for login completion detection
     let config_path = rsclaw_base_dir().join("rsclaw.json5");
-    let mtime = std::fs::metadata(&config_path).ok().and_then(|m| m.modified().ok());
+    let mtime = std::fs::metadata(&config_path)
+        .ok()
+        .and_then(|m| m.modified().ok());
     *LOGIN_START_MTIME.lock().unwrap() = mtime.or(Some(std::time::SystemTime::now()));
 
     // Try sidecar binary next to executable
@@ -1328,7 +1453,11 @@ fn channel_login_start(channel: String) -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let spawned = exe_dir.as_ref().and_then(|dir| {
-        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
+        let sidecar = dir.join(if cfg!(target_os = "windows") {
+            "rsclaw.exe"
+        } else {
+            "rsclaw"
+        });
         if sidecar.exists() {
             // hide_window prevents a flashing cmd console on Windows.
             hide_window(
@@ -1360,7 +1489,8 @@ fn channel_login_start(channel: String) -> Result<String, String> {
 }
 
 /// Track config mtime at login start
-static LOGIN_START_MTIME: std::sync::Mutex<Option<std::time::SystemTime>> = std::sync::Mutex::new(None);
+static LOGIN_START_MTIME: std::sync::Mutex<Option<std::time::SystemTime>> =
+    std::sync::Mutex::new(None);
 
 /// Check if channel login completed by comparing config mtime.
 #[tauri::command]
@@ -1406,8 +1536,16 @@ fn channel_login_qr() -> Result<Option<String>, String> {
         let n = (b0 << 16) | (b1 << 8) | b2;
         b64.push(B64[((n >> 18) & 0x3F) as usize] as char);
         b64.push(B64[((n >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 { b64.push(B64[((n >> 6) & 0x3F) as usize] as char); } else { b64.push('='); }
-        if chunk.len() > 2 { b64.push(B64[(n & 0x3F) as usize] as char); } else { b64.push('='); }
+        if chunk.len() > 1 {
+            b64.push(B64[((n >> 6) & 0x3F) as usize] as char);
+        } else {
+            b64.push('=');
+        }
+        if chunk.len() > 2 {
+            b64.push(B64[(n & 0x3F) as usize] as char);
+        } else {
+            b64.push('=');
+        }
     }
     Ok(Some(format!("data:image/png;base64,{}", b64)))
 }
@@ -1439,12 +1577,14 @@ fn save_cron_jobs(content: String) -> Result<(), String> {
     );
 
     use std::io::{Read, Write};
-    let addr = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>()
+    let addr = format!("127.0.0.1:{port}")
+        .parse::<std::net::SocketAddr>()
         .map_err(|e| format!("invalid addr: {e}"))?;
     match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)) {
         Ok(mut stream) => {
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-            stream.write_all(request.as_bytes())
+            stream
+                .write_all(request.as_bytes())
                 .map_err(|e| format!("send failed: {e}"))?;
             let mut resp = Vec::with_capacity(512);
             let _ = stream.read_to_end(&mut resp);
@@ -1491,18 +1631,19 @@ fn get_gateway_port_number() -> u64 {
 fn http_shutdown_gateway() -> Result<(), String> {
     use std::io::{Read, Write};
     let port = get_gateway_port_number();
-    let addr = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>()
+    let addr = format!("127.0.0.1:{port}")
+        .parse::<std::net::SocketAddr>()
         .map_err(|e| format!("invalid addr: {e}"))?;
-    let mut stream = std::net::TcpStream::connect_timeout(
-        &addr, std::time::Duration::from_secs(2),
-    ).map_err(|e| format!("connect failed: {e}"))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
+        .map_err(|e| format!("connect failed: {e}"))?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-    let req =
-        "POST /api/v1/shutdown HTTP/1.1\r\n\
+    let req = "POST /api/v1/shutdown HTTP/1.1\r\n\
          Host: 127.0.0.1\r\n\
          Content-Length: 0\r\n\
          Connection: close\r\n\r\n";
-    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
     let mut buf = [0u8; 256];
     let _ = stream.read(&mut buf); // drain response (best-effort)
     Ok(())
@@ -1530,7 +1671,11 @@ fn get_cron_jobs() -> Result<serde_json::Value, String> {
                 let mut resp = Vec::with_capacity(8192);
                 let _ = stream.read_to_end(&mut resp);
                 let resp_str = String::from_utf8_lossy(&resp);
-                if resp_str.lines().next().map_or(false, |l| l.contains(" 200 ")) {
+                if resp_str
+                    .lines()
+                    .next()
+                    .map_or(false, |l| l.contains(" 200 "))
+                {
                     if let Some(body_start) = resp_str.find("\r\n\r\n") {
                         let body = &resp_str[body_start + 4..];
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
@@ -1548,8 +1693,7 @@ fn get_cron_jobs() -> Result<serde_json::Value, String> {
         return Ok(serde_json::json!({ "jobs": [] }));
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let val: serde_json::Value =
-        json5::from_str(&raw).unwrap_or(serde_json::json!({ "jobs": [] }));
+    let val: serde_json::Value = json5::from_str(&raw).unwrap_or(serde_json::json!({ "jobs": [] }));
     Ok(val)
 }
 
@@ -1564,7 +1708,9 @@ fn get_skills() -> Result<serde_json::Value, String> {
                 if entry.file_type().map_or(false, |ft| ft.is_dir()) {
                     let name = entry.file_name().to_string_lossy().to_string();
                     // Skip hidden dirs and metadata dirs
-                    if name.starts_with('.') { continue; }
+                    if name.starts_with('.') {
+                        continue;
+                    }
                     let skill_path = entry.path();
                     // Try to read SKILL.md for metadata
                     let mut description = String::new();
@@ -1577,7 +1723,7 @@ fn get_skills() -> Result<serde_json::Value, String> {
                             // Parse YAML front-matter
                             if content.starts_with("---") {
                                 if let Some(end) = content[3..].find("---") {
-                                    let yaml = &content[3..3+end];
+                                    let yaml = &content[3..3 + end];
                                     for line in yaml.lines() {
                                         let line = line.trim();
                                         if let Some(v) = line.strip_prefix("description:") {
@@ -1596,7 +1742,9 @@ fn get_skills() -> Result<serde_json::Value, String> {
                     if let Ok(dir_entries) = std::fs::read_dir(&skill_path) {
                         for de in dir_entries.flatten() {
                             let n = de.file_name().to_string_lossy().to_string();
-                            if (n.ends_with(".sh") || n.ends_with(".py") || n.ends_with(".js")) && !n.starts_with('.') {
+                            if (n.ends_with(".sh") || n.ends_with(".py") || n.ends_with(".js"))
+                                && !n.starts_with('.')
+                            {
                                 tools.push(n.rsplit('.').nth(1).unwrap_or(&n).to_string());
                             }
                         }
@@ -1647,7 +1795,9 @@ fn search_skills(query: String) -> Result<serde_json::Value, String> {
         // footer ("Install with: rsclaw skills install <name>") lives
         // below it and must not be parsed as a result.
         if trimmed.is_empty() {
-            if seen_any_result { break; }
+            if seen_any_result {
+                break;
+            }
             continue;
         }
 
@@ -1667,7 +1817,9 @@ fn search_skills(query: String) -> Result<serde_json::Value, String> {
             // Stats header: "NAME INSTALLS STARS REGISTRY DESCRIPTION"
             has_stats = Some(cols.len() >= 5 && cols[1] == "INSTALLS");
             // The header itself is not a result; skip it.
-            if cols.first().copied() == Some("NAME") { continue; }
+            if cols.first().copied() == Some("NAME") {
+                continue;
+            }
         }
 
         let stats_mode = has_stats.unwrap_or(false);
@@ -1684,10 +1836,14 @@ fn search_skills(query: String) -> Result<serde_json::Value, String> {
         // land where they should; the description (last column, may itself
         // contain spaces) is rejoined from the remainder.
         let cols: Vec<&str> = trimmed.split_whitespace().collect();
-        if cols.len() < need { continue; }
+        if cols.len() < need {
+            continue;
+        }
 
         let name = cols[0].trim();
-        if name.is_empty() || name == "NAME" { continue; }
+        if name.is_empty() || name == "NAME" {
+            continue;
+        }
 
         let (installs, stars, registry, desc) = if stats_mode {
             (cols[1], cols[2], cols[3], cols[4..].join(" "))
@@ -1714,9 +1870,14 @@ fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_esc = false;
     for c in s.chars() {
-        if c == '\x1b' { in_esc = true; continue; }
+        if c == '\x1b' {
+            in_esc = true;
+            continue;
+        }
         if in_esc {
-            if c.is_ascii_alphabetic() { in_esc = false; }
+            if c.is_ascii_alphabetic() {
+                in_esc = false;
+            }
             continue;
         }
         out.push(c);
@@ -1730,10 +1891,11 @@ fn uninstall_skill(name: String) -> Result<String, String> {
     run_rsclaw_command(&["skills", "uninstall", &name])
 }
 
-/// List installed plugins by reading ~/.rsclaw/plugins/<name>/{plugin.json5,openclaw.plugin.json}
-/// Returns `{ plugins: [{ name, version, description, runtime, entry, tools, channels, path }] }`.
-/// `runtime` is normalized into `"wasm" | "js"` for the UI. JS covers
-/// node/bun/deno (shell-bridge subprocess speaking JSON-RPC over stdio).
+/// List installed plugins by reading
+/// ~/.rsclaw/plugins/<name>/{plugin.json5,openclaw.plugin.json} Returns `{
+/// plugins: [{ name, version, description, runtime, entry, tools, channels,
+/// path }] }`. `runtime` is normalized into `"wasm" | "js"` for the UI. JS
+/// covers node/bun/deno (shell-bridge subprocess speaking JSON-RPC over stdio).
 /// Future non-JS subprocess runtimes (python/go binary/etc.) will need
 /// a new bucket; for now they fall back to "js" too — the manifest's
 /// actual runtime hint is passed through verbatim in `runtimeRaw` so
@@ -1745,11 +1907,15 @@ fn get_plugins() -> Result<serde_json::Value, String> {
     if plugins_dir.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
             for entry in entries.flatten() {
-                if !entry.file_type().map_or(false, |ft| ft.is_dir()) { continue; }
+                if !entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                    continue;
+                }
                 let dir = entry.path();
                 let name_os = entry.file_name();
                 let dir_name = name_os.to_string_lossy().to_string();
-                if dir_name.starts_with('.') { continue; }
+                if dir_name.starts_with('.') {
+                    continue;
+                }
                 let json5_path = dir.join("plugin.json5");
                 let legacy_path = dir.join("openclaw.plugin.json");
                 let raw = if json5_path.exists() {
@@ -1764,16 +1930,38 @@ fn get_plugins() -> Result<serde_json::Value, String> {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let name = val.get("name").and_then(|v| v.as_str())
+                let name = val
+                    .get("name")
+                    .and_then(|v| v.as_str())
                     .or_else(|| val.get("id").and_then(|v| v.as_str()))
-                    .unwrap_or(&dir_name).to_string();
-                let runtime_raw = val.get("runtime").and_then(|v| v.as_str()).unwrap_or("node");
+                    .unwrap_or(&dir_name)
+                    .to_string();
+                let runtime_raw = val
+                    .get("runtime")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("node");
                 let runtime = if runtime_raw == "wasm" { "wasm" } else { "js" };
-                let tools: Vec<String> = val.get("tools").and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
+                let tools: Vec<String> = val
+                    .get("tools")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| {
+                                t.get("name")
+                                    .and_then(|n| n.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
-                let channels: Vec<String> = val.get("channels").and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|c| c.as_str().map(|s| s.to_string())).collect())
+                let channels: Vec<String> = val
+                    .get("channels")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 plugins.push(serde_json::json!({
                     "name": name,
@@ -1793,7 +1981,8 @@ fn get_plugins() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "plugins": plugins }))
 }
 
-/// Install a plugin via sidecar. `spec` can be a URL, local .wasm/.zip path, or directory.
+/// Install a plugin via sidecar. `spec` can be a URL, local .wasm/.zip path, or
+/// directory.
 #[tauri::command]
 fn install_plugin(spec: String) -> Result<String, String> {
     run_rsclaw_command(&["plugins", "install", &spec])
@@ -1836,8 +2025,9 @@ fn tool_install_outcomes()
     R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Append a tool-install run's captured output to ~/.rsclaw/var/tools-install.log
-/// with a timestamped header, so failures stay diagnosable after the fact.
+/// Append a tool-install run's captured output to
+/// ~/.rsclaw/var/tools-install.log with a timestamped header, so failures stay
+/// diagnosable after the fact.
 fn append_install_log(name: &str, force: bool, body: &str) {
     use std::io::Write;
     let path = rsclaw_base_dir().join("var").join("tools-install.log");
@@ -1853,7 +2043,10 @@ fn append_install_log(name: &str, force: bool, body: &str) {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let _ = writeln!(f, "\n===== install '{name}' (force={force}) epoch={ts} =====");
+        let _ = writeln!(
+            f,
+            "\n===== install '{name}' (force={force}) epoch={ts} ====="
+        );
         let _ = f.write_all(body.as_bytes());
         let _ = f.flush();
     }
@@ -1915,7 +2108,10 @@ fn install_tool(name: String, force: Option<bool>) -> Result<String, String> {
                 );
                 (o.status.success(), body)
             }
-            Err(e) => (false, format!("failed to spawn rsclaw tools install: {e}\n")),
+            Err(e) => (
+                false,
+                format!("failed to spawn rsclaw tools install: {e}\n"),
+            ),
         };
 
         append_install_log(&name, forced, &body);
@@ -1941,7 +2137,11 @@ fn install_tool(name: String, force: Option<bool>) -> Result<String, String> {
 /// real error text on failure.
 #[tauri::command]
 fn get_tool_install_result(name: String) -> serde_json::Value {
-    match tool_install_outcomes().lock().ok().and_then(|m| m.get(&name).cloned()) {
+    match tool_install_outcomes()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&name).cloned())
+    {
         Some(o) => serde_json::json!({
             "done": o.done,
             "success": o.success,
@@ -1979,7 +2179,11 @@ fn local_tool_binary_path(name: &str) -> Option<std::path::PathBuf> {
         "node" => &["node"],
         "bun" => &["bun"],
         "python" => &["python3", "python"],
-        "sherpa-onnx" => &["sherpa-onnx-offline-tts", "sherpa-onnx-offline", "sherpa-onnx"],
+        "sherpa-onnx" => &[
+            "sherpa-onnx-offline-tts",
+            "sherpa-onnx-offline",
+            "sherpa-onnx",
+        ],
         "opencode" => &["opencode"],
         "claude-code" => &["claude"],
         _ => &[name],
@@ -2063,7 +2267,9 @@ fn expand_env_vars(s: &str) -> String {
             if let Some(end_off) = s[i + 2..].find('}') {
                 let var_name = &s[i + 2..i + 2 + end_off];
                 if !var_name.is_empty()
-                    && var_name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    && var_name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 {
                     if let Ok(val) = std::env::var(var_name) {
                         out.push_str(&val);
@@ -2087,8 +2293,8 @@ fn expand_env_vars(s: &str) -> String {
 /// updated — mirroring the gateway's `resolve_base_url`.
 fn provider_base_url_from_defaults(provider: &str) -> Option<String> {
     let user_path = rsclaw_base_dir().join("defaults.toml");
-    let toml_src = std::fs::read_to_string(&user_path)
-        .unwrap_or_else(|_| EMBEDDED_DEFAULTS_TOML.to_owned());
+    let toml_src =
+        std::fs::read_to_string(&user_path).unwrap_or_else(|_| EMBEDDED_DEFAULTS_TOML.to_owned());
     let catalog: DefaultsCatalog = toml::from_str(&toml_src).ok()?;
     catalog
         .providers
@@ -2099,9 +2305,15 @@ fn provider_base_url_from_defaults(provider: &str) -> Option<String> {
 
 /// Test provider API key by calling /v1/models directly (no gateway needed).
 #[tauri::command]
-async fn test_provider(provider: String, api_key: String, base_url: Option<String>, api_type: Option<String>) -> Result<serde_json::Value, String> {
-    // Expand `${VAR}` env placeholders so a config like `apiKey: "${ANTHROPIC_API_KEY}"`
-    // tests the actual key, matching the gateway's runtime expansion.
+async fn test_provider(
+    provider: String,
+    api_key: String,
+    base_url: Option<String>,
+    api_type: Option<String>,
+) -> Result<serde_json::Value, String> {
+    // Expand `${VAR}` env placeholders so a config like `apiKey:
+    // "${ANTHROPIC_API_KEY}"` tests the actual key, matching the gateway's
+    // runtime expansion.
     let raw_key = api_key.clone();
     let api_key = expand_env_vars(&api_key);
     let base_url = base_url.map(|u| expand_env_vars(&u));
@@ -2147,22 +2359,22 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         u
     } else {
         match provider.as_str() {
-            "anthropic"   => "https://api.anthropic.com/v1",
-            "openai"      => "https://api.openai.com/v1",
-            "deepseek"    => "https://api.deepseek.com/v1",
-            "qwen"        => "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "doubao"      => "https://ark.cn-beijing.volces.com/api/v3",
-            "minimax"     => "https://api.minimaxi.com/v1",
-            "kimi"        => "https://api.moonshot.cn/v1",
-            "zhipu"       => "https://open.bigmodel.cn/api/paas/v4",
-            "groq"        => "https://api.groq.com/openai/v1",
-            "grok"        => "https://api.x.ai/v1",
-            "gemini"      => "https://generativelanguage.googleapis.com/v1beta",
+            "anthropic" => "https://api.anthropic.com/v1",
+            "openai" => "https://api.openai.com/v1",
+            "deepseek" => "https://api.deepseek.com/v1",
+            "qwen" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "doubao" => "https://ark.cn-beijing.volces.com/api/v3",
+            "minimax" => "https://api.minimaxi.com/v1",
+            "kimi" => "https://api.moonshot.cn/v1",
+            "zhipu" => "https://open.bigmodel.cn/api/paas/v4",
+            "groq" => "https://api.groq.com/openai/v1",
+            "grok" => "https://api.x.ai/v1",
+            "gemini" => "https://generativelanguage.googleapis.com/v1beta",
             "siliconflow" => "https://api.siliconflow.cn/v1",
-            "openrouter"  => "https://openrouter.ai/api/v1",
-            "gaterouter"  => "https://api.gaterouter.ai/openai/v1",
-            "ollama"      => "http://localhost:11434",
-            "rsclaw"      => "https://api.rsclaw.ai/v1",
+            "openrouter" => "https://openrouter.ai/api/v1",
+            "gaterouter" => "https://api.gaterouter.ai/openai/v1",
+            "ollama" => "http://localhost:11434",
+            "rsclaw" => "https://api.rsclaw.ai/v1",
             "custom" | "codingplan" => "",
             _ => return Ok(serde_json::json!({"ok": false, "error": "unknown provider"})),
         }
@@ -2173,14 +2385,21 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
     // Determine auth style based on provider or api_type
     let auth_style = match effective_api_type {
         "anthropic" => "x-api-key",
-        "gemini"    => "gemini-key",  // query param auth
-        "ollama"    => "none",
-        _ => if api_key.is_empty() { "none" } else { "bearer" },
+        "gemini" => "gemini-key", // query param auth
+        "ollama" => "none",
+        _ => {
+            if api_key.is_empty() {
+                "none"
+            } else {
+                "bearer"
+            }
+        }
     };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
-        .build().unwrap_or_default();
+        .build()
+        .unwrap_or_default();
 
     // Providers without a public model-listing endpoint return a curated
     // built-in list. Without this the UI hits `/models`, sees a 404 (or
@@ -2188,9 +2407,9 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
     // even when the key is fine.
     //
     // - Minimax — no `/models` route exists upstream.
-    // - Volcengine ARK (doubao) — `/v3/models` 404s; only the inference
-    //   endpoint is public. Inference fallback below confirms the key
-    //   but can't enumerate models.
+    // - Volcengine ARK (doubao) — `/v3/models` 404s; only the inference endpoint is
+    //   public. Inference fallback below confirms the key but can't enumerate
+    //   models.
     if provider == "minimax" {
         return Ok(serde_json::json!({
             "ok": true,
@@ -2229,7 +2448,9 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
 
     let mut req = client.get(&url);
     match auth_style {
-        "bearer" => { req = req.header("Authorization", format!("Bearer {api_key}")); }
+        "bearer" => {
+            req = req.header("Authorization", format!("Bearer {api_key}"));
+        }
         "x-api-key" => {
             // Send BOTH headers so the same code path covers:
             //   - Standard Anthropic (api.anthropic.com) — uses x-api-key
@@ -2248,18 +2469,27 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             // Extract model IDs — handle different response formats
-            let models: Vec<String> = if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
-                // OpenAI format: { data: [{ id: "..." }] }
-                data.iter().filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
-            } else if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
-                // Ollama / Gemini format: { models: [{ name: "..." }] }
-                models.iter().filter_map(|m| {
-                    m.get("name").or_else(|| m.get("id"))
-                        .and_then(|v| v.as_str())
-                        // Gemini returns "models/gemini-2.5-flash" — strip prefix
-                        .map(|s| s.strip_prefix("models/").unwrap_or(s).to_owned())
-                }).collect()
-            } else { vec![] };
+            let models: Vec<String> =
+                if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+                    // OpenAI format: { data: [{ id: "..." }] }
+                    data.iter()
+                        .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned()))
+                        .collect()
+                } else if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
+                    // Ollama / Gemini format: { models: [{ name: "..." }] }
+                    models
+                        .iter()
+                        .filter_map(|m| {
+                            m.get("name")
+                                .or_else(|| m.get("id"))
+                                .and_then(|v| v.as_str())
+                                // Gemini returns "models/gemini-2.5-flash" — strip prefix
+                                .map(|s| s.strip_prefix("models/").unwrap_or(s).to_owned())
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                };
             Ok(serde_json::json!({"ok": true, "models": models}))
         }
         Ok(resp) => {
@@ -2278,8 +2508,14 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
                     || effective_api_type == "anthropic"
                     || effective_api_type == "anthropic-messages")
             {
-                if let Ok(probe_ok) =
-                    probe_inference_endpoint(&client, effective_base, effective_api_type, &api_key, auth_style).await
+                if let Ok(probe_ok) = probe_inference_endpoint(
+                    &client,
+                    effective_base,
+                    effective_api_type,
+                    &api_key,
+                    auth_style,
+                )
+                .await
                 {
                     if probe_ok {
                         return Ok(serde_json::json!({"ok": true, "models": []}));
@@ -2519,8 +2755,7 @@ fn read_file_as_data_url(path: String) -> Result<String, String> {
         Some("heif") => "image/heif",
         _ => "image/jpeg",
     };
-    const B64: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut b64 = String::with_capacity(data.len() * 4 / 3 + 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -2547,7 +2782,8 @@ fn read_file_as_data_url(path: String) -> Result<String, String> {
 #[cfg(target_os = "macos")]
 fn set_dock_visible(visible: bool) {
     unsafe {
-        let app: *mut objc::runtime::Object = objc::msg_send![objc::class!(NSApplication), sharedApplication];
+        let app: *mut objc::runtime::Object =
+            objc::msg_send![objc::class!(NSApplication), sharedApplication];
         // NSApplicationActivationPolicyRegular = 0 (show in dock)
         // NSApplicationActivationPolicyAccessory = 1 (no dock, no menu bar)
         let policy: i64 = if visible { 0 } else { 1 };
@@ -2564,7 +2800,8 @@ fn stop_gateway_sync() {
 }
 
 fn main() {
-    // Catch SIGTERM/SIGINT (macOS/Linux Dock quit, Ctrl+C) to stop gateway before exit.
+    // Catch SIGTERM/SIGINT (macOS/Linux Dock quit, Ctrl+C) to stop gateway before
+    // exit.
     #[cfg(unix)]
     {
         std::thread::spawn(|| {
@@ -2594,8 +2831,15 @@ fn main() {
             stop_gateway_sync();
             0 // allow default handler to terminate
         }
-        unsafe extern "system" { fn SetConsoleCtrlHandler(handler: unsafe extern "system" fn(u32) -> i32, add: i32) -> i32; }
-        unsafe { SetConsoleCtrlHandler(handler, 1); }
+        unsafe extern "system" {
+            fn SetConsoleCtrlHandler(
+                handler: unsafe extern "system" fn(u32) -> i32,
+                add: i32,
+            ) -> i32;
+        }
+        unsafe {
+            SetConsoleCtrlHandler(handler, 1);
+        }
     }
 
     tauri::Builder::default()

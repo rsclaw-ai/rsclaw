@@ -97,6 +97,37 @@ impl TaskStore {
     // Tasks
     // -----------------------------------------------------------------------
 
+    /// Atomically create a task and its optional owner if the task ID is
+    /// unused.
+    ///
+    /// Returns `false` without modifying either table when the task or an owner
+    /// reservation already exists. This prevents caller-supplied task IDs from
+    /// overwriting another principal's task or claiming an orphaned owner
+    /// entry.
+    pub fn create_task(&self, task: &A2aTask, principal: Option<&str>) -> Result<bool> {
+        let json = serde_json::to_string(task)?;
+        let txn = self.db.begin_write()?;
+        let created = {
+            let mut tasks = txn.open_table(TASKS)?;
+            let mut owners = txn.open_table(TASK_OWNERS)?;
+            let task_exists = tasks.get(task.id.as_str())?.is_some();
+            let owner_exists = owners.get(task.id.as_str())?.is_some();
+            if task_exists || owner_exists {
+                false
+            } else {
+                tasks.insert(task.id.as_str(), json.as_str())?;
+                if let Some(principal) = principal {
+                    owners.insert(task.id.as_str(), principal)?;
+                }
+                true
+            }
+        };
+        if created {
+            txn.commit()?;
+        }
+        Ok(created)
+    }
+
     /// Record the principal that owns `task_id` (A2A §7.5 access control).
     pub fn put_owner(&self, task_id: &str, principal: &str) -> Result<()> {
         let txn = self.db.begin_write()?;
@@ -312,5 +343,68 @@ impl TaskStore {
         };
         txn.commit()?;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rsclaw_a2a_types::types::A2aTaskStatus;
+
+    use super::*;
+
+    fn task(id: &str, context_id: &str) -> A2aTask {
+        A2aTask {
+            id: id.to_owned(),
+            context_id: Some(context_id.to_owned()),
+            status: A2aTaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            history: Vec::new(),
+            artifacts: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn create_task_atomically_preserves_original_task_and_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(&tmp.path().join("tasks.redb")).unwrap();
+
+        assert!(
+            store
+                .create_task(&task("shared", "original"), Some("alice"))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .create_task(&task("shared", "replacement"), Some("bob"))
+                .unwrap()
+        );
+
+        assert_eq!(store.get_owner("shared").unwrap().as_deref(), Some("alice"));
+        assert_eq!(
+            store.get("shared").unwrap().unwrap().context_id.as_deref(),
+            Some("original")
+        );
+    }
+
+    #[test]
+    fn create_task_rejects_orphaned_owner_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(&tmp.path().join("tasks.redb")).unwrap();
+        store.put_owner("reserved", "alice").unwrap();
+
+        assert!(
+            !store
+                .create_task(&task("reserved", "replacement"), Some("bob"))
+                .unwrap()
+        );
+        assert!(store.get("reserved").unwrap().is_none());
+        assert_eq!(
+            store.get_owner("reserved").unwrap().as_deref(),
+            Some("alice")
+        );
     }
 }

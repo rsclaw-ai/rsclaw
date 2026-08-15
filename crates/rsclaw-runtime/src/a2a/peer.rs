@@ -15,10 +15,10 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use bytes::BytesMut;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry as DashEntry};
 use futures::StreamExt;
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 use webrtc::{
     data_channel::{DataChannel, DataChannelEvent},
@@ -30,7 +30,7 @@ use webrtc::{
 
 use crate::{
     a2a::{
-        relay::{RelayFrame, RouteMode, StreamPending},
+        relay::{RelayFrame, RelayStreamItem, RouteMode, StreamPending},
         relay_identity::{sign_payload, signing_key_from_b64, verify_payload},
         types::{JsonRpcRequest, JsonRpcResponse},
     },
@@ -50,6 +50,15 @@ const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const PEER_STREAM_MAX_LIFETIME: Duration = Duration::from_secs(1800);
 const MAX_PEER_STREAMS: usize = 1024;
 const MAX_PEER_PENDING_REQUESTS: usize = 4096;
+const MAX_PEER_INBOUND_REQUESTS: usize = 1024;
+const MAX_PEER_INBOUND_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PEER_REQUEST_TOMBSTONES: usize = 16_384;
+const MAX_PEER_TASK_ROUTES: usize = 4096;
+const MAX_PEER_REQUEST_ID_BYTES: usize = 256;
+const MAX_PEER_PRINCIPAL_BYTES: usize = 512;
+const MAX_PEER_TARGET_BYTES: usize = 512;
+const MAX_PEER_METHOD_BYTES: usize = 64;
+const MAX_PEER_NODE_ID_BYTES: usize = 128;
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(15);
 const PEER_SIGNAL_SESSION_TTL: Duration = Duration::from_secs(60);
 const MAX_PEER_SIGNAL_SESSIONS: usize = 1024;
@@ -57,6 +66,8 @@ const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_INFLIGHT_REASSEMBLIES: usize = 64;
 const MAX_REASSEMBLY_BYTES: usize = 16 * 1024 * 1024;
 const PEER_ROUTE_TTL: Duration = Duration::from_secs(300);
+const MAX_PEER_ROUTES_PER_LEASE: usize = 256;
+const MAX_PEER_ROUTES: usize = 4096;
 
 /// Failure classification for a direct unary invocation.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +87,7 @@ struct PeerConnectionEntry {
     session_id: String,
     session_generation: Option<u64>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    lifecycle: tokio_util::sync::CancellationToken,
 }
 
 struct PeerSession {
@@ -99,6 +111,22 @@ struct PeerStreamTask {
     task_id: String,
     connection_generation: u64,
     cancel_owner: Option<Arc<tokio_util::sync::CancellationToken>>,
+}
+
+type InboundRequestKey = (u64, String);
+type InboundReplayKey = (String, String);
+
+struct PeerInboundRequestGuard {
+    manager: Arc<PeerManager>,
+    key: InboundRequestKey,
+    _request_permit: OwnedSemaphorePermit,
+    _byte_permit: OwnedSemaphorePermit,
+}
+
+impl Drop for PeerInboundRequestGuard {
+    fn drop(&mut self) {
+        self.manager.inbound_requests.remove(&self.key);
+    }
 }
 
 struct Reassembly {
@@ -149,12 +177,18 @@ pub struct PeerManager {
     sessions: Mutex<HashMap<String, PeerSession>>,
     consumed_sessions: Mutex<HashMap<String, Instant>>,
     routes: DashMap<String, super::relay::RouteEntry>,
+    route_admission: Mutex<()>,
     pending: DashMap<String, (oneshot::Sender<JsonRpcResponse>, String)>,
     pending_admission: Mutex<()>,
     stream_pending: DashMap<String, StreamPending>,
     stream_admission: Mutex<()>,
     task_routes: DashMap<String, String>,
-    peer_stream_tasks: DashMap<String, PeerStreamTask>,
+    task_route_admission: Mutex<()>,
+    peer_stream_tasks: DashMap<InboundRequestKey, PeerStreamTask>,
+    inbound_requests: DashMap<InboundRequestKey, ()>,
+    inbound_request_tombstones: Mutex<HashMap<InboundReplayKey, Instant>>,
+    inbound_request_slots: Arc<Semaphore>,
+    inbound_request_bytes: Arc<Semaphore>,
     request_counter: AtomicU64,
     generation_counter: AtomicU64,
     pub metrics: super::relay::RelayMetrics,
@@ -167,12 +201,18 @@ impl Default for PeerManager {
             sessions: Mutex::new(HashMap::new()),
             consumed_sessions: Mutex::new(HashMap::new()),
             routes: DashMap::new(),
+            route_admission: Mutex::new(()),
             pending: DashMap::new(),
             pending_admission: Mutex::new(()),
             stream_pending: DashMap::new(),
             stream_admission: Mutex::new(()),
             task_routes: DashMap::new(),
+            task_route_admission: Mutex::new(()),
             peer_stream_tasks: DashMap::new(),
+            inbound_requests: DashMap::new(),
+            inbound_request_tombstones: Mutex::new(HashMap::new()),
+            inbound_request_slots: Arc::new(Semaphore::new(MAX_PEER_INBOUND_REQUESTS)),
+            inbound_request_bytes: Arc::new(Semaphore::new(MAX_PEER_INBOUND_BYTES)),
             request_counter: AtomicU64::new(0),
             generation_counter: AtomicU64::new(1),
             metrics: super::relay::RelayMetrics::default(),
@@ -197,6 +237,9 @@ impl PeerManager {
             consumed.retain(|_, expires_at| *expires_at > Instant::now());
             if consumed.contains_key(session_id) {
                 anyhow::bail!("replayed peer signaling session '{session_id}'");
+            }
+            if consumed.len() >= MAX_PEER_SIGNAL_SESSIONS {
+                anyhow::bail!("peer signaling tombstone capacity exceeded");
             }
         }
         let generation = self.generation_counter.fetch_add(1, Ordering::Relaxed);
@@ -235,25 +278,20 @@ impl PeerManager {
         Ok(())
     }
 
-    fn mark_session_consumed(&self, session_id: &str) {
+    fn mark_session_consumed(&self, session_id: &str) -> anyhow::Result<()> {
         let mut consumed = self
             .consumed_sessions
             .lock()
             .expect("consumed peer signaling session mutex poisoned");
         consumed.retain(|_, expires_at| *expires_at > Instant::now());
-        if consumed.len() >= MAX_PEER_SIGNAL_SESSIONS {
-            let oldest = consumed
-                .iter()
-                .min_by_key(|(_, expires_at)| **expires_at)
-                .map(|(session_id, _)| session_id.clone());
-            if let Some(oldest) = oldest {
-                consumed.remove(&oldest);
-            }
+        if !consumed.contains_key(session_id) && consumed.len() >= MAX_PEER_SIGNAL_SESSIONS {
+            anyhow::bail!("peer signaling tombstone capacity exceeded");
         }
         consumed.insert(
             session_id.to_owned(),
             Instant::now() + PEER_SIGNAL_SESSION_TTL,
         );
+        Ok(())
     }
 
     fn remove_session_if_generation(
@@ -397,6 +435,7 @@ impl PeerManager {
         }
         let generation = self.generation_counter.fetch_add(1, Ordering::Relaxed);
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lifecycle = tokio_util::sync::CancellationToken::new();
         let mut superseded_connection = None;
         if let Some(previous) = self.direct_connections.insert(
             peer_node_id.to_owned(),
@@ -406,9 +445,11 @@ impl PeerManager {
                 session_id: session_id.to_owned(),
                 session_generation,
                 cancelled: cancelled.clone(),
+                lifecycle,
             },
         ) {
             previous.cancelled.store(true, Ordering::Release);
+            previous.lifecycle.cancel();
             if let Some(previous_session_generation) = previous.session_generation
                 && (previous.session_id != session_id
                     || Some(previous_session_generation) != session_generation)
@@ -456,6 +497,7 @@ impl PeerManager {
         else {
             return;
         };
+        current.lifecycle.cancel();
         let session_id = current.session_id;
         if let Some(session_generation) = current.session_generation {
             self.remove_session_if_generation_owned(&session_id, peer_node_id, session_generation);
@@ -498,45 +540,33 @@ impl PeerManager {
             .map(|entry| entry.key().clone())
             .collect();
         for request_id in stream_ids {
-            let synthetic = serde_json::json!({
-                "kind": "status-update",
-                "taskId": "",
-                "contextId": "",
-                "status": {
-                    "state": "TASK_STATE_FAILED",
-                    "message": {
-                        "role": "ROLE_AGENT",
-                        "messageId": format!("peer-loss-{}", uuid::Uuid::new_v4()),
-                        "parts": [{
-                            "type": "text",
-                            "text": format!("peer direct connection lost: '{peer_node_id}' disconnected")
-                        }]
-                    }
-                },
-                "final": true
-            });
-            self.forward_stream_event(&request_id, synthetic);
-            self.stream_pending.remove(&request_id);
-            self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
+            if let Some((_, stream)) = self.stream_pending.remove(&request_id) {
+                let item = stream.failure_item(
+                    "peer-loss",
+                    format!("peer direct connection lost: '{peer_node_id}' disconnected"),
+                );
+                if stream.tx.send(item).is_err() {
+                    debug!(%request_id, "peer stream failure receiver already dropped");
+                }
+                self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         info!(peer = %peer_node_id, %session_id, generation, "peer WebRTC data channel unregistered");
     }
 
     fn take_stream_tasks(&self, connection_generation: u64) -> Vec<PeerStreamTask> {
-        let request_ids: Vec<String> = self
+        let request_keys: Vec<InboundRequestKey> = self
             .peer_stream_tasks
             .iter()
             .filter(|entry| entry.value().connection_generation == connection_generation)
             .map(|entry| entry.key().clone())
             .collect();
-        request_ids
+        request_keys
             .into_iter()
-            .filter_map(|request_id| {
+            .filter_map(|request_key| {
                 self.peer_stream_tasks
-                    .remove_if(&request_id, |_, task| {
-                        task.connection_generation == connection_generation
-                    })
+                    .remove(&request_key)
                     .map(|(_, task)| task)
             })
             .collect()
@@ -548,9 +578,7 @@ impl PeerManager {
         connection_generation: u64,
     ) -> Option<PeerStreamTask> {
         self.peer_stream_tasks
-            .remove_if(request_id, |_, task| {
-                task.connection_generation == connection_generation
-            })
+            .remove(&(connection_generation, request_id.to_owned()))
             .map(|(_, task)| task)
     }
 
@@ -585,24 +613,86 @@ impl PeerManager {
         Some(entry.clone())
     }
 
-    /// Add a direct route advertised by its authenticated owning peer.
-    pub fn add_route(&self, agent_ref: &str, node_id: &str) {
-        self.routes.insert(
-            agent_ref.to_owned(),
-            super::relay::RouteEntry {
-                agent_ref: agent_ref.to_owned(),
-                node_id: node_id.to_owned(),
-                epoch: 1,
-                expires_at: Instant::now() + PEER_ROUTE_TTL,
-                mode: RouteMode::Direct,
-            },
-        );
+    /// Atomically replace one authenticated peer's direct route snapshot.
+    pub fn replace_routes(&self, node_id: &str, agents: &[String]) -> anyhow::Result<()> {
+        if agents.len() > MAX_PEER_ROUTES_PER_LEASE {
+            anyhow::bail!(
+                "peer route lease contains too many agents: {} > {MAX_PEER_ROUTES_PER_LEASE}",
+                agents.len()
+            );
+        }
+        let prefix = format!("{node_id}/");
+        let mut unique_agents = std::collections::HashSet::with_capacity(agents.len());
+        for agent_ref in agents {
+            super::relay::validate_agent_ref(agent_ref)?;
+            if !agent_ref.starts_with(&prefix) {
+                anyhow::bail!("node '{node_id}' cannot advertise '{agent_ref}'");
+            }
+            unique_agents.insert(agent_ref);
+        }
+
+        let _admission = self
+            .route_admission
+            .lock()
+            .expect("peer route admission mutex poisoned");
+        let now = Instant::now();
+        self.routes.retain(|_, route| route.expires_at > now);
+        let other_routes = self
+            .routes
+            .iter()
+            .filter(|route| route.value().node_id != node_id)
+            .count();
+        if other_routes.saturating_add(unique_agents.len()) > MAX_PEER_ROUTES {
+            anyhow::bail!("peer route capacity exceeded");
+        }
+        self.routes.retain(|_, route| route.node_id != node_id);
+        let expires_at = now + PEER_ROUTE_TTL;
+        for agent_ref in unique_agents {
+            let agent_ref = agent_ref.as_str().to_owned();
+            self.routes.insert(
+                agent_ref.clone(),
+                super::relay::RouteEntry {
+                    agent_ref,
+                    node_id: node_id.to_owned(),
+                    epoch: 1,
+                    expires_at,
+                    mode: RouteMode::Direct,
+                },
+            );
+        }
+        Ok(())
     }
 
-    /// Record a task route learned from a response or stream event.
-    pub fn record_task_route(&self, task_id: &str, agent_ref: &str) {
+    /// Record a task route learned from a source-authenticated response or
+    /// stream event. Existing ownership is immutable and the table fails closed
+    /// at capacity so a remote peer cannot redirect or grow routing authority.
+    pub fn record_task_route(&self, task_id: &str, agent_ref: &str) -> anyhow::Result<()> {
+        if task_id.is_empty()
+            || task_id.len() > MAX_PEER_REQUEST_ID_BYTES
+            || agent_ref.is_empty()
+            || agent_ref.len() > MAX_PEER_TARGET_BYTES
+        {
+            warn!(%task_id, %agent_ref, "invalid peer task route rejected");
+            anyhow::bail!("invalid peer task route");
+        }
+        let _admission = self
+            .task_route_admission
+            .lock()
+            .expect("peer task route admission mutex poisoned");
+        if let Some(existing) = self.task_routes.get(task_id) {
+            if existing.value() != agent_ref {
+                warn!(%task_id, existing = %existing.value(), attempted = %agent_ref, "peer task route collision rejected");
+                anyhow::bail!("peer task route collision");
+            }
+            return Ok(());
+        }
+        if self.task_routes.len() >= MAX_PEER_TASK_ROUTES {
+            warn!(%task_id, %agent_ref, "peer task route capacity exceeded");
+            anyhow::bail!("peer task route capacity exceeded");
+        }
         self.task_routes
             .insert(task_id.to_owned(), agent_ref.to_owned());
+        Ok(())
     }
 
     /// Look up an agent route by task ID.
@@ -687,13 +777,31 @@ impl PeerManager {
         result
     }
 
-    /// Complete a pending synchronous request.
-    pub fn complete_pending(&self, request_id: &str, response: JsonRpcResponse) {
-        if let Some((_, (tx, _))) = self.pending.remove(request_id)
+    /// Complete a pending synchronous request only when it came from the
+    /// authenticated peer that owns the correlation.
+    pub fn complete_pending_from(
+        &self,
+        request_id: &str,
+        response: JsonRpcResponse,
+        source_node: &str,
+    ) -> bool {
+        let Some(expected) = self.pending.get(request_id) else {
+            return false;
+        };
+        if expected.value().1 != source_node {
+            self.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
+            warn!(%request_id, expected = %expected.value().1, actual = %source_node, "peer response source mismatch");
+            return true;
+        }
+        drop(expected);
+        if let Some((_, (tx, _))) = self
+            .pending
+            .remove_if(request_id, |_, (_, node_id)| node_id == source_node)
             && tx.send(response).is_err()
         {
             debug!(%request_id, "peer response waiter already dropped");
         }
+        true
     }
 
     /// Invoke a streaming request over the direct data channel.
@@ -704,7 +812,7 @@ impl PeerManager {
         params: Value,
         principal: &str,
         peer_node_id: &str,
-    ) -> Result<(String, String, broadcast::Receiver<Value>), PeerInvokeError> {
+    ) -> Result<(String, String, broadcast::Receiver<RelayStreamItem>), PeerInvokeError> {
         let request_id = format!(
             "peer:stream:{}",
             self.request_counter.fetch_add(1, Ordering::Relaxed)
@@ -727,6 +835,8 @@ impl PeerManager {
                     agent_ref: target.to_owned(),
                     node_id: peer_node_id.to_owned(),
                     deadline: Instant::now() + PEER_STREAM_MAX_LIFETIME,
+                    task_id: None,
+                    context_id: None,
                 },
             );
         }
@@ -747,20 +857,127 @@ impl PeerManager {
         Ok((request_id, peer_node_id.to_owned(), event_rx))
     }
 
-    /// Forward one event to its streaming subscriber.
-    pub fn forward_stream_event(&self, request_id: &str, value: Value) -> usize {
-        let Some(entry) = self.stream_pending.get(request_id) else {
-            return 0;
-        };
-        if let Some(task_id) = value.get("taskId").and_then(Value::as_str) {
-            self.record_task_route(task_id, &entry.agent_ref);
-        }
-        entry.tx.send(value).unwrap_or(0)
+    /// Forward one locally synthesized event to its streaming subscriber.
+    fn forward_stream_event(&self, request_id: &str, value: Value) -> usize {
+        self.forward_stream_event_inner(request_id, None, value)
     }
 
-    /// Remove a streaming entry.
+    /// Forward a stream event only when it came from the authenticated peer
+    /// that owns the correlation.
+    pub fn forward_stream_event_from(
+        &self,
+        request_id: &str,
+        source_node: &str,
+        value: Value,
+    ) -> usize {
+        self.forward_stream_event_inner(request_id, Some(source_node), value)
+    }
+
+    fn forward_stream_event_inner(
+        &self,
+        request_id: &str,
+        source_node: Option<&str>,
+        value: Value,
+    ) -> usize {
+        let Some(mut entry) = self.stream_pending.get_mut(request_id) else {
+            return 0;
+        };
+        if source_node.is_some_and(|source_node| source_node != entry.node_id) {
+            self.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
+            warn!(%request_id, expected = %entry.node_id, actual = %source_node.unwrap_or_default(), "peer stream event source mismatch");
+            return 0;
+        }
+        entry.observe_identity(&value);
+        if let Some(task_id) = entry.task_id.as_deref()
+            && let Err(error) = self.record_task_route(task_id, &entry.agent_ref)
+        {
+            return entry
+                .tx
+                .send(RelayStreamItem::Error {
+                    code: -32005,
+                    message: format!("remote task {task_id} route rejected: {error}"),
+                })
+                .unwrap_or(0);
+        }
+        entry.tx.send(RelayStreamItem::Event(value)).unwrap_or(0)
+    }
+
+    /// Remove a streaming entry owned by the local caller.
     pub fn complete_streaming(&self, request_id: &str) -> bool {
         self.stream_pending.remove(request_id).is_some()
+    }
+
+    fn complete_streaming_from(&self, request_id: &str, source_node: &str) -> bool {
+        let Some(expected) = self.stream_pending.get(request_id) else {
+            return false;
+        };
+        if expected.node_id != source_node {
+            self.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
+            warn!(%request_id, expected = %expected.node_id, actual = %source_node, "peer stream response source mismatch");
+            return true;
+        }
+        drop(expected);
+        self.stream_pending
+            .remove_if(request_id, |_, stream| stream.node_id == source_node)
+            .is_some()
+    }
+
+    fn try_admit_inbound_request(
+        self: &Arc<Self>,
+        peer_node_id: &str,
+        connection_generation: u64,
+        request_id: &str,
+        frame_bytes: usize,
+        replay_lifetime: Duration,
+    ) -> Result<PeerInboundRequestGuard, &'static str> {
+        if request_id.is_empty() || request_id.len() > MAX_PEER_REQUEST_ID_BYTES {
+            return Err("invalid peer inbound request id");
+        }
+        let byte_permits = u32::try_from(frame_bytes)
+            .ok()
+            .filter(|bytes| *bytes > 0 && *bytes as usize <= MAX_RELAY_FRAME_BYTES)
+            .ok_or("invalid peer inbound request size")?;
+        let request_permit = self
+            .inbound_request_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "peer inbound request capacity exceeded")?;
+        let byte_permit = self
+            .inbound_request_bytes
+            .clone()
+            .try_acquire_many_owned(byte_permits)
+            .map_err(|_| "peer inbound byte capacity exceeded")?;
+
+        let now = Instant::now();
+        let replay_key = (peer_node_id.to_owned(), request_id.to_owned());
+        {
+            let mut tombstones = self
+                .inbound_request_tombstones
+                .lock()
+                .expect("peer inbound request tombstone mutex poisoned");
+            tombstones.retain(|_, expires_at| *expires_at > now);
+            if tombstones.contains_key(&replay_key) {
+                return Err("duplicate peer inbound request id");
+            }
+            if tombstones.len() >= MAX_PEER_REQUEST_TOMBSTONES {
+                return Err("peer inbound replay capacity exceeded");
+            }
+            tombstones.insert(replay_key, now + replay_lifetime);
+        }
+
+        let key = (connection_generation, request_id.to_owned());
+        match self.inbound_requests.entry(key.clone()) {
+            DashEntry::Occupied(_) => Err("duplicate peer inbound request id"),
+            DashEntry::Vacant(entry) => {
+                entry.insert(());
+                Ok(PeerInboundRequestGuard {
+                    manager: self.clone(),
+                    key,
+                    _request_permit: request_permit,
+                    _byte_permit: byte_permit,
+                })
+            }
+        }
     }
 
     /// Send cancellation for a direct streaming request.
@@ -784,27 +1001,17 @@ impl PeerManager {
             .map(|entry| (entry.key().clone(), entry.value().node_id.clone()))
             .collect();
         for (request_id, node_id) in &expired {
-            let synthetic = serde_json::json!({
-                "kind": "status-update",
-                "taskId": "",
-                "contextId": "",
-                "status": {
-                    "state": "TASK_STATE_FAILED",
-                    "message": {
-                        "role": "ROLE_AGENT",
-                        "messageId": format!("peer-deadline-{}", uuid::Uuid::new_v4()),
-                        "parts": [{
-                            "type": "text",
-                            "text": "peer stream exceeded lifetime cap"
-                        }]
-                    }
-                },
-                "final": true
-            });
-            self.forward_stream_event(request_id, synthetic);
-            self.stream_pending.remove(request_id);
-            self.send_cancel_to(node_id, request_id);
-            self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
+            if let Some((_, stream)) = self.stream_pending.remove(request_id) {
+                let item = stream.failure_item(
+                    "peer-deadline",
+                    "peer stream exceeded lifetime cap".to_owned(),
+                );
+                if stream.tx.send(item).is_err() {
+                    debug!(%request_id, "peer deadline receiver already dropped");
+                }
+                self.send_cancel_to(node_id, request_id);
+                self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
+            }
         }
         expired.len()
     }
@@ -880,7 +1087,7 @@ fn configured_peer<'a>(
 
 /// Return whether a signaling node ID cannot alter canonical field boundaries.
 pub(crate) fn valid_signaling_node_id(value: &str) -> bool {
-    !value.is_empty() && !value.contains(['\r', '\n'])
+    !value.is_empty() && value.len() <= MAX_PEER_NODE_ID_BYTES && !value.contains(['\r', '\n'])
 }
 
 /// Return whether a signaling session ID is bounded and cannot alter canonical
@@ -1256,7 +1463,15 @@ pub(crate) async fn apply_peer_offer(
             return Err(error);
         }
     };
-    state.peer_manager.mark_session_consumed(session_id);
+    if let Err(error) = state.peer_manager.mark_session_consumed(session_id) {
+        state
+            .peer_manager
+            .remove_session_if_generation(session_id, session_generation);
+        if let Err(close_error) = connection.close().await {
+            warn!(%close_error, "failed to close peer answer after tombstone admission failure");
+        }
+        return Err(error);
+    }
     Ok(RelayFrame::PeerAnswer {
         session_id: session_id.to_owned(),
         target_node: source_node.to_owned(),
@@ -1534,6 +1749,7 @@ async fn run_data_channel(
                                 match partial.insert(index, payload) {
                                     Ok(Some(frame_bytes)) => {
                                         reassembly.remove(&message_id);
+                                        let frame_len = frame_bytes.len();
                                         match serde_json::from_slice::<RelayFrame>(&frame_bytes) {
                                             Ok(frame)
                                                 if !state
@@ -1544,6 +1760,7 @@ async fn run_data_channel(
                                                     &state,
                                                     &peer_node_id,
                                                     generation,
+                                                    frame_len,
                                                     frame,
                                                 );
                                             }
@@ -1639,6 +1856,7 @@ pub(crate) fn handle_peer_frame(
     state: &AppState,
     peer_node_id: &str,
     connection_generation: u64,
+    frame_bytes: usize,
     frame: RelayFrame,
 ) {
     // Keep the current-generation map guard through frame admission. Connection
@@ -1657,7 +1875,7 @@ pub(crate) fn handle_peer_frame(
         return;
     };
     let spoke_tx = connection.tx.clone();
-    let connection_cancelled = connection.cancelled.clone();
+    let connection_lifecycle = connection.lifecycle.clone();
 
     match frame {
         RelayFrame::Request {
@@ -1665,21 +1883,67 @@ pub(crate) fn handle_peer_frame(
             target,
             method,
             params,
-            principal: _,
+            principal,
             ..
         } => {
+            if target.is_empty()
+                || target.len() > MAX_PEER_TARGET_BYTES
+                || method.is_empty()
+                || method.len() > MAX_PEER_METHOD_BYTES
+                || principal.is_empty()
+                || principal.len() > MAX_PEER_PRINCIPAL_BYTES
+            {
+                if let Err(error) = spoke_tx.try_send(RelayFrame::Response {
+                    request_id,
+                    response: JsonRpcResponse::err(
+                        Value::Null,
+                        -32004,
+                        "invalid peer inbound request fields",
+                    ),
+                }) {
+                    warn!(peer = %peer_node_id, %error, "cannot queue peer validation response");
+                }
+                return;
+            }
+            let replay_lifetime = if method == "SendStreamingMessage" || method == "SubscribeToTask"
+            {
+                PEER_STREAM_MAX_LIFETIME
+            } else {
+                PEER_REQUEST_TIMEOUT
+            };
+            let inbound_guard = match state.peer_manager.try_admit_inbound_request(
+                peer_node_id,
+                connection_generation,
+                &request_id,
+                frame_bytes,
+                replay_lifetime,
+            ) {
+                Ok(guard) => guard,
+                Err(reason) => {
+                    if let Err(error) = spoke_tx.try_send(RelayFrame::Response {
+                        request_id,
+                        response: JsonRpcResponse::err(Value::Null, -32004, reason),
+                    }) {
+                        warn!(peer = %peer_node_id, %error, "cannot queue peer admission response");
+                    }
+                    return;
+                }
+            };
             let state = state.clone();
             let peer_node_id = peer_node_id.to_owned();
             tokio::spawn(async move {
+                let mut inbound_guard = Some(inbound_guard);
                 let response = handle_peer_spoke_request(
                     &state,
                     &request_id,
                     &target,
                     &method,
                     params,
+                    &principal,
                     &peer_node_id,
                     connection_generation,
-                    connection_cancelled,
+                    connection_lifecycle,
+                    &mut inbound_guard,
                     spoke_tx.clone(),
                 )
                 .await;
@@ -1691,20 +1955,30 @@ pub(crate) fn handle_peer_frame(
                 {
                     warn!(peer = %peer_node_id, %error, "cannot queue peer response");
                 }
+                drop(inbound_guard);
             });
         }
         RelayFrame::Response {
             request_id,
             response,
         } => {
-            if !state.peer_manager.complete_streaming(&request_id) {
-                state.peer_manager.complete_pending(&request_id, response);
+            if !state
+                .peer_manager
+                .complete_streaming_from(&request_id, peer_node_id)
+            {
+                state
+                    .peer_manager
+                    .complete_pending_from(&request_id, response, peer_node_id);
             }
         }
         RelayFrame::Event {
             request_id, result, ..
         } => {
-            if state.peer_manager.forward_stream_event(&request_id, result) == 0 {
+            if state
+                .peer_manager
+                .forward_stream_event_from(&request_id, peer_node_id, result)
+                == 0
+            {
                 debug!(%request_id, "peer event for unknown stream");
             }
         }
@@ -1733,22 +2007,21 @@ pub(crate) fn handle_peer_frame(
         RelayFrame::RouteLease {
             node_id, agents, ..
         } => {
-            let prefix = format!("{peer_node_id}/");
-            if node_id != peer_node_id
-                || agents.iter().any(|agent| {
-                    super::relay::validate_agent_ref(agent).is_err() || !agent.starts_with(&prefix)
-                })
-            {
+            let result = if node_id == peer_node_id {
+                state.peer_manager.replace_routes(peer_node_id, &agents)
+            } else {
+                Err(anyhow!(
+                    "peer '{peer_node_id}' cannot advertise routes for '{node_id}'"
+                ))
+            };
+            if let Err(error) = result {
                 state
                     .peer_manager
                     .metrics
                     .acl_denials
                     .fetch_add(1, Ordering::Relaxed);
-                warn!(peer = %peer_node_id, "invalid peer route lease rejected");
+                warn!(peer = %peer_node_id, %error, "invalid peer route lease rejected");
                 return;
-            }
-            for agent in agents {
-                state.peer_manager.add_route(&agent, peer_node_id);
             }
         }
         other => {
@@ -1764,9 +2037,11 @@ async fn handle_peer_spoke_request(
     target: &str,
     method: &str,
     mut params: Value,
+    principal: &str,
     peer_node_id: &str,
     connection_generation: u64,
-    connection_cancelled: Arc<std::sync::atomic::AtomicBool>,
+    connection_lifecycle: tokio_util::sync::CancellationToken,
+    inbound_guard: &mut Option<PeerInboundRequestGuard>,
     spoke_tx: mpsc::Sender<RelayFrame>,
 ) -> Option<JsonRpcResponse> {
     let local_node = match local_node_id(state) {
@@ -1794,15 +2069,26 @@ async fn handle_peer_spoke_request(
             format!("peer '{peer_node_id}' is not authorized to invoke {target}"),
         ));
     }
+    if !super::relay::transport_principal_matches_node(principal, peer_node_id) {
+        state
+            .peer_manager
+            .metrics
+            .acl_denials
+            .fetch_add(1, Ordering::Relaxed);
+        return Some(JsonRpcResponse::err(
+            Value::Null,
+            -32003,
+            "transport principal does not match the authenticated peer",
+        ));
+    }
     if let Some(metadata) = params.get_mut("metadata").and_then(Value::as_object_mut) {
         metadata.insert("agentId".to_owned(), Value::String(local_agent));
     }
 
     if method == "SendStreamingMessage" || method == "SubscribeToTask" {
-        let caller = Some(super::auth::A2aIdentity {
-            id: format!("node:{peer_node_id}"),
-            scopes: Vec::new(),
-        });
+        let caller = Some(super::auth::transport_authenticated_identity(
+            principal.to_owned(),
+        ));
         let (task_id, event_rx, cancel_owner) = if method == "SubscribeToTask" {
             let (task_id, event_rx) = super::streaming::subscribe_to_task(state, &caller, &params);
             (task_id, event_rx, None)
@@ -1810,14 +2096,14 @@ async fn handle_peer_spoke_request(
             super::streaming::spawn_streaming_task(state.clone(), caller, params).await
         };
         state.peer_manager.peer_stream_tasks.insert(
-            request_id.to_owned(),
+            (connection_generation, request_id.to_owned()),
             PeerStreamTask {
                 task_id: task_id.clone(),
                 connection_generation,
                 cancel_owner,
             },
         );
-        if connection_cancelled.load(Ordering::Acquire) {
+        if connection_lifecycle.is_cancelled() {
             if let Some(task) = state
                 .peer_manager
                 .take_stream_task(request_id, connection_generation)
@@ -1834,10 +2120,21 @@ async fn handle_peer_spoke_request(
         }
         let peer_manager = state.peer_manager.clone();
         let request_id = request_id.to_owned();
+        let stream_guard = inbound_guard
+            .take()
+            .expect("admitted peer stream must own its inbound guard");
         tokio::spawn(async move {
+            let _stream_guard = stream_guard;
             let mut stream = tokio_stream::wrappers::BroadcastStream::new(event_rx);
             let mut seq = 0;
-            while let Some(item) = stream.next().await {
+            loop {
+                let item = tokio::select! {
+                    _ = connection_lifecycle.cancelled() => break,
+                    item = stream.next() => item,
+                };
+                let Some(item) = item else {
+                    break;
+                };
                 match item {
                     Ok(event) => {
                         let final_event = event.is_final();
@@ -1860,13 +2157,15 @@ async fn handle_peer_spoke_request(
                 }
             }
             peer_manager.take_stream_task(&request_id, connection_generation);
-            if let Err(error) = spoke_tx.try_send(RelayFrame::Response {
-                request_id,
-                response: JsonRpcResponse::ok(
-                    Value::String(task_id),
-                    serde_json::json!({"ok": true}),
-                ),
-            }) {
+            if !connection_lifecycle.is_cancelled()
+                && let Err(error) = spoke_tx.try_send(RelayFrame::Response {
+                    request_id,
+                    response: JsonRpcResponse::ok(
+                        Value::String(task_id),
+                        serde_json::json!({"ok": true}),
+                    ),
+                })
+            {
                 warn!(%error, "cannot queue peer stream response");
             }
         });
@@ -1882,10 +2181,9 @@ async fn handle_peer_spoke_request(
     Some(
         super::server::a2a_rpc_handler_inner(
             state.clone(),
-            Some(super::auth::A2aIdentity {
-                id: format!("node:{peer_node_id}"),
-                scopes: Vec::new(),
-            }),
+            Some(super::auth::transport_authenticated_identity(
+                principal.to_owned(),
+            )),
             request,
         )
         .await
@@ -1896,6 +2194,52 @@ async fn handle_peer_spoke_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_route_lease_is_bounded_and_replaces_previous_snapshot() {
+        let manager = PeerManager::default();
+        manager
+            .replace_routes("peer-a", &["peer-a/old".to_owned()])
+            .expect("initial peer route should be accepted");
+        manager
+            .replace_routes(
+                "peer-a",
+                &["peer-a/main".to_owned(), "peer-a/worker".to_owned()],
+            )
+            .expect("replacement peer routes should be accepted");
+        assert!(manager.route_for("peer-a/old").is_none());
+        assert!(manager.route_for("peer-a/main").is_some());
+        assert!(manager.route_for("peer-a/worker").is_some());
+
+        let oversized: Vec<String> = (0..257)
+            .map(|index| format!("peer-a/agent-{index}"))
+            .collect();
+        let error = manager
+            .replace_routes("peer-a", &oversized)
+            .expect_err("oversized direct route lease must fail");
+        assert!(error.to_string().contains("too many agents"));
+        assert!(manager.route_for("peer-a/main").is_some());
+    }
+
+    #[test]
+    fn peer_route_capacity_is_bounded_across_connections() {
+        let manager = PeerManager::default();
+        for peer in 0..(MAX_PEER_ROUTES / MAX_PEER_ROUTES_PER_LEASE) {
+            let node_id = format!("peer-{peer}");
+            let agents: Vec<String> = (0..MAX_PEER_ROUTES_PER_LEASE)
+                .map(|index| format!("{node_id}/agent-{index}"))
+                .collect();
+            manager
+                .replace_routes(&node_id, &agents)
+                .expect("peer routes within global capacity should be accepted");
+        }
+        assert_eq!(manager.routes.len(), MAX_PEER_ROUTES);
+        let error = manager
+            .replace_routes("overflow", &["overflow/main".to_owned()])
+            .expect_err("global peer route capacity must reject new entries");
+        assert!(error.to_string().contains("capacity exceeded"));
+        assert_eq!(manager.routes.len(), MAX_PEER_ROUTES);
+    }
 
     struct NoopPeerHandler;
 
@@ -2400,6 +2744,8 @@ mod tests {
                     agent_ref: "node-b/main".to_owned(),
                     node_id: "node-b".to_owned(),
                     deadline: Instant::now() + PEER_STREAM_MAX_LIFETIME,
+                    task_id: None,
+                    context_id: None,
                 },
             );
         }
@@ -2416,6 +2762,287 @@ mod tests {
 
         assert!(matches!(result, Err(PeerInvokeError::Unavailable(_))));
         assert_eq!(manager.stream_pending.len(), MAX_PEER_STREAMS);
+    }
+
+    #[test]
+    fn direct_stream_failures_preserve_identity_or_return_transport_error() {
+        let manager = PeerManager::default();
+        let (unknown_tx, mut unknown_rx) = broadcast::channel(1);
+        manager.stream_pending.insert(
+            "unknown".to_owned(),
+            StreamPending {
+                tx: unknown_tx,
+                agent_ref: "node-b/main".to_owned(),
+                node_id: "node-b".to_owned(),
+                deadline: Instant::now(),
+                task_id: None,
+                context_id: None,
+            },
+        );
+        assert_eq!(manager.sweep_expired_streams(), 1);
+        assert!(matches!(
+            unknown_rx.try_recv().expect("transport error"),
+            RelayStreamItem::Error { code: -32004, .. }
+        ));
+
+        let (known_tx, mut known_rx) = broadcast::channel(2);
+        manager.stream_pending.insert(
+            "known".to_owned(),
+            StreamPending {
+                tx: known_tx,
+                agent_ref: "node-b/main".to_owned(),
+                node_id: "node-b".to_owned(),
+                deadline: Instant::now() + PEER_STREAM_MAX_LIFETIME,
+                task_id: None,
+                context_id: None,
+            },
+        );
+        manager.forward_stream_event_from(
+            "known",
+            "node-b",
+            serde_json::json!({"taskId": "task-1", "contextId": "context-1"}),
+        );
+        assert!(matches!(
+            known_rx.try_recv().expect("initial event"),
+            RelayStreamItem::Event(_)
+        ));
+        manager
+            .stream_pending
+            .get_mut("known")
+            .expect("known stream")
+            .deadline = Instant::now();
+        assert_eq!(manager.sweep_expired_streams(), 1);
+        let RelayStreamItem::Event(failure) = known_rx.try_recv().expect("terminal event") else {
+            panic!("known task identity must produce a terminal task event");
+        };
+        assert_eq!(failure["taskId"], "task-1");
+        assert_eq!(failure["contextId"], "context-1");
+        assert_eq!(failure["status"]["state"], "TASK_STATE_FAILED");
+    }
+
+    #[test]
+    fn direct_response_and_events_require_expected_peer_source() {
+        let manager = PeerManager::default();
+        let (response_tx, mut response_rx) = oneshot::channel();
+        manager
+            .pending
+            .insert("peer:7".to_owned(), (response_tx, "node-b".to_owned()));
+        let forged = JsonRpcResponse::ok(Value::String("peer:7".to_owned()), Value::Null);
+        assert!(manager.complete_pending_from("peer:7", forged, "node-c"));
+        assert!(manager.pending.contains_key("peer:7"));
+        assert!(matches!(
+            response_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        let valid = JsonRpcResponse::ok(
+            Value::String("peer:7".to_owned()),
+            serde_json::json!({"ok": true}),
+        );
+        assert!(manager.complete_pending_from("peer:7", valid, "node-b"));
+        assert!(response_rx.try_recv().is_ok());
+
+        let (stream_tx, mut stream_rx) = broadcast::channel(1);
+        manager.stream_pending.insert(
+            "peer:stream:8".to_owned(),
+            StreamPending {
+                tx: stream_tx,
+                agent_ref: "node-b/main".to_owned(),
+                node_id: "node-b".to_owned(),
+                deadline: Instant::now() + PEER_STREAM_MAX_LIFETIME,
+                task_id: None,
+                context_id: None,
+            },
+        );
+        let forged_event = serde_json::json!({"taskId": "forged-task"});
+        assert_eq!(
+            manager.forward_stream_event_from("peer:stream:8", "node-c", forged_event),
+            0
+        );
+        assert!(matches!(
+            stream_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(manager.route_for_task("forged-task").is_none());
+        assert!(manager.complete_streaming_from("peer:stream:8", "node-c"));
+        assert!(manager.stream_pending.contains_key("peer:stream:8"));
+
+        let valid_event = serde_json::json!({"taskId": "valid-task"});
+        assert_eq!(
+            manager.forward_stream_event_from("peer:stream:8", "node-b", valid_event),
+            1
+        );
+        assert!(stream_rx.try_recv().is_ok());
+        assert_eq!(
+            manager.route_for_task("valid-task").as_deref(),
+            Some("node-b/main")
+        );
+        assert!(manager.complete_streaming_from("peer:stream:8", "node-b"));
+    }
+
+    #[test]
+    fn direct_task_routes_are_bounded_and_collision_safe() {
+        let manager = PeerManager::default();
+        manager
+            .record_task_route("task-0", "node-a/main")
+            .expect("initial task route should be recorded");
+        assert!(manager.record_task_route("task-0", "node-b/main").is_err());
+        assert_eq!(
+            manager.route_for_task("task-0").as_deref(),
+            Some("node-a/main")
+        );
+
+        for index in 1..MAX_PEER_TASK_ROUTES {
+            manager
+                .record_task_route(&format!("task-{index}"), "node-a/main")
+                .expect("task route within capacity should be recorded");
+        }
+        assert!(
+            manager
+                .record_task_route("task-overflow", "node-a/main")
+                .is_err()
+        );
+        assert_eq!(manager.task_routes.len(), MAX_PEER_TASK_ROUTES);
+        assert!(manager.route_for_task("task-overflow").is_none());
+    }
+
+    #[test]
+    fn direct_inbound_request_admission_is_bounded_and_replay_safe() {
+        let manager = Arc::new(PeerManager::default());
+        let first = manager
+            .try_admit_inbound_request("node-a", 1, "duplicate", 1024, PEER_REQUEST_TIMEOUT)
+            .expect("first request id should be admitted");
+        assert!(
+            manager
+                .try_admit_inbound_request("node-a", 1, "duplicate", 1024, PEER_REQUEST_TIMEOUT,)
+                .is_err()
+        );
+        drop(first);
+        assert!(
+            manager
+                .try_admit_inbound_request("node-a", 2, "duplicate", 1024, PEER_REQUEST_TIMEOUT,)
+                .is_err()
+        );
+        drop(
+            manager
+                .try_admit_inbound_request("node-b", 2, "duplicate", 1024, PEER_REQUEST_TIMEOUT)
+                .expect("a different authenticated source owns a separate replay key"),
+        );
+
+        let permits: Vec<_> = (0..MAX_PEER_INBOUND_REQUESTS)
+            .map(|index| {
+                manager
+                    .try_admit_inbound_request(
+                        "node-a",
+                        3,
+                        &format!("request-{index}"),
+                        1024,
+                        PEER_REQUEST_TIMEOUT,
+                    )
+                    .expect("request within capacity should be admitted")
+            })
+            .collect();
+
+        assert!(
+            manager
+                .try_admit_inbound_request(
+                    "node-a",
+                    3,
+                    "request-overflow",
+                    1024,
+                    PEER_REQUEST_TIMEOUT,
+                )
+                .is_err()
+        );
+        drop(permits);
+        assert!(manager.inbound_requests.is_empty());
+        assert!(
+            manager
+                .try_admit_inbound_request(
+                    "node-a",
+                    3,
+                    "request-after-release",
+                    1024,
+                    PEER_REQUEST_TIMEOUT,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn direct_inbound_request_bytes_are_bounded() {
+        let manager = Arc::new(PeerManager::default());
+        let permits: Vec<_> = (0..(MAX_PEER_INBOUND_BYTES / MAX_RELAY_FRAME_BYTES))
+            .map(|index| {
+                manager
+                    .try_admit_inbound_request(
+                        "node-a",
+                        1,
+                        &format!("large-request-{index}"),
+                        MAX_RELAY_FRAME_BYTES,
+                        PEER_REQUEST_TIMEOUT,
+                    )
+                    .expect("request within byte capacity should be admitted")
+            })
+            .collect();
+        assert!(
+            manager
+                .try_admit_inbound_request(
+                    "node-a",
+                    1,
+                    "large-request-overflow",
+                    1,
+                    PEER_REQUEST_TIMEOUT,
+                )
+                .is_err()
+        );
+        drop(permits);
+        assert_eq!(
+            manager.inbound_request_bytes.available_permits(),
+            MAX_PEER_INBOUND_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_lifecycle_releases_waiting_inbound_request() {
+        let manager = Arc::new(PeerManager::default());
+        let (tx, _rx) = mpsc::channel(1);
+        let generation = manager.register_connection("node-b", "session", tx);
+        let lifecycle = manager
+            .direct_connections
+            .get("node-b")
+            .expect("connection should be registered")
+            .lifecycle
+            .clone();
+        let guard = manager
+            .try_admit_inbound_request(
+                "node-b",
+                generation,
+                "subscribe-no-events",
+                1024,
+                PEER_STREAM_MAX_LIFETIME,
+            )
+            .expect("subscription should be admitted");
+        let waiter = tokio::spawn(async move {
+            let _guard = guard;
+            lifecycle.cancelled().await;
+        });
+
+        manager.unregister_connection("node-b", generation);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("connection cancellation should wake waiter")
+            .expect("waiter should not panic");
+
+        assert!(manager.inbound_requests.is_empty());
+        assert_eq!(
+            manager.inbound_request_slots.available_permits(),
+            MAX_PEER_INBOUND_REQUESTS
+        );
+        assert_eq!(
+            manager.inbound_request_bytes.available_permits(),
+            MAX_PEER_INBOUND_BYTES
+        );
     }
 
     #[test]
@@ -2437,9 +3064,35 @@ mod tests {
             .reserve_session("replayed-offer", "node-b")
             .expect("initial offer should reserve");
         manager.remove_session_if_generation("replayed-offer", generation);
-        manager.mark_session_consumed("replayed-offer");
+        manager
+            .mark_session_consumed("replayed-offer")
+            .expect("consumed session should be recorded");
 
         assert!(manager.reserve_session("replayed-offer", "node-b").is_err());
+    }
+
+    #[test]
+    fn consumed_signaling_capacity_fails_closed_without_eviction() {
+        let manager = PeerManager::default();
+        for index in 0..MAX_PEER_SIGNAL_SESSIONS {
+            manager
+                .mark_session_consumed(&format!("consumed-{index}"))
+                .expect("tombstone within capacity should be retained");
+        }
+
+        let error = manager
+            .mark_session_consumed("overflow")
+            .expect_err("full tombstone table must reject a new session");
+        assert!(error.to_string().contains("tombstone capacity exceeded"));
+        assert!(
+            manager
+                .consumed_sessions
+                .lock()
+                .expect("consumed peer signaling session mutex poisoned")
+                .contains_key("consumed-0"),
+            "capacity rejection must not evict a live replay tombstone"
+        );
+        assert!(manager.reserve_session("new-offer", "node-b").is_err());
     }
 
     #[test]
@@ -2507,7 +3160,7 @@ mod tests {
         task_cancels.insert("task-owned".to_owned(), owned.clone());
         task_cancels.insert("task-replacement".to_owned(), replacement.clone());
         manager.peer_stream_tasks.insert(
-            "request-owned".to_owned(),
+            (1, "request-owned".to_owned()),
             PeerStreamTask {
                 task_id: "task-owned".to_owned(),
                 connection_generation: 1,
@@ -2515,7 +3168,7 @@ mod tests {
             },
         );
         manager.peer_stream_tasks.insert(
-            "request-replacement".to_owned(),
+            (2, "request-replacement".to_owned()),
             PeerStreamTask {
                 task_id: "task-replacement".to_owned(),
                 connection_generation: 2,
@@ -2530,18 +3183,22 @@ mod tests {
         assert!(!replacement.is_cancelled());
         assert!(!task_cancels.contains_key("task-owned"));
         assert!(task_cancels.contains_key("task-replacement"));
-        assert!(!manager.peer_stream_tasks.contains_key("request-owned"));
+        assert!(
+            !manager
+                .peer_stream_tasks
+                .contains_key(&(1, "request-owned".to_owned()))
+        );
         assert!(
             manager
                 .peer_stream_tasks
-                .contains_key("request-replacement")
+                .contains_key(&(2, "request-replacement".to_owned()))
         );
 
         let old_same_id = Arc::new(tokio_util::sync::CancellationToken::new());
         let replacement_same_id = Arc::new(tokio_util::sync::CancellationToken::new());
         task_cancels.insert("shared-task".to_owned(), replacement_same_id.clone());
         manager.peer_stream_tasks.insert(
-            "old-shared-request".to_owned(),
+            (3, "old-shared-request".to_owned()),
             PeerStreamTask {
                 task_id: "shared-task".to_owned(),
                 connection_generation: 3,

@@ -131,14 +131,22 @@ has a monotonically increasing generation, so teardown from an older connection
 cannot remove its replacement. A replacement cancels and closes the superseded
 connection, and stale DataChannel tasks verify their generation before processing
 inbound frames. Route leases received over the direct channel
-must advertise only `peer_node/agent` references. Direct routes and pending
-requests are removed when the owning generation closes. Inbound streaming tasks
-are correlated with that connection generation; connection loss removes their
-mappings and fires their cancellation tokens without affecting replacement-owned
-tasks. Heartbeats use `RelayFrame::Ping/Pong`.
+must advertise only `peer_node/agent` references. Each lease is a complete,
+source-owned snapshot capped at 256 agents; replacement removes the previous
+snapshot, and the process-wide direct route table is capped at 4,096 entries.
+Direct routes and pending requests are removed when the owning generation closes.
+Inbound requests acquire
+one of 1,024 process-wide direct-admission permits before task creation and atomically
+reserve `(connection_generation, request_id)`; duplicate IDs are rejected. Inbound
+streaming tasks are correlated with that connection generation. Each forwarding loop
+selects on the owning connection's cancellation token, so replacement/disconnect
+removes its mapping, releases its permit, and fires its task cancellation token
+without affecting replacement-owned tasks. Heartbeats use `RelayFrame::Ping/Pong`.
 
 Direct request identity is bound to the authenticated peer node. The untrusted
-`principal` string in a data frame is not used as the caller identity.
+`principal` string in a data frame is not used as the caller identity. Outbound
+unary responses and stream events/terminal responses are accepted only from the
+same authenticated peer node recorded when the correlation was created.
 
 ### Route ownership
 
@@ -179,7 +187,12 @@ unavailable before delivery and can safely use hub fallback. Direct and hub
 outbound streaming-correlation tables are each capped at 1,024 entries, while
 direct and hub outbound unary-correlation tables are each capped at 4,096 entries.
 Admission is checked before queueing a request; streaming's 30-minute lifetime
-sweeps and unary's 120-second response timeout are secondary cleanup bounds.
+sweeps and unary's 120-second response timeout are secondary cleanup bounds. An
+artifact event's `lastChunk` closes only that artifact's chunk sequence; forwarding
+continues until a final task status event. Stream correlations retain the first
+validated task/context identity. Disconnect/deadline failures preserve those IDs in
+a terminal status event; if identity was never established, the transport emits a
+request-correlated JSON-RPC `-32004` error rather than an empty-ID task event.
 
 ### Hub authorization
 
@@ -192,19 +205,26 @@ Direct DataChannel requests are checked against the same configured source
 node `a2a:invoke:<target>` scopes; the frame's claimed principal cannot widen
 that authority.
 
-Hub and spoke WebSocket writer queues are bounded to 256 frames. A saturated hub
-writer is treated as a failed connection and triggers the normal route, pending
-request, and stream cleanup instead of accumulating unbounded memory. Spoke-side
+Hub route leases are validated completely before mutation, capped at 256 agents
+per lease and 4,096 live routes process-wide, and their peer-controlled TTL is
+clamped to the protocol's 30-second maximum. Capacity or validation failure leaves
+the prior table unchanged. Hub and spoke WebSocket writer queues are bounded to
+256 frames. A saturated hub writer is treated as a failed connection and triggers
+the normal route, pending request, and stream cleanup instead of accumulating
+unbounded memory. Spoke-side
 control queues likewise fail closed on saturation. Re-authenticating the same
 hub node ID replaces and closes the old socket; every inbound frame is fenced by
 the active connection epoch, so a superseded socket cannot retain node authority.
 Spoke-side streaming task mappings carry the authenticated control generation
 and the exact cancellation-token owner; direct mappings carry the equivalent
 connection generation and token owner. Cancel, worker cleanup, and disconnect
-teardown remove or cancel only the matching task incarnation, even if a client
-reuses the same task ID. INPUT_REQUIRED suspension entries carry the same owner,
-so a stale wait-input timeout cannot delete a replacement task's resume sender or
-cancellation token. Hub correlation for
+teardown remove or cancel only the matching task incarnation. Persistent A2A task
+creation writes the initial task and authenticated principal owner in one
+transaction and rejects any existing task or owner reservation, so a caller-supplied
+task ID cannot replace or claim another task. Resume verifies that immutable owner
+before consuming an INPUT_REQUIRED sender. Suspension entries also carry the exact
+cancellation owner, so a stale wait-input timeout cannot delete the current task's
+resume sender or cancellation token. Hub correlation for
 spoke-originated unary requests is capped at 4,096 entries. Each entry expires at
 the forwarded request deadline, clamped to the hub request-timeout ceiling; the
 periodic relay sweeper removes expired entries and returns a terminal timeout to
@@ -283,6 +303,10 @@ valid `ws://` or `wss://` hub endpoint, and relay token or private-key
 authentication. Every configured endpoint must be valid for its list: `stun:` or
 `stuns:` in `stunUrls`, and `turn:` or `turns:` in `turnUrls`. Configured TURN
 URLs additionally require non-blank resolved username and credential values.
+Configured relay, relay-node, and private-key-file credentials must resolve to
+non-empty values or startup fails. Relay node IDs must be unique. Inline/file
+private keys and configured public keys must decode as raw 32-byte Ed25519 key
+material before the relay starts.
 
 Hub node configuration must grant source spokes the desired
 `a2a:invoke:<node/agent>` scopes in addition to relay connect/advertise scopes.
@@ -309,7 +333,8 @@ Required automated coverage includes:
 - frame chunk boundaries, the 8 MiB frame limit, and bounded aggregate
   reassembly memory;
 - bounded direct and relay writer queues, bounded direct/hub stream correlation,
-  bounded/expiring hub unary request correlation, and overload fail-closed behavior;
+  bounded/expiring hub unary request correlation, bounded/atomic route leases with
+  TTL clamping, and overload fail-closed behavior;
 - direct connection loss cancelling only generation-owned inbound streaming tasks;
 - delivered remote errors never being reclassified as safe-to-retry admission failures;
 - HTTP/SSE fallback when the runtime direct/hub host reports no route, including

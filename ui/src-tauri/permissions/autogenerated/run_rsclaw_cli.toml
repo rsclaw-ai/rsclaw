@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-run-rsclaw-cli"
+description = "Enables the run_rsclaw_cli command without any pre-configured scope."
+commands.allow = ["run_rsclaw_cli"]
+
+[[permission]]
+identifier = "deny-run-rsclaw-cli"
+description = "Denies the run_rsclaw_cli command without any pre-configured scope."
+commands.deny = ["run_rsclaw_cli"]

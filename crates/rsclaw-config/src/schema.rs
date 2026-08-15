@@ -194,8 +194,8 @@ pub struct GatewayAuth {
 /// One named A2A client credential. The `secret` is accepted on EITHER the
 /// `Authorization: Bearer` or `X-API-Key` header — transport is the caller's
 /// choice, not a server config axis. Once the secret matches, the request is
-/// attributed to `id` (the principal). `scopes` is reserved for per-method
-/// authorization (A2A spec §7.5) and is not enforced yet.
+/// attributed to `id` (the principal). `scopes` controls method/action
+/// authorization (A2A spec §7.5); an empty list grants no operations.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct A2aClient {
@@ -203,7 +203,9 @@ pub struct A2aClient {
     pub id: String,
     /// Accepted secret: plain string, `${ENV}`, or a secret ref.
     pub secret: SecretOrString,
-    /// Reserved for per-method authorization (A2A §7.5); unenforced today.
+    /// Method/action authorization grants. `*` grants all operations; narrower
+    /// forms include `a2a:method:<Method>` and
+    /// `a2a:invoke/read/cancel/push:<target>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 }

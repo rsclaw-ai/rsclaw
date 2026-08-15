@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-migrate-openclaw"
+description = "Enables the migrate_openclaw command without any pre-configured scope."
+commands.allow = ["migrate_openclaw"]
+
+[[permission]]
+identifier = "deny-migrate-openclaw"
+description = "Denies the migrate_openclaw command without any pre-configured scope."
+commands.deny = ["migrate_openclaw"]

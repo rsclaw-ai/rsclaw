@@ -46,7 +46,7 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::{Multipart, Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -60,7 +60,10 @@ use rsclaw_config::runtime::RuntimeConfig;
 use rsclaw_store::Store;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, broadcast};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, Any, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing::{info, warn};
 
 use crate::{cmd::config_json::load_config_json, gateway::LiveConfig, ws::types::EventFrame};
@@ -400,6 +403,35 @@ struct PatchAgentRequest {
 // Router builder
 // ---------------------------------------------------------------------------
 
+fn trusted_cors_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    if matches!(
+        origin,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    ) {
+        return true;
+    }
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && matches!(
+            url.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+        )
+}
+
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin, _request_parts| {
+            trusted_cors_origin(origin)
+        }))
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
 /// Build the Axum router with all API routes, middleware, and static file
 /// serving.
 pub fn build_router(state: AppState) -> Router {
@@ -580,8 +612,10 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             rate_limit_middleware,
         ))
-        // H2: restrict CORS when not on loopback
-        .layer(CorsLayer::permissive())
+        // H2: browsers may call the gateway only from local development or
+        // desktop origins. Remote deployments should use a same-origin reverse
+        // proxy rather than granting arbitrary websites ambient gateway access.
+        .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -906,6 +940,33 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cors_allows_only_local_and_desktop_origins() {
+        for allowed in [
+            "http://localhost:3000",
+            "https://127.0.0.1:18888",
+            "http://[::1]:3000",
+            "tauri://localhost",
+            "http://tauri.localhost",
+        ] {
+            assert!(
+                trusted_cors_origin(&HeaderValue::from_str(allowed).unwrap()),
+                "expected allowed origin: {allowed}"
+            );
+        }
+        for denied in [
+            "https://example.com",
+            "https://localhost.example.com",
+            "file://localhost/tmp/index.html",
+            "null",
+        ] {
+            assert!(
+                !trusted_cors_origin(&HeaderValue::from_str(denied).unwrap()),
+                "expected denied origin: {denied}"
+            );
+        }
+    }
 
     #[test]
     fn reload_scope_default_is_all() {

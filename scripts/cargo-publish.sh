@@ -47,6 +47,12 @@ CRATES=(
 MAX_RETRIES="${PUBLISH_MAX_RETRIES:-15}"
 RETRY_DELAY="${PUBLISH_RETRY_DELAY:-60}"
 
+if [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]]; then
+  echo "Refusing to publish from a dirty working tree" >&2
+  git -C "$ROOT" status --short >&2
+  exit 1
+fi
+
 publish_package() {
   local name="$1"
   local dir="$2"
@@ -56,7 +62,7 @@ publish_package() {
   while (( attempt <= MAX_RETRIES )); do
     echo ">>> Publishing ${name} (attempt ${attempt}/${MAX_RETRIES})..."
 
-    if output=$(cd "$dir" && cargo publish --no-verify --allow-dirty 2>&1); then
+    if output=$(cd "$dir" && cargo publish 2>&1); then
       printf '%s\n' "$output"
       echo "<<< ${name} published"
       return 0

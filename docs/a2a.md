@@ -67,7 +67,18 @@ For streaming, add `Accept: text/event-stream` and switch to `SendStreamingMessa
 1. The gateway's operator token (`gateway.auth.token`) as a bearer — admin-level identity.
 2. Any configured A2A principal secret (`gateway.a2a.clients[].secret`) — scoped identity for partners.
 
-Header must be `Authorization: Bearer <secret>` or `X-API-Key: <secret>`. Empty `Accepted` set (no operator token AND no principals) is dev pass-through — open mode.
+Header must be `Authorization: Bearer <secret>` or `X-API-Key: <secret>`. Empty `Accepted` set (no operator token AND no principals) is dev pass-through — open mode. Explicitly configured credentials must resolve to non-empty values or config loading fails.
+
+Named clients are fail-closed: an empty `scopes` list grants no operations. Supported grants are:
+
+- `*` — all standard A2A operations;
+- `a2a:method:<Method>` or `a2a:method:*` — one/all JSON-RPC methods;
+- `a2a:invoke:<agent>` — `SendMessage` / `SendStreamingMessage` for an agent;
+- `a2a:read:<taskId>`, `a2a:read:tasks`, `a2a:read:agent-card` — task/card reads;
+- `a2a:cancel:<taskId>` — task cancellation;
+- `a2a:push:<taskId>` — push-notification config operations.
+
+Each action scope accepts `*` as its target. When `SendMessage` or `SendStreamingMessage` omits `metadata.agentId`, authorization resolves the gateway's actual default agent before matching `a2a:invoke:<agent>`; a grant for that default agent therefore works without requiring `a2a:invoke:*`. Legacy `authTokens` / `apiKeys` and their environment-list equivalents retain historical full access through an explicit internal `*` grant. Transport-authenticated direct and relay requests receive an internal `*` only after their node/target ACL succeeds, preventing the standard dispatcher from denying the same request a second time. Task ownership checks still apply after scope authorization.
 
 Set these env vars to enforce auth without editing config:
 
@@ -252,11 +263,11 @@ gateway.a2a.relay.principals = [
 ]
 ```
 
-The hub-side `can_invoke()` ACL gates every routed call against the caller's identity and the target node — denials are audit-logged. Operators bypassing via the gateway's own auth_token always pass.
+The hub-side `can_invoke()` ACL gates every routed call against the caller's identity and the target node — denials are audit-logged. Operators bypassing via the gateway's own auth_token always pass. Configured relay and per-node tokens, inline private keys, and private-key files are fail-closed: unresolved or empty values stop configuration loading. Relay node IDs must be unique, and Ed25519 public/private key material must decode to raw 32-byte values before startup.
 
 ### Spoke ↔ hub frames
 
-Once the WS is open the protocol uses framed JSON over a single connection: requests fan out (hub → spoke), responses + streaming events fan in (spoke → hub). Stream entries are reaped on terminal `Response` or on disconnect (the relay publishes `TASK_STATE_FAILED` with reason `relay route lost`). Health monitoring + auto-reconnect with primary-standby failover are built in (`strategy: "primary_standby"` walks the `relays:` list in order).
+Once the WS is open the protocol uses framed JSON over a single connection: requests fan out (hub → spoke), responses + streaming events fan in (spoke → hub). Stream entries are reaped on terminal `Response` or on disconnect (the relay publishes `TASK_STATE_FAILED` with reason `relay route lost`). Route leases are validated atomically, limited to 256 agents per lease and 4,096 live routes per direct or hub table; hub TTLs are clamped to 30 seconds. A direct lease replaces that authenticated peer's previous route snapshot. Health monitoring + auto-reconnect with primary-standby failover are built in (`strategy: "primary_standby"` walks the `relays:` list in order).
 
 ### Multi-hop
 

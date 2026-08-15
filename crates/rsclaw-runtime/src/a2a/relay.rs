@@ -82,11 +82,113 @@ const MAX_PEER_SDP_BYTES: usize = 64 * 1024;
 const MAX_PEER_SIGNAL_SESSIONS: usize = 1024;
 const RELAY_WRITE_QUEUE_CAPACITY: usize = 256;
 const MAX_SPOKE_RELAY_REQUESTS: usize = 4096;
+const MAX_RELAY_REQUEST_TOMBSTONES: usize = 16_384;
+const MAX_SPOKE_INBOUND_REQUESTS: usize = 1024;
+const MAX_SPOKE_INBOUND_TOMBSTONES: usize = 16_384;
+const MAX_RELAY_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SPOKE_INBOUND_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RELAY_STREAMS: usize = 1024;
 const MAX_RELAY_PENDING_REQUESTS: usize = 4096;
+const MAX_RELAY_TASK_ROUTES: usize = 4096;
+const MAX_RELAY_REQUEST_ID_BYTES: usize = 256;
+const MAX_RELAY_TARGET_BYTES: usize = 512;
+const MAX_RELAY_METHOD_BYTES: usize = 64;
+const MAX_RELAY_PRINCIPAL_BYTES: usize = 512;
+const MAX_ROUTES_PER_LEASE: usize = 256;
+const MAX_RELAY_ROUTES: usize = 4096;
 /// Backoff cap when failing over between relays. Same envelope as the
 /// per-relay reconnect backoff but applied across the entire list.
 const FAILOVER_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+fn valid_relay_request_fields(
+    request_id: &str,
+    target: &str,
+    method: &str,
+    principal: &str,
+) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= MAX_RELAY_REQUEST_ID_BYTES
+        && !target.is_empty()
+        && target.len() <= MAX_RELAY_TARGET_BYTES
+        && !method.is_empty()
+        && method.len() <= MAX_RELAY_METHOD_BYTES
+        && !principal.is_empty()
+        && principal.len() <= MAX_RELAY_PRINCIPAL_BYTES
+}
+
+fn canonical_transport_principal_for_node(node_id: &str, principal: &str) -> Result<String> {
+    let canonical = format!(
+        "node:{}:{}:{}:{}",
+        node_id.len(),
+        node_id,
+        principal.len(),
+        principal
+    );
+    if canonical.len() > MAX_RELAY_PRINCIPAL_BYTES || canonical.contains(['\r', '\n']) {
+        anyhow::bail!("canonical A2A transport principal is invalid");
+    }
+    Ok(canonical)
+}
+
+/// Return whether a canonical principal is bound to the authenticated node.
+pub(crate) fn transport_principal_matches_node(principal: &str, node_id: &str) -> bool {
+    let prefix = format!("node:{}:{node_id}:", node_id.len());
+    let Some(encoded_principal) = principal.strip_prefix(&prefix) else {
+        return false;
+    };
+    let Some((encoded_len, raw_principal)) = encoded_principal.split_once(':') else {
+        return false;
+    };
+    encoded_len
+        .parse::<usize>()
+        .is_ok_and(|expected_len| expected_len == raw_principal.len())
+}
+
+/// Bind a caller identity to the authenticated local transport node using an
+/// unambiguous length-prefixed encoding shared by direct and hub paths.
+pub(crate) fn canonical_transport_principal(state: &AppState, principal: &str) -> Result<String> {
+    let node_id = state
+        .config
+        .gateway
+        .a2a_relay
+        .node_id
+        .as_deref()
+        .filter(|node_id| !node_id.is_empty())
+        .ok_or_else(|| anyhow!("A2A transport requires gateway.a2a.relay.nodeId"))?;
+    canonical_transport_principal_for_node(node_id, principal)
+}
+
+fn relay_failure_event(
+    message_id_prefix: &str,
+    task_id: &str,
+    context_id: &str,
+    message: String,
+) -> Value {
+    serde_json::json!({
+        "kind": "status-update",
+        "taskId": task_id,
+        "contextId": context_id,
+        "status": {
+            "state": "TASK_STATE_FAILED",
+            "message": {
+                "role": "ROLE_AGENT",
+                "messageId": format!("{message_id_prefix}-{}", Uuid::new_v4()),
+                "parts": [{
+                    "type": "text",
+                    "text": message,
+                }],
+            }
+        },
+        "final": true,
+    })
+}
+
+fn redacted_hub_url(value: &str) -> String {
+    let Ok(url) = url::Url::parse(value) else {
+        return "<invalid-relay-url>".to_owned();
+    };
+    format!("{}{}", url.origin().ascii_serialization(), url.path())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloCapabilities {
@@ -236,12 +338,69 @@ pub(crate) struct SpokeStreamTask {
     cancel_owner: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
 }
 
+struct SpokeInboundRequestGuard {
+    hub: std::sync::Arc<RelayHub>,
+    request_id: String,
+    frame_bytes: u64,
+}
+
+impl Drop for SpokeInboundRequestGuard {
+    fn drop(&mut self) {
+        self.hub.spoke_inbound_requests.remove(&self.request_id);
+        self.hub
+            .spoke_inbound_bytes
+            .fetch_sub(self.frame_bytes, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RelayStreamItem {
+    Event(Value),
+    Error { code: i64, message: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamPending {
-    pub tx: broadcast::Sender<Value>,
+    pub tx: broadcast::Sender<RelayStreamItem>,
     pub agent_ref: String,
     pub node_id: String,
     pub deadline: std::time::Instant,
+    pub task_id: Option<String>,
+    pub context_id: Option<String>,
+}
+
+impl StreamPending {
+    pub(crate) fn observe_identity(&mut self, value: &Value) {
+        if self.task_id.is_none() {
+            self.task_id = value
+                .get("taskId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= MAX_RELAY_REQUEST_ID_BYTES)
+                .map(str::to_owned);
+        }
+        if self.context_id.is_none() {
+            self.context_id = value
+                .get("contextId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= MAX_RELAY_REQUEST_ID_BYTES)
+                .map(str::to_owned);
+        }
+    }
+
+    pub(crate) fn failure_item(&self, message_id_prefix: &str, message: String) -> RelayStreamItem {
+        match (self.task_id.as_deref(), self.context_id.as_deref()) {
+            (Some(task_id), Some(context_id)) => RelayStreamItem::Event(relay_failure_event(
+                message_id_prefix,
+                task_id,
+                context_id,
+                message,
+            )),
+            _ => RelayStreamItem::Error {
+                code: -32004,
+                message,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +474,7 @@ pub struct RelayHub {
     connections: DashMap<String, Connection>,
     connection_generation: AtomicU64,
     routes: DashMap<String, RouteEntry>,
+    route_admission: std::sync::Mutex<()>,
     /// request_id → (waiter, target_node_id). We carry node_id so that
     /// when a connection drops we can resolve only its pending waiters
     /// instead of nuking every in-flight JSON-RPC call.
@@ -323,6 +483,13 @@ pub struct RelayHub {
     /// Hub-side request ID → authenticated source spoke for spoke-originated
     /// unary requests that the hub is relaying to another spoke.
     spoke_request_sources: std::sync::Mutex<HashMap<String, SpokeRelayRequest>>,
+    /// Source-bound replay records retained after spoke request completion.
+    spoke_request_tombstones: std::sync::Mutex<HashMap<(String, String), std::time::Instant>>,
+    /// Spoke-side active inbound requests and completed-request replay records.
+    spoke_inbound_requests: DashMap<String, ()>,
+    spoke_inbound_tombstones: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    spoke_inbound_admission: std::sync::Mutex<()>,
+    spoke_inbound_bytes: AtomicU64,
     /// Spoke-side active authenticated control connection used for hub
     /// fallback.
     spoke_control: std::sync::RwLock<Option<SpokeControl>>,
@@ -343,8 +510,10 @@ pub struct RelayHub {
     /// sniffing responses and streaming events as they pass through the
     /// hub. Lets follow-up task-bound RPCs (GetTask, CancelTask, push
     /// config ops, SubscribeToTask) route to the right spoke even when
-    /// the client only knows the task_id.
+    /// the client only knows the task_id. Entries never overwrite prior
+    /// ownership and admission is bounded without evicting historical routes.
     task_routes: DashMap<String, String>,
+    task_route_admission: std::sync::Mutex<()>,
     /// Hub-authorized offer sessions. Answers must match the authenticated
     /// source/target pair before the hub forwards them.
     peer_signal_sessions: std::sync::Mutex<HashMap<String, PeerSignalSession>>,
@@ -386,6 +555,74 @@ impl RelayHub {
         Self::default()
     }
 
+    fn reserve_peer_signal_session(
+        &self,
+        session_id: &str,
+        source_node: &str,
+        target_node: &str,
+    ) -> Result<()> {
+        let now = std::time::Instant::now();
+        let mut sessions = self
+            .peer_signal_sessions
+            .lock()
+            .expect("peer signaling session mutex poisoned");
+        sessions.retain(|_, session| session.expires_at > now);
+        let mut consumed = self
+            .consumed_peer_signal_sessions
+            .lock()
+            .expect("consumed peer signaling session mutex poisoned");
+        consumed.retain(|_, expires_at| *expires_at > now);
+        if sessions.contains_key(session_id) || consumed.contains_key(session_id) {
+            anyhow::bail!("duplicate peer signaling session '{session_id}'");
+        }
+        if sessions.len() >= MAX_PEER_SIGNAL_SESSIONS {
+            anyhow::bail!("peer signaling session capacity exceeded");
+        }
+        if consumed.len() >= MAX_PEER_SIGNAL_SESSIONS {
+            anyhow::bail!("peer signaling tombstone capacity exceeded");
+        }
+        sessions.insert(
+            session_id.to_owned(),
+            PeerSignalSession {
+                source_node: source_node.to_owned(),
+                target_node: target_node.to_owned(),
+                expires_at: now + PEER_SIGNAL_TTL,
+            },
+        );
+        Ok(())
+    }
+
+    fn consume_peer_signal_session(
+        &self,
+        session_id: &str,
+        answer_source: &str,
+        offer_source: &str,
+    ) -> Result<()> {
+        let now = std::time::Instant::now();
+        let mut sessions = self
+            .peer_signal_sessions
+            .lock()
+            .expect("peer signaling session mutex poisoned");
+        sessions.retain(|_, session| session.expires_at > now);
+        let mut consumed = self
+            .consumed_peer_signal_sessions
+            .lock()
+            .expect("consumed peer signaling session mutex poisoned");
+        consumed.retain(|_, expires_at| *expires_at > now);
+        let valid_session = sessions.get(session_id).is_some_and(|session| {
+            session.source_node == offer_source && session.target_node == answer_source
+        });
+        if !valid_session {
+            anyhow::bail!("unknown or mismatched peer signaling session '{session_id}'");
+        }
+        if consumed.len() >= MAX_PEER_SIGNAL_SESSIONS {
+            anyhow::bail!("peer signaling tombstone capacity exceeded");
+        }
+        sessions.remove(session_id);
+        consumed.insert(session_id.to_owned(), now + PEER_SIGNAL_TTL);
+        Ok(())
+    }
+
     fn reserve_spoke_request(
         &self,
         request_id: &str,
@@ -393,7 +630,23 @@ impl RelayHub {
         target_node: &str,
         deadline_ms: u64,
     ) -> bool {
+        if request_id.is_empty() || request_id.len() > MAX_RELAY_REQUEST_ID_BYTES {
+            return false;
+        }
         let now = std::time::Instant::now();
+        let expires_at =
+            now + Duration::from_millis(deadline_ms.clamp(1, REQUEST_TIMEOUT.as_millis() as u64));
+        let replay_key = (source_node.to_owned(), request_id.to_owned());
+        let mut tombstones = self
+            .spoke_request_tombstones
+            .lock()
+            .expect("spoke relay request tombstone mutex poisoned");
+        tombstones.retain(|_, expiry| *expiry > now);
+        if tombstones.contains_key(&replay_key) || tombstones.len() >= MAX_RELAY_REQUEST_TOMBSTONES
+        {
+            return false;
+        }
+
         let mut requests = self
             .spoke_request_sources
             .lock()
@@ -407,13 +660,63 @@ impl RelayHub {
             SpokeRelayRequest {
                 source_node: source_node.to_owned(),
                 target_node: target_node.to_owned(),
-                expires_at: now
-                    + Duration::from_millis(
-                        deadline_ms.clamp(1, REQUEST_TIMEOUT.as_millis() as u64),
-                    ),
+                expires_at,
             },
         );
+        tombstones.insert(replay_key, expires_at);
         true
+    }
+
+    fn try_admit_spoke_inbound_request(
+        self: &std::sync::Arc<Self>,
+        request_id: &str,
+        frame_bytes: usize,
+        replay_lifetime: Duration,
+    ) -> Result<SpokeInboundRequestGuard, &'static str> {
+        if request_id.is_empty() || request_id.len() > MAX_RELAY_REQUEST_ID_BYTES {
+            return Err("invalid spoke inbound request id");
+        }
+        if frame_bytes == 0 || frame_bytes > MAX_RELAY_FRAME_BYTES {
+            return Err("invalid spoke inbound request size");
+        }
+        let _admission = self
+            .spoke_inbound_admission
+            .lock()
+            .expect("spoke inbound request admission mutex poisoned");
+        let now = std::time::Instant::now();
+        let mut tombstones = self
+            .spoke_inbound_tombstones
+            .lock()
+            .expect("spoke inbound request tombstone mutex poisoned");
+        tombstones.retain(|_, expiry| *expiry > now);
+        if tombstones.contains_key(request_id) {
+            return Err("duplicate spoke inbound request id");
+        }
+        if tombstones.len() >= MAX_SPOKE_INBOUND_TOMBSTONES {
+            return Err("spoke inbound replay capacity exceeded");
+        }
+        if self.spoke_inbound_requests.len() >= MAX_SPOKE_INBOUND_REQUESTS {
+            return Err("spoke inbound request capacity exceeded");
+        }
+        let frame_bytes = frame_bytes as u64;
+        if self
+            .spoke_inbound_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(frame_bytes)
+            > MAX_SPOKE_INBOUND_BYTES as u64
+        {
+            return Err("spoke inbound byte capacity exceeded");
+        }
+        tombstones.insert(request_id.to_owned(), now + replay_lifetime);
+        self.spoke_inbound_requests
+            .insert(request_id.to_owned(), ());
+        self.spoke_inbound_bytes
+            .fetch_add(frame_bytes, Ordering::AcqRel);
+        Ok(SpokeInboundRequestGuard {
+            hub: self.clone(),
+            request_id: request_id.to_owned(),
+            frame_bytes,
+        })
     }
 
     /// Send a `RelayFrame` to a connected node via its WS connection.
@@ -481,16 +784,41 @@ impl RelayHub {
         ttl_ms: u64,
         epoch: u64,
     ) -> Result<()> {
-        let ttl = Duration::from_millis(ttl_ms.max(1));
-        let expires_at = std::time::Instant::now() + ttl;
+        if agents.len() > MAX_ROUTES_PER_LEASE {
+            anyhow::bail!(
+                "route lease contains too many agents: {} > {MAX_ROUTES_PER_LEASE}",
+                agents.len()
+            );
+        }
+        let prefix = format!("{node_id}/");
+        let mut unique_agents = std::collections::HashSet::with_capacity(agents.len());
         for agent_ref in agents {
             validate_agent_ref(agent_ref)?;
-            if !agent_ref.starts_with(&format!("{node_id}/")) {
+            if !agent_ref.starts_with(&prefix) {
                 anyhow::bail!("node '{node_id}' cannot advertise '{agent_ref}'");
             }
+            unique_agents.insert(agent_ref);
+        }
+
+        let now = std::time::Instant::now();
+        let ttl = Duration::from_millis(ttl_ms.clamp(1, ROUTE_TTL_MS));
+        let expires_at = now + ttl;
+        let _admission = self
+            .route_admission
+            .lock()
+            .expect("relay route admission mutex poisoned");
+        self.routes.retain(|_, route| route.expires_at > now);
+        let new_routes = unique_agents
+            .iter()
+            .filter(|agent_ref| !self.routes.contains_key(agent_ref.as_str()))
+            .count();
+        if self.routes.len().saturating_add(new_routes) > MAX_RELAY_ROUTES {
+            anyhow::bail!("relay route capacity exceeded");
+        }
+        for agent_ref in unique_agents {
             if let Some(existing) = self.routes.get(agent_ref)
                 && existing.epoch > epoch
-                && existing.expires_at > std::time::Instant::now()
+                && existing.expires_at > now
             {
                 continue;
             }
@@ -722,30 +1050,16 @@ impl RelayHub {
             .map(|entry| entry.key().clone())
             .collect();
         for request_id in lost {
-            // We may not know the task_id for streams that haven't yet
-            // emitted their first event with a taskId attached. Leaving
-            // it empty is fine — A2A clients key off `final: true` +
-            // `status.state` to terminate the stream.
-            let synthetic = serde_json::json!({
-                "kind": "status-update",
-                "taskId": "",
-                "contextId": "",
-                "status": {
-                    "state": "failed",
-                    "message": {
-                        "role": "agent",
-                        "messageId": format!("relay-loss-{}", Uuid::new_v4()),
-                        "parts": [{
-                            "kind": "text",
-                            "text": format!("relay route lost: node '{node_id}' disconnected"),
-                        }],
-                    }
-                },
-                "final": true,
-            });
-            self.forward_stream_event(&request_id, synthetic);
-            self.stream_pending.remove(&request_id);
-            self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
+            if let Some((_, stream)) = self.stream_pending.remove(&request_id) {
+                let item = stream.failure_item(
+                    "relay-loss",
+                    format!("relay route lost: node '{node_id}' disconnected"),
+                );
+                if stream.tx.send(item).is_err() {
+                    debug!(%request_id, "relay stream failure receiver already dropped");
+                }
+                self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
+            }
         }
         // Resolve only pending waiters bound to this node so we don't
         // wait REQUEST_TIMEOUT for a corpse. Other nodes' pending RPCs
@@ -835,7 +1149,7 @@ impl RelayHub {
         method: &str,
         params: Value,
         principal: &str,
-    ) -> Result<(String, String, broadcast::Receiver<Value>)> {
+    ) -> Result<(String, String, broadcast::Receiver<RelayStreamItem>)> {
         let route = self
             .route_for(target)
             .ok_or_else(|| anyhow!("no live relay route for {target}"))?;
@@ -860,6 +1174,8 @@ impl RelayHub {
                     agent_ref: target.to_owned(),
                     node_id: route.node_id.clone(),
                     deadline: std::time::Instant::now() + STREAM_MAX_LIFETIME,
+                    task_id: None,
+                    context_id: None,
                 },
             );
         }
@@ -913,18 +1229,64 @@ impl RelayHub {
         self.stream_pending.remove(request_id).is_some()
     }
 
+    fn complete_streaming_from(&self, request_id: &str, source_node: &str) -> bool {
+        let Some(expected) = self.stream_pending.get(request_id) else {
+            return false;
+        };
+        if expected.node_id != source_node {
+            self.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
+            warn!(%request_id, expected = %expected.node_id, actual = %source_node, "relay stream response source mismatch");
+            return true;
+        }
+        drop(expected);
+        self.stream_pending
+            .remove_if(request_id, |_, stream| stream.node_id == source_node)
+            .is_some()
+    }
+
     /// Route a wire-event `Value` to the stream subscriber for `request_id`,
     /// if one exists. Returns the number of active receivers. Also sniffs
     /// the wire event's `taskId` and records the task→agent route.
     fn forward_stream_event(&self, request_id: &str, value: Value) -> usize {
-        let Some(entry) = self.stream_pending.get(request_id) else {
+        self.forward_stream_event_inner(request_id, None, value)
+    }
+
+    fn forward_stream_event_from(
+        &self,
+        request_id: &str,
+        source_node: &str,
+        value: Value,
+    ) -> usize {
+        self.forward_stream_event_inner(request_id, Some(source_node), value)
+    }
+
+    fn forward_stream_event_inner(
+        &self,
+        request_id: &str,
+        source_node: Option<&str>,
+        value: Value,
+    ) -> usize {
+        let Some(mut entry) = self.stream_pending.get_mut(request_id) else {
             return 0;
         };
-        if let Some(task_id) = value.get("taskId").and_then(|v| v.as_str()) {
-            self.task_routes
-                .insert(task_id.to_owned(), entry.agent_ref.clone());
+        if source_node.is_some_and(|source_node| source_node != entry.node_id) {
+            self.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
+            warn!(%request_id, expected = %entry.node_id, actual = %source_node.unwrap_or_default(), "relay stream event source mismatch");
+            return 0;
         }
-        entry.tx.send(value).unwrap_or(0)
+        entry.observe_identity(&value);
+        if let Some(task_id) = entry.task_id.as_deref()
+            && let Err(error) = self.record_task_route(task_id, &entry.agent_ref)
+        {
+            return entry
+                .tx
+                .send(RelayStreamItem::Error {
+                    code: -32005,
+                    message: format!("remote task {task_id} route rejected: {error}"),
+                })
+                .unwrap_or(0);
+        }
+        entry.tx.send(RelayStreamItem::Event(value)).unwrap_or(0)
     }
 
     /// Walk `stream_pending` and force-terminate any entry past its
@@ -980,45 +1342,60 @@ impl RelayHub {
         }
 
         for (request_id, node_id) in &expired {
-            let synthetic = serde_json::json!({
-                "kind": "status-update",
-                "taskId": "",
-                "contextId": "",
-                "status": {
-                    "state": "failed",
-                    "message": {
-                        "role": "agent",
-                        "messageId": format!("relay-deadline-{}", Uuid::new_v4()),
-                        "parts": [{
-                            "kind": "text",
-                            "text": format!(
-                                "relay stream exceeded {}s lifetime cap; aborting",
-                                STREAM_MAX_LIFETIME.as_secs()
-                            ),
-                        }],
-                    }
-                },
-                "final": true,
-            });
-            self.forward_stream_event(request_id, synthetic);
-            self.stream_pending.remove(request_id);
-            self.send_cancel_to(node_id, request_id);
-            self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
-            warn!(
-                request_id = %request_id,
-                node_id = %node_id,
-                "relay stream hit deadline — synthetic failure emitted"
-            );
+            if let Some((_, stream)) = self.stream_pending.remove(request_id) {
+                let item = stream.failure_item(
+                    "relay-deadline",
+                    format!(
+                        "relay stream exceeded {}s lifetime cap; aborting",
+                        STREAM_MAX_LIFETIME.as_secs()
+                    ),
+                );
+                if stream.tx.send(item).is_err() {
+                    debug!(%request_id, "relay deadline receiver already dropped");
+                }
+                self.send_cancel_to(node_id, request_id);
+                self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    request_id = %request_id,
+                    node_id = %node_id,
+                    "relay stream hit deadline — terminal failure emitted"
+                );
+            }
         }
         expired.len() + expired_spoke_request_count
     }
 
     /// Record `task_id → agent_ref` so a follow-up RPC (GetTask, CancelTask,
     /// SubscribeToTask, push config ops) carrying only the task_id can be
-    /// routed to the spoke that owns the task.
-    pub fn record_task_route(&self, task_id: &str, agent_ref: &str) {
+    /// routed to the spoke that owns the task. Existing ownership is immutable
+    /// and capacity failure does not evict historical routes.
+    pub fn record_task_route(&self, task_id: &str, agent_ref: &str) -> Result<()> {
+        if task_id.is_empty()
+            || task_id.len() > MAX_RELAY_REQUEST_ID_BYTES
+            || agent_ref.is_empty()
+            || agent_ref.len() > MAX_RELAY_TARGET_BYTES
+        {
+            warn!(%task_id, %agent_ref, "invalid relay task route rejected");
+            anyhow::bail!("invalid relay task route");
+        }
+        let _admission = self
+            .task_route_admission
+            .lock()
+            .expect("relay task route admission mutex poisoned");
+        if let Some(existing) = self.task_routes.get(task_id) {
+            if existing.value() != agent_ref {
+                warn!(%task_id, existing = %existing.value(), attempted = %agent_ref, "relay task route collision rejected");
+                anyhow::bail!("relay task route collision");
+            }
+            return Ok(());
+        }
+        if self.task_routes.len() >= MAX_RELAY_TASK_ROUTES {
+            warn!(%task_id, %agent_ref, "relay task route capacity exceeded");
+            anyhow::bail!("relay task route capacity exceeded");
+        }
         self.task_routes
             .insert(task_id.to_owned(), agent_ref.to_owned());
+        Ok(())
     }
 
     /// Look up the agent_ref ("node/agent") that owns `task_id`, if known.
@@ -1084,7 +1461,8 @@ pub fn scope_allows(scopes: &[String], namespace: &str, action: &str, target: &s
     let exact = format!("{namespace}:{action}:{target}");
     let all = format!("{namespace}:{action}:*");
     scopes.iter().any(|scope| {
-        scope == &exact
+        scope == "*"
+            || scope == &exact
             || scope == &all
             || scope
                 .strip_suffix("/*")
@@ -1448,6 +1826,10 @@ async fn handle_hub_socket(socket: WebSocket, ctx: HubCtx, node: A2aRelayNodeRun
             warn!(node = %node.node_id, epoch, "superseded relay connection rejected");
             break;
         }
+        if text.len() > MAX_RELAY_FRAME_BYTES {
+            warn!(node = %node.node_id, "oversized a2a relay frame rejected");
+            break;
+        }
         match serde_json::from_str::<RelayFrame>(&text) {
             Ok(frame) => handle_hub_frame(&ctx, &node, frame).await,
             Err(e) => warn!(node = %node.node_id, error = %e, "invalid a2a relay frame"),
@@ -1564,7 +1946,7 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
                 if !ctx.hub.send_to_node(&source_node, &frame) {
                     debug!(source = %source_node, "spoke request response source disconnected");
                 }
-            } else if !ctx.hub.complete_streaming(&request_id) {
+            } else if !ctx.hub.complete_streaming_from(&request_id, &node.node_id) {
                 ctx.hub
                     .complete_pending_from(&request_id, response, Some(&node.node_id));
             }
@@ -1578,6 +1960,20 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
             deadline_ms,
         } => {
             let source_node = node.node_id.clone();
+            if !valid_relay_request_fields(&request_id, &target, &method, &principal) {
+                ctx.hub.send_to_node(
+                    &source_node,
+                    &RelayFrame::Response {
+                        request_id,
+                        response: JsonRpcResponse::err(
+                            Value::Null,
+                            -32004,
+                            "invalid relay request fields",
+                        ),
+                    },
+                );
+                return;
+            }
             let Some(route) = ctx.hub.route_for(&target) else {
                 let response = JsonRpcResponse::err(
                     Value::Null,
@@ -1610,6 +2006,7 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
             if route.node_id == source_node
                 || !FORWARDABLE_METHODS.contains(&method.as_str())
                 || !scope_allows(&node.scopes, "a2a", "invoke", &target)
+                || !transport_principal_matches_node(&principal, &source_node)
                 || !target_can_receive
             {
                 ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
@@ -1653,7 +2050,7 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
                 target,
                 method,
                 params,
-                principal: format!("node:{source_node}:{principal}"),
+                principal,
                 deadline_ms,
             };
             if !ctx.hub.send_to_node(&route.node_id, &forward) {
@@ -1678,7 +2075,11 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
         RelayFrame::Event {
             request_id, result, ..
         } => {
-            if ctx.hub.forward_stream_event(&request_id, result) == 0 {
+            if ctx
+                .hub
+                .forward_stream_event_from(&request_id, &node.node_id, result)
+                == 0
+            {
                 debug!(request_id, "relay event for unknown stream");
             }
         }
@@ -1702,37 +2103,13 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
                 warn!(source = %source_node, target = %target_node, session = %session_id, "peer offer rejected");
                 return;
             }
+            if let Err(error) =
+                ctx.hub
+                    .reserve_peer_signal_session(&session_id, &source_node, &target_node)
             {
-                let mut sessions = ctx
-                    .hub
-                    .peer_signal_sessions
-                    .lock()
-                    .expect("peer signaling session mutex poisoned");
-                if sessions.contains_key(&session_id)
-                    || ctx
-                        .hub
-                        .consumed_peer_signal_sessions
-                        .lock()
-                        .expect("consumed peer signaling session mutex poisoned")
-                        .contains_key(&session_id)
-                {
-                    ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
-                    warn!(source = %source_node, target = %target_node, session = %session_id, "duplicate peer offer session rejected");
-                    return;
-                }
-                if sessions.len() >= MAX_PEER_SIGNAL_SESSIONS {
-                    ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
-                    warn!(source = %source_node, target = %target_node, "peer signaling session capacity exceeded");
-                    return;
-                }
-                sessions.insert(
-                    session_id.clone(),
-                    PeerSignalSession {
-                        source_node: source_node.clone(),
-                        target_node: target_node.clone(),
-                        expires_at: std::time::Instant::now() + PEER_SIGNAL_TTL,
-                    },
-                );
+                ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
+                warn!(source = %source_node, target = %target_node, session = %session_id, %error, "peer offer session rejected");
+                return;
             }
             let forward = RelayFrame::PeerOfferRelay {
                 session_id: session_id.clone(),
@@ -1756,51 +2133,20 @@ async fn handle_hub_frame(ctx: &HubCtx, node: &A2aRelayNodeRuntime, frame: Relay
             signature,
         } => {
             let answer_source = node.node_id.clone();
-            let removed = {
-                let mut sessions = ctx
-                    .hub
-                    .peer_signal_sessions
-                    .lock()
-                    .expect("peer signaling session mutex poisoned");
-                let valid_session = crate::a2a::peer::valid_signaling_id(&session_id)
-                    && crate::a2a::peer::valid_signaling_node_id(&answer_source)
-                    && crate::a2a::peer::valid_signaling_node_id(&target_node)
-                    && sessions.get(&session_id).is_some_and(|session| {
-                        session.expires_at > std::time::Instant::now()
-                            && session.source_node == target_node
-                            && session.target_node == answer_source
-                            && !sdp.is_empty()
-                            && sdp.len() <= MAX_PEER_SDP_BYTES
-                    });
-                valid_session
-                    .then(|| sessions.remove(&session_id))
-                    .flatten()
-            };
-            if removed.is_none() {
+            let valid_answer = crate::a2a::peer::valid_signaling_id(&session_id)
+                && crate::a2a::peer::valid_signaling_node_id(&answer_source)
+                && crate::a2a::peer::valid_signaling_node_id(&target_node)
+                && !sdp.is_empty()
+                && sdp.len() <= MAX_PEER_SDP_BYTES;
+            let consumed = valid_answer.then(|| {
+                ctx.hub
+                    .consume_peer_signal_session(&session_id, &answer_source, &target_node)
+            });
+            if !matches!(consumed, Some(Ok(()))) {
                 ctx.hub.metrics.acl_denials.fetch_add(1, Ordering::Relaxed);
-                warn!(source = %answer_source, target = %target_node, session = %session_id, "unknown or mismatched peer answer rejected");
+                let error = consumed.and_then(Result::err);
+                warn!(source = %answer_source, target = %target_node, session = %session_id, ?error, "unknown, mismatched, or capacity-rejected peer answer");
                 return;
-            }
-            {
-                let mut consumed = ctx
-                    .hub
-                    .consumed_peer_signal_sessions
-                    .lock()
-                    .expect("consumed peer signaling session mutex poisoned");
-                consumed.retain(|_, expires_at| *expires_at > std::time::Instant::now());
-                if consumed.len() >= MAX_PEER_SIGNAL_SESSIONS {
-                    let oldest = consumed
-                        .iter()
-                        .min_by_key(|(_, expires_at)| **expires_at)
-                        .map(|(session_id, _)| session_id.clone());
-                    if let Some(oldest) = oldest {
-                        consumed.remove(&oldest);
-                    }
-                }
-                consumed.insert(
-                    session_id.clone(),
-                    std::time::Instant::now() + PEER_SIGNAL_TTL,
-                );
             }
             let forward = RelayFrame::PeerAnswerRelay {
                 session_id,
@@ -1868,6 +2214,18 @@ pub fn task_id_from_params(params: &Value) -> Option<&str> {
 
 /// Resolve a request target from explicit agent metadata or a known task route.
 pub fn relay_target_from_request(state: &AppState, req: &JsonRpcRequest) -> Option<String> {
+    if let Some(task_id) = task_id_from_params(&req.params) {
+        let local_task = state.task_store.get(task_id);
+        let local_owner = state.task_store.get_owner(task_id);
+        match (local_task, local_owner) {
+            (Ok(Some(_)), _) | (_, Ok(Some(_))) => return None,
+            (Err(error), _) | (_, Err(error)) => {
+                warn!(%task_id, %error, "local task lookup failed; refusing remote route");
+                return None;
+            }
+            (Ok(None), Ok(None)) => {}
+        }
+    }
     relay_target_from_routes(&state.peer_manager, &state.relay_hub, req)
 }
 
@@ -1972,14 +2330,23 @@ async fn forward_via_peer(
         None,
         Some("peer_direct"),
     );
-    let principal = principal_id;
+    let principal = match canonical_transport_principal(state, principal_id) {
+        Ok(principal) => principal,
+        Err(error) => {
+            return PeerForwardResult::Handled(JsonRpcResponse::err(
+                req.id.clone(),
+                -32004,
+                error.to_string(),
+            ));
+        }
+    };
     let mut params = req.params.clone();
     rewrite_target_agent_for_spoke(&mut params, target);
     let outcome = classify_peer_forward_result(
         &req.id,
         state
             .peer_manager
-            .invoke_jsonrpc(target, &req.method, params, principal, peer_node_id)
+            .invoke_jsonrpc(target, &req.method, params, &principal, peer_node_id)
             .await,
     );
     if let PeerForwardResult::Handled(response) = &outcome
@@ -1988,8 +2355,13 @@ async fn forward_via_peer(
             .as_ref()
             .and_then(|result| result.get("id"))
             .and_then(Value::as_str)
+        && let Err(error) = state.peer_manager.record_task_route(task_id, target)
     {
-        state.peer_manager.record_task_route(task_id, target);
+        return PeerForwardResult::Handled(JsonRpcResponse::err(
+            req.id.clone(),
+            -32005,
+            format!("remote task {task_id} was created but its route was rejected: {error}"),
+        ));
     }
     outcome
 }
@@ -2037,12 +2409,21 @@ async fn forward_via_hub(
         None,
         Some("cross_node"),
     );
-    let principal = principal_id;
+    let principal = match canonical_transport_principal(state, principal_id) {
+        Ok(principal) => principal,
+        Err(error) => {
+            return Some(JsonRpcResponse::err(
+                req.id.clone(),
+                -32004,
+                error.to_string(),
+            ));
+        }
+    };
     let mut params = req.params.clone();
     rewrite_target_agent_for_spoke(&mut params, target);
     match state
         .relay_hub
-        .invoke_jsonrpc(target, &req.method, params, principal)
+        .invoke_jsonrpc(target, &req.method, params, &principal)
         .await
     {
         Ok(mut response) => {
@@ -2052,8 +2433,15 @@ async fn forward_via_hub(
                 .as_ref()
                 .and_then(|r| r.get("id"))
                 .and_then(|v| v.as_str())
+                && let Err(error) = state.relay_hub.record_task_route(task_id, target)
             {
-                state.relay_hub.record_task_route(task_id, target);
+                return Some(JsonRpcResponse::err(
+                    req.id.clone(),
+                    -32005,
+                    format!(
+                        "remote task {task_id} was created but its route was rejected: {error}"
+                    ),
+                ));
             }
             Some(response)
         }
@@ -2093,6 +2481,7 @@ impl rsclaw_types::OutboundA2aHost for GatewayOutboundA2aHost {
             });
 
             let target = request.target;
+            let principal = canonical_transport_principal(&state, &request.principal)?;
             let mut response = if let Some((peer_node_id, _)) =
                 resolve_peer_route(&state.peer_manager, &target)
             {
@@ -2104,7 +2493,7 @@ impl rsclaw_types::OutboundA2aHost for GatewayOutboundA2aHost {
                         &target,
                         "SendMessage",
                         direct_params,
-                        &request.principal,
+                        &principal,
                         &peer_node_id,
                     )
                     .await
@@ -2129,7 +2518,7 @@ impl rsclaw_types::OutboundA2aHost for GatewayOutboundA2aHost {
                 rewrite_target_agent_for_spoke(&mut relay_params, &target);
                 response = state
                     .relay_hub
-                    .invoke_via_spoke(&target, "SendMessage", relay_params, &request.principal)
+                    .invoke_via_spoke(&target, "SendMessage", relay_params, &principal)
                     .await?;
             }
 
@@ -2239,6 +2628,7 @@ pub fn start_spoke_if_configured(state: AppState) {
         let mut per_relay_delay = Duration::from_secs(1);
         loop {
             let hub_url = &urls[idx];
+            let safe_hub_url = redacted_hub_url(hub_url);
             let connect_start = std::time::Instant::now();
             match run_spoke_once(state.clone(), &relay, hub_url).await {
                 Ok(()) => {
@@ -2248,13 +2638,13 @@ pub fn start_spoke_if_configured(state: AppState) {
                     // exponential growth.
                     idx = 0;
                     per_relay_delay = Duration::from_secs(1);
-                    info!(hub = %hub_url, "a2a relay spoke session ended cleanly, returning to primary");
+                    info!(hub = %safe_hub_url, "a2a relay spoke session ended cleanly, returning to primary");
                 }
                 Err(e) => {
                     let was_long_lived = connect_start.elapsed() > Duration::from_secs(60);
                     warn!(
                         error = %e,
-                        hub = %hub_url,
+                        hub = %safe_hub_url,
                         idx,
                         "a2a relay spoke disconnected"
                     );
@@ -2278,7 +2668,7 @@ pub fn start_spoke_if_configured(state: AppState) {
                                 .metrics
                                 .failovers
                                 .fetch_add(1, Ordering::Relaxed);
-                            info!(next_hub = %urls[idx], "a2a relay failing over");
+                            info!(next_hub = %redacted_hub_url(&urls[idx]), "a2a relay failing over");
                         }
                         per_relay_delay = (per_relay_delay * 2).min(FAILOVER_BACKOFF_MAX);
                     }
@@ -2306,10 +2696,18 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
     if token.is_none() && signing_key.is_none() {
         anyhow::bail!("a2a relay spoke requires either token or private_key");
     }
-    let sep = if hub_url.contains('?') { '&' } else { '?' };
-    let url = format!("{hub_url}{sep}node_id={}", urlencoding::encode(node_id));
+    let mut url = url::Url::parse(hub_url).context("parse relay hub URL")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!("relay hub URL must not contain credentials, query, or fragment");
+    }
+    url.query_pairs_mut().append_pair("node_id", node_id);
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     let mut request = url
+        .as_str()
         .into_client_request()
         .context("build relay WebSocket request")?;
     if let Some(token) = token {
@@ -2321,10 +2719,11 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
             authorization,
         );
     }
+    let safe_hub_url = redacted_hub_url(hub_url);
     let (stream, _) = tokio_tungstenite::connect_async(request)
         .await
-        .with_context(|| format!("connect relay hub {hub_url}"))?;
-    info!(node = %node_id, hub = %hub_url, keypair = signing_key.is_some(), "a2a relay spoke connected");
+        .with_context(|| format!("connect relay hub {safe_hub_url}"))?;
+    info!(node = %node_id, hub = %safe_hub_url, keypair = signing_key.is_some(), "a2a relay spoke connected");
 
     let (mut write, mut read) = stream.split();
     // Channel item: either a RelayFrame (encoded as JSON Text by the
@@ -2450,6 +2849,10 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
         let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
             continue;
         };
+        let frame_bytes = text.len();
+        if frame_bytes > MAX_RELAY_FRAME_BYTES {
+            anyhow::bail!("oversized spoke relay frame rejected");
+        }
         let frame: RelayFrame = serde_json::from_str(&text)?;
         match frame {
             RelayFrame::Challenge {
@@ -2491,6 +2894,51 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
                 principal,
                 ..
             } => {
+                if !valid_relay_request_fields(&request_id, &target, &method, &principal) {
+                    if spoke_tx
+                        .try_send(RelayFrame::Response {
+                            request_id,
+                            response: JsonRpcResponse::err(
+                                Value::Null,
+                                -32004,
+                                "invalid spoke inbound request fields",
+                            ),
+                        })
+                        .is_err()
+                    {
+                        debug!("spoke validation response dropped because writer closed");
+                    }
+                    continue;
+                }
+                let replay_lifetime = if method == "SendStreamingMessage"
+                    || method == "SubscribeToTask"
+                {
+                    STREAM_MAX_LIFETIME
+                } else {
+                    REQUEST_TIMEOUT
+                };
+                let inbound_guard = match state
+                    .relay_hub
+                    .try_admit_spoke_inbound_request(
+                        &request_id,
+                        frame_bytes,
+                        replay_lifetime,
+                    )
+                {
+                    Ok(guard) => guard,
+                    Err(reason) => {
+                        if spoke_tx
+                            .try_send(RelayFrame::Response {
+                                request_id,
+                                response: JsonRpcResponse::err(Value::Null, -32004, reason),
+                            })
+                            .is_err()
+                        {
+                            debug!("spoke admission response dropped because writer closed");
+                        }
+                        continue;
+                    }
+                };
                 let response = handle_spoke_request(
                     &state,
                     node_id,
@@ -2501,6 +2949,7 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
                     principal,
                     spoke_tx.clone(),
                     &control_generation,
+                    inbound_guard,
                 )
                 .await;
                 if let Some(response) = response
@@ -2709,6 +3158,7 @@ async fn handle_spoke_request(
     principal: String,
     spoke_tx: mpsc::Sender<RelayFrame>,
     control_generation: &str,
+    inbound_guard: SpokeInboundRequestGuard,
 ) -> Option<JsonRpcResponse> {
     let Some(local_agent) = local_agent_from_ref(target, node_id) else {
         return Some(JsonRpcResponse::err(
@@ -2724,10 +3174,9 @@ async fn handle_spoke_request(
 
     // Streaming methods: spawn the task locally and forward events via relay.
     if method == "SendStreamingMessage" || method == "SubscribeToTask" {
-        let caller = Some(A2aIdentity {
-            id: principal,
-            scopes: Vec::new(),
-        });
+        let caller = Some(crate::a2a::auth::transport_authenticated_identity(
+            principal,
+        ));
         let (task_id, event_rx, cancel_owner) = if method == "SubscribeToTask" {
             let (task_id, event_rx) =
                 crate::a2a::streaming::subscribe_to_task(state, &caller, &params);
@@ -2747,6 +3196,7 @@ async fn handle_spoke_request(
         let relay_hub = state.relay_hub.clone();
         let control_generation = control_generation.to_owned();
         tokio::spawn(async move {
+            let _inbound_guard = inbound_guard;
             use futures::StreamExt;
             use tokio_stream::wrappers::BroadcastStream;
 
@@ -2799,10 +3249,9 @@ async fn handle_spoke_request(
         method: method.to_owned(),
         params,
     };
-    let caller = Some(A2aIdentity {
-        id: principal,
-        scopes: Vec::new(),
-    });
+    let caller = Some(crate::a2a::auth::transport_authenticated_identity(
+        principal,
+    ));
     Some(
         crate::a2a::server::a2a_rpc_handler_inner(state.clone(), caller, req)
             .await
@@ -2859,6 +3308,110 @@ mod tests {
     }
 
     #[test]
+    fn stream_identity_retention_is_bounded() {
+        let (tx, _rx) = broadcast::channel(1);
+        let mut pending = StreamPending {
+            tx,
+            agent_ref: "node-a/main".to_owned(),
+            node_id: "node-a".to_owned(),
+            deadline: std::time::Instant::now() + STREAM_MAX_LIFETIME,
+            task_id: None,
+            context_id: None,
+        };
+        pending.observe_identity(&serde_json::json!({
+            "taskId": "x".repeat(MAX_RELAY_REQUEST_ID_BYTES + 1),
+            "contextId": "y".repeat(MAX_RELAY_REQUEST_ID_BYTES + 1),
+        }));
+        assert!(pending.task_id.is_none());
+        assert!(pending.context_id.is_none());
+        pending.observe_identity(&serde_json::json!({
+            "taskId": "task-ok",
+            "contextId": "context-ok",
+        }));
+        assert_eq!(pending.task_id.as_deref(), Some("task-ok"));
+        assert_eq!(pending.context_id.as_deref(), Some("context-ok"));
+    }
+
+    #[test]
+    fn completed_spoke_request_id_cannot_be_replayed_by_same_source() {
+        let hub = RelayHub::new();
+        assert!(hub.reserve_spoke_request(
+            "request-replay",
+            "source-a",
+            "target",
+            REQUEST_TIMEOUT.as_millis() as u64,
+        ));
+        hub.spoke_request_sources
+            .lock()
+            .expect("spoke relay request mutex poisoned")
+            .remove("request-replay");
+        assert!(!hub.reserve_spoke_request(
+            "request-replay",
+            "source-a",
+            "target",
+            REQUEST_TIMEOUT.as_millis() as u64,
+        ));
+        assert!(hub.reserve_spoke_request(
+            "request-replay",
+            "source-b",
+            "target",
+            REQUEST_TIMEOUT.as_millis() as u64,
+        ));
+    }
+
+    #[test]
+    fn spoke_inbound_request_admission_is_bounded_and_replay_safe() {
+        let hub = Arc::new(RelayHub::new());
+        let first = hub
+            .try_admit_spoke_inbound_request("request-replay", 1024, REQUEST_TIMEOUT)
+            .expect("first request should be admitted");
+        drop(first);
+        assert!(
+            hub.try_admit_spoke_inbound_request("request-replay", 1024, REQUEST_TIMEOUT)
+                .is_err()
+        );
+
+        let guards: Vec<_> = (0..MAX_SPOKE_INBOUND_REQUESTS)
+            .map(|index| {
+                hub.try_admit_spoke_inbound_request(
+                    &format!("active-request-{index}"),
+                    1024,
+                    REQUEST_TIMEOUT,
+                )
+                .expect("request within active capacity should be admitted")
+            })
+            .collect();
+        assert!(
+            hub.try_admit_spoke_inbound_request("active-overflow", 1024, REQUEST_TIMEOUT)
+                .is_err()
+        );
+        drop(guards);
+        assert!(hub.spoke_inbound_requests.is_empty());
+        assert_eq!(hub.spoke_inbound_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn spoke_inbound_request_bytes_are_bounded() {
+        let hub = Arc::new(RelayHub::new());
+        let guards: Vec<_> = (0..(MAX_SPOKE_INBOUND_BYTES / MAX_RELAY_FRAME_BYTES))
+            .map(|index| {
+                hub.try_admit_spoke_inbound_request(
+                    &format!("large-request-{index}"),
+                    MAX_RELAY_FRAME_BYTES,
+                    REQUEST_TIMEOUT,
+                )
+                .expect("request within byte capacity should be admitted")
+            })
+            .collect();
+        assert!(
+            hub.try_admit_spoke_inbound_request("large-overflow", 1, REQUEST_TIMEOUT)
+                .is_err()
+        );
+        drop(guards);
+        assert_eq!(hub.spoke_inbound_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn spoke_request_correlation_is_bounded_and_expires() {
         let hub = RelayHub::new();
         for index in 0..MAX_SPOKE_RELAY_REQUESTS {
@@ -2894,11 +3447,95 @@ mod tests {
     }
 
     #[test]
+    fn canonical_transport_principals_are_unambiguous_and_node_bound() {
+        let plain = canonical_transport_principal_for_node("node-a", "alice")
+            .expect("plain principal should encode");
+        let prefixed = canonical_transport_principal_for_node("node-a", &plain)
+            .expect("prefixed principal should encode distinctly");
+        assert_ne!(plain, prefixed);
+        assert!(transport_principal_matches_node(&plain, "node-a"));
+        assert!(!transport_principal_matches_node(&plain, "node-b"));
+        assert!(!transport_principal_matches_node(
+            "node:6:node-a:100:short",
+            "node-a"
+        ));
+    }
+
+    #[test]
+    fn relay_task_routes_are_bounded_and_collision_safe() {
+        let hub = RelayHub::new();
+        hub.record_task_route("task-0", "node-a/main")
+            .expect("initial task route should be recorded");
+        assert!(hub.record_task_route("task-0", "node-b/main").is_err());
+        assert_eq!(hub.route_for_task("task-0").as_deref(), Some("node-a/main"));
+
+        for index in 1..MAX_RELAY_TASK_ROUTES {
+            hub.record_task_route(&format!("task-{index}"), "node-a/main")
+                .expect("task route within capacity should be recorded");
+        }
+        assert!(
+            hub.record_task_route("task-overflow", "node-a/main")
+                .is_err()
+        );
+        assert_eq!(hub.task_routes.len(), MAX_RELAY_TASK_ROUTES);
+        assert!(hub.route_for_task("task-overflow").is_none());
+    }
+
+    #[test]
     fn suffix_scopes_match_agent_children_only() {
         let scopes = vec!["a2a:invoke:a3/*".to_owned()];
         assert!(scope_allows(&scopes, "a2a", "invoke", "a3/main"));
         assert!(!scope_allows(&scopes, "a2a", "invoke", "a30/main"));
         assert!(!scope_allows(&scopes, "a2a", "cancel", "a3/main"));
+    }
+
+    #[test]
+    fn signaling_tombstone_capacity_fails_closed_without_eviction() {
+        let hub = RelayHub::new();
+        let expires_at = std::time::Instant::now() + PEER_SIGNAL_TTL;
+        {
+            let mut consumed = hub
+                .consumed_peer_signal_sessions
+                .lock()
+                .expect("consumed peer signaling session mutex poisoned");
+            for index in 0..MAX_PEER_SIGNAL_SESSIONS {
+                consumed.insert(format!("consumed-{index}"), expires_at);
+            }
+        }
+        hub.peer_signal_sessions
+            .lock()
+            .expect("peer signaling session mutex poisoned")
+            .insert(
+                "pending".to_owned(),
+                PeerSignalSession {
+                    source_node: "a1".to_owned(),
+                    target_node: "a2".to_owned(),
+                    expires_at,
+                },
+            );
+
+        let error = hub
+            .reserve_peer_signal_session("new-offer", "a1", "a2")
+            .expect_err("full tombstone table must reject a new offer");
+        assert!(error.to_string().contains("tombstone capacity exceeded"));
+        let error = hub
+            .consume_peer_signal_session("pending", "a2", "a1")
+            .expect_err("full tombstone table must reject answer completion");
+        assert!(error.to_string().contains("tombstone capacity exceeded"));
+        assert!(
+            hub.consumed_peer_signal_sessions
+                .lock()
+                .expect("consumed peer signaling session mutex poisoned")
+                .contains_key("consumed-0"),
+            "capacity rejection must not evict a live replay tombstone"
+        );
+        assert!(
+            hub.peer_signal_sessions
+                .lock()
+                .expect("peer signaling session mutex poisoned")
+                .contains_key("pending"),
+            "answer rejection must retain the active session until normal expiry"
+        );
     }
 
     #[test]
@@ -2908,6 +3545,64 @@ mod tests {
             .apply_route_lease("a1", &["a3/main".to_owned()], 10_000, 1)
             .expect_err("cross-node route should fail");
         assert!(err.to_string().contains("cannot advertise"));
+    }
+
+    #[test]
+    fn route_lease_ttl_is_clamped() {
+        let hub = RelayHub::new();
+        let before = std::time::Instant::now();
+        hub.apply_route_lease("a1", &["a1/main".to_owned()], u64::MAX, 1)
+            .expect("authenticated route lease should be accepted with bounded TTL");
+        let route = hub.route_for("a1/main").expect("route");
+        assert!(
+            route.expires_at
+                <= before + Duration::from_millis(ROUTE_TTL_MS) + Duration::from_millis(100),
+            "peer-controlled route TTL must not exceed the protocol maximum"
+        );
+    }
+
+    #[test]
+    fn route_lease_agent_count_is_bounded() {
+        let hub = RelayHub::new();
+        let agents: Vec<String> = (0..257).map(|index| format!("a1/agent-{index}")).collect();
+        let error = hub
+            .apply_route_lease("a1", &agents, 10_000, 1)
+            .expect_err("oversized route lease must be rejected before insertion");
+        assert!(error.to_string().contains("too many agents"));
+        assert_eq!(hub.route_count(), 0);
+    }
+
+    #[test]
+    fn relay_route_capacity_is_bounded_across_leases() {
+        let hub = RelayHub::new();
+        for batch in 0..(MAX_RELAY_ROUTES / MAX_ROUTES_PER_LEASE) {
+            let agents: Vec<String> = (0..MAX_ROUTES_PER_LEASE)
+                .map(|index| format!("a1/agent-{batch}-{index}"))
+                .collect();
+            hub.apply_route_lease("a1", &agents, 10_000, batch as u64)
+                .expect("route batch within capacity should be accepted");
+        }
+        assert_eq!(hub.route_count(), MAX_RELAY_ROUTES);
+        let error = hub
+            .apply_route_lease("a1", &["a1/overflow".to_owned()], 10_000, u64::MAX)
+            .expect_err("route capacity must reject new entries");
+        assert!(error.to_string().contains("capacity exceeded"));
+        assert_eq!(hub.route_count(), MAX_RELAY_ROUTES);
+    }
+
+    #[test]
+    fn invalid_route_lease_is_not_partially_applied() {
+        let hub = RelayHub::new();
+        let error = hub
+            .apply_route_lease(
+                "a1",
+                &["a1/valid".to_owned(), "other/invalid".to_owned()],
+                10_000,
+                1,
+            )
+            .expect_err("cross-node route should fail atomically");
+        assert!(error.to_string().contains("cannot advertise"));
+        assert!(hub.route_for("a1/valid").is_none());
     }
 
     #[test]
@@ -3054,7 +3749,8 @@ mod tests {
     fn relay_target_falls_back_to_task_id_route() {
         let hub = RelayHub::new();
         let peer_manager = crate::a2a::peer::PeerManager::default();
-        hub.record_task_route("task-abc", "a3/main");
+        hub.record_task_route("task-abc", "a3/main")
+            .expect("task route should be recorded");
 
         // No metadata.agentId, only `id` (task_id) — should still route.
         let req = JsonRpcRequest {
@@ -3093,7 +3789,7 @@ mod tests {
     #[test]
     fn forward_stream_event_records_task_route() {
         let hub = RelayHub::new();
-        let (event_tx, _event_rx) = broadcast::channel::<Value>(4);
+        let (event_tx, _event_rx) = broadcast::channel::<RelayStreamItem>(4);
         hub.stream_pending.insert(
             "req-1".to_owned(),
             StreamPending {
@@ -3101,6 +3797,8 @@ mod tests {
                 agent_ref: "a3/main".to_owned(),
                 node_id: "a3".to_owned(),
                 deadline: std::time::Instant::now() + Duration::from_secs(60),
+                task_id: None,
+                context_id: None,
             },
         );
 
@@ -3128,6 +3826,71 @@ mod tests {
         hub.apply_route_lease("home-mac", &["home-mac/main".to_owned()], 10_000, 1)
             .unwrap();
 
+        let (request_id, _node_id, mut event_rx) = hub
+            .invoke_streaming(
+                "home-mac/main",
+                "SendStreamingMessage",
+                serde_json::json!({"metadata": {"agentId": "main"}}),
+                "node:hub",
+            )
+            .await
+            .unwrap();
+
+        hub.forward_stream_event_from(
+            &request_id,
+            "home-mac",
+            serde_json::json!({
+                "kind": "status-update",
+                "taskId": "task-remote",
+                "contextId": "context-remote",
+                "status": {"state": "TASK_STATE_WORKING"},
+                "final": false,
+            }),
+        );
+        assert!(matches!(
+            event_rx.recv().await.expect("initial event"),
+            RelayStreamItem::Event(_)
+        ));
+
+        // Drop the connection (simulates spoke WS death).
+        hub.unregister_connection("home-mac", 1);
+
+        let item = tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("synthetic failure event must arrive")
+            .expect("recv ok");
+        let RelayStreamItem::Event(event) = item else {
+            panic!("known task identity must produce a terminal task event");
+        };
+        assert_eq!(event["kind"], "status-update");
+        assert_eq!(event["taskId"], "task-remote");
+        assert_eq!(event["contextId"], "context-remote");
+        assert_eq!(event["status"]["state"], "TASK_STATE_FAILED");
+        assert_eq!(event["status"]["message"]["role"], "ROLE_AGENT");
+        assert_eq!(event["status"]["message"]["parts"][0]["type"], "text");
+        assert_eq!(event["final"], true);
+        let state = serde_json::from_value::<crate::a2a::types::TaskState>(
+            event["status"]["state"].clone(),
+        )
+        .expect("synthetic state must use the A2A v1 wire enum");
+        assert_eq!(state, crate::a2a::types::TaskState::Failed);
+        serde_json::from_value::<crate::a2a::types::A2aMessage>(event["status"]["message"].clone())
+            .expect("synthetic message must use the A2A v1 wire shape");
+        assert_eq!(
+            hub.metrics.inflight_losses.load(Ordering::Relaxed),
+            1,
+            "inflight_losses metric must increment"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_before_task_identity_returns_correlated_transport_error() {
+        let hub = std::sync::Arc::new(RelayHub::new());
+        let (tx, mut _rx) = mpsc::channel(RELAY_WRITE_QUEUE_CAPACITY);
+        hub.register_connection("home-mac", tx, 1);
+        hub.apply_route_lease("home-mac", &["home-mac/main".to_owned()], 10_000, 1)
+            .unwrap();
+
         let (_request_id, _node_id, mut event_rx) = hub
             .invoke_streaming(
                 "home-mac/main",
@@ -3138,21 +3901,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Drop the connection (simulates spoke WS death).
         hub.unregister_connection("home-mac", 1);
 
-        let event = tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
+        let item = tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
             .await
-            .expect("synthetic failure event must arrive")
+            .expect("transport error must arrive")
             .expect("recv ok");
-        assert_eq!(event["kind"], "status-update");
-        assert_eq!(event["status"]["state"], "failed");
-        assert_eq!(event["final"], true);
-        assert_eq!(
-            hub.metrics.inflight_losses.load(Ordering::Relaxed),
-            1,
-            "inflight_losses metric must increment"
-        );
+        assert!(matches!(item, RelayStreamItem::Error { code: -32004, .. }));
     }
 
     #[tokio::test]
@@ -3464,6 +4219,8 @@ mod tests {
                     agent_ref: "node-b/main".to_owned(),
                     node_id: "node-b".to_owned(),
                     deadline: std::time::Instant::now() + STREAM_MAX_LIFETIME,
+                    task_id: None,
+                    context_id: None,
                 },
             );
         }
@@ -3561,6 +4318,16 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(hub.metrics.acl_denials.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn relay_hub_url_redaction_removes_credentials_and_query() {
+        let redacted =
+            redacted_hub_url("wss://user:password@hub.example.test/relay?token=secret#fragment");
+
+        assert_eq!(redacted, "wss://hub.example.test/relay");
+        assert!(!redacted.contains("password"));
+        assert!(!redacted.contains("secret"));
     }
 
     #[test]
@@ -3828,7 +4595,8 @@ mod tests {
                 target: format!("{RT_NODE_B}/main"),
                 method: "SendMessage".into(),
                 params: serde_json::json!({}),
-                principal: "agent-a".into(),
+                principal: canonical_transport_principal_for_node(RT_NODE_A, "agent-a")
+                    .expect("test transport principal should be valid"),
                 deadline_ms: 30_000,
             },
         )
@@ -3846,7 +4614,11 @@ mod tests {
         };
         assert_eq!(request_id, "spoke-request-1");
         assert_eq!(target, format!("{RT_NODE_B}/main"));
-        assert_eq!(principal, format!("node:{RT_NODE_A}:agent-a"));
+        assert_eq!(
+            principal,
+            canonical_transport_principal_for_node(RT_NODE_A, "agent-a")
+                .expect("test transport principal should be valid")
+        );
 
         rt_send(
             &mut spoke_b,

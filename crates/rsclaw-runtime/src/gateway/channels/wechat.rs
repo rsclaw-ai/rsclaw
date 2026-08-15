@@ -456,11 +456,8 @@ pub(crate) fn start_wechat_personal_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(10),
-                                reply_rx,
-                            )
-                            .await
+                            match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+                                .await
                             {
                                 Ok(Ok(r)) => {
                                     if !r.is_empty {

@@ -72,12 +72,13 @@ impl AgentEvent {
         }
     }
 
+    /// Return whether this event terminates the overall task stream.
+    ///
+    /// An artifact's `lastChunk` only terminates that artifact's chunk
+    /// sequence; the task remains live until a terminal status event
+    /// arrives.
     pub fn is_final(&self) -> bool {
-        match self {
-            Self::Status { final_, .. } => *final_,
-            Self::InputRequired { .. } | Self::AuthRequired { .. } => false,
-            Self::Artifact { last_chunk, .. } => *last_chunk,
-        }
+        matches!(self, Self::Status { final_: true, .. })
     }
 
     /// Serialize to the v1.0 wire event JSON payload that goes inside the
@@ -198,4 +199,47 @@ pub struct SuspendedTask {
     pub context_id: String,
     /// Oneshot sender for the resume input. Runtime holds the receiver.
     pub resume_tx: tokio::sync::oneshot::Sender<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_last_chunk_does_not_terminate_task_stream() {
+        let event = AgentEvent::Artifact {
+            task_id: "task-1".to_owned(),
+            context_id: "context-1".to_owned(),
+            artifact_id: "artifact-1".to_owned(),
+            parts: vec![A2aPart::Text {
+                text: "done".to_owned(),
+            }],
+            append: false,
+            last_chunk: true,
+        };
+
+        assert!(!event.is_final());
+        assert_eq!(event.to_wire_event()["lastChunk"], true);
+    }
+
+    #[test]
+    fn only_final_status_terminates_task_stream() {
+        let working = AgentEvent::Status {
+            task_id: "task-1".to_owned(),
+            context_id: "context-1".to_owned(),
+            state: TaskState::Working,
+            message: None,
+            final_: false,
+        };
+        let completed = AgentEvent::Status {
+            task_id: "task-1".to_owned(),
+            context_id: "context-1".to_owned(),
+            state: TaskState::Completed,
+            message: None,
+            final_: true,
+        };
+
+        assert!(!working.is_final());
+        assert!(completed.is_final());
+    }
 }

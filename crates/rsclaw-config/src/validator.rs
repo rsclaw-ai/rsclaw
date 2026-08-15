@@ -2,6 +2,7 @@
 //! Runs after loading + schema deserialization.
 
 use anyhow::{Result, bail};
+use base64::Engine as _;
 use tracing::{debug, warn};
 
 use super::{runtime::RuntimeConfig, schema::DmScope};
@@ -11,13 +12,25 @@ fn is_blank(value: Option<&str>) -> bool {
 }
 
 fn is_valid_node_id(value: &str) -> bool {
-    !value.trim().is_empty() && !value.contains(['\r', '\n'])
+    !value.trim().is_empty() && value.len() <= 128 && !value.contains(['\r', '\n'])
+}
+
+fn is_valid_ed25519_key(value: &str) -> bool {
+    base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .is_ok_and(|bytes| bytes.len() == 32)
 }
 
 fn is_valid_hub_url(value: &str) -> bool {
     !value.chars().any(char::is_whitespace)
-        && url::Url::parse(value)
-            .is_ok_and(|url| matches!(url.scheme(), "ws" | "wss") && url.host_str().is_some())
+        && url::Url::parse(value).is_ok_and(|url| {
+            matches!(url.scheme(), "ws" | "wss")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
 }
 
 fn is_valid_ice_url(value: &str, allowed_schemes: &[&str]) -> bool {
@@ -56,9 +69,30 @@ pub fn validate(cfg: &RuntimeConfig) -> Result<()> {
 }
 
 fn validate_gateway(cfg: &RuntimeConfig) -> Result<()> {
+    let bind_address = cfg
+        .gateway
+        .bind_address
+        .as_deref()
+        .map(|value| {
+            value
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| anyhow::anyhow!("gateway.bindAddress must be a valid IP address"))
+        })
+        .transpose()?;
     if !cfg.gateway.auth_token_configured {
+        let exposes_non_loopback = bind_address.is_some_and(|address| !address.is_loopback())
+            || bind_address.is_none()
+                && !matches!(
+                    cfg.gateway.bind,
+                    crate::schema::BindMode::Loopback | crate::schema::BindMode::Tailnet
+                );
+        if exposes_non_loopback {
+            bail!(
+                "effective gateway bind exposes a non-loopback listener and requires gateway.auth.token"
+            );
+        }
         warn!(
-            "gateway.auth.token is not set — the gateway accepts all connections without authentication. \
+            "gateway.auth.token is not set — the loopback gateway accepts local connections without authentication. \
              Set gateway.auth.token in your config to require a bearer token."
         );
     }
@@ -82,6 +116,43 @@ fn validate_gateway(cfg: &RuntimeConfig) -> Result<()> {
     {
         bail!("gateway.a2a.relay requires single-line configured peer node IDs");
     }
+    let mut relay_node_ids = std::collections::HashSet::new();
+    for node in &cfg.gateway.a2a_relay.nodes {
+        if !relay_node_ids.insert(node.node_id.as_str()) {
+            bail!("duplicate relay nodeId: \"{}\"", node.node_id);
+        }
+        if node
+            .public_key
+            .as_deref()
+            .is_some_and(|key| !is_valid_ed25519_key(key))
+        {
+            bail!(
+                "gateway.a2a.relay.nodes publicKey must be base64-encoded raw 32-byte Ed25519 keys"
+            );
+        }
+    }
+    if cfg
+        .gateway
+        .a2a_relay
+        .private_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .is_some_and(|key| !is_valid_ed25519_key(key))
+    {
+        bail!("gateway.a2a.relay.privateKey must be a base64-encoded raw 32-byte Ed25519 key");
+    }
+    if cfg.gateway.a2a_relay.mode == super::runtime::A2aRelayModeRuntime::Spoke
+        && cfg
+            .gateway
+            .a2a_relay
+            .hub_urls
+            .iter()
+            .any(|url| !is_valid_hub_url(url))
+    {
+        bail!(
+            "gateway.a2a.relay requires valid ws:// or wss:// hubUrl and relays entries without credentials, query, or fragment"
+        );
+    }
     if let Some(peer) = cfg
         .gateway
         .a2a_relay
@@ -103,17 +174,6 @@ fn validate_gateway(cfg: &RuntimeConfig) -> Result<()> {
         }
         if cfg.gateway.a2a_relay.hub_urls.is_empty() {
             bail!("gateway.a2a.relay.peer.enabled requires hubUrl or relays");
-        }
-        if cfg
-            .gateway
-            .a2a_relay
-            .hub_urls
-            .iter()
-            .any(|url| !is_valid_hub_url(url))
-        {
-            bail!(
-                "gateway.a2a.relay.peer.enabled requires valid ws:// or wss:// hubUrl and relays entries"
-            );
         }
         if is_blank(cfg.gateway.a2a_relay.token.as_deref())
             && is_blank(cfg.gateway.a2a_relay.private_key.as_deref())
@@ -210,8 +270,8 @@ mod tests {
     use crate::{
         runtime::IntoRuntime,
         schema::{
-            A2aPeerRelayConfig, A2aRelayConfig, A2aRelayMode, Config, GatewayA2a, GatewayConfig,
-            SecretOrString,
+            A2aPeerRelayConfig, A2aRelayConfig, A2aRelayMode, BindMode, Config, GatewayA2a,
+            GatewayAuth, GatewayConfig, SecretOrString,
         },
     };
 
@@ -246,6 +306,113 @@ mod tests {
             turn_credential: None,
             listen_port: None,
         }
+    }
+
+    #[test]
+    fn non_loopback_gateway_requires_authentication() {
+        let cfg = Config {
+            gateway: Some(GatewayConfig {
+                bind: Some(BindMode::Lan),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config should resolve");
+
+        let error = validate(&cfg).expect_err("unauthenticated LAN bind must fail closed");
+        assert!(error.to_string().contains("requires gateway.auth.token"));
+    }
+
+    #[test]
+    fn bind_address_cannot_bypass_loopback_auth_policy() {
+        let cfg = Config {
+            gateway: Some(GatewayConfig {
+                bind: Some(BindMode::Loopback),
+                bind_address: Some("0.0.0.0".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config should resolve");
+
+        let error = validate(&cfg).expect_err("effective non-loopback bind must require auth");
+        assert!(error.to_string().contains("requires gateway.auth.token"));
+
+        let cfg = Config {
+            gateway: Some(GatewayConfig {
+                bind: Some(BindMode::Loopback),
+                bind_address: Some("127.0.0.1".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config should resolve");
+        validate(&cfg).expect("explicit loopback bind address should remain valid");
+    }
+
+    #[test]
+    fn authenticated_non_loopback_gateway_is_allowed() {
+        let cfg = Config {
+            gateway: Some(GatewayConfig {
+                bind: Some(BindMode::Lan),
+                auth: Some(GatewayAuth {
+                    mode: None,
+                    token: Some(SecretOrString::Plain("gateway-token".to_owned())),
+                    password: None,
+                    allow_tailscale: None,
+                    allow_local: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config should resolve");
+
+        validate(&cfg).expect("authenticated LAN bind should be valid");
+    }
+
+    #[test]
+    fn relay_nodes_require_unique_ids() {
+        let mut cfg = peer_config(enabled_peer(), A2aRelayMode::Spoke);
+        cfg.gateway.a2a_relay.nodes = vec![
+            crate::runtime::A2aRelayNodeRuntime {
+                node_id: "node-b".to_owned(),
+                token: "token-a".to_owned(),
+                ..Default::default()
+            },
+            crate::runtime::A2aRelayNodeRuntime {
+                node_id: "node-b".to_owned(),
+                token: "token-b".to_owned(),
+                ..Default::default()
+            },
+        ];
+
+        let error = validate(&cfg).expect_err("duplicate relay node IDs must fail");
+        assert!(error.to_string().contains("duplicate relay nodeId"));
+    }
+
+    #[test]
+    fn relay_ed25519_keys_must_be_base64_raw_32_bytes() {
+        let mut cfg = peer_config(enabled_peer(), A2aRelayMode::Spoke);
+        cfg.gateway.a2a_relay.private_key = Some("not-base64".to_owned());
+        let error = validate(&cfg).expect_err("malformed private key must fail");
+        assert!(error.to_string().contains("privateKey"));
+
+        let mut cfg = peer_config(enabled_peer(), A2aRelayMode::Spoke);
+        cfg.gateway
+            .a2a_relay
+            .nodes
+            .push(crate::runtime::A2aRelayNodeRuntime {
+                node_id: "node-b".to_owned(),
+                public_key: Some("c2hvcnQ=".to_owned()),
+                ..Default::default()
+            });
+        let error = validate(&cfg).expect_err("wrong-length public key must fail");
+        assert!(error.to_string().contains("publicKey"));
     }
 
     #[test]
@@ -456,6 +623,42 @@ mod tests {
             peer.turn_credential = Some(SecretOrString::Plain("credential".to_owned()));
             let cfg = peer_config(peer, A2aRelayMode::Spoke);
             validate(&cfg).expect_err("malformed TURN endpoint must fail");
+        }
+    }
+
+    #[test]
+    fn spoke_rejects_unsafe_hub_url_when_peer_transport_is_disabled() {
+        let mut peer = enabled_peer();
+        peer.enabled = false;
+        let mut cfg = peer_config(peer, A2aRelayMode::Spoke);
+        cfg.gateway.a2a_relay.hub_urls =
+            vec!["wss://hub.example.test/relay?tenant=acme".to_owned()];
+
+        let error = validate(&cfg).expect_err("unsafe spoke relay URL must fail at startup");
+        assert!(
+            error
+                .to_string()
+                .contains("without credentials, query, or fragment")
+        );
+    }
+
+    #[test]
+    fn peer_transport_rejects_hub_url_credentials_query_and_fragment() {
+        for unsafe_url in [
+            "wss://user@hub.example.test/relay",
+            "wss://user:password@hub.example.test/relay",
+            "wss://hub.example.test/relay?token=secret",
+            "wss://hub.example.test/relay#secret",
+        ] {
+            let mut cfg = peer_config(enabled_peer(), A2aRelayMode::Spoke);
+            cfg.gateway.a2a_relay.hub_urls = vec![unsafe_url.to_owned()];
+
+            let error = validate(&cfg).expect_err("unsafe relay URL must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires valid ws:// or wss:// hubUrl and relays entries")
+            );
         }
     }
 

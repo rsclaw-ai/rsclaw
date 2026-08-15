@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stream-fetch"
+description = "Enables the stream_fetch command without any pre-configured scope."
+commands.allow = ["stream_fetch"]
+
+[[permission]]
+identifier = "deny-stream-fetch"
+description = "Denies the stream_fetch command without any pre-configured scope."
+commands.deny = ["stream_fetch"]

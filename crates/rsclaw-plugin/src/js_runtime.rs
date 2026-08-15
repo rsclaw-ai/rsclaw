@@ -224,12 +224,16 @@ impl JsPlugin {
     /// shutdown — fine in practice but noisy under tracing and test reports.
     pub async fn shutdown(&self) {
         let mut child = self.child.lock().await;
-        let _ = child.kill().await;
-        drop(child);
-        if let Some(handle) = self.reader_handle.lock().await.take() {
-            let _ = handle.await;
+        if let Err(error) = child.kill().await {
+            warn!(plugin = %self.name, %error, "failed to kill plugin subprocess during shutdown");
         }
-        debug!(plugin = %self.name, "plugin subprocess terminated");
+        drop(child);
+        if let Some(handle) = self.reader_handle.lock().await.take()
+            && let Err(error) = handle.await
+        {
+            warn!(plugin = %self.name, %error, "plugin reader task failed during shutdown");
+        }
+        debug!(plugin = %self.name, "plugin subprocess shutdown completed");
     }
 }
 

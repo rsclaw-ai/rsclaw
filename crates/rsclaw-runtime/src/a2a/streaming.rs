@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::{
     a2a::{
         event::AgentEvent,
-        relay::{audit_relay, relay_target_from_params},
+        relay::{audit_relay, canonical_transport_principal, relay_target_from_request},
         types::{
             A2aArtifact, A2aMessage, A2aTask, A2aTaskStatus, JsonRpcRequest, SendMessageParams,
             TaskState,
@@ -61,23 +61,33 @@ pub async fn handle_streaming_rpc(
     req: JsonRpcRequest,
 ) -> Response {
     let req_id = req.id.clone();
+    let default_agent = state.agents.default_agent().ok();
+    if !crate::a2a::auth::method_allowed_with_default(
+        caller.as_ref(),
+        &req.method,
+        &req.params,
+        default_agent.as_ref().map(|agent| agent.id.as_str()),
+    ) {
+        return sse_jsonrpc_error(
+            Some(req_id),
+            -32003,
+            format!("not authorized to call {}", req.method),
+        );
+    }
 
     // Relay forwarding: if the request targets a spoke node, try PeerManager
     // (direct P2P) first, then relay hub, then local fallback (ADR 0002 §Route
     // Decision).
-    let relay_target = relay_target_from_params(&req.params).or_else(|| {
-        crate::a2a::relay::task_id_from_params(&req.params).and_then(|task_id| {
-            state
-                .peer_manager
-                .route_for_task(task_id)
-                .or_else(|| state.relay_hub.route_for_task(task_id))
-        })
-    });
+    let relay_target = relay_target_from_request(&state, &req);
     if let Some(ref target) = relay_target {
-        let principal = caller
+        let principal_id = caller
             .as_ref()
             .map(|id| id.id.as_str())
             .unwrap_or("anonymous-dev");
+        let principal = match canonical_transport_principal(&state, principal_id) {
+            Ok(principal) => principal,
+            Err(error) => return sse_jsonrpc_error(Some(req_id), -32004, error.to_string()),
+        };
 
         // Try peer direct first.
         let peer_route = crate::a2a::relay::resolve_peer_route(&state.peer_manager, target);
@@ -94,7 +104,7 @@ pub async fn handle_streaming_rpc(
             match classify_peer_streaming_admission(
                 state
                     .peer_manager
-                    .invoke_streaming(target, &req.method, params, principal, &peer_node_id)
+                    .invoke_streaming(target, &req.method, params, &principal, &peer_node_id)
                     .await,
             ) {
                 PeerStreamingAdmission::Started((request_id, node_id, event_rx)) => {
@@ -109,11 +119,24 @@ pub async fn handle_streaming_rpc(
                             let req_id = req_id.clone();
                             async move {
                                 match result {
-                                    Ok(value) => {
+                                    Ok(crate::a2a::relay::RelayStreamItem::Event(value)) => {
                                         let payload = json!({
                                             "jsonrpc": "2.0",
                                             "id": req_id,
                                             "result": value,
+                                        });
+                                        Some(Ok::<_, Infallible>(
+                                            Event::default().json_data(payload).unwrap_or_default(),
+                                        ))
+                                    }
+                                    Ok(crate::a2a::relay::RelayStreamItem::Error {
+                                        code,
+                                        message,
+                                    }) => {
+                                        let payload = json!({
+                                            "jsonrpc": "2.0",
+                                            "id": req_id,
+                                            "error": { "code": code, "message": message },
                                         });
                                         Some(Ok::<_, Infallible>(
                                             Event::default().json_data(payload).unwrap_or_default(),
@@ -164,7 +187,7 @@ pub async fn handle_streaming_rpc(
             let target_node = target.split('/').next().unwrap_or("");
             audit_relay(
                 "deny",
-                principal,
+                &principal,
                 "invoke",
                 &format!("agent:{target}"),
                 relay_id,
@@ -182,7 +205,7 @@ pub async fn handle_streaming_rpc(
         crate::a2a::relay::rewrite_target_agent_for_spoke(&mut params, target);
         match state
             .relay_hub
-            .invoke_streaming(target, &req.method, params, principal)
+            .invoke_streaming(target, &req.method, params, &principal)
             .await
         {
             Ok((request_id, node_id, event_rx)) => {
@@ -197,11 +220,21 @@ pub async fn handle_streaming_rpc(
                         let req_id = req_id.clone();
                         async move {
                             match result {
-                                Ok(value) => {
+                                Ok(crate::a2a::relay::RelayStreamItem::Event(value)) => {
                                     let payload = json!({
                                         "jsonrpc": "2.0",
                                         "id": req_id,
                                         "result": value,
+                                    });
+                                    Some(Ok::<_, Infallible>(
+                                        Event::default().json_data(payload).unwrap_or_default(),
+                                    ))
+                                }
+                                Ok(crate::a2a::relay::RelayStreamItem::Error { code, message }) => {
+                                    let payload = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req_id,
+                                        "error": { "code": code, "message": message },
                                     });
                                     Some(Ok::<_, Infallible>(
                                         Event::default().json_data(payload).unwrap_or_default(),
@@ -354,6 +387,28 @@ mod tests {
     }
 }
 
+fn rejected_stream(
+    state: &AppState,
+    context_id: &str,
+    message: String,
+) -> (
+    String,
+    tokio::sync::broadcast::Receiver<AgentEvent>,
+    Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
+) {
+    let rejection_id = Uuid::new_v4().to_string();
+    let receiver = state.task_event_bus.subscribe(&rejection_id);
+    state.task_event_bus.publish(AgentEvent::Status {
+        task_id: rejection_id.clone(),
+        context_id: context_id.to_owned(),
+        state: TaskState::Failed,
+        message: Some(rsclaw_a2a_types::event::text_message(&message)),
+        final_: true,
+    });
+    state.task_event_bus.close(&rejection_id);
+    (rejection_id, receiver, None)
+}
+
 /// Spawn an agent task and return `(task_id, subscriber)`. The subscriber is
 /// taken BEFORE any events are published to the bus so the SSE consumer
 /// observes the full Submitted → Working → Completed sequence.
@@ -395,14 +450,6 @@ pub(crate) async fn spawn_streaming_task(
         .task_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-    // §7.5: stamp the creating principal so only it (or the operator token)
-    // can later read / cancel / subscribe to this streaming task.
-    if let Some(c) = caller.as_ref() {
-        if let Err(e) = state.task_store.put_owner(&task_id, &c.id) {
-            tracing::warn!(task_id, error = %e, "A2A streaming: failed to put_owner");
-        }
-    }
 
     // CRITICAL: subscribe BEFORE any publish so the SSE consumer sees
     // Submitted/Working frames. broadcast channels don't replay history.
@@ -468,11 +515,6 @@ pub(crate) async fn spawn_streaming_task(
         }
     });
 
-    let cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
-    state
-        .task_cancels
-        .insert(task_id.clone(), cancel_token.clone());
-
     // Persist initial task state (Submitted).
     let initial_history = A2aMessage {
         message_id: params.message.message_id.clone(),
@@ -494,9 +536,31 @@ pub(crate) async fn spawn_streaming_task(
         artifacts: vec![],
         metadata: None,
     };
-    if let Err(e) = state.task_store.put(&initial_task) {
-        warn!(err = %e, "failed to persist initial streaming task");
+    // Task and owner are one atomic reservation. On duplicate or storage
+    // failure, publish the rejection on a fresh ephemeral correlation so this
+    // request cannot emit to, close, or replace another caller's task state.
+    match state.task_store.create_task(
+        &initial_task,
+        caller.as_ref().map(|identity| identity.id.as_str()),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            let message = if crate::a2a::server::caller_owns(&state.task_store, &caller, &task_id) {
+                format!("task already exists: {task_id}")
+            } else {
+                "task not found".to_owned()
+            };
+            return rejected_stream(&state, &session_key, message);
+        }
+        Err(error) => {
+            return rejected_stream(&state, &session_key, format!("cannot create task: {error}"));
+        }
     }
+
+    let cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+    state
+        .task_cancels
+        .insert(task_id.clone(), cancel_token.clone());
 
     // Mirror events into the persistent store as they arrive.
     let persist_store = state.task_store.clone();

@@ -13,7 +13,8 @@
     "macOSPrivateApi": true,
     "withGlobalTauri": true,
     "security": {
-      "csp": null,
+      "csp": "default-src 'self' tauri: asset:; connect-src 'self' ipc: http://ipc.localhost http://localhost:* https://localhost:* http://127.0.0.1:* https://127.0.0.1:* http://[::1]:* https://[::1]:* ws://localhost:* wss://localhost:* ws://127.0.0.1:* wss://127.0.0.1:* ws://[::1]:* wss://[::1]:*; img-src 'self' asset: http://asset.localhost blob: data: https:; media-src 'self' asset: http://asset.localhost blob: data: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+      "devCsp": null,
       "assetProtocol": {
         "enable": true,
         "scope": [
