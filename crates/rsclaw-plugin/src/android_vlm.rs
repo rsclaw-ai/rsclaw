@@ -9,8 +9,32 @@ use rsclaw_computer::{
     operator::{ActionFut, ActionOutput, ScreenshotFut},
 };
 
+use crate::android_uiauto::AndroidOperationOptions;
+
 /// Android operator used by the host-side VLM driver.
-pub(crate) struct AndroidUiautoOperator;
+pub(crate) struct AndroidUiautoOperator {
+    options: AndroidOperationOptions,
+}
+
+impl AndroidUiautoOperator {
+    pub(crate) fn legacy() -> Self {
+        Self {
+            options: AndroidOperationOptions::default(),
+        }
+    }
+
+    pub(crate) fn with_options(options: AndroidOperationOptions) -> Self {
+        Self { options }
+    }
+
+    fn args(&self, value: serde_json::Value) -> Result<String> {
+        let mut value = value;
+        self.options
+            .inject_into(&mut value)
+            .map_err(|error| anyhow!(error))?;
+        Ok(value.to_string())
+    }
+}
 
 impl Operator for AndroidUiautoOperator {
     fn name(&self) -> &'static str {
@@ -37,7 +61,8 @@ impl Operator for AndroidUiautoOperator {
 
     fn screenshot(&self) -> ScreenshotFut<'_> {
         Box::pin(async move {
-            let raw = crate::android_uiauto::call("screenshot", "{}")
+            let args = self.args(serde_json::json!({}))?;
+            let raw = crate::android_uiauto::call("screenshot", &args)
                 .await
                 .map_err(|error| anyhow!(error))?;
             let value: serde_json::Value =
@@ -67,14 +92,14 @@ impl Operator for AndroidUiautoOperator {
                     y,
                     button: MouseButton::Left,
                 } => {
-                    let args = serde_json::json!({ "x": x, "y": y }).to_string();
+                    let args = self.args(serde_json::json!({ "x": x, "y": y }))?;
                     crate::android_uiauto::call("tap", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
                     Ok(ActionOutput::ok())
                 }
                 Action::ClickAndWait { x, y, wait_ms } => {
-                    let args = serde_json::json!({ "x": x, "y": y }).to_string();
+                    let args = self.args(serde_json::json!({ "x": x, "y": y }))?;
                     crate::android_uiauto::call("tap", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
@@ -82,22 +107,25 @@ impl Operator for AndroidUiautoOperator {
                     Ok(ActionOutput::ok())
                 }
                 Action::LongPress { x, y, duration_ms } => {
-                    let args = serde_json::json!({ "x": x, "y": y, "durationMs": duration_ms })
-                        .to_string();
+                    let args = self.args(serde_json::json!({
+                        "x": x,
+                        "y": y,
+                        "durationMs": duration_ms
+                    }))?;
                     crate::android_uiauto::call("long-press", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
                     Ok(ActionOutput::ok())
                 }
                 Action::DoubleClick { x, y } => {
-                    let args = serde_json::json!({ "x": x, "y": y }).to_string();
+                    let args = self.args(serde_json::json!({ "x": x, "y": y }))?;
                     crate::android_uiauto::call("double-tap", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
                     Ok(ActionOutput::ok())
                 }
                 Action::Type { text } => {
-                    let args = serde_json::json!({ "text": text }).to_string();
+                    let args = self.args(serde_json::json!({ "text": text }))?;
                     crate::android_uiauto::call("input-text", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
@@ -124,10 +152,9 @@ impl Operator for AndroidUiautoOperator {
                         ScrollDir::Left => (cx + dist / 2, cy, cx - dist / 2, cy),
                         ScrollDir::Right => (cx - dist / 2, cy, cx + dist / 2, cy),
                     };
-                    let args = serde_json::json!({
+                    let args = self.args(serde_json::json!({
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2, "durationMs": 300
-                    })
-                    .to_string();
+                    }))?;
                     crate::android_uiauto::call("swipe", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
@@ -145,14 +172,14 @@ impl Operator for AndroidUiautoOperator {
                             ));
                         }
                     };
-                    let args = serde_json::json!({ "key": key_name }).to_string();
+                    let args = self.args(serde_json::json!({ "key": key_name }))?;
                     crate::android_uiauto::call("key", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
                     Ok(ActionOutput::ok())
                 }
                 Action::ActivateApp { app } => {
-                    let args = serde_json::json!({ "package": app }).to_string();
+                    let args = self.args(serde_json::json!({ "package": app }))?;
                     crate::android_uiauto::call("launch", &args)
                         .await
                         .map_err(|error| anyhow!(error))?;
@@ -194,5 +221,20 @@ mod tests {
             png_dimensions(&png).expect("valid PNG header"),
             (1080, 2408)
         );
+    }
+
+    #[test]
+    fn explicit_vlm_operator_injects_transport_on_every_action() {
+        let options =
+            AndroidOperationOptions::parse("a11y", "vision").expect("a11y vision options");
+        let operator = AndroidUiautoOperator::with_options(options);
+        let raw = operator
+            .args(serde_json::json!({ "x": 12, "y": 34 }))
+            .expect("action arguments");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("JSON action arguments");
+        assert_eq!(value["opType"], "a11y");
+        assert_eq!(value["opMode"], "vision");
+        assert_eq!(value["x"], 12);
+        assert_eq!(value["y"], 34);
     }
 }

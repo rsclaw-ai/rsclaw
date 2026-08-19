@@ -9,14 +9,23 @@
 ## Decision
 
 Android plugins use ClsAgent `cls android` primitives for screenshot, coordinate
-input, and app activation, plus a narrowly allowlisted `cls android uiauto raw`
-sidecar for native protocol operations that do not require an accessibility
-tree. The host must not spawn `adb`, open a local ADB forward, or fall back to
-legacy `uiautomator dump`.
+input, and app activation. Each high-level call may select an explicit operation
+transport with `opType` (`auto`, `a11y`, `u2`, or `adb`) and an independent
+targeting policy with `opMode` (`vision` or `selector`). Omitting both preserves
+the existing `cls android uiauto` behavior.
 
-This is a breaking replacement of `host-android`. The old ADB-shaped functions
-and implementation are removed; callers must migrate with the host. Old Android
-plugins are outside this contract and are not part of the compatibility gate.
+`opMode: "vision"` permits screenshot-grounded coordinate actions and text entry
+only after a visual coordinate has focused the target. It rejects selectors,
+XML/source reads, and element IDs. An explicit `opType` is fail-closed: the host
+must not silently switch to another transport. The narrowly allowlisted
+`cls android uiauto raw` sidecar remains available to legacy selector-oriented
+callers, but vision-only plugins do not use it. The host must not spawn `adb`,
+open a local ADB forward, or fall back to legacy `uiautomator dump`.
+
+This is an additive compatibility change. Existing `android-call` and
+`android-vlm-drive` callers keep their legacy `auto` behavior when routing
+options are absent. Plugins that require a fixed transport use explicit options;
+those calls fail closed and never inherit the compatibility fallback chain.
 
 ## Configuration
 
@@ -50,6 +59,15 @@ android-call: func(command: string, args-json: string)
 android-uiauto-raw: func(method: string, path: string, json-body: option<string>)
     -> result<string, string>;
 
+/// Preserve the legacy auto-routed VLM entry for existing plugins.
+android-vlm-drive: func(instruction: string, max-steps: u32,
+    action-spaces: option<list<string>>) -> result<string, string>;
+
+/// Run the VLM driver with an explicit fail-closed transport and target mode.
+android-vlm-drive-with-options: func(instruction: string, max-steps: u32,
+    action-spaces: option<list<string>>, op-type: string, op-mode: string)
+    -> result<string, string>;
+
 /// Push a local artifact file to device shared storage through the CLS
 /// relay-backed ADB transport. Returns the staged device path.
 android-stage-file: func(local-path: string, media-kind: string)
@@ -62,13 +80,14 @@ android-stage-file: func(local-path: string, media-kind: string)
 The initial allowlist is:
 
 ```text
-status screenshot tap swipe key launch
+status screenshot tap swipe key launch relaunch input-text ocr-region
 ```
 
-Tree/dump/find/text commands are deliberately absent. WeChat exposes only a
-collapsed empty accessibility root, so production observation is screenshot
-only. Customer text is sent through the raw request's private file instead of
-the process argument list.
+Tree, dump, find, source, and selector commands are deliberately absent from
+`opMode: "vision"`. WeChat exposes only a collapsed empty accessibility root,
+so production observation is screenshot-only. After a screenshot-grounded tap
+focuses the field, `input-text` uses the accessibility service's focused-input
+`ACTION_SET_TEXT`, with bounded clipboard paste only as its internal fallback.
 
 The host owns a per-command option allowlist. Unknown commands, unknown fields,
 non-object arguments, NUL bytes, oversized values, and non-finite/negative
@@ -81,6 +100,7 @@ Examples:
 {"command":"screenshot","args":{}}
 {"command":"tap","args":{"x":540,"y":2100}}
 {"command":"launch","args":{"package":"com.tencent.mm"}}
+{"command":"tap","args":{"x":540,"y":2100,"opType":"a11y","opMode":"vision"}}
 ```
 
 The screenshot response also carries an additive `contactBadge` object derived
@@ -185,9 +205,9 @@ still enforces its 45-second process deadline.
   never an authorization signal.
 - A write flow must verify the foreground package and independent conversation
   title immediately before input and again before the send action.
-- Text input focuses the composer with a verified visual coordinate, writes a
-  bounded clipboard payload, and injects `KEYCODE_PASTE`; it never locates a
-  focused element through accessibility.
+- Text input focuses the composer with a verified visual coordinate, then asks
+  the accessibility service to replace the focused input text. Clipboard paste
+  is an internal accessibility fallback; selectors and element IDs are not used.
 - Raw is a transport escape hatch, not an agent-facing general tool. Production
   agents receive ticket-scoped plugin tools, never method/path/body control.
 - The host transport does not make a multi-call UI workflow atomic. The v2
