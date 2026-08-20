@@ -46,7 +46,7 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::{Multipart, Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -60,7 +60,10 @@ use rsclaw_config::runtime::RuntimeConfig;
 use rsclaw_store::Store;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, broadcast};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, Any, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing::{info, warn};
 
 use crate::{cmd::config_json::load_config_json, gateway::LiveConfig, ws::types::EventFrame};
@@ -135,6 +138,52 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
+
+/// Suspended runtime input owned by one exact A2A task incarnation.
+pub struct OwnedSuspendedTask {
+    /// Resume sender and task metadata consumed by the follow-up request.
+    pub task: rsclaw_a2a_types::event::SuspendedTask,
+    /// Exact cancellation token identifying the task incarnation.
+    pub cancel_owner: Arc<tokio_util::sync::CancellationToken>,
+}
+
+/// Remove suspended input for the currently registered task incarnation.
+pub(crate) fn take_current_suspended_task(
+    suspended_tasks: &dashmap::DashMap<String, OwnedSuspendedTask>,
+    task_cancels: &dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+    task_id: &str,
+) -> Option<OwnedSuspendedTask> {
+    // Keep the DashMap read guard alive through suspension removal so a
+    // replacement cannot change the current owner between lookup and consume.
+    let owner = task_cancels.get(task_id)?;
+    remove_suspended_task_if_owner(suspended_tasks, task_id, owner.value())
+}
+
+/// Remove suspended input only when it belongs to the expected task
+/// incarnation.
+pub(crate) fn remove_suspended_task_if_owner(
+    suspended_tasks: &dashmap::DashMap<String, OwnedSuspendedTask>,
+    task_id: &str,
+    owner: &Arc<tokio_util::sync::CancellationToken>,
+) -> Option<OwnedSuspendedTask> {
+    suspended_tasks
+        .remove_if(task_id, |_, suspended| {
+            Arc::ptr_eq(&suspended.cancel_owner, owner)
+        })
+        .map(|(_, suspended)| suspended)
+}
+
+/// Remove the current A2A cancellation token only when it is the expected task
+/// owner.
+pub(crate) fn remove_task_cancel_if_owner(
+    task_cancels: &dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+    task_id: &str,
+    owner: &Arc<tokio_util::sync::CancellationToken>,
+) -> Option<Arc<tokio_util::sync::CancellationToken>> {
+    task_cancels
+        .remove_if(task_id, |_, current| Arc::ptr_eq(current, owner))
+        .map(|(_, token)| token)
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -240,11 +289,11 @@ pub struct AppState {
     /// Cancellation tokens for in-flight A2A tasks, keyed by task_id.
     /// Inserted on SendMessage / SendStreamingMessage entry; fired by
     /// CancelTask.
-    pub task_cancels: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    pub task_cancels: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
     /// Tasks paused on TASK_STATE_INPUT_REQUIRED / AUTH_REQUIRED, keyed by
     /// task_id. Resumed when the client sends another SendMessage with the
     /// matching taskId.
-    pub suspended_tasks: Arc<dashmap::DashMap<String, crate::a2a::event::SuspendedTask>>,
+    pub suspended_tasks: Arc<dashmap::DashMap<String, OwnedSuspendedTask>>,
     /// Persistent A2A task / push-config store (redb).
     pub task_store: Arc<crate::a2a::store::TaskStore>,
     /// Push notification dispatcher (subscribes to event bus, signs payloads).
@@ -252,8 +301,8 @@ pub struct AppState {
     /// Private rsclaw A2A relay hub state. Empty/idle unless
     /// `gateway.a2a.relay.mode = "hub"`.
     pub relay_hub: Arc<crate::a2a::relay::RelayHub>,
-    /// Peer-to-peer direct connection manager (ADR 0002). Tracks direct WS
-    /// connections between spoke nodes after hole-punch succeeds.
+    /// Peer-to-peer direct connection manager (ADR 0002). Tracks authenticated
+    /// WebRTC DataChannels established through hub-assisted ICE signaling.
     pub peer_manager: std::sync::Arc<crate::a2a::peer::PeerManager>,
     /// User-managed RAG knowledge base (desktop `/api/v1/knowledge/*`).
     /// Collections are a tag veneer over the single KB store. `None` when
@@ -354,6 +403,35 @@ struct PatchAgentRequest {
 // Router builder
 // ---------------------------------------------------------------------------
 
+fn trusted_cors_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    if matches!(
+        origin,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    ) {
+        return true;
+    }
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && matches!(
+            url.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+        )
+}
+
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin, _request_parts| {
+            trusted_cors_origin(origin)
+        }))
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
 /// Build the Axum router with all API routes, middleware, and static file
 /// serving.
 pub fn build_router(state: AppState) -> Router {
@@ -436,10 +514,6 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/a2a/relay/stats",
             get(crate::a2a::relay::relay_stats_handler),
-        )
-        .route(
-            "/a2a/peer/ws",
-            get(crate::a2a::peer::peer_ws_handler),
         )
         .route("/tools/execute", post(execute_tool))
         .route("/hub/catalog", get(hub_catalog))
@@ -538,8 +612,10 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             rate_limit_middleware,
         ))
-        // H2: restrict CORS when not on loopback
-        .layer(CorsLayer::permissive())
+        // H2: browsers may call the gateway only from local development or
+        // desktop origins. Remote deployments should use a same-origin reverse
+        // proxy rather than granting arbitrary websites ambient gateway access.
+        .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -609,7 +685,6 @@ async fn auth_middleware(
         // auth and any A2A v1.0 client following the spec would 401.
         || path == "/api/v1/a2a"
         || path == "/api/v1/a2a/relay/ws"
-        || path == "/api/v1/a2a/peer/ws"
     {
         return next.run(request).await;
     }
@@ -865,6 +940,69 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cors_allows_only_local_and_desktop_origins() {
+        for allowed in [
+            "http://localhost:3000",
+            "https://127.0.0.1:18888",
+            "http://[::1]:3000",
+            "tauri://localhost",
+            "http://tauri.localhost",
+        ] {
+            assert!(
+                trusted_cors_origin(&HeaderValue::from_str(allowed).unwrap()),
+                "expected allowed origin: {allowed}"
+            );
+        }
+        for denied in [
+            "https://example.com",
+            "https://localhost.example.com",
+            "file://localhost/tmp/index.html",
+            "null",
+        ] {
+            assert!(
+                !trusted_cors_origin(&HeaderValue::from_str(denied).unwrap()),
+                "expected denied origin: {denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn reload_scope_default_is_all() {
+        assert_eq!(parse_reload_scopes("all").unwrap(), vec!["all"]);
+    }
+
+    #[test]
+    fn reload_scope_accepts_singular_and_plural() {
+        assert_eq!(parse_reload_scopes("skill").unwrap(), vec!["skills"]);
+        assert_eq!(parse_reload_scopes("skills").unwrap(), vec!["skills"]);
+        assert_eq!(parse_reload_scopes("model").unwrap(), vec!["providers"]);
+    }
+
+    #[test]
+    fn reload_scope_parses_comma_list_and_dedupes() {
+        assert_eq!(
+            parse_reload_scopes("skills, plugins ,skill").unwrap(),
+            vec!["skills", "plugins"]
+        );
+    }
+
+    #[test]
+    fn reload_scope_rejects_unknown_instead_of_silently_doing_nothing() {
+        // A typo used to match no scope, run nothing, and still report
+        // `reloaded: true`.
+        let err = parse_reload_scopes("modl").unwrap_err();
+        assert_eq!(err, vec!["modl".to_owned()]);
+    }
+
+    #[test]
+    fn reload_scope_does_not_substring_match_all() {
+        // `contains("all")` fired on any value containing those letters, so
+        // `install` silently triggered a FULL reload of every subsystem.
+        let err = parse_reload_scopes("install").unwrap_err();
+        assert_eq!(err, vec!["install".to_owned()]);
+    }
 
     #[test]
     fn reload_reports_failed_scopes() {
@@ -1915,17 +2053,83 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// POST /api/v1/config/reload — validate that the on-disk config still parses.
+///
+/// This does NOT reload anything: it neither writes `LiveConfig` nor rebuilds
+/// any component. `POST /api/v1/reload?scope=…` is the endpoint that applies a
+/// change. Kept under the old path for compatibility, but the response now
+/// says `validated` instead of claiming `reloaded: true` — the previous
+/// wording made a pure parse check look like a successful apply.
 async fn config_reload(State(_state): State<AppState>) -> impl IntoResponse {
-    // Re-load config from disk and broadcast a reload event.
-    // Full hot-reload wiring is completed in the gateway startup path;
-    // here we just validate the config is still parseable.
     match rsclaw_config::load() {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"reloaded": true}))).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e.to_string()})),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "validated": true,
+                "reloaded": false,
+                "hint": "config parses; POST /api/v1/reload?scope=… to apply it",
+            })),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"validated": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Scope names accepted by `POST /api/v1/reload`.
+pub const KNOWN_RELOAD_SCOPES: [&str; 7] = [
+    "all",
+    "skills",
+    "plugins",
+    "providers",
+    "mcp",
+    "channels",
+    "agents",
+];
+
+/// Parse a comma-separated `?scope=` value into canonical scope names.
+///
+/// Exact matching, not substring: the previous `scope.contains("all")` fired
+/// on any value that happened to contain those letters (`install`,
+/// `callback`, …) and silently ran a full reload, while a misspelled scope
+/// (`modl`) matched nothing yet still reported `reloaded: true`. Singular and
+/// plural spellings are both accepted because the CLI and older callers mix
+/// them.
+///
+/// Returns `Err(unknown)` listing every unrecognised entry so the caller can
+/// reject the request instead of silently doing nothing.
+fn parse_reload_scopes(scope: &str) -> Result<Vec<&'static str>, Vec<String>> {
+    let mut selected: Vec<&'static str> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+
+    for raw in scope.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let canonical = match raw {
+            "all" => Some("all"),
+            "skill" | "skills" => Some("skills"),
+            "plugin" | "plugins" => Some("plugins"),
+            "provider" | "providers" | "model" | "models" => Some("providers"),
+            "mcp" => Some("mcp"),
+            "channel" | "channels" => Some("channels"),
+            "agent" | "agents" => Some("agents"),
+            _ => None,
+        };
+        match canonical {
+            Some(s) => {
+                if !selected.contains(&s) {
+                    selected.push(s);
+                }
+            }
+            None => unknown.push(raw.to_owned()),
+        }
+    }
+
+    if unknown.is_empty() {
+        Ok(selected)
+    } else {
+        Err(unknown)
     }
 }
 
@@ -1941,10 +2145,26 @@ async fn http_reload(
         .get("scope")
         .map(|s| s.to_lowercase())
         .unwrap_or_else(|| "all".to_owned());
-    let reload_skills = scope.contains("all") || scope.contains("skill");
-    let reload_plugins = scope.contains("all") || scope.contains("plugin");
-    let reload_providers = scope.contains("all") || scope.contains("provider");
-    let reload_mcp = scope.contains("all") || scope.contains("mcp");
+    let selected = match parse_reload_scopes(&scope) {
+        Ok(s) => s,
+        Err(unknown) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "reloaded": false,
+                    "error": format!("unknown scope(s): {}", unknown.join(", ")),
+                    "known_scopes": KNOWN_RELOAD_SCOPES,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let has = |s: &str| selected.iter().any(|x| *x == "all" || *x == s);
+    let reload_skills = has("skills");
+    let reload_plugins = has("plugins");
+    let reload_providers = has("providers");
+    let reload_mcp = has("mcp");
 
     // Serialize concurrent reload requests to prevent double-spawn races.
     let _reload_guard = state.reload_mutex.lock().await;
@@ -1983,8 +2203,7 @@ async fn http_reload(
     // into LiveConfig — same as the file watcher does. Without this, HTTP
     // reload reports success while live reads stay stale.
     {
-        let (restart_tx, _) = tokio::sync::broadcast::channel::<Vec<String>>(1);
-        let restart_fields = state.live.apply(fresh_config.clone(), &restart_tx).await;
+        let restart_fields = state.live.apply(fresh_config.clone()).await;
         if !restart_fields.is_empty() {
             details.insert(
                 "restart_recommended".to_owned(),
@@ -2156,7 +2375,12 @@ async fn http_reload(
                     "plugins".to_owned(),
                     serde_json::json!({"reloaded": true, "wasm": wasm_count, "js": js_count, "codex": codex_count}),
                 );
-                tracing::info!(wasm_count, js_count, codex_count, "hot-reload: plugins reloaded");
+                tracing::info!(
+                    wasm_count,
+                    js_count,
+                    codex_count,
+                    "hot-reload: plugins reloaded"
+                );
             }
             Err(e) => {
                 details.insert(
@@ -2200,7 +2424,8 @@ async fn http_reload(
                 tracing::info!(count = old_count, "hot-reload: cleared old MCP clients");
             }
         }
-        let spawned = respawn_mcp_servers(&fresh_config, &codex_mcp_for_reload, Arc::clone(&registry)).await;
+        let spawned =
+            respawn_mcp_servers(&fresh_config, &codex_mcp_for_reload, Arc::clone(&registry)).await;
         details.insert(
             "mcp".to_owned(),
             serde_json::json!({"reloaded": true, "servers": spawned}),
@@ -2208,7 +2433,7 @@ async fn http_reload(
     }
 
     // --- Channels: remove deconfigured channels, hot-add new ones ---
-    let reload_channels = scope.contains("all") || scope.contains("channel");
+    let reload_channels = has("channels");
     if reload_channels {
         let configured_channels = fresh_config
             .raw
@@ -2628,7 +2853,7 @@ async fn http_reload(
 
     // --- Agents: diff config vs registry, spawn new / remove old / restart changed
     // ---
-    let reload_agents = scope.contains("all") || scope.contains("agent");
+    let reload_agents = has("agents");
     if reload_agents {
         // Detect whether agents.defaults.model changed BEFORE swapping the slot.
         let defaults_model_changed = {

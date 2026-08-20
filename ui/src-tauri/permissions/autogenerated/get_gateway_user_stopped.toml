@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-gateway-user-stopped"
+description = "Enables the get_gateway_user_stopped command without any pre-configured scope."
+commands.allow = ["get_gateway_user_stopped"]
+
+[[permission]]
+identifier = "deny-get-gateway-user-stopped"
+description = "Denies the get_gateway_user_stopped command without any pre-configured scope."
+commands.deny = ["get_gateway_user_stopped"]

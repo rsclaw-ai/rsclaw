@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-glow-overlay"
+description = "Enables the open_glow_overlay command without any pre-configured scope."
+commands.allow = ["open_glow_overlay"]
+
+[[permission]]
+identifier = "deny-open-glow-overlay"
+description = "Denies the open_glow_overlay command without any pre-configured scope."
+commands.deny = ["open_glow_overlay"]

@@ -1,116 +1,151 @@
 # Review: dev
-Date: 2026-07-23
+Date: 2026-08-15
 
 ## Summary
 
-Reviewed all changes from `6b9dd6a9fe03f0e22fc1817f1189132d1c0534f7` through `be66c3e3`. `RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo test --workspace -q` passes, but the range contains release-publishing, security, hot-reload lifecycle, and OCR defects that are not covered by that suite.
+Comprehensive pre-landing review of `dev` at `5c750a690d2e` plus the current remediation worktree. The review covered A2A direct/hub/HTTP transport, server/auth/CORS, config/secrets, channels/gateway, agent/provider/store, Tauri/UI native boundaries, release workflows, installer integrity, and executable test evidence. The initial review confirmed twelve blocking findings; later resource and final provenance passes found relay credential/route/key gaps plus seven additional blockers in transport authorization, default-agent scope resolution, signaling replay retention, manual release provenance/tag namespace, runner root discovery, and remote-staging cleanup. All identified local code/config blockers are now remediated and the current scoped gates are green. The branch is still not approved for landing because target architecture discovery, binary-only upload, and remote Linux E2E on `DEFAULT-UNKNOWN-LINUX-CURSOR` could not run through the host-denied `cls` boundary.
 
 ## Issues
 
-### [BLOCK] Publishing reuses stale internal-crate versions
-File: scripts/cargo-publish.sh:66
+### [NOTE] Resolved — gateway origin and non-loopback auth policy fail closed
+File: `crates/rsclaw-runtime/src/server/mod.rs`; `crates/rsclaw-config/src/validator.rs`
 
-Every internal crate still declares `version = "0.1.0"` (for example `crates/rsclaw-agent/Cargo.toml:3`), while the script treats Cargo's `already exists` upload failure as success. `cargo search` confirms `rsclaw-agent = 0.1.0` and `rsclaw-provider = 0.1.0` already exist. Consequently a release publishes `rsclaw-runtime 2026.6.26` against old crates.io artifacts rather than this range's source. Version all changed publishable crates for each release, and only accept an existing version after verifying its checksum/source matches.
+The router now emits CORS approval only for loopback development and Tauri desktop origins. Configuration validation rejects unauthenticated `Auto`, `Lan`, `All`, and `Custom` bindings; unauthenticated operation remains limited to modes that bind loopback. Tests cover accepted/rejected origins and authenticated/unauthenticated LAN binding.
 
-### [BLOCK] Open gateway trusts a client-forged forwarding header
-File: crates/rsclaw-runtime/src/server/mod.rs:3597
+### [NOTE] Resolved — Tauri native capabilities are contained
+File: `ui/src-tauri/tauri.conf.json`; `ui/src-tauri/capabilities/default.json`; `ui/src-tauri/src/main.rs`; `ui/src-tauri/src/stream.rs`
 
-When gateway auth is disabled, `trusted_headers` is decided from the request's `X-Forwarded-For`, which an external client can supply as `127.0.0.1`. The following code then accepts attacker-controlled `X-Session-Key`, `X-User-Id`, and `X-Channel` at lines 3651-3705, permitting session-context spoofing. Derive locality from `ConnectInfo<SocketAddr>`; parse forwarded headers only behind an explicitly trusted proxy.
+Production now has an explicit CSP, renderer shell permissions are limited to the one used `open` capability, and workspace reads/writes accept only the two supported profile files (`SOUL.md` and `USER.md`). Native streaming accepts only loopback HTTP(S), disables redirects, restricts methods, rejects URL credentials/fragments and hop-by-hop/proxy headers, and reports malformed request/response headers instead of panicking. Tauri's app manifest now generates per-command permissions: the main window receives the application command set, while the remote `rsclaw-console` capability receives only close/install-key. Both console commands also validate the invoking webview label and exact origin in Rust. Six Tauri unit tests and a manifest-level Cargo check pass.
 
-### [BLOCK] Custom Responses and Ollama providers still leak `OPENAI_API_KEY`
-File: crates/rsclaw-provider/src/build.rs:141
+### [NOTE] Resolved — release and installer integrity fail closed
+File: `.github/workflows/release-cli.yml`; `.github/workflows/release-desktop.yml`; `scripts/install.sh`; `scripts/cargo-publish.sh`
 
-The Ollama and OpenAI Responses branches unconditionally fall back to `OPENAI_API_KEY` even when `baseUrl` points to a custom endpoint. `OpenAiProvider` attaches that value as `Authorization: Bearer` (`openai.rs:764-766`). A provider configured with `api: "openai-responses"`, a third-party base URL, and no `apiKey` therefore receives the gateway's OpenAI credential. Apply the same custom-endpoint guard used by the completions branch.
+Release creation now depends on successful build matrices, fails checksum generation normally, and verifies the exact expected CLI/desktop filenames rather than only an artifact count. Manual dispatch checks out the fully-qualified `refs/tags/<tag>`, verifies that the tag exists and `HEAD` is its commit, and derives artifact names and the GitHub release tag from the same value. A same-named branch cannot satisfy the check, and the workflow can no longer publish a branch commit under an unrelated tag or emit `rsclaw-dev-*` assets. Installation requires a checksum file, exactly one valid matching SHA-256 entry, a local SHA-256 tool, and a matching digest. Crate publishing refuses a dirty tree and uses Cargo's default package verification. Both workflow YAML files parsed successfully and static provenance assertions passed.
 
-### [BLOCK] CLI image output writes to a predictable shared temporary path
-File: crates/rsclaw-channel/src/cli.rs:55
+### [NOTE] Resolved — mandatory production Rust errors are explicit
+File: `crates/rsclaw-heartbeat/src/lib.rs`; `crates/rsclaw-plugin/src/js_runtime.rs`; `ui/src-tauri/src/stream.rs`
 
-Generated images are always written beneath `/tmp/rsclaw-cli-images/image_{i}{ext}`. The directory creation error is discarded and `tokio::fs::write` follows symlinks, allowing a local attacker to pre-create a symlink and redirect/overwrite the predictable output. The default directory/file permissions also expose generated images to other local users. Use a private randomly-named temporary directory and create output files without following symlinks.
+The heartbeat mutex uses an explanatory poison invariant, plugin shutdown warns on child-kill or reader-task failures instead of silently reporting success, and renderer-controlled/request-response headers return command errors instead of panicking. Heartbeat, plugin, and Tauri tests pass.
 
-### [BLOCK] HTTP rate limiter leaks one map entry per observed IP
-File: crates/rsclaw-runtime/src/server/mod.rs:93
+### [SUGGEST] Manual computer-use harness is diagnostic, not a gate
+File: `scripts/e2e-computer-use.sh`
 
-`map.entry(ip).or_default()` allocates an entry for every source address, while cleanup only retains entries inside the current address's vector and never removes empty or expired map keys. Requests from many IPv6/proxy addresses grow the map permanently until restart. Bound the key space and evict expired idle keys (for example with a TTL/LRU cache).
+The untracked script lacks `set -e`, does not use fail-on-HTTP-error for dispatch, writes a predictable temporary file, and prints counts without asserting task success. It should use a secure temp file and assert permission response, HTTP status, reply shape, executed-action count, and zero VLM/permission failures before it is used as release evidence.
 
-### [BLOCK] Reload removes the implicit default `main` agent
-File: crates/rsclaw-runtime/src/server/mod.rs:2111
+### [SUGGEST] UI offers an unimplemented `multi_home` strategy
+File: `ui/app/components/rsclaw-panel.tsx:4735-4740`; `crates/rsclaw-runtime/src/a2a/relay.rs` (`start_spoke`)
 
-With `agents.defaults` but no `agents.list`, startup synthesizes `main`, whereas reload converts the absent list into an empty set and removes every running agent at lines 2175-2186. The registry's `default_id` remains `main`, so subsequent dispatch fails with `agent not found: main`. Preserve/reconstruct the synthesized default entry during reload and add a regression test.
+The control panel presents `multi_home` as operational while runtime logs a warning and falls back to `primary_standby`. Disable or label the option unsupported until concurrent connections and duplicate suppression exist.
 
-### [BLOCK] Channel reload removes custom webhook channels but retains their routes
-File: crates/rsclaw-runtime/src/server/mod.rs:1981
+### [SUGGEST] Task-route caches need an explicit retention policy
+File: `crates/rsclaw-runtime/src/a2a/peer.rs` (`task_routes`); `crates/rsclaw-runtime/src/a2a/relay.rs` (`task_routes`)
 
-The configured-name list includes only built-in channel types. A configured custom channel such as `orders-hook` is therefore unregistered at lines 2009-2019. Its webhook remains in `custom_webhooks` (`gateway/channels/custom.rs:408-413`), so `/hooks/<name>` continues returning 202 while its cancelled outbound consumer discards replies. Diff custom channel names and remove/rebuild their webhook registrations atomically.
+Both task ID to agent route maps are process-lifetime `DashMap`s. Arbitrary eviction could break historical task follow-ups, so retention requires an explicit protocol/ADR decision rather than an ad hoc cap.
 
-### [BLOCK] Custom WebSocket tasks survive channel removal
-File: crates/rsclaw-runtime/src/gateway/channels/custom.rs:782
+### [SUGGEST] Provider diagnostics can persist user/model content
+File: `crates/rsclaw-provider/src/anthropic.rs`; `crates/rsclaw-provider/src/openai.rs`; `crates/rsclaw-provider/src/rsclaw.rs`
 
-`ChannelManager::unregister` only cancels tokens registered in `ChannelManager` (`rsclaw-channel/src/lib.rs:742-747`). `start_custom_websocket` registers no token and its task selections observe only global shutdown, so a removed custom WebSocket stays connected until process exit. Register the channel token and select on it in both the receive and outbound tasks.
+Response bodies and optional full turn dumps can contain sensitive conversation data. Default logs should be metadata-only; full dumps need explicit opt-in, restrictive permissions, and retention guidance.
 
-### [BLOCK] Multi-account channel cancellation only stops the final account
-File: crates/rsclaw-runtime/src/gateway/channels/discord.rs:511
+## Resolved During Review
 
-Discord registers its cancellation token under `DiscordChannel::name()`, which is always `"discord"` (`rsclaw-channel/src/discord.rs:623-626`). Each account overwrites the prior token in the token map, so removal cancels only the final account. The same bare-name pattern exists in Slack and the other multi-account channel starters. Key tokens by the registration/account name and cancel every alias belonging to the removed channel.
+### [NOTE] Standard inbound A2A scopes are enforced before dispatch
+File: `crates/rsclaw-runtime/src/a2a/auth.rs`; `crates/rsclaw-runtime/src/a2a/server.rs`; `crates/rsclaw-runtime/src/a2a/streaming.rs`
 
-### [BLOCK] Concurrent reload requests can double-start a channel permanently
-File: crates/rsclaw-runtime/src/server/mod.rs:2004
+Named principals now require `*`, `a2a:method:<Method>`, or the appropriate `a2a:invoke/read/cancel/push:<target>` grant before local or relayed dispatch. Empty scopes deny all operations. Gateway/dev callers remain unrestricted; legacy token/API-key lists receive an explicit compatibility `*` grant. Requests that omit `metadata.agentId` resolve the registry's actual default agent before an `a2a:invoke:<agent>` check, so a specific default-agent grant does not require a wildcard.
 
-Each reload snapshots `running` before starting channels. Two simultaneous hot-adds both see the channel as absent, then each calls a starter; the later `register_with_name` and token insertion overwrite the earlier entries (`rsclaw-channel/src/lib.rs:665-671,709-722`). Later removal can only cancel the second task set. Serialize reload transactions or make registration/token creation an atomic check-and-insert operation.
+### [NOTE] Transport-authenticated unary and streaming requests survive standard dispatch authorization
+File: `crates/rsclaw-runtime/src/a2a/auth.rs`; `crates/rsclaw-runtime/src/a2a/peer.rs`; `crates/rsclaw-runtime/src/a2a/relay.rs`
 
-### [BLOCK] WeChat 4.x Windows OCR can capture the foreground application
-File: crates/rsclaw-desktop/src/native.rs:442
+Direct and relay node/target ACLs run before local dispatch. After that check succeeds, both unary and streaming paths use one transport-authenticated identity carrying an internal `*` grant. This prevents the standard HTTP authorization layer from rejecting an already-authorized transport request while retaining the original principal ID for task ownership and audit.
 
-The new Alt+A path maps the normal `com.tencent.xinWeChat` input to process name `WeChat`, but WeChat 4.x uses `Weixin.exe`. On failure it substitutes the arbitrary rectangle `0,0,1200,800` and sends Alt+A/Enter to the current foreground app. This can OCR another application's clipboard image. Match both WeChat/Weixin process aliases and fail closed if no matching window is found.
+### [NOTE] Signaling replay tombstones fail closed without early eviction
+File: `crates/rsclaw-runtime/src/a2a/peer.rs`; `crates/rsclaw-runtime/src/a2a/relay.rs`; `docs/adr/0002-a2a-p2p-direct.md`
 
-### [BLOCK] Concurrent macOS OCR requests overwrite a process-global temporary image
-File: crates/rsclaw-desktop/src/native.rs:687
+Live consumed-session tombstones are retained for the full 60-second signaling window. A full 1,024-entry tombstone table rejects new peer/hub signaling admission and answer completion instead of evicting an unexpired replay record. Capacity rejection leaves existing tombstones and the hub's active session intact until normal expiry.
 
-The new path uses `/tmp/rsclaw_ocr_<pid>.png`; `DesktopSession::ocr_window` runs OCR work concurrently without a mutex. Two calls can overwrite each other's source image or delete it before the other call reads it. Use a secure per-call tempfile/UUID and a cleanup guard.
+### [NOTE] Transport stream failures preserve identity or return JSON-RPC errors
+File: `crates/rsclaw-runtime/src/a2a/peer.rs`; `crates/rsclaw-runtime/src/a2a/relay.rs`; `crates/rsclaw-runtime/src/a2a/streaming.rs`
 
-### [BLOCK] OCR CLI advertises model and language overrides that are ignored
-File: crates/rsclaw-runtime/src/cmd/image.rs:27
+Direct and hub stream correlations retain validated task/context IDs. Disconnect and deadline failures emit a canonical terminal task event when both IDs are known. Before identity exists they emit a request-correlated JSON-RPC `-32004` SSE error instead of fabricating an empty-ID task event.
 
-`ImageOcrArgs` exposes `--model` and `--lang` (`rsclaw-cli/src/image.rs:39-45`), but the execution path passes only `path`, `prompt`, and `max_tokens` to `OcrClient`. `rsclaw image ocr image.png --model foo --lang ja` silently uses configured values instead. Implement per-call model/language overrides or remove these options.
+### [NOTE] Task creation and resume now enforce immutable ownership
+File: `crates/rsclaw-runtime/src/a2a/store.rs`; `crates/rsclaw-runtime/src/a2a/server.rs`; `crates/rsclaw-runtime/src/a2a/streaming.rs`
 
-### [BLOCK] Agent OCR silently truncates out-of-range `max_tokens`
-File: crates/rsclaw-agent/src/tools_ocr.rs:56
+The initial task and optional authenticated owner are created in one redb transaction only when both task and owner keys are absent. Duplicate caller-supplied task IDs cannot overwrite task, owner, event bus, or cancellation state. Resume checks the recorded owner before consuming the suspended sender; storage failures stop dispatch.
 
-The JSON `u64` is cast with `as u32`; `4294967296` becomes zero and is sent to the OCR service. Reject values above `u32::MAX` with `u32::try_from` and declare the same limit in the tool schema.
+### [NOTE] Configured gateway and A2A credentials now fail closed
+File: `crates/rsclaw-config/src/runtime.rs`
+
+Configured gateway auth and A2A `clients`, `authTokens`, and `apiKeys` use full File/Exec/Env resolution. Unresolved, empty, non-Unicode, or explicitly empty credential configuration returns a startup/reload error. Dev pass-through remains available only when no inbound credential field or environment credential is configured.
+
+### [NOTE] Direct correlation now verifies the authenticated source peer
+File: `crates/rsclaw-runtime/src/a2a/peer.rs`; `tests/a2a_p2p_e2e.rs`
+
+Unary responses, stream events, and stream terminal responses are accepted only from the peer node recorded at outbound admission. The public integration-test API now requires the source node instead of exposing an unbound completion method.
+
+### [NOTE] Direct inbound work is bounded, unique, and connection-owned
+File: `crates/rsclaw-runtime/src/a2a/peer.rs`
+
+Inbound direct requests atomically reserve `(connection_generation, request_id)` and one of 1,024 permits before task creation. Duplicate IDs are rejected. Streaming workers select on a per-connection cancellation token and hold an RAII guard that releases both the reservation and permit on terminal event, send failure, replacement, or disconnect.
+
+### [NOTE] Streaming terminal and synthetic failure wire semantics were corrected
+File: `crates/rsclaw-a2a-types/src/event.rs`; `crates/rsclaw-runtime/src/a2a/relay.rs`
+
+Artifact `lastChunk` no longer terminates the task stream before its final status. Relay-synthesized failures now use `TASK_STATE_FAILED`, `ROLE_AGENT`, and `type: text` and are deserializable by the repository's v1 types.
+
+### [NOTE] Relay URLs and resume failures now fail safely
+File: `crates/rsclaw-config/src/validator.rs`; `crates/rsclaw-runtime/src/a2a/relay.rs`; `crates/rsclaw-runtime/src/a2a/server.rs`
+
+All spoke hub URLs reject userinfo, query, and fragment at startup; runtime logs only a redacted origin/path. A closed resume receiver now immediately cancels/finalizes the owned task and returns JSON-RPC error `-32004` instead of waiting and returning a stale snapshot.
+
+### [NOTE] Relay credentials and route leases now fail closed under malformed or hostile input
+File: `crates/rsclaw-config/src/runtime.rs`; `crates/rsclaw-config/src/validator.rs`; `crates/rsclaw-runtime/src/a2a/peer.rs`; `crates/rsclaw-runtime/src/a2a/relay.rs`
+
+Configured relay, relay-node, inline-private-key, and private-key-file credentials must resolve to non-empty values. Relay node IDs are unique and Ed25519 key strings must decode to raw 32-byte material. Direct and hub route tables are capped at 4,096 entries with 256 agents per lease; hub TTL is clamped to 30 seconds and validation/capacity failure is atomic. Direct leases replace the authenticated source peer's prior snapshot. The former public single-route test hook was replaced with the same bounded source-owned snapshot API used by production.
+
+## Verification
+
+Executed on the current reviewed worktree with `CARGO_INCREMENTAL=0`, `RSCLAW_BUILD_VERSION=dev`, and `RSCLAW_BUILD_DATE=test`:
+
+- `cargo test -p rsclaw-a2a-types`: **2 passed**.
+- `cargo test -p rsclaw-config`: **69 passed**.
+- `cargo test -p rsclaw-runtime a2a::`: **104 passed, 1 ignored**.
+- `cargo test -p rsclaw --test a2a_p2p --test a2a_p2p_e2e --test a2a_v1_compliance`: **8 + 3 + 22 passed**.
+- `cargo test -p rsclaw-runtime`: **235 passed, 1 ignored** before the instance-port regression tests were added.
+- `RSCLAW_PORT=65534 cargo test --all`: exit **0** on the current worktree. The full gate included **11/11** KB CLI smoke tests while the user's unrelated gateway remained running on port 18888. Two focused runtime tests also verify that an explicit isolated-instance port is preserved when profile config omits a port and that an explicit profile-config port retains priority.
+- `cargo test -p rsclaw-heartbeat`: **20 passed**.
+- `cargo test -p rsclaw-plugin`: **67 passed**.
+- `cargo test --manifest-path ui/src-tauri/Cargo.toml`: **6 passed**.
+- Changed-crate capped Clippy (`rsclaw-a2a-types`, config, runtime, heartbeat, plugin, all targets): exit **0**.
+- `cargo check --manifest-path ui/src-tauri/Cargo.toml`: exit **0**.
+- `yarn --cwd ui tsc --noEmit`: exit **0**.
+- Fresh rust-analyzer diagnostics for the changed Rust files: **0 errors**.
+- `git diff --check`: exit **0**.
+- `scripts/all_build_rsclaw.sh` parsed successfully through side-effect-free negative preflight execution. Root discovery was verified from outside the repository for the repository script and for a copied home-level script with `RSCLAW_REPO_ROOT`. The current runner materializes the active tracked and non-ignored untracked inputs into a temporary Git index, writes an immutable tree object, extracts that tree into private local staging, and runs `scripts/build.sh` from the extracted tree rather than the mutable worktree. Both Cargo target and package dist are private directories under that staging; the upload copy is frozen directly from the private binary before any atomic local publication to shared `target/dist`. The initial private cold build exceeded the shell tool's fixed 600-second limit and is not counted as a pass. Its retained source was verified blob-by-blob, including file modes and symlink targets, against immutable tree `7848f0a897edd31803da56c28b1501cabed7d08b`; no cargo/rustc process remained. Resuming the same private Cargo target completed successfully in 8m36s, after which private binary/archive publication and cleanup passed. The runner validates flags, port, and node, discovers architecture before build, and freezes exactly one matching raw binary into a separate private local staging directory before hashing/upload. Remote staging uses a 128-bit random path, atomic `mkdir -m 700`, owner/mode/symlink checks, and a separate 256-bit ownership sentinel; cleanup deletes only a directory carrying the exact sentinel. The frozen binary copy must match the build-output digest and is the only uploaded file. The uploaded binary is checksum/version/architecture-verified, run in place, and removed before success. The EXIT trap removes both local and owned remote staging on failure while preserving the original exit status.
+- `cargo brd` produced a native arm64 macOS `target/release-dev/rsclaw` reporting version `2026.8.6`. Before the Linux `/proc` starttime binding was added, the then-current generated remote program ran against that binary on isolated port `28893`; it passed the second architecture check, checksum, health, unauthenticated config `401`, unauthenticated A2A `401`, authenticated config `200`, public Agent Card `200`, and authenticated `GetExtendedAgentCard` JSON-RPC assertions. It emitted `REMOTE_E2E_OK`, removed the upload directory, left no listener, and did not access or stop the user's port-`18888` gateway. This remains historical runner evidence, not validation of the newest Linux-only process-identity branch.
+- Current worktree static Linux builds (`RSCLAW_BUILD_VERSION=2026.8.6`, `RSCLAW_BUILD_DATE=2026-08-15`):
+  - x86_64 binary SHA-256 `9b1fdc53a9db2b116419cb0872a934f6307c28fd24c462c7b1827a063e460a53`; `file` reports static PIE and stripped; current archive SHA-256 `5ab2b1d9de200d578c851ae00beba1b22745157ff05075aad7e5a9ea86b35965`. The successful private build used immutable Git tree `7848f0a897edd31803da56c28b1501cabed7d08b` (deterministic archive SHA-256 `4bcd972f6b78b0cd196a6d869675bc97159ccbf07711e8948f7aa9e12811f626`); the archive contains exactly one byte-identical `rsclaw` payload.
+  - aarch64 binary SHA-256 `f7da12b74c46a182b85cb91c81ff3751338a7250970f2f8cf7c2230f67ffcfd9`; `file` reports statically linked and stripped; archive SHA-256 `0dfbbdadec6f630170901022d98023ffc50629c2cabc4f2186761c5226227c1b`.
+  - Both archives contain exactly one executable `rsclaw` entry whose bytes equal the corresponding raw binary; the scoped two-entry `dist/SHA256SUMS.txt` verified successfully. The current host has no `readelf`, so this pass does not independently claim dynamic-section inspection.
+- Narrow native review workflows found and drove remediation of receiver replay, owner identity, route-cache, retained-byte, effective-bind, Tauri command-ACL, release provenance, installer pinning, streaming precedence, and canonical-principal aliasing blockers. The final canonical encoding is length-prefixed and covered by an injectivity/node-binding regression.
+
+`next lint` is not configured and opened its interactive first-run prompt; no lint result is claimed. The KB CLI contamination was resolved by preserving an explicit `RSCLAW_PORT` override for `--base-dir` instances, without stopping or modifying the user's gateway or changing KB routing; the isolated full-workspace gate is now green. Strict `-D warnings`, hostile NAT/TURN, remote direct/WebRTC relay traversal, and cross-platform CI were not established. Target-host architecture matching, binary-only upload, isolated gateway/A2A JSON-RPC smoke, and remote cleanup were established by the 17:25 CST evidence below.
+
+### Remote gate evidence — 2026-08-15 17:25 CST
+
+- The minimal `/usr/local/bin/cls run -n DEFAULT-UNKNOWN-LINUX-CURSOR -t 30 'uname -m'` probe was retried once at 14:59 CST and rejected with `Operation not permitted` before any target output. By 15:01 CST the same host-level denial had persisted across three consecutive goal turns, so no further command variants were attempted.
+- Safe alternatives found no independently approved remote execution/SFTP or Linux VM/container plugin, project knowledge entry, whitelisted target/architecture environment variable, DNS record, or mDNS record for the node. `cls status` previously exited `0` with no module metadata. Browser and TCP probes previously confirmed ports 11080/18080 accept local connections but expose neither HTTP metadata nor a target session. Existing user-owned `cls`/SSH sessions were not inspected or reused because their binding to the requested node cannot be authenticated without bypassing the host boundary. `cls tunnel-sync` was not executed because its documented behavior writes `~/.cls/config.toml`; the local `cls server agents` identity store is absent from the workspace and would not contain architecture even if present. No relay control request was sent.
+- At 15:06 CST a single-node, non-verbose `cls list --all 'DEFAULT-UNKNOWN-LINUX-CURSOR' --json` query was also rejected with `Operation not permitted` before returning mapping data. This confirms the boundary covers node-map access as well as remote execution and is not an SSH-only failure.
+- `DEFAULT-UNKNOWN-LINUX-CURSOR` is `NXDOMAIN`, has no SSH config/known-host mapping, and therefore cannot be reached through the loaded SSH agent without the private `cls` node mapping.
+- No optional remote execution/SFTP tool, QEMU user emulator, or container runtime is available.
+- Project knowledge, complete session history, and non-secret target environment variables contain no recorded architecture or public relay endpoint.
+- A local `cls` process listens on ports 11080 and 18080 but exposes no read-only health/agent metadata on `/`, `/health`, `/status`, or `/cls/agents`; observed established sockets were only the loopback Browser probes from this review, not a remote agent session. It therefore cannot identify the target without initiating a private mapped connection. Its external working directory is host-denied and was not read.
+- Local safe-alternative verification at 15:01 CST used a fake `cls` function only: target selection accepted `x86_64`, `aarch64`, and `arm64`, mapped them to the expected musl targets, and rejected `riscv64`; runner flag/target preflights passed. The generated POSIX remote smoke program passed `sh -n` and retained assertions for loopback isolation, unauthenticated `401`, authenticated A2A, and `REMOTE_E2E_OK`. At 15:04 CST the runner was further hardened so non-`BUILD_ONLY` execution always discovers remote architecture even when `TARGET` is explicitly set; an explicit mismatch now exits `2` before build or upload. Fake-`cls` tests proved both architecture mapping and mismatch rejection. At 15:06 CST the generated remote program gained a second `uname -m` target check before checksum/execution, closing the discovery-to-upload TOCTOU if a node mapping or machine changes; generated-program syntax and both architecture branches were checked locally. Architecture parsing now accepts only one unique canonical target, treats `aarch64`/`arm64` as equivalent, ignores architecture-like node-label substrings, and rejects mixed `x86_64`/ARM output instead of choosing the last token. At 15:09 CST the current generated program ran end to end against the native arm64 `rsclaw 2026.8.6` on isolated port 28893 and emitted `REMOTE_E2E_OK`; staging and listener cleanup were asserted. Deliberate architecture and checksum mismatches each exited `1` before gateway startup or binary execution and also cleaned staging. At 15:12 CST the current generated program was rerun on port 28896 after adding an exact `rsclaw <build-version>` assertion and a per-run 256-bit `/dev/urandom` auth token; it emitted `REMOTE_E2E_OK` and cleaned all state. A deliberate version mismatch exited `1` before gateway startup, and unsafe/multi-node names plus quote/space/newline build-version inputs exited `2` before build or remote access. At 15:15 CST build provenance was hardened with a deterministic snapshot over `HEAD`, every tracked file's content, and non-ignored untracked files while excluding generated artifact directories. At 15:22 CST the snapshot was extended to file kind, executable bit, and symlink target; it must remain unchanged across the build, immediately before staging/upload, and after remote smoke before success is reported. Tests proved stable snapshots, detection of a new source file, executable-bit and symlink-target changes, exclusion of `target/` artifacts, build-time mutation rejection, pre-upload mutation rejection, and post-smoke mutation rejection. The build output is now copied into private local staging, compared to the original digest, and only that frozen copy is uploaded; tampering during the freeze failed closed and success/upload-failure paths removed local staging. At 15:31 CST both full and binary-only generated remote programs were changed to remove and verify absence of remote staging before emitting `REMOTE_E2E_OK`/`REMOTE_BINARY_OK`. The local runner now requires the exact success marker (optionally preceded by one `cls` node prefix) even when `cls run` exits zero. Current generated programs passed full and binary-only cleanup-before-marker tests; missing-marker output failed closed with exit `1`, one remote cleanup attempt, and no local residue. At 15:50 CST generated remote output gained machine-checkable `REMOTE_TARGET`, `REMOTE_SHA256`, and `REMOTE_VERSION` evidence lines. The current generated program emitted all structured evidence plus `REMOTE_E2E_OK`; a forced cleanup-command failure exited `1` without emitting a success marker. At 15:53 CST the local runner began requiring exact matches for all four evidence lines rather than trusting the success marker alone. Parser tests rejected incorrect target/SHA/version and marker substrings; full fake-`cls` `main()` execution accepted the complete prefixed evidence set, while an output containing `REMOTE_E2E_OK` but omitting the SHA failed with exit `1`, one cleanup call, and no local residue. At 15:57 CST remote gateway shutdown was made bounded. At 15:59 CST the asynchronous watchdog was replaced with synchronous Linux `/proc/<pid>/stat` state polling before KILL/wait. At 16:01 CST an independent pre-landing review correctly rejected three remaining claims: active-worktree before/after hashes did not freeze build input, predictable `mkdir -p` remote staging was not private atomic admission, and state-only PID checks did not bind lifecycle to the original process. The runner now builds from an immutable Git tree, uses random atomic sentinel-owned remote staging, captures `/proc/<pid>/stat` starttime and revalidates it before TERM/KILL, and refuses success rather than waiting indefinitely if the same non-zombie process survives the bounded TERM/KILL windows. Authenticated curl headers now come from a mode-600 temporary config instead of argv. A second independent review then found two narrower residual gaps: the frozen source still wrote build outputs to shared `target/`, and remote smoke cleanup did not revalidate staging ownership. Cargo target/dist are now private and the upload copy comes directly from that private binary; every remote deletion path rechecks directory/sentinel type, UID, mode, and the 256-bit token. The private-tree x86_64 compile, direct private-output publication, archive/payload/checksum checks, atomic-staging positive/collision tests, and wrong-sentinel cleanup refusal passed. A third targeted review found one remaining creation-failure trap deletion before admission; it now performs no deletion until full admission and repeats the same ownership predicate before removal. Its forced pre-admission failure test left the random directory intact instead of deleting it. `SHA256SUMS.txt` is now restricted to current-version archives for the two supported musl targets; stale/foreign matching files were excluded in a negative test. The final targeted review reported no blocking finding: immutable private build/upload flow, bounded PID lifecycle, admission-aware remote cleanup, and scoped checksums are resolved. It retains a non-blocking note that portable shell path validation plus `rm` cannot provide an fd-bound defense against a malicious same-user pathname-swap race. At 17:25 CST the reviewed runner executed on the real Linux target, exercising the `/proc` starttime lifecycle path and completing cleanup before its success marker. Direct `bash -n` of scripts containing deployment/install commands was host-denied before execution, so no such syntax result is claimed.
+- The requested home-level copy still does not exist: a read-only check at 15:31 CST returned `HOME_RUNNER_MISSING`. Workspace sandbox policy rejects creation under `~/`, so no bypass was attempted; the repository script remains the authoritative reviewed copy.
+- At 15:31 CST the user reported that `DEFAULT-UNKNOWN-LINUX-CURSOR` access was restored and identified the target as `x86_64`. The agent immediately retried the exact `cls run ... 'uname -m'` probe and then the complete reviewed runner with `TARGET=x86_64-unknown-linux-musl`; both were still rejected by the API tool sandbox with `Operation not permitted` before remote output. The runner consequently failed closed on empty architecture output before build or upload. No alternative SSH/SFTP plugin became available. This is now an agent-tool sandbox restriction, not an unresolved target-architecture decision. At 15:45 CST the current x86_64 `BUILD_ONLY=1` path was rerun successfully from source snapshot `fd8b15b8c8d7c7c31d48a4a6757acaeccdee83a207d09d9800b39296879b70d0`; at 15:47 CST an auditable handoff was generated under `target/` with the final worktree snapshot, binary SHA, exact command, and expected success markers for execution from an unrestricted user terminal. At 17:14 CST optional-tool search found no remote execution/SFTP plugin. Public `cls` help confirmed that `run`, `exec`, and `upload` share the same node mapping/transport; `forward` without the map requires a private relay URL, fingerprint, and token; `tunnel-sync` consumes that token and writes `~/.cls/config.toml`; none is an acceptable bypass. `cls status` still returned exit `0` with no module output. Two immutable builds whose trees differed only in runner/review files produced different binary digests, so the handoff was changed to `DEPLOY_EXISTING=1`: it requires the exact pre-verified binary SHA and source tree, allows current-tree drift only in `scripts/all_build_rsclaw.sh` and `docs/reviews/dev.md`, discovers/rechecks target architecture normally, freezes the existing binary into private upload staging, and never rebuilds. Conflict, malformed-SHA, non-allowlisted-source, exact-SHA, no-build, one-file upload, structured-evidence, and cleanup paths passed local/fake-transport tests; no fake result is presented as remote evidence. A final review required and verified `EXPECTED_RUNNER_SHA`: missing or mismatched verifier hashes fail before `cls`, compensating for the runner-only source-drift allowance. It also confirmed that binary-only mode logs `E2E skipped` rather than claiming an E2E pass.
+- At 17:25 CST the user explicitly re-authorized the exact `cls run -n DEFAULT-UNKNOWN-LINUX-CURSOR ...` path. Architecture discovery returned `[DEFAULT-UNKNOWN-LINUX-CURSOR] x86_64`. The pinned `DEPLOY_EXISTING=1` runner verified runner SHA-256 `624530a58155c8c9b19b10b226fb1e216784506384e2b4e5a35ea475a2b8dfe2`, source tree `7848f0a897edd31803da56c28b1501cabed7d08b`, and local binary SHA-256 `9b1fdc53a9db2b116419cb0872a934f6307c28fd24c462c7b1827a063e460a53`; it uploaded exactly that x86_64 raw binary to random private staging. The real target emitted exact `REMOTE_TARGET=x86_64-unknown-linux-musl`, `REMOTE_SHA256=9b1fdc53a9db2b116419cb0872a934f6307c28fd24c462c7b1827a063e460a53`, `REMOTE_VERSION=rsclaw 2026.8.6`, and `REMOTE_E2E_OK`, followed by the local completion marker. The smoke covered health, unauthenticated config `401`, unauthenticated A2A `401`, authenticated config `200`, public Agent Card `200`, and authenticated `GetExtendedAgentCard`. An independent post-run command confirmed the exact upload directory was absent, port `28889` had no listener, and no user-owned `rsclaw-e2e*` directory created in the preceding ten minutes remained; it emitted `REMOTE_CLEANUP_OK`, `Linux 6.12.94+ x86_64`, and `64`.
 
 ## Verdict
 
-BLOCKED — 14 blocking issues must be resolved.
-
----
-
-## Re-review: 2026-07-24
-
-Re-reviewed the 14 items against `88fe1c66` plus the current uncommitted hot-reload changes. The targeted runtime suite passes (`cargo test -p rsclaw-runtime --lib -q`: 159 passed, 1 ignored), but `cargo test --workspace -q` currently cannot compile because multiple workspace crates lack their direct test dependencies (`tempfile`, `rustls`) and `rsclaw-heartbeat` imports a nonexistent `crate::MemoryTier`.
-
-### Resolved / addressed
-
-- Implicit `main` agent removal: addressed in `server/mod.rs:2221-2259`, which now synthesizes the same default agent used at startup.
-- Custom webhook removal: addressed by including configured custom names and removing stale webhook entries during teardown (`server/mod.rs:2033-2040, 2061-2065`).
-- Custom WebSocket cancellation: addressed by registering and selecting on the per-channel token (`gateway/channels/custom.rs:784-829`).
-- Concurrent reload double-start: addressed by the gateway-wide reload mutex (`server/mod.rs:257-259, 1847-1848`).
-
-### [BLOCK] Multi-account channel teardown still leaves a dead bare sender
-File: crates/rsclaw-runtime/src/server/mod.rs:2056
-
-The account-keyed cancellation change stops all account tasks, but channel removal only deletes `channel_senders[name]`, where `name` is e.g. `discord/default`. It leaves the bare fallback `discord` sender installed. Starters deliberately preserve that fallback with `entry("discord").or_insert_with(...)` (`gateway/channels/discord.rs:95-98`), so disabling then re-enabling Discord leaves account-less notifications routed to the old, cancelled sender. Remove/rebuild the bare fallback when the final account for a channel is removed.
-
-### Still blocking (unchanged)
-
-- Publishing stale internal crate versions: `scripts/cargo-publish.sh:66`.
-- Forged `X-Forwarded-For` trusts OpenAI session headers: `server/mod.rs:3731-3755`.
-- `OPENAI_API_KEY` leaks to custom Responses/Ollama endpoints: `provider/build.rs:141-150`.
-- CLI image output uses predictable shared temporary paths: `channel/cli.rs:55-63`.
-- Per-IP HTTP rate limiter retains every historical IP key: `server/mod.rs:93-100`.
-- Windows WeChat 4.x OCR can capture the foreground application: `desktop/native.rs:442`.
-- macOS OCR shares a PID-only temporary image: `desktop/native.rs:687`.
-- `rsclaw image ocr --model/--lang` options remain ignored: `runtime/cmd/image.rs:27-33`.
-- Agent OCR still truncates oversized `max_tokens`: `agent/tools_ocr.rs:56`.
-
-## Re-review Verdict
-
-BLOCKED — 10 blocking issues remain. The custom-channel and multi-account fixes are currently uncommitted.
+PASS — the reviewed local code/config blockers are resolved, scoped gates are green, the matching static x86_64 binary was uploaded alone, and the isolated real-target Linux gateway/A2A E2E plus cleanup gate passed on `DEFAULT-UNKNOWN-LINUX-CURSOR`. This approval is limited to the reviewed scope and does not claim strict warning-free validation, hostile NAT/TURN traversal, remote direct/WebRTC relay traversal, cross-platform CI, commit, push, tag, or release execution.

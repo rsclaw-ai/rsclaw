@@ -14,8 +14,7 @@ use rsclaw_config::schema::BindMode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
-use tracing::info;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -174,6 +173,19 @@ pub async fn a2a_rpc_handler_inner(
     req: JsonRpcRequest,
 ) -> Json<JsonRpcResponse> {
     let id = req.id.clone();
+    let default_agent = state.agents.default_agent().ok();
+    if !crate::a2a::auth::method_allowed_with_default(
+        caller.as_ref(),
+        &req.method,
+        &req.params,
+        default_agent.as_ref().map(|agent| agent.id.as_str()),
+    ) {
+        return Json(JsonRpcResponse::err(
+            id,
+            -32003,
+            format!("not authorized to call {}", req.method),
+        ));
+    }
     if let Some(response) =
         crate::a2a::relay::try_forward_jsonrpc(&state, caller.as_ref(), &req).await
     {
@@ -283,15 +295,38 @@ async fn handle_send_message(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Resume path: client is sending follow-up input to a paused task.
+    // Check ownership BEFORE consuming the suspended entry. Task ownership is
+    // immutable after atomic creation, so a different principal cannot steal a
+    // resume handle by supplying another caller's task ID.
+    if !caller_owns(&state.task_store, &caller, &task_id) {
+        return Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::not_found(format!("tasks/{task_id}")),
+        ));
+    }
     // Route the new text to the suspended runtime, then wait on the bus
     // for the resumed turn to reach a terminal state (or re-suspend with
     // another InputRequired). Without this wait, sync clients that don't
     // open SSE never see the resumed turn's outcome.
-    if let Some((_, suspended)) = state.suspended_tasks.remove(&task_id) {
+    if let Some(suspended) = crate::server::take_current_suspended_task(
+        &state.suspended_tasks,
+        &state.task_cancels,
+        &task_id,
+    ) {
         // Subscribe BEFORE firing the resume so we don't race past the
         // first events the bridged runtime emits.
         let mut bus_rx = state.task_event_bus.subscribe(&task_id);
-        let _ = suspended.resume_tx.send(text);
+        let suspended_context_id = suspended.task.context_id.clone();
+        if let Err(error) = deliver_resume_input(suspended.task.resume_tx, text) {
+            suspended.cancel_owner.cancel();
+            finalize_failed_task(
+                &state,
+                &task_id,
+                &suspended_context_id,
+                &suspended.cancel_owner,
+            );
+            return Json(JsonRpcResponse::err(id, -32004, error));
+        }
 
         let timeout_secs: u64 = std::env::var("RSCLAW_A2A_RESUME_TIMEOUT_SECS")
             .ok()
@@ -373,22 +408,39 @@ async fn handle_send_message(
         artifacts: vec![],
         metadata: None,
     };
-    if let Err(e) = state.task_store.put(&initial_task) {
-        warn!(err = %e, "failed to persist initial task");
-    }
-    // §7.5: record the creating principal so only it (or the operator token)
-    // can later read/cancel/configure this task.
-    if let Some(c) = caller.as_ref() {
-        if let Err(e) = state.task_store.put_owner(&task_id, &c.id) {
-            warn!(err = %e, task_id = %task_id, "failed to persist task owner");
+    // Persist task and owner in one transaction. A caller-supplied task ID may
+    // resume its existing suspended task above, but it may never overwrite an
+    // existing task or owner reservation.
+    match state.task_store.create_task(
+        &initial_task,
+        caller.as_ref().map(|identity| identity.id.as_str()),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            let error = if caller_owns(&state.task_store, &caller, &task_id) {
+                a2a_errors::invalid_argument(
+                    format!("task already exists: {task_id}"),
+                    "message.taskId",
+                )
+            } else {
+                a2a_errors::not_found(format!("tasks/{task_id}"))
+            };
+            return Json(JsonRpcResponse::err_struct(id, error));
+        }
+        Err(error) => {
+            return Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::internal(format!("cannot create task: {error}")),
+            ));
         }
     }
 
     // Register a cancellation token so CancelTask can stop the in-flight turn.
-    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
     state
         .task_cancels
         .insert(task_id.clone(), cancel_token.clone());
+    let cancel_owner = cancel_token.clone();
 
     // Push notification fan-out — same as the streaming path. Without this,
     // synchronous SendMessage tasks emit events to the bus but no push
@@ -423,7 +475,13 @@ async fn handle_send_message(
     // (RSCLAW_A2A_WAIT_INPUT_TIMEOUT_SECS, default 30 min) tears the
     // entry down so a never-resumed task doesn't leak forever.
     let (ireq_tx, ireq_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
-    spawn_input_request_listener(state.clone(), task_id.clone(), session_key.clone(), ireq_rx);
+    spawn_input_request_listener(
+        state.clone(),
+        task_id.clone(),
+        session_key.clone(),
+        cancel_owner.clone(),
+        ireq_rx,
+    );
 
     // Bridge runtime → bus for mid-turn AgentEvents (Working progress with
     // tool names, InputRequired/AuthRequired, etc.). Streaming has the same
@@ -455,7 +513,7 @@ async fn handle_send_message(
         task_id: Some(task_id.clone()),
         context_id: Some(session_key.clone()),
         event_tx: Some(event_tx),
-        cancel_token: Some(cancel_token),
+        cancel_token: Some((*cancel_token).clone()),
         input_request_tx: Some(ireq_tx),
         extra_tools: vec![],
         images: vec![],
@@ -464,7 +522,7 @@ async fn handle_send_message(
     };
 
     if handle.tx.send(msg).await.is_err() {
-        finalize_failed_task(&state, &task_id, &session_key);
+        finalize_failed_task(&state, &task_id, &session_key, &cancel_owner);
         return Json(JsonRpcResponse::err(id, -32603, "agent inbox closed"));
     }
 
@@ -474,11 +532,11 @@ async fn handle_send_message(
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), reply_rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => {
-                finalize_failed_task(&state, &task_id, &session_key);
+                finalize_failed_task(&state, &task_id, &session_key, &cancel_owner);
                 return Json(JsonRpcResponse::err(id, -32603, "reply channel dropped"));
             }
             Err(_) => {
-                finalize_failed_task(&state, &task_id, &session_key);
+                finalize_failed_task(&state, &task_id, &session_key, &cancel_owner);
                 return Json(JsonRpcResponse::err(
                     id,
                     -32000,
@@ -535,7 +593,11 @@ async fn handle_send_message(
             if let Err(e) = state.task_store.delete_push_configs_for_task(&task_id) {
                 warn!(err = %e, task_id = %task_id, "failed to clean up push configs");
             }
-            state.task_cancels.remove(&task_id);
+            crate::server::remove_task_cancel_if_owner(
+                &state.task_cancels,
+                &task_id,
+                &cancel_owner,
+            );
 
             state
                 .task_event_bus
@@ -580,7 +642,11 @@ async fn handle_send_message(
             if let Err(e) = state.task_store.delete_push_configs_for_task(&task_id) {
                 tracing::warn!(task_id, error = %e, "A2A: failed to delete push configs on error path");
             }
-            state.task_cancels.remove(&task_id);
+            crate::server::remove_task_cancel_if_owner(
+                &state.task_cancels,
+                &task_id,
+                &cancel_owner,
+            );
             state
                 .task_event_bus
                 .publish(rsclaw_a2a_types::event::AgentEvent::Status {
@@ -606,7 +672,11 @@ async fn handle_send_message(
         rsclaw_agent::registry::ReplyOutcome::Canceled => {
             // CancelTask dispatcher already published Canceled and closed the
             // bus. Don't republish; just return the persisted task snapshot.
-            state.task_cancels.remove(&task_id);
+            crate::server::remove_task_cancel_if_owner(
+                &state.task_cancels,
+                &task_id,
+                &cancel_owner,
+            );
             let task_snapshot = state.task_store.get(&task_id).ok().flatten();
             let result = serde_json::to_value(task_snapshot).unwrap_or_else(|_| {
                 json!({
@@ -1037,6 +1107,7 @@ pub(crate) fn spawn_input_request_listener(
     state: AppState,
     task_id: String,
     context_id: String,
+    cancel_owner: std::sync::Arc<tokio_util::sync::CancellationToken>,
     mut ireq_rx: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<String>>,
 ) {
     let timeout_secs: u64 = std::env::var("RSCLAW_A2A_WAIT_INPUT_TIMEOUT_SECS")
@@ -1048,10 +1119,13 @@ pub(crate) fn spawn_input_request_listener(
         while let Some(resume_tx) = ireq_rx.recv().await {
             state.suspended_tasks.insert(
                 task_id.clone(),
-                rsclaw_a2a_types::event::SuspendedTask {
-                    task_id: task_id.clone(),
-                    context_id: context_id.clone(),
-                    resume_tx,
+                crate::server::OwnedSuspendedTask {
+                    task: rsclaw_a2a_types::event::SuspendedTask {
+                        task_id: task_id.clone(),
+                        context_id: context_id.clone(),
+                        resume_tx,
+                    },
+                    cancel_owner: cancel_owner.clone(),
                 },
             );
             // Arm timeout. Spawned per-suspension so successive resumes
@@ -1060,19 +1134,30 @@ pub(crate) fn spawn_input_request_listener(
             let state_t = state.clone();
             let task_id_t = task_id.clone();
             let context_id_t = context_id.clone();
+            let cancel_owner_t = cancel_owner.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
                 // If the entry was already consumed by the resume short-
                 // path, `.remove` returns None and we do nothing. Only if
                 // the suspension is still live do we tear it down.
-                if state_t.suspended_tasks.remove(&task_id_t).is_some() {
+                if crate::server::remove_suspended_task_if_owner(
+                    &state_t.suspended_tasks,
+                    &task_id_t,
+                    &cancel_owner_t,
+                )
+                .is_some()
+                {
                     if let Err(e) = state_t.task_store.set_status(&task_id_t, TaskState::Failed) {
                         tracing::warn!(task_id = %task_id_t, error = %e, "A2A: failed to set status=Failed on input timeout");
                     }
                     if let Err(e) = state_t.task_store.delete_push_configs_for_task(&task_id_t) {
                         tracing::warn!(task_id = %task_id_t, error = %e, "A2A: failed to delete push configs on input timeout");
                     }
-                    state_t.task_cancels.remove(&task_id_t);
+                    crate::server::remove_task_cancel_if_owner(
+                        &state_t.task_cancels,
+                        &task_id_t,
+                        &cancel_owner_t,
+                    );
                     state_t.task_event_bus.publish(
                         rsclaw_a2a_types::event::AgentEvent::Status {
                             task_id: task_id_t.clone(),
@@ -1117,19 +1202,33 @@ async fn resolve_agent_workspace(state: &AppState, agent_id: Option<&str>) -> st
         .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"))
 }
 
+fn deliver_resume_input(
+    resume_tx: tokio::sync::oneshot::Sender<String>,
+    text: String,
+) -> Result<(), String> {
+    resume_tx
+        .send(text)
+        .map_err(|_| "suspended task resume receiver closed".to_owned())
+}
+
 /// Mark a task as Failed and clean up its in-memory state.
 /// Used by every early-error return in `handle_send_message` so a task
 /// that never reached `Completed` doesn't linger as `Working` in the store
 /// (GetTask/ListTasks would surface it as stuck) and so the cancel token
 /// + broadcast channel don't leak.
-fn finalize_failed_task(state: &AppState, task_id: &str, context_id: &str) {
+fn finalize_failed_task(
+    state: &AppState,
+    task_id: &str,
+    context_id: &str,
+    cancel_owner: &std::sync::Arc<tokio_util::sync::CancellationToken>,
+) {
     if let Err(e) = state.task_store.set_status(task_id, TaskState::Failed) {
         tracing::warn!(task_id, error = %e, "A2A: failed to set status=Failed in finalize");
     }
     if let Err(e) = state.task_store.delete_push_configs_for_task(task_id) {
         tracing::warn!(task_id, error = %e, "A2A: failed to delete push configs in finalize");
     }
-    state.task_cancels.remove(task_id);
+    crate::server::remove_task_cancel_if_owner(&state.task_cancels, task_id, cancel_owner);
     state
         .task_event_bus
         .publish(rsclaw_a2a_types::event::AgentEvent::Status {
@@ -1152,6 +1251,74 @@ mod tests {
             id: id.to_owned(),
             scopes: vec![],
         })
+    }
+
+    #[test]
+    fn stale_input_timeout_cannot_remove_replacement_task_state() {
+        let task_cancels = dashmap::DashMap::new();
+        let suspended_tasks = dashmap::DashMap::new();
+        let old_owner = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        let replacement_owner = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        task_cancels.insert("shared-task".to_owned(), replacement_owner.clone());
+        let (resume_tx, _resume_rx) = tokio::sync::oneshot::channel();
+        suspended_tasks.insert(
+            "shared-task".to_owned(),
+            crate::server::OwnedSuspendedTask {
+                task: rsclaw_a2a_types::event::SuspendedTask {
+                    task_id: "shared-task".to_owned(),
+                    context_id: "replacement-context".to_owned(),
+                    resume_tx,
+                },
+                cancel_owner: replacement_owner.clone(),
+            },
+        );
+
+        assert!(
+            crate::server::remove_suspended_task_if_owner(
+                &suspended_tasks,
+                "shared-task",
+                &old_owner,
+            )
+            .is_none()
+        );
+        assert!(
+            crate::server::remove_task_cancel_if_owner(&task_cancels, "shared-task", &old_owner,)
+                .is_none()
+        );
+        assert!(suspended_tasks.contains_key("shared-task"));
+        assert!(task_cancels.contains_key("shared-task"));
+        assert!(!replacement_owner.is_cancelled());
+
+        task_cancels.insert("shared-task".to_owned(), old_owner.clone());
+        assert!(
+            crate::server::take_current_suspended_task(
+                &suspended_tasks,
+                &task_cancels,
+                "shared-task",
+            )
+            .is_none()
+        );
+        assert!(suspended_tasks.contains_key("shared-task"));
+        task_cancels.insert("shared-task".to_owned(), replacement_owner.clone());
+        assert!(
+            crate::server::take_current_suspended_task(
+                &suspended_tasks,
+                &task_cancels,
+                "shared-task",
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn closed_resume_receiver_is_reported_immediately() {
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        drop(resume_rx);
+
+        let error = deliver_resume_input(resume_tx, "follow-up".to_owned())
+            .expect_err("closed receiver must reject resume input");
+
+        assert_eq!(error, "suspended task resume receiver closed");
     }
 
     #[test]

@@ -260,8 +260,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // 4. Load skills.
     let global_skills = base_dir.join("skills");
-    let mut skills_registry =
-        load_skills(&global_skills, None, config.ext.skills.as_ref()).unwrap_or_else(|e| {
+    let mut skills_registry = load_skills(&global_skills, None, config.ext.skills.as_ref())
+        .unwrap_or_else(|e| {
             warn!("failed to load skills: {e:#}");
             SkillRegistry::new()
         });
@@ -757,7 +757,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         } else {
                             // No channel specified — send to first registered channel (default)
                             let first = {
-                                let guard = senders.read().expect("channel_senders RwLock poisoned");
+                                let guard =
+                                    senders.read().expect("channel_senders RwLock poisoned");
                                 guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
                             };
                             if let Some((ch_name, tx)) = first {
@@ -775,7 +776,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         // router is best-effort — skip the missed messages and
                         // keep running so fan-out doesn't die for the rest of
                         // the process lifetime.
-                        tracing::warn!(skipped = n, "notification router: lagged, skipping missed messages");
+                        tracing::warn!(
+                            skipped = n,
+                            "notification router: lagged, skipping missed messages"
+                        );
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -839,7 +843,6 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         tokio::spawn(async move { watcher.run().await });
         let live_reload = Arc::clone(&live);
         let watcher_reload_mutex = Arc::clone(&reload_mutex);
-        let (restart_tx, _) = broadcast::channel::<Vec<String>>(8);
         let bridge_tx = restart_request_tx.clone();
         let bridge_pending = Arc::clone(&pending_restart);
         let bridge_shutdown = shutdown.clone();
@@ -864,7 +867,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             let old = live_reload.snapshot().await;
                             rsclaw_config::live_config::classify_change(&old, &new_owned)
                         };
-                        live_reload.apply(new_owned, &restart_tx).await;
+                        live_reload.apply(new_owned).await;
                         drop(guard);
 
                         match impact {
@@ -899,9 +902,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                                     ),
                                 );
                             }
-                            rsclaw_config::live_config::ChangeImpact::NeedsRestart {
-                                sections,
-                            } => {
+                            rsclaw_config::live_config::ChangeImpact::NeedsRestart { sections } => {
                                 warn!(?sections, "config change requires gateway restart");
                                 publish_restart(
                                     &bridge_tx,
@@ -1160,13 +1161,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         // Same cell the file watcher holds — see its definition above.
         reload_mutex: Arc::clone(&reload_mutex),
     };
+    if !rsclaw_types::set_outbound_a2a_host(Arc::new(
+        crate::a2a::relay::GatewayOutboundA2aHost::new(state.clone()),
+    )) {
+        tracing::warn!(
+            "outbound A2A host was already installed; keeping the existing process-global host"
+        );
+    }
     crate::a2a::relay::start_spoke_if_configured(state.clone());
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
-    // Relay stream deadline sweeper. The hub-side `stream_pending`
-    // map has no end-to-end timeout (reqwest's was removed in b94c40f
-    // to support long video-gen flows). Without this loop a stuck
-    // spoke + healthy WS + slow consumer could pin entries forever.
+    // Relay deadline sweeper. Hub stream entries, spoke-request correlation,
+    // and signaling state all need periodic expiry; admission paths also sweep
+    // locally, but an otherwise idle gateway must not retain stale state.
     {
         let relay_hub = Arc::clone(&state.relay_hub);
         let peer_mgr = Arc::clone(&state.peer_manager);
@@ -1183,6 +1190,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 let peer_swept = peer_mgr.sweep_expired_streams();
                 if peer_swept > 0 {
                     tracing::info!(swept = peer_swept, "peer stream deadline sweeper");
+                }
+                let signaling_swept = peer_mgr.sweep_expired_sessions();
+                if signaling_swept > 0 {
+                    tracing::info!(swept = signaling_swept, "peer signaling session sweeper");
                 }
             }
         });

@@ -108,19 +108,11 @@ resolve_version() {
     echo "$latest"
 }
 
-# Extract browser_download_url for a given filename from cached release JSON
+# Resolve every asset from one exact release tag. Archive and checksum URLs
+# must never be selected independently from a multi-release API response.
 resolve_download_url() {
-    local filename="$1"
-    if [[ -n "$RELEASE_JSON" ]]; then
-        local url
-        url="$(echo "$RELEASE_JSON" | grep -o "\"browser_download_url\" *: *\"[^\"]*${filename}\"" | head -1 | sed 's/.*"\(http[^"]*\)".*/\1/')"
-        if [[ -n "$url" ]]; then
-            echo "$url"
-            return
-        fi
-    fi
-    # Fallback: construct URL from GITHUB_URL
-    echo "${GITHUB_URL}/${REPO}/releases/download/${VERSION:-latest}/${filename}"
+    local filename="$1" version="$2"
+    echo "${GITHUB_URL}/${REPO}/releases/download/${version}/${filename}"
 }
 
 # --- Verify checksum ---
@@ -133,8 +125,8 @@ verify_checksum() {
     elif command -v shasum &>/dev/null; then
         actual_hash="$(shasum -a 256 "$file" | awk '{print $1}')"
     else
-        echo "Warning: no sha256sum or shasum found, skipping checksum verification"
-        return 0
+        echo "Error: checksum verification requires sha256sum or shasum" >&2
+        return 1
     fi
 
     if [[ "$actual_hash" != "$expected_hash" ]]; then
@@ -143,6 +135,7 @@ verify_checksum() {
         echo "  Actual:   $actual_hash"
         return 1
     fi
+    return 0
 }
 
 # --- Main ---
@@ -151,13 +144,17 @@ cleanup() { [[ -n "$CLEANUP_DIR" ]] && rm -rf "$CLEANUP_DIR"; }
 trap cleanup EXIT
 
 main() {
-    local target version archive_name download_url checksums_url
+    local target version archive_name download_url checksums_url expected
 
     target="$(detect_target)"
     echo "Detected platform: $target"
 
     fetch_release_data
     version="$(resolve_version)"
+    if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Error: invalid release version: $version" >&2
+        exit 1
+    fi
     echo "Installing rsclaw $version ..."
 
     # Build candidate list: primary target + fallback variants
@@ -174,8 +171,8 @@ main() {
     local downloaded=false
     for try_target in "${targets[@]}"; do
         archive_name="rsclaw-${version}-${try_target}.tar.gz"
-        download_url="$(resolve_download_url "$archive_name")"
-        checksums_url="$(resolve_download_url "SHA256SUMS.txt")"
+        download_url="$(resolve_download_url "$archive_name" "$version")"
+        checksums_url="$(resolve_download_url "SHA256SUMS.txt" "$version")"
 
         echo "Trying ${archive_name} ..."
         if curl -fSL --progress-bar -o "${tmpdir}/${archive_name}" "$download_url" 2>/dev/null; then
@@ -192,16 +189,18 @@ main() {
     fi
 
     echo "Downloading checksums ..."
-    if curl -fsSL -o "${tmpdir}/SHA256SUMS.txt" "$checksums_url"; then
-        expected="$(grep "$archive_name" "${tmpdir}/SHA256SUMS.txt" | awk '{print $1}')"
-        if [[ -n "$expected" ]]; then
-            echo "Verifying checksum ..."
-            verify_checksum "${tmpdir}/${archive_name}" "$expected"
-            echo "Checksum OK"
-        fi
-    else
-        echo "Warning: checksums not available, skipping verification"
+    if ! curl -fsSL -o "${tmpdir}/SHA256SUMS.txt" "$checksums_url"; then
+        echo "Error: checksums are required but could not be downloaded" >&2
+        exit 1
     fi
+    expected="$(awk -v file="$archive_name" '$2 == file {print $1}' "${tmpdir}/SHA256SUMS.txt")"
+    if [[ ! "$expected" =~ ^[[:xdigit:]]{64}$ ]]; then
+        echo "Error: expected exactly one valid checksum for ${archive_name}" >&2
+        exit 1
+    fi
+    echo "Verifying checksum ..."
+    verify_checksum "${tmpdir}/${archive_name}" "$expected"
+    echo "Checksum OK"
 
     echo "Extracting ..."
     tar xzf "${tmpdir}/${archive_name}" -C "${tmpdir}"

@@ -650,7 +650,9 @@ fn require_auth_for_destructive(ctx: &MethodCtx) -> bool {
 
 pub async fn system_shutdown(ctx: MethodCtx) -> MethodResult {
     if !require_auth_for_destructive(&ctx) {
-        return Err(ErrorShape::unauthorized("authentication required for system.shutdown"));
+        return Err(ErrorShape::unauthorized(
+            "authentication required for system.shutdown",
+        ));
     }
     // Exit the gateway process cleanly. We spawn the exit on a delay so the
     // caller's WS frame has time to flush. Clients (tray Quit, CLI) use this
@@ -671,7 +673,9 @@ pub async fn system_shutdown(ctx: MethodCtx) -> MethodResult {
 /// the listener, so the child cannot lose the bind() race against itself.
 pub async fn system_restart(ctx: MethodCtx) -> MethodResult {
     if !require_auth_for_destructive(&ctx) {
-        return Err(ErrorShape::unauthorized("authentication required for system.restart"));
+        return Err(ErrorShape::unauthorized(
+            "authentication required for system.restart",
+        ));
     }
     tracing::warn!("system.restart requested via WS");
     ctx.state.shutdown.request_restart();

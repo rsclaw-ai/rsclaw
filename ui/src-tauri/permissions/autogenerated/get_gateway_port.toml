@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-gateway-port"
+description = "Enables the get_gateway_port command without any pre-configured scope."
+commands.allow = ["get_gateway_port"]
+
+[[permission]]
+identifier = "deny-get-gateway-port"
+description = "Denies the get_gateway_port command without any pre-configured scope."
+commands.deny = ["get_gateway_port"]

@@ -286,7 +286,10 @@ impl HeartbeatRunner {
             }
         }
 
-        let mut active = self.active.lock().unwrap();
+        let mut active = self
+            .active
+            .lock()
+            .expect("heartbeat active-set mutex poisoned");
         for (agent_id, workspace) in &dirs {
             // Find all HEARTBEAT*.md files in the workspace.
             let heartbeat_files = Self::find_heartbeat_files(workspace);

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-status"
+description = "Enables the gateway_status command without any pre-configured scope."
+commands.allow = ["gateway_status"]
+
+[[permission]]
+identifier = "deny-gateway-status"
+description = "Denies the gateway_status command without any pre-configured scope."
+commands.deny = ["gateway_status"]

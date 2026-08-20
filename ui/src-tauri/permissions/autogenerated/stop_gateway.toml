@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stop-gateway"
+description = "Enables the stop_gateway command without any pre-configured scope."
+commands.allow = ["stop_gateway"]
+
+[[permission]]
+identifier = "deny-stop-gateway"
+description = "Denies the stop_gateway command without any pre-configured scope."
+commands.deny = ["stop_gateway"]

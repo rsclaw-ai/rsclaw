@@ -140,7 +140,10 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tokenizers = "0.21"
 qrcode = "0.14"
-xz2 = "0.1"
+# `static` builds liblzma into the binary instead of linking `liblzma.so.5`.
+# Required for musl targets (no system liblzma) and removes the last non-libc
+# shared-object dependency on the gnu targets too.
+xz2 = { version = "0.1", features = ["static"] }
 zip = "2"
 rust_xlsxwriter = "0.83"
 calamine = "0.36"
@@ -212,10 +215,18 @@ mailparse = "0.16.1"
 #   cap-rs = { path = "../cap-protocol/crates/cap-rs", ...features }
 cap-rs = { version = "0.1.0", default-features = false, features = ["stream-json", "codex", "acp"] }
 
+# Opt-in global allocator. musl ships `mallocng`, which is markedly slower than
+# glibc's malloc under the multi-threaded, high-frequency allocation patterns of
+# tantivy index builds and candle inference. Enabled by the musl release builds
+# only — the gnu/macOS/Windows builds keep the system allocator.
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
 [features]
 default = ["openclaw-migrate"]
 channel-matrix = ["rsclaw-runtime/channel-matrix"]
 openclaw-migrate = ["rsclaw-migrate/openclaw-migrate", "rsclaw-runtime/openclaw-migrate"]
+# Swap in mimalloc as the global allocator (see the dependency note above).
+mimalloc-allocator = ["dep:mimalloc"]
 tray = ["rsclaw-runtime/tray"]
 
 [profile.release]

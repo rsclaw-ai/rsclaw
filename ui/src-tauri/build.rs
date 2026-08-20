@@ -1,9 +1,61 @@
-use std::path::PathBuf;
-use std::process::Command;
+use std::{path::PathBuf, process::Command};
+
+const APP_COMMANDS: &[&str] = &[
+    "stream_fetch",
+    "start_gateway",
+    "stop_gateway",
+    "gateway_status",
+    "get_config_path",
+    "clear_webview_cache_dirs",
+    "run_setup",
+    "write_config",
+    "read_config_file",
+    "get_channel_accounts",
+    "check_setup",
+    "get_gateway_port",
+    "get_version",
+    "scan_openclaw",
+    "detect_openclaw",
+    "channel_login_start",
+    "channel_login_qr",
+    "channel_login_status",
+    "get_cron_jobs",
+    "save_cron_jobs",
+    "get_skills",
+    "install_skill",
+    "uninstall_skill",
+    "search_skills",
+    "get_plugins",
+    "install_plugin",
+    "uninstall_plugin",
+    "install_tool",
+    "get_tool_install_status",
+    "get_tool_install_result",
+    "read_defaults_catalog",
+    "test_provider",
+    "write_workspace_file",
+    "read_workspace_file",
+    "run_rsclaw_cli",
+    "migrate_openclaw",
+    "set_auto_start",
+    "get_auto_start",
+    "set_gateway_user_stopped",
+    "get_gateway_user_stopped",
+    "open_path",
+    "save_attach_image",
+    "read_file_as_data_url",
+    "open_glow_overlay",
+    "close_glow_overlay",
+    "open_rsclaw_console",
+    "close_rsclaw_console",
+    "rsclaw_console_install_key",
+];
 
 fn main() {
     check_sidecar_version();
-    tauri_build::build()
+    let attributes = tauri_build::Attributes::new()
+        .app_manifest(tauri_build::AppManifest::new().commands(APP_COMMANDS));
+    tauri_build::try_build(attributes).expect("failed to build Tauri application metadata")
 }
 
 /// Fail the desktop build if the bundled rsclaw sidecar doesn't match
@@ -24,10 +76,10 @@ fn main() {
 /// host-executable at desktop-build time.
 ///
 /// Escape hatches:
-///   - RSCLAW_SKIP_SIDECAR_CHECK=1 — bypass entirely (CI stages that
-///     place the sidecar after this crate is configured).
-///   - Sidecar reports "dev" — env var was unset during sidecar build;
-///     warn and skip (common for ad-hoc `cargo build --bin rsclaw`).
+///   - RSCLAW_SKIP_SIDECAR_CHECK=1 — bypass entirely (CI stages that place the
+///     sidecar after this crate is configured).
+///   - Sidecar reports "dev" — env var was unset during sidecar build; warn and
+///     skip (common for ad-hoc `cargo build --bin rsclaw`).
 ///   - Exec fails (true cross-compile) — warn and skip.
 fn check_sidecar_version() {
     if std::env::var("RSCLAW_SKIP_SIDECAR_CHECK").is_ok() {

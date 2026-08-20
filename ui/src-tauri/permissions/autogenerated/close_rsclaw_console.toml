@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-close-rsclaw-console"
+description = "Enables the close_rsclaw_console command without any pre-configured scope."
+commands.allow = ["close_rsclaw_console"]
+
+[[permission]]
+identifier = "deny-close-rsclaw-console"
+description = "Denies the close_rsclaw_console command without any pre-configured scope."
+commands.deny = ["close_rsclaw_console"]

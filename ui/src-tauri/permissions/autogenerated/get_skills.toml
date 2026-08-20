@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-skills"
+description = "Enables the get_skills command without any pre-configured scope."
+commands.allow = ["get_skills"]
+
+[[permission]]
+identifier = "deny-get-skills"
+description = "Denies the get_skills command without any pre-configured scope."
+commands.deny = ["get_skills"]

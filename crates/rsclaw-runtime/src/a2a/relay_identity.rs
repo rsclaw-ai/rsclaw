@@ -95,18 +95,29 @@ pub fn verify_handshake(
     nonce_relay: &str,
     signature_b64: &str,
 ) -> Result<()> {
+    let payload = canonical_payload(node_id, relay_id, nonce_node, nonce_relay);
+    verify_payload(public_key_b64, &payload, signature_b64)
+        .context("handshake signature verification failed")
+}
+
+/// Sign arbitrary protocol bytes with a node's Ed25519 key.
+pub fn sign_payload(signing_key: &SigningKey, payload: &[u8]) -> String {
+    let signature: Signature = signing_key.sign(payload);
+    encode_b64(&signature.to_bytes())
+}
+
+/// Verify an Ed25519 signature over arbitrary protocol bytes.
+pub fn verify_payload(public_key_b64: &str, payload: &[u8], signature_b64: &str) -> Result<()> {
     if signature_b64.trim().is_empty() {
-        bail!("empty handshake signature");
+        bail!("empty signature");
     }
-    let vk = verifying_key_from_b64(public_key_b64)?;
-    let sig_bytes = decode_b64(signature_b64)?;
-    let sig_arr: [u8; 64] = sig_bytes
+    let key = verifying_key_from_b64(public_key_b64)?;
+    let signature_bytes = decode_b64(signature_b64)?;
+    let signature_array: [u8; 64] = signature_bytes
         .try_into()
         .map_err(|_| anyhow!("ed25519 signature must be 64 bytes"))?;
-    let signature = Signature::from_bytes(&sig_arr);
-    let payload = canonical_payload(node_id, relay_id, nonce_node, nonce_relay);
-    vk.verify(&payload, &signature)
-        .context("handshake signature verification failed")
+    key.verify(payload, &Signature::from_bytes(&signature_array))
+        .context("signature verification failed")
 }
 
 /// Helper for tooling/tests: derive the public key (base64) from a private

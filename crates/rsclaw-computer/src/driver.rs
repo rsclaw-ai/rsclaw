@@ -179,6 +179,13 @@ impl VlmDriver<'_> {
         if let Some(deny) = self.permission_gate(instruction).await? {
             return Ok(deny);
         }
+        // Apps cleared during this run. Seeded with the up-front target so
+        // the first action does not re-prompt; `reverify_consent` adds any
+        // further app the user approves mid-run. Kept here rather than on
+        // the struct so `AllowOnce` is not re-consumed on every action.
+        let mut consented: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        consented.insert(self.initial_consent_target().await);
         self.emit_started(instruction);
 
         // 2. Build the system prompt once. The action space + matched app-rules are
@@ -565,6 +572,31 @@ impl VlmDriver<'_> {
                     factors: [screen_w.max(1), screen_h.max(1)],
                 };
 
+                // Keyboard input lands wherever focus currently is, and
+                // focus can move mid-run (the model activates something
+                // else, a dialog steals it, the user switches windows).
+                // The up-front gate runs once and then up to `max_loop`
+                // actions execute, so without this an approval for
+                // "WeChat" could be spent typing into whatever is focused
+                // 20 steps later — a password manager, another chat.
+                //
+                // Scoped to keyboard actions deliberately: `Type`/`Hotkey`
+                // target the keyboard focus, which is precisely what
+                // `frontmost_app()` reports. Clicks target coordinates and
+                // may legitimately land on a window that is not yet
+                // frontmost, so checking focus for them would prompt
+                // spuriously — and prompt fatigue is its own security
+                // failure. A click that moves focus is caught by the next
+                // keyboard action.
+                if matches!(
+                    action,
+                    Action::Type { .. } | Action::Hotkey { .. } | Action::HoldKey { .. }
+                ) && let Some(deny) =
+                    self.reverify_consent(&mut consented, instruction).await?
+                {
+                    return Ok(deny);
+                }
+
                 let exec_result = match self.operator.execute(&action, &ctx).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -615,6 +647,77 @@ impl VlmDriver<'_> {
         }
     }
 
+    /// The app the up-front prompt is about.
+    ///
+    /// Prefers the caller-declared label because that is the user's stated
+    /// intent ("send a WeChat message"), and at gate time the frontmost app
+    /// is still whatever launched the run — a terminal or the RsClaw window.
+    /// Falls back to the live frontmost app, then the operator name.
+    async fn initial_consent_target(&self) -> String {
+        if !self.app.is_empty() {
+            return self.app.clone();
+        }
+        match self.operator.frontmost_app().await {
+            Ok(Some(front)) if !front.trim().is_empty() => front,
+            _ => self.operator.name().to_owned(),
+        }
+    }
+
+    /// Re-check consent against the app that actually has focus, prompting
+    /// for one that has not been approved yet.
+    ///
+    /// The up-front gate alone is not a sufficient control: it runs once,
+    /// then `max_loop` (30 by default) actions execute against whatever is
+    /// focused. Approving "WeChat" must not become a licence to drive the
+    /// password manager that popped up two steps later.
+    ///
+    /// `consented` holds the apps already cleared *in this run*. It exists
+    /// because `AllowOnce` is consume-on-read in the store: calling
+    /// `check()` before every action would swallow the grant on the first
+    /// action and deny the second.
+    async fn reverify_consent(
+        &self,
+        consented: &mut std::collections::HashSet<String>,
+        instruction: &str,
+    ) -> Result<Option<DriverOutcome>> {
+        if self.permission.bypass_all() {
+            return Ok(None);
+        }
+
+        let front = match self.operator.frontmost_app().await {
+            Ok(Some(f)) if !f.trim().is_empty() => f,
+            // Operator cannot introspect focus (browser/adb operators, or
+            // a Wayland session, which refuses to report it). Those runs
+            // are governed by the up-front gate alone — there is nothing
+            // to compare against.
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                warn!(error = %e, "frontmost_app failed mid-run; skipping re-verification");
+                return Ok(None);
+            }
+        };
+
+        if consented
+            .iter()
+            .any(|a| crate::operators::native::app_labels_match(a, &front))
+        {
+            return Ok(None);
+        }
+
+        warn!(
+            app = %front,
+            granted_for = %self.app,
+            "focus moved to an app not yet consented to — prompting"
+        );
+        match self.ensure_consent(&front, instruction).await? {
+            Some(deny) => Ok(Some(deny)),
+            None => {
+                consented.insert(front);
+                Ok(None)
+            }
+        }
+    }
+
     /// Run the permission flow. Returns:
     ///   `Ok(None)` when the user has already allowed (or bypass mode is on),
     ///   `Ok(Some(DriverOutcome::PermissionDenied))` when denied,
@@ -623,12 +726,18 @@ impl VlmDriver<'_> {
         if self.permission.bypass_all() {
             return Ok(None);
         }
+        let app = self.initial_consent_target().await;
+        self.ensure_consent(&app, instruction).await
+    }
 
-        let app = if self.app.is_empty() {
-            self.operator.name().to_owned()
-        } else {
-            self.app.clone()
-        };
+    /// Check-then-prompt for one specific app. Shared by the up-front gate
+    /// and the mid-run focus re-verification.
+    async fn ensure_consent(
+        &self,
+        app: &str,
+        instruction: &str,
+    ) -> Result<Option<DriverOutcome>> {
+        let app = app.to_owned();
 
         match self.permission.check(&self.agent_id, &app).await? {
             Some(PermissionDecision::AllowAlways)

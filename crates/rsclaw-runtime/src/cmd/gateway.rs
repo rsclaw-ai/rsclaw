@@ -247,9 +247,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             let scope_param = scope
                 .map(|s| s.join(","))
                 .unwrap_or_else(|| "all".to_owned());
-            let url = format!(
-                "http://127.0.0.1:{port}/api/v1/reload?scope={scope_param}"
-            );
+            let url = format!("http://127.0.0.1:{port}/api/v1/reload?scope={scope_param}");
             let client = reqwest::Client::new();
             let mut req = client.post(&url);
             if !auth_token.is_empty() {
@@ -257,11 +255,13 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             }
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    let body: serde_json::Value =
-                        resp.json().await.unwrap_or_default();
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     println!("  {} Reload complete", green("[ok]"));
                     if let Some(details) = body.get("details") {
-                        println!("  {}", serde_json::to_string_pretty(details).unwrap_or_default());
+                        println!(
+                            "  {}",
+                            serde_json::to_string_pretty(details).unwrap_or_default()
+                        );
                     }
                 }
                 Ok(resp) => {
@@ -270,9 +270,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                     anyhow::bail!("reload failed ({status}): {body}");
                 }
                 Err(e) => {
-                    anyhow::bail!(
-                        "gateway unreachable at {url} — is it running?\n  {e}"
-                    );
+                    anyhow::bail!("gateway unreachable at {url} — is it running?\n  {e}");
                 }
             }
             Ok(())
@@ -465,10 +463,7 @@ fn first_live_pid(output: &[u8], my_pid: u32) -> Option<u32> {
 
 #[cfg(target_os = "linux")]
 fn find_pid_with_linux_socket_tools(port: u16, my_pid: u32) -> Option<u32> {
-    for (command, args) in [
-        ("ss", &["-ltnp"][..]),
-        ("netstat", &["-ltnp"][..]),
-    ] {
+    for (command, args) in [("ss", &["-ltnp"][..]), ("netstat", &["-ltnp"][..])] {
         let Some(output) = std::process::Command::new(command).args(args).output().ok() else {
             continue;
         };
@@ -514,10 +509,7 @@ fn detect_port() -> u16 {
     detect_port_from_sources(instance_port, configured_port)
 }
 
-fn detect_port_from_sources(
-    instance_port: Option<u16>,
-    configured_port: Option<u16>,
-) -> u16 {
+fn detect_port_from_sources(instance_port: Option<u16>, configured_port: Option<u16>) -> u16 {
     instance_port.or(configured_port).unwrap_or(18888)
 }
 
@@ -550,11 +542,11 @@ fn service_manager_allowed_with_overrides(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::socket_endpoint_has_port;
     use super::{
         detect_port_from_sources, select_gateway_pid, service_manager_allowed_with_overrides,
     };
-    #[cfg(unix)]
-    use super::socket_endpoint_has_port;
 
     #[test]
     fn gateway_pid_file_takes_priority_over_port_listener() {

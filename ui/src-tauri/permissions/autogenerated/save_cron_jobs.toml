@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-cron-jobs"
+description = "Enables the save_cron_jobs command without any pre-configured scope."
+commands.allow = ["save_cron_jobs"]
+
+[[permission]]
+identifier = "deny-save-cron-jobs"
+description = "Denies the save_cron_jobs command without any pre-configured scope."
+commands.deny = ["save_cron_jobs"]

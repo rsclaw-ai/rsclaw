@@ -1,7 +1,7 @@
 # RsClaw
 
 > **記憶し、学習し、マシン間でルーティングできる AI エージェントエンジン。**
-> 15MB の Rust バイナリ · A2A hub-spoke フリート · 三層記憶 · ベクトル + BM25 ナレッジベース · 13 チャンネル · 15 LLM プロバイダー · OpenClaw drop-in 置き換え。
+> 21MB の Rust バイナリ · A2A hub-spoke フリート · 三層記憶 · ベクトル + BM25 ナレッジベース · 13 チャンネル · 15 LLM プロバイダー · OpenClaw drop-in 置き換え。
 
 [![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
 [![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
@@ -17,7 +17,7 @@
 
 ほとんどの AI エージェントはチャット欄に縛られたステートレスなプロセスです。**RsClaw はフリートです**：各ノードが構造化されたメモリを永続化し、プライベートなナレッジベースを索引し、[Google A2A v1.0](https://a2a-protocol.org/) を話します。ラップトップで打った一言が GPU spoke で画像生成、フリートノードで RAG、リモートのパートナーエージェントで専門タスクへ並列にファンアウトし、ひとつのストリーミング応答として戻ってきます。
 
-15 MB、~20 MB RAM、シングルバイナリ。純粋な Rust。Node も Python もなし。
+21 MB、~28 MB RAM、シングルバイナリ。純粋な Rust。Node も Python もなし。
 
 💬 [コミュニティ参加](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 

@@ -105,11 +105,11 @@ use clap::Parser;
 use cmd::{
     cmd_agent_turn, cmd_agents, cmd_anycli, cmd_approvals, cmd_backup, cmd_browser, cmd_channels,
     cmd_completion, cmd_config, cmd_configure, cmd_cron, cmd_daemon, cmd_dashboard, cmd_debug,
-    cmd_devices, cmd_directory, cmd_dns, cmd_docs, cmd_doctor, cmd_env, cmd_gateway, cmd_health,
-    cmd_hooks, cmd_image, cmd_kb, cmd_logs, cmd_memory, cmd_message, cmd_migrate, cmd_models,
-    cmd_onboard, cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox, cmd_secrets, cmd_security,
-    cmd_sessions, cmd_setup, cmd_skills, cmd_status, cmd_system, cmd_tools, cmd_tray, cmd_tui,
-    cmd_uninstall, cmd_update, cmd_watch, cmd_webhooks,
+    cmd_devices, cmd_directory, cmd_dns, cmd_doctor, cmd_env, cmd_gateway, cmd_health, cmd_hooks,
+    cmd_image, cmd_kb, cmd_logs, cmd_memory, cmd_message, cmd_migrate, cmd_models, cmd_onboard,
+    cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox, cmd_secrets, cmd_security, cmd_sessions,
+    cmd_setup, cmd_skills, cmd_status, cmd_system, cmd_tools, cmd_tray, cmd_tui, cmd_uninstall,
+    cmd_update, cmd_watch, cmd_webhooks,
 };
 pub use rsclaw_agent as agent;
 pub use rsclaw_artifact as artifact;
@@ -162,6 +162,21 @@ fn read_config_port(base_dir: &std::path::Path) -> Option<u16> {
         .and_then(|g| g.get("port"))
         .and_then(|p| p.as_u64())
         .and_then(|p| u16::try_from(p).ok())
+}
+
+fn resolve_instance_port_from_sources(
+    configured_port: Option<u16>,
+    env_port: Option<u16>,
+    auto_port: u16,
+) -> u16 {
+    configured_port.or(env_port).unwrap_or(auto_port)
+}
+
+fn resolve_instance_port(base_dir: &std::path::Path, auto_port: u16) -> u16 {
+    let env_port = std::env::var("RSCLAW_PORT")
+        .ok()
+        .and_then(|port| port.parse::<u16>().ok());
+    resolve_instance_port_from_sources(read_config_port(base_dir), env_port, auto_port)
 }
 
 fn resolve_instance(cli: &Cli) -> (std::path::PathBuf, u16) {
@@ -235,14 +250,12 @@ pub async fn run() -> Result<()> {
             .as_deref()
             .unwrap_or_else(|| cli.profile.as_deref().unwrap_or("dev"));
         // Config wins: if the profile's rsclaw.json5 explicitly sets
-        // gateway.port, that's the authoritative port for both the
-        // gateway process and any CLI subcommand (channels pair, agents
-        // bind, etc.) that talks to it via 127.0.0.1:<port>. The
-        // auto-computed offset is only the FALLBACK for profiles that
-        // never customized their port. Without this, binding a port in
-        // config silently lost to the CLI flag and CLI tools dialed the
-        // wrong port — reported as 'pair errors with port 18888'.
-        let port = read_config_port(&base_dir).unwrap_or(auto_port);
+        // gateway.port, that's authoritative for the gateway and local CLI
+        // clients. Otherwise preserve an explicit RSCLAW_PORT multi-instance
+        // override before falling back to the computed profile port. Without
+        // this, `--base-dir` rewrites an isolated test/operator port to 18888
+        // and CLI subcommands can contact an unrelated default gateway.
+        let port = resolve_instance_port(&base_dir, auto_port);
         println!(
             "profile: {label}  base: {}  port: {port}",
             base_dir.display()
@@ -331,7 +344,6 @@ pub async fn run() -> Result<()> {
         Command::Completion(args) => cmd_completion(args).await,
         Command::Dashboard { no_open } => cmd_dashboard(no_open).await,
         Command::Daemon(sub) => cmd_daemon(sub).await,
-        Command::Docs { query } => cmd_docs(query).await,
         Command::Qr(args) => cmd_qr(args).await,
         Command::Uninstall(args) => cmd_uninstall(args).await,
         Command::Webhooks(sub) => cmd_webhooks(sub).await,
@@ -458,6 +470,27 @@ fn init_tracing(cli: &Cli) {
             .with_timer(timer)
             .with_env_filter(filter)
             .init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_instance_port_from_sources;
+
+    #[test]
+    fn explicit_instance_port_is_preserved_without_profile_config() {
+        assert_eq!(
+            resolve_instance_port_from_sources(None, Some(65534), 18888),
+            65534
+        );
+    }
+
+    #[test]
+    fn profile_config_port_precedes_instance_environment() {
+        assert_eq!(
+            resolve_instance_port_from_sources(Some(19001), Some(65534), 18888),
+            19001
+        );
     }
 }
 

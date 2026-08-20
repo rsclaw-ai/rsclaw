@@ -10,6 +10,14 @@
 
 use anyhow::Result;
 
+// musl ships `mallocng`, which is markedly slower than glibc's malloc under the
+// multi-threaded allocation churn of tantivy index builds and candle inference.
+// The musl release builds enable this feature; gnu/macOS/Windows keep the
+// system allocator.
+#[cfg(feature = "mimalloc-allocator")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<()> {
     // Install the TLS crypto provider (aws-lc-rs) before any HTTP client is
     // created.

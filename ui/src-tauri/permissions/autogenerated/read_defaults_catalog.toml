@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-defaults-catalog"
+description = "Enables the read_defaults_catalog command without any pre-configured scope."
+commands.allow = ["read_defaults_catalog"]
+
+[[permission]]
+identifier = "deny-read-defaults-catalog"
+description = "Denies the read_defaults_catalog command without any pre-configured scope."
+commands.deny = ["read_defaults_catalog"]

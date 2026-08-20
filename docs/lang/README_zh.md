@@ -1,7 +1,7 @@
 # RsClaw
 
 > **会记住、会学习、能跨机路由的 AI Agent 引擎。**
-> 一个 15MB 的 Rust 二进制 · A2A hub-spoke 集群 · 三层记忆 · 向量 + BM25 知识库 · 13 个通道 · 15 个 LLM 提供商 · OpenClaw drop-in 替换。
+> 一个 21MB 的 Rust 二进制 · A2A hub-spoke 集群 · 三层记忆 · 向量 + BM25 知识库 · 13 个通道 · 15 个 LLM 提供商 · OpenClaw drop-in 替换。
 
 [![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
 [![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
@@ -18,7 +18,7 @@
 
 绝大多数 AI Agent 是绑在聊天框上的无状态进程。**RsClaw 是一个集群**：每个节点持久化结构化记忆、维护私有知识库、说 [Google A2A v1.0 协议](https://a2a-protocol.org/)——你在笔记本上敲的一句话可以同时扇出到 GPU spoke 出图、到大内存 spoke 跑 RAG、到第三方 partner agent 调专项工具，最后汇聚成一条流式回答送回来。
 
-15 MB，~20 MB RAM，单文件静态二进制。纯 Rust，零 Node，零 Python。
+21 MB，~28 MB RAM，单文件二进制。纯 Rust，零 Node，零 Python。
 
 💬 [加入社区](https://rsclaw.ai/zh/community) — WeChat / Feishu / QQ / Telegram
 
@@ -343,7 +343,7 @@ rsclaw start
 
 | | RsClaw | OpenClaw |
 |---|---|---|
-| 二进制体积 | ~15 MB 单文件静态 | ~300 MB + node_modules |
+| 二进制体积 | ~21 MB 单文件 | ~300 MB + node_modules |
 | 启动 | ~26 ms | 2–5 秒 |
 | 闲置内存 | ~20 MB | ~1 GB |
 | 长期记忆 | 三层 + Weibull 衰减 + 混合检索 | — |

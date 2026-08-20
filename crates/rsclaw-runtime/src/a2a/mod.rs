@@ -12,7 +12,6 @@ pub mod relay_identity;
 pub mod server;
 pub mod store;
 pub mod streaming;
-pub mod stun;
 pub mod version;
 
 // event + types lifted to rsclaw-a2a-types (crate-split step-12 P1);

@@ -126,12 +126,7 @@ pub(crate) fn start_channels(
                 if handle.tx.send(msg).await.is_err() {
                     return;
                 }
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    reply_rx,
-                )
-                .await
-                {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                     Ok(Ok(reply)) => {
                         let pending = reply.pending_analysis;
                         if !reply.is_empty {

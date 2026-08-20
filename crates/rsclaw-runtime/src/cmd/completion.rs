@@ -29,7 +29,7 @@ _rsclaw() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="setup onboard configure config doctor gateway channels agents models skills plugins memory sessions cron hooks system secrets security sandbox logs status health tui backup reset update pairing completion dashboard daemon docs qr uninstall webhooks"
+    commands="setup onboard configure config doctor gateway channels agents models skills plugins memory sessions cron hooks system secrets security sandbox logs status health tui backup reset update pairing completion dashboard daemon qr uninstall webhooks"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=($(compgen -W "${commands}" -- "${cur}"))
@@ -78,7 +78,6 @@ _rsclaw() {
         'completion:Generate shell completions'
         'dashboard:Open Control UI'
         'daemon:Legacy gateway alias'
-        'docs:Search live documentation'
         'qr:Generate app pairing QR'
         'uninstall:Uninstall service and data'
         'webhooks:Webhook helpers'
@@ -124,7 +123,6 @@ complete -c rsclaw -n __fish_use_subcommand -a pairing -d 'DM pairing management
 complete -c rsclaw -n __fish_use_subcommand -a completion -d 'Generate shell completions'
 complete -c rsclaw -n __fish_use_subcommand -a dashboard -d 'Open Control UI'
 complete -c rsclaw -n __fish_use_subcommand -a daemon -d 'Legacy gateway alias'
-complete -c rsclaw -n __fish_use_subcommand -a docs -d 'Search live documentation'
 complete -c rsclaw -n __fish_use_subcommand -a qr -d 'Generate app pairing QR'
 complete -c rsclaw -n __fish_use_subcommand -a uninstall -d 'Uninstall service and data'
 complete -c rsclaw -n __fish_use_subcommand -a webhooks -d 'Webhook helpers'
@@ -146,7 +144,7 @@ Register-ArgumentCompleter -Native -CommandName rsclaw -ScriptBlock {
         'message', 'tui', 'backup', 'reset', 'update', 'upgrade',
         'pairing', 'approvals', 'devices', 'directory', 'anycli',
         'browser', 'dns', 'agent-turn', 'completion', 'dashboard',
-        'daemon', 'docs', 'qr', 'migrate', 'uninstall', 'webhooks',
+        'daemon', 'qr', 'migrate', 'uninstall', 'webhooks',
         'watch', 'debug'
     )
     $commands | Where-Object { $_ -like "$wordToComplete*" }

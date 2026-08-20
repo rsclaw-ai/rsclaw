@@ -7,11 +7,11 @@
 //!   `state.live.gateway.read().auth_token`  — reads the currently active token
 //!
 //! On config file change:
-//!   `live.apply(new_cfg, &restart_tx)`      — diffs and updates each lock
+//!   `live.apply(new_cfg)`                   — diffs and updates each lock
 
 use std::sync::Arc;
 
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::{
@@ -61,21 +61,17 @@ impl LiveConfig {
     ///
     /// Behaviour:
     ///   - If the change is hot-safe (only fields whitelisted in
-    ///     `strip_live_fields` differ — currently per-agent / default
-    ///     temperature) the new values are written into all live RwLocks and an
-    ///     empty list is returned.
-    ///   - Otherwise the current live state is left untouched, the changed
-    ///     section names are returned (and broadcast via `restart_tx`), and the
-    ///     caller is expected to surface a restart banner.
+    ///     `strip_live_fields` differ) the new values are written into all
+    ///     live RwLocks and an empty list is returned.
+    ///   - Otherwise the current live state is left untouched and the changed
+    ///     section names are returned. Callers classify them with
+    ///     [`classify_change`] to decide between a scoped reload and a restart
+    ///     banner.
     ///
     /// `is_hot_safe_only` / `diff_restart_sections` is the single source of
     /// truth — coarse field-by-field checks were removed in favour of a
     /// JSON-equality diff over `raw`.
-    pub async fn apply(
-        &self,
-        new: RuntimeConfig,
-        restart_tx: &broadcast::Sender<Vec<String>>,
-    ) -> Vec<String> {
+    pub async fn apply(&self, new: RuntimeConfig) -> Vec<String> {
         let old = self.snapshot().await;
         let restart_fields = diff_restart_sections(&old, &new);
 
@@ -84,9 +80,6 @@ impl LiveConfig {
                 ?restart_fields,
                 "hot-reload skipped: fields require gateway restart"
             );
-            if restart_tx.send(restart_fields.clone()).is_err() {
-                tracing::debug!("restart broadcast: no receivers");
-            }
             return restart_fields;
         }
 
@@ -583,8 +576,7 @@ mod tests {
         let mut new_cfg = cfg;
         new_cfg.gateway.auth_token = Some("rotated".to_owned());
 
-        let (tx, _) = broadcast::channel(8);
-        let restart = live.apply(new_cfg, &tx).await;
+        let restart = live.apply(new_cfg).await;
         assert!(restart.is_empty());
         assert_eq!(
             live.gateway.read().await.auth_token.as_deref(),
@@ -898,8 +890,7 @@ mod tests {
             }
         }
 
-        let (tx, _) = broadcast::channel(8);
-        let sections = live.apply(new_cfg, &tx).await;
+        let sections = live.apply(new_cfg).await;
         assert!(
             sections.iter().any(|s| s == "config.channels"),
             "expected config.channels in returned sections, got {sections:?}"
