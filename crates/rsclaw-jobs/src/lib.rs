@@ -809,19 +809,26 @@ fn parse_rsclaw_native_poll(value: Value) -> Result<PollOutcome> {
                 .to_owned();
             Ok(PollOutcome::Done(url))
         }
-        "failed" | "cancelled" => {
+        "failed" => {
+            let code = value
+                .pointer("/status/error")
+                .and_then(|error| error.as_str())
+                .unwrap_or("unknown");
             let message = value
-                .pointer("/status/error/message")
+                .pointer("/status/message")
                 .and_then(|message| message.as_str())
-                .or_else(|| {
-                    value
-                        .pointer("/status/reason")
-                        .and_then(|reason| reason.as_str())
-                })
-                .unwrap_or("job failed");
-            Ok(PollOutcome::Failed(format!("{state}: {message}")))
+                .filter(|message| !message.is_empty());
+            let detail = message.map_or_else(
+                || format!("failed: {code}"),
+                |message| format!("failed: {code}: {message}"),
+            );
+            Ok(PollOutcome::Failed(detail))
         }
-        _ => Ok(PollOutcome::Pending),
+        "cancelled" => Ok(PollOutcome::Failed("cancelled".to_owned())),
+        "queued" | "in_progress" => Ok(PollOutcome::Pending),
+        other => Err(anyhow!(
+            "rsclaw-native: unknown or missing job state `{other}`: {value}"
+        )),
     }
 }
 
@@ -899,9 +906,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_rsclaw_native_poll(json!({
-                "status": {"state": "failed", "error": {"message": "worker failed"}}
+                "status": {
+                    "state": "failed",
+                    "error": "backend_failure",
+                    "message": "worker failed"
+                }
             })),
-            Ok(PollOutcome::Failed(message)) if message == "failed: worker failed"
+            Ok(PollOutcome::Failed(message))
+                if message == "failed: backend_failure: worker failed"
         ));
     }
 
@@ -913,5 +925,11 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn native_poll_rejects_unknown_or_missing_state() {
+        assert!(parse_rsclaw_native_poll(json!({"status":{"state":"paused"}})).is_err());
+        assert!(parse_rsclaw_native_poll(json!({"status":{}})).is_err());
     }
 }

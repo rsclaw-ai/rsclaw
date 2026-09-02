@@ -31,6 +31,12 @@ impl super::runtime::AgentRuntime {
             })?;
         let duration = args["duration"].as_u64().unwrap_or(5);
         let aspect_ratio = args["aspect_ratio"].as_str().unwrap_or("16:9");
+        let generate_audio = match args.get("generate_audio") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_bool().ok_or_else(|| {
+                anyhow!("video_gen: `generate_audio` must be a boolean when provided")
+            })?),
+        };
 
         // Optional first-frame / reference image(s) for image-to-video.
         // Accept a single string or an array. Each entry may be a public
@@ -303,6 +309,7 @@ impl super::runtime::AgentRuntime {
                         prompt,
                         duration,
                         aspect_ratio,
+                        generate_audio,
                         Some(model_id.as_str()),
                         &images,
                         video_ref,
@@ -672,6 +679,7 @@ fn native_video_body(
     prompt: &str,
     duration: u64,
     aspect_ratio: &str,
+    generate_audio: Option<bool>,
     images: &[String],
     video_ref: Option<&str>,
 ) -> Value {
@@ -707,22 +715,20 @@ fn native_video_body(
         }));
     }
 
-    json!({
-        "kind": {
-            "kind": "video",
-            "model": "rsclaw-video-v3",
-            "prompt": prompt,
-            "resolution": "720p",
-            "aspect_ratio": aspect_ratio,
-            "duration_secs": duration,
-            "fps": 24,
-            "steps": 20,
-            "generate_audio": false,
-            "frames": frames,
-            "references": references,
-        },
-        "metadata": {},
-    })
+    let mut kind = json!({
+        "kind": "video",
+        "model": "rsclaw-video-v3",
+        "prompt": prompt,
+        "resolution": "720p",
+        "aspect_ratio": aspect_ratio,
+        "duration_secs": duration,
+        "frames": frames,
+        "references": references,
+    });
+    if let Some(generate_audio) = generate_audio {
+        kind["generate_audio"] = json!(generate_audio);
+    }
+    json!({"kind": kind, "metadata": {}})
 }
 
 /// Submit a standard rsclaw video task through the typed durable jobs API and
@@ -735,13 +741,21 @@ async fn submit_rsclaw_video(
     prompt: &str,
     duration: u64,
     aspect_ratio: &str,
+    generate_audio: Option<bool>,
     model_hint: Option<&str>,
     images: &[String],
     video_ref: Option<&str>,
     idempotency_key: &str,
 ) -> Result<String> {
     validate_native_rsclaw_model(model_hint)?;
-    let body = native_video_body(prompt, duration, aspect_ratio, images, video_ref);
+    let body = native_video_body(
+        prompt,
+        duration,
+        aspect_ratio,
+        generate_audio,
+        images,
+        video_ref,
+    );
     let url = format!(
         "{}/v1/jobs",
         rsclaw_provider::rsclaw_http::gen_host_base(None)
@@ -816,9 +830,12 @@ mod tests {
             "https://example.test/start.png".to_owned(),
             "https://example.test/end.png".to_owned(),
         ];
-        let body = native_video_body("snow", 5, "16:9", &images, None);
+        let body = native_video_body("snow", 5, "16:9", None, &images, None);
         assert_eq!(body["kind"]["model"], "rsclaw-video-v3");
         assert_eq!(body["kind"]["duration_secs"], 5);
+        assert!(body["kind"].get("fps").is_none());
+        assert!(body["kind"].get("steps").is_none());
+        assert!(body["kind"].get("generate_audio").is_none());
         assert_eq!(body["kind"]["frames"]["start"]["type"], "url");
         assert_eq!(body["kind"]["frames"]["end"]["url"], images[1]);
         assert!(
@@ -832,11 +849,16 @@ mod tests {
             "transfer",
             6,
             "9:16",
+            Some(true),
             &["https://example.test/subject.png".to_owned()],
             Some("https://example.test/drive.mp4"),
         );
+        assert_eq!(body["kind"]["generate_audio"], true);
         assert_eq!(body["kind"]["references"][0]["role"], "structure");
         assert_eq!(body["kind"]["references"][0]["type"], "video");
         assert_eq!(body["kind"]["references"][1]["role"], "subject");
+
+        let body = native_video_body("silent", 5, "1:1", Some(false), &[], None);
+        assert_eq!(body["kind"]["generate_audio"], false);
     }
 }

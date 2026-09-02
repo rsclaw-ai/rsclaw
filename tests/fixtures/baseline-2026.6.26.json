@@ -1472,6 +1472,10 @@
             ],
             "default": "16:9"
           },
+          "generate_audio": {
+            "type": "boolean",
+            "description": "Optional audio override for native rsclaw video. Omit to use the server default; true requests generated audio, false explicitly disables it."
+          },
           "image": {
             "type": "string",
             "description": "Optional reference image(s) for image-to-video (agnes, doubao, rsclaw). A single image as a string, OR a JSON array: ONE image = first frame (animate this image), TWO = first + last frame (interpolate), THREE+ = reference images (doubao multimodal). Each entry: a LOCAL FILE PATH (e.g. the path returned by image_gen — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI."
