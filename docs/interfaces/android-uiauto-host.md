@@ -12,7 +12,9 @@ Android plugins use ClsAgent `cls android` primitives for screenshot, coordinate
 input, and app activation. Each high-level call may select an explicit operation
 transport with `opType` (`auto`, `a11y`, `u2`, or `adb`) and an independent
 targeting policy with `opMode` (`vision` or `selector`). Omitting both preserves
-the existing `cls android uiauto` behavior.
+the existing `cls android uiauto` behavior. `opType: "u2"` is the strict
+cls-service transport and is emitted with the canonical `cls android uiauto`
+command; the `cls android u2` spelling is only a legacy CLI alias.
 
 `opMode: "vision"` permits screenshot-grounded coordinate actions and text entry
 only after a visual coordinate has focused the target. It rejects selectors,
@@ -34,7 +36,7 @@ The gateway process reads:
 | Variable | Required | Default | Meaning |
 |---|---:|---:|---|
 | `RSCLAW_ANDROID_NODE` | yes | none | CLS tunnel node, for example `android-dev` |
-| `RSCLAW_ANDROID_UIAUTO_PORT` | no | `6790` | Device-local UIAutomator2 HTTP port |
+| `RSCLAW_ANDROID_UIAUTO_PORT` | no | `6666` | Device-local cls-service HTTP port |
 | `RSCLAW_CLS_BIN` | no | `cls` | Explicit CLS executable path/name |
 
 Missing or invalid configuration fails closed with a short host error. It must
@@ -84,10 +86,10 @@ status screenshot tap swipe key launch relaunch input-text ocr-region
 ```
 
 Tree, dump, find, source, and selector commands are deliberately absent from
-`opMode: "vision"`. WeChat exposes only a collapsed empty accessibility root,
-so production observation is screenshot-only. After a screenshot-grounded tap
-focuses the field, `input-text` uses the accessibility service's focused-input
-`ACTION_SET_TEXT`, with bounded clipboard paste only as its internal fallback.
+`opMode: "vision"`. WeChat production observation is screenshot-only. Text entry
+must include screenshot-grounded `x` and `y`; the host emits one
+`cls android uiauto type-at --replace` operation and never supplies a selector
+or element ID.
 
 The host owns a per-command option allowlist. Unknown commands, unknown fields,
 non-object arguments, NUL bytes, oversized values, and non-finite/negative
@@ -100,7 +102,7 @@ Examples:
 {"command":"screenshot","args":{}}
 {"command":"tap","args":{"x":540,"y":2100}}
 {"command":"launch","args":{"package":"com.tencent.mm"}}
-{"command":"tap","args":{"x":540,"y":2100,"opType":"a11y","opMode":"vision"}}
+{"command":"tap","args":{"x":540,"y":2100,"opType":"u2","opMode":"vision"}}
 ```
 
 The screenshot response also carries an additive `contactBadge` object derived
@@ -236,9 +238,8 @@ Host unit tests cover:
 Integration smoke tests use a dedicated device/node:
 
 ```bash
-cls android status -n android-dev
-cls android screenshot -n android-dev -o /tmp/android-canary.png
-cls android uiauto raw -n android-dev /status
+cls android uiauto status -n android-dev
+cls android uiauto screenshot -n android-dev -o /tmp/android-canary.png
 ```
 
 WeChat on the canary device exposes a one-node empty root even with Android

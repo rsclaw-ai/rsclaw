@@ -18,7 +18,7 @@ use base64::Engine as _;
 use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-const DEFAULT_UIAUTO_PORT: u16 = 6790;
+const DEFAULT_UIAUTO_PORT: u16 = 6666;
 const MAX_ARGS_BYTES: usize = 64 * 1024;
 const MAX_RAW_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
@@ -362,10 +362,10 @@ async fn input_text(
             args.push("auto".to_string());
             run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
         }
-        AndroidOpType::U2 => Err(
-            "android operation: input-text is unavailable for opType=u2 without a selector"
-                .to_string(),
-        ),
+        AndroidOpType::U2 => {
+            let args = uiauto_visual_text_args(config, input)?;
+            run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+        }
         AndroidOpType::Adb => Err(
             "android operation: input-text is unavailable for opType=adb in vision mode"
                 .to_string(),
@@ -390,6 +390,24 @@ fn input_text_args(config: &Config, input: InputText) -> Vec<String> {
     args.push("--text".to_string());
     args.push(input.text);
     args
+}
+
+fn uiauto_visual_text_args(config: &Config, input: InputText) -> Result<Vec<String>, String> {
+    let (x, y) = input.point.ok_or_else(|| {
+        "android operation: opType=u2 input-text requires screenshot-grounded `x` and `y`"
+            .to_string()
+    })?;
+    let mut args = explicit_base_args(config, AndroidOpType::U2, "type-at")?;
+    args.extend([
+        "--x".to_string(),
+        x.to_string(),
+        "--y".to_string(),
+        y.to_string(),
+        "--text".to_string(),
+        input.text,
+        "--replace".to_string(),
+    ]);
+    Ok(args)
 }
 
 fn append_xy(mut args: Vec<String>, x: u32, y: u32) -> Vec<String> {
@@ -1712,11 +1730,12 @@ fn build_explicit_call_args(
     validate_object_keys(command, object, specs)?;
     validate_command_requirements(command, object, specs)?;
 
-    let mut args = if command == "relaunch" && op_type == AndroidOpType::Auto {
-        relaunch_base_args(config)
-    } else {
-        explicit_base_args(config, op_type, command)?
-    };
+    let mut args =
+        if command == "relaunch" && matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
+            relaunch_base_args(config)
+        } else {
+            explicit_base_args(config, op_type, command)?
+        };
     for spec in specs {
         let Some(value) = object.get(spec.key) else {
             continue;
@@ -1742,7 +1761,7 @@ fn explicit_base_args(
         ]),
         AndroidOpType::U2 => Ok(vec![
             "android".to_string(),
-            "u2".to_string(),
+            "uiauto".to_string(),
             command.to_string(),
             "-n".to_string(),
             config.node.clone(),
@@ -2552,7 +2571,7 @@ mod tests {
                 "-n",
                 "android-dev",
                 "--port",
-                "6790",
+                "6666",
                 "--x",
                 "123",
                 "--y",
@@ -2560,6 +2579,46 @@ mod tests {
                 "--text",
                 "你好",
             ]
+        );
+    }
+
+    #[test]
+    fn explicit_u2_visual_text_uses_canonical_uiauto_type_at() {
+        assert_eq!(
+            uiauto_visual_text_args(
+                &config(),
+                InputText {
+                    text: "你好".to_string(),
+                    point: Some((123, 456)),
+                },
+            )
+            .expect("visual text arguments"),
+            [
+                "android",
+                "uiauto",
+                "type-at",
+                "-n",
+                "android-dev",
+                "--port",
+                "6666",
+                "--x",
+                "123",
+                "--y",
+                "456",
+                "--text",
+                "你好",
+                "--replace",
+            ]
+        );
+        assert!(
+            uiauto_visual_text_args(
+                &config(),
+                InputText {
+                    text: "你好".to_string(),
+                    point: None,
+                },
+            )
+            .is_err()
         );
     }
 
@@ -2606,6 +2665,18 @@ mod tests {
         assert_eq!(
             explicit_base_args(&config(), AndroidOpType::A11y, "tap").expect("a11y tap args"),
             ["android", "a11y", "tap", "-n", "android-dev"]
+        );
+        assert_eq!(
+            explicit_base_args(&config(), AndroidOpType::U2, "tap").expect("u2 tap args"),
+            [
+                "android",
+                "uiauto",
+                "tap",
+                "-n",
+                "android-dev",
+                "--port",
+                "6666",
+            ]
         );
         assert!(explicit_base_args(&config(), AndroidOpType::Adb, "tap").is_err());
     }
@@ -2813,7 +2884,7 @@ mod tests {
         Config {
             cls_bin: "cls".to_string(),
             node: "android-dev".to_string(),
-            port: 6790,
+            port: 6666,
         }
     }
 
@@ -2829,7 +2900,7 @@ mod tests {
                 "-n",
                 "android-dev",
                 "--port",
-                "6790",
+                "6666",
                 "--x",
                 "20",
                 "--y",
@@ -2858,7 +2929,7 @@ mod tests {
                 "-n",
                 "android-dev",
                 "--port",
-                "6790",
+                "6666",
                 "--package",
                 "org.example.app",
             ]
@@ -3175,10 +3246,10 @@ mod tests {
 
     #[test]
     fn config_validation_fails_closed() {
-        assert!(Config::new("cls".to_string(), String::new(), 6790).is_err());
+        assert!(Config::new("cls".to_string(), String::new(), 6666).is_err());
         assert!(Config::new("cls".to_string(), "android-dev".to_string(), 0).is_err());
         assert_eq!(
-            Config::new("cls".to_string(), "android-dev".to_string(), 6790)
+            Config::new("cls".to_string(), "android-dev".to_string(), 6666)
                 .expect("valid configuration"),
             config()
         );
