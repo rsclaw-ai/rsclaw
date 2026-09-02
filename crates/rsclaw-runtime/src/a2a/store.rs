@@ -5,8 +5,10 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use rsclaw_a2a_types::types::{
-    A2aArtifact, A2aMessage, A2aTask, PushNotificationConfig, TaskState,
+    A2aArtifact, A2aMessage, A2aTask, AttemptRecord, DurableTaskRecord, OperationRecord,
+    PushNotificationConfig, TaskState, WorkLease, WorkRecord,
 };
+use thiserror::Error;
 
 const TASKS: TableDefinition<&str, &str> = TableDefinition::new("a2a_tasks");
 /// Push configs keyed by "{task_id}:{config_id}".
@@ -15,6 +17,31 @@ const PUSH_CONFIGS: TableDefinition<&str, &str> = TableDefinition::new("a2a_push
 /// the `A2aTask` wire type so the owning principal never leaks in responses;
 /// used only server-side to enforce per-caller access (A2A spec §7.5).
 const TASK_OWNERS: TableDefinition<&str, &str> = TableDefinition::new("a2a_task_owners");
+
+// Durable-execution tables are deliberately separate from the existing A2A task
+// projection tables. Nothing in the legacy task path reads or mutates them.
+const DURABLE_TASKS: TableDefinition<&str, &str> = TableDefinition::new("a2a_durable_tasks");
+const ATTEMPTS: TableDefinition<&str, &str> = TableDefinition::new("a2a_attempts");
+const WORKS: TableDefinition<&str, &str> = TableDefinition::new("a2a_works");
+const OPERATIONS: TableDefinition<&str, &str> = TableDefinition::new("a2a_operations");
+
+#[derive(Debug, Error)]
+pub enum DurableStoreError {
+    #[error("idempotency conflict")]
+    IdempotencyConflict,
+    #[error("state conflict: {0}")]
+    StateConflict(&'static str),
+    #[error("fenced by lease epoch {current_epoch}")]
+    Fenced { current_epoch: u64 },
+    #[error(transparent)]
+    Storage(#[from] anyhow::Error),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationAdmission {
+    Applied(OperationRecord),
+    Existing(OperationRecord),
+}
 
 pub struct TaskStore {
     db: Database,
@@ -88,6 +115,10 @@ impl TaskStore {
             let _ = txn.open_table(TASKS)?;
             let _ = txn.open_table(PUSH_CONFIGS)?;
             let _ = txn.open_table(TASK_OWNERS)?;
+            let _ = txn.open_table(DURABLE_TASKS)?;
+            let _ = txn.open_table(ATTEMPTS)?;
+            let _ = txn.open_table(WORKS)?;
+            let _ = txn.open_table(OPERATIONS)?;
         }
         txn.commit()?;
         Ok(Self { db })
@@ -344,6 +375,179 @@ impl TaskStore {
         txn.commit()?;
         Ok(n)
     }
+
+    /// Atomically admit an operation and its Task -> Attempt -> Work records.
+    /// A replay with the same key and digest returns the original result; a
+    /// different digest is rejected without changing any table.
+    pub fn create_execution(
+        &self,
+        operation: &OperationRecord,
+        task: &DurableTaskRecord,
+        attempt: &AttemptRecord,
+        work: &WorkRecord,
+    ) -> std::result::Result<OperationAdmission, DurableStoreError> {
+        if attempt.task_id != task.task_id
+            || work.task_id != task.task_id
+            || work.attempt_id != attempt.attempt_id
+        {
+            return Err(DurableStoreError::StateConflict(
+                "invalid task/attempt/work relationship",
+            ));
+        }
+        let operation_json = serde_json::to_string(operation).map_err(anyhow::Error::from)?;
+        let task_json = serde_json::to_string(task).map_err(anyhow::Error::from)?;
+        let attempt_json = serde_json::to_string(attempt).map_err(anyhow::Error::from)?;
+        let work_json = serde_json::to_string(work).map_err(anyhow::Error::from)?;
+        let key = operation.key.storage_key();
+        let txn = self.db.begin_write().map_err(anyhow::Error::from)?;
+        let admission = {
+            let mut operations = txn.open_table(OPERATIONS).map_err(anyhow::Error::from)?;
+            if let Some(previous) = operations.get(key.as_str()).map_err(anyhow::Error::from)? {
+                let previous: OperationRecord =
+                    serde_json::from_str(previous.value()).map_err(anyhow::Error::from)?;
+                if previous.request_digest != operation.request_digest {
+                    return Err(DurableStoreError::IdempotencyConflict);
+                }
+                OperationAdmission::Existing(previous)
+            } else {
+                let mut tasks = txn.open_table(DURABLE_TASKS).map_err(anyhow::Error::from)?;
+                let mut attempts = txn.open_table(ATTEMPTS).map_err(anyhow::Error::from)?;
+                let mut works = txn.open_table(WORKS).map_err(anyhow::Error::from)?;
+                if tasks
+                    .get(task.task_id.as_str())
+                    .map_err(anyhow::Error::from)?
+                    .is_some()
+                    || attempts
+                        .get(attempt.attempt_id.as_str())
+                        .map_err(anyhow::Error::from)?
+                        .is_some()
+                    || works
+                        .get(work.work_id.as_str())
+                        .map_err(anyhow::Error::from)?
+                        .is_some()
+                {
+                    return Err(DurableStoreError::StateConflict(
+                        "durable ID already exists",
+                    ));
+                }
+                tasks
+                    .insert(task.task_id.as_str(), task_json.as_str())
+                    .map_err(anyhow::Error::from)?;
+                attempts
+                    .insert(attempt.attempt_id.as_str(), attempt_json.as_str())
+                    .map_err(anyhow::Error::from)?;
+                works
+                    .insert(work.work_id.as_str(), work_json.as_str())
+                    .map_err(anyhow::Error::from)?;
+                operations
+                    .insert(key.as_str(), operation_json.as_str())
+                    .map_err(anyhow::Error::from)?;
+                OperationAdmission::Applied(operation.clone())
+            }
+        };
+        txn.commit().map_err(anyhow::Error::from)?;
+        Ok(admission)
+    }
+
+    pub fn durable_work(&self, work_id: &str) -> Result<Option<WorkRecord>> {
+        let txn = self.db.begin_read()?;
+        let works = txn.open_table(WORKS)?;
+        works
+            .get(work_id)?
+            .map(|value| serde_json::from_str(value.value()).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Persist that a DispatchWork frame entered the outbound transport log.
+    /// Until a matching receipt this is deliberately DeliveryUnknown.
+    pub fn record_outbound_dispatch(&self, work_id: &str, dispatch: &str) -> Result<()> {
+        self.update_work(work_id, |work| {
+            work.outbound_dispatch = dispatch.to_owned();
+            work.delivery_state = rsclaw_a2a_types::types::DeliveryState::DeliveryUnknown;
+            Ok(())
+        })
+    }
+
+    /// Persist an authenticated receipt. A lower lease epoch is fenced; a
+    /// duplicate receipt at the current epoch is a no-op when identical.
+    pub fn record_receipt(
+        &self,
+        work_id: &str,
+        lease_epoch: u64,
+        receipt: &str,
+    ) -> std::result::Result<(), DurableStoreError> {
+        self.update_durable_work(work_id, |work| {
+            if lease_epoch != work.lease.lease_epoch {
+                return Err(DurableStoreError::Fenced {
+                    current_epoch: work.lease.lease_epoch,
+                });
+            }
+            if let Some(existing) = &work.receipt {
+                if existing != receipt {
+                    return Err(DurableStoreError::StateConflict("conflicting receipt"));
+                }
+                return Ok(());
+            }
+            work.receipt = Some(receipt.to_owned());
+            work.delivery_state = rsclaw_a2a_types::types::DeliveryState::Delivered;
+            Ok(())
+        })
+    }
+
+    /// Advance a work fence. Epochs never move backwards or remain unchanged.
+    pub fn advance_lease_epoch(
+        &self,
+        work_id: &str,
+        expected_epoch: u64,
+        lease: WorkLease,
+    ) -> std::result::Result<(), DurableStoreError> {
+        self.update_durable_work(work_id, |work| {
+            if expected_epoch != work.lease.lease_epoch || lease.lease_epoch <= expected_epoch {
+                return Err(DurableStoreError::Fenced {
+                    current_epoch: work.lease.lease_epoch,
+                });
+            }
+            work.lease = lease;
+            Ok(())
+        })
+    }
+
+    fn update_work(
+        &self,
+        work_id: &str,
+        update: impl FnOnce(&mut WorkRecord) -> Result<()>,
+    ) -> Result<()> {
+        self.update_durable_work(work_id, |work| {
+            update(work).map_err(DurableStoreError::Storage)
+        })
+        .map_err(|error| anyhow!(error))
+    }
+
+    fn update_durable_work(
+        &self,
+        work_id: &str,
+        update: impl FnOnce(&mut WorkRecord) -> std::result::Result<(), DurableStoreError>,
+    ) -> std::result::Result<(), DurableStoreError> {
+        let txn = self.db.begin_write().map_err(anyhow::Error::from)?;
+        {
+            let mut works = txn.open_table(WORKS).map_err(anyhow::Error::from)?;
+            let work_json = works
+                .get(work_id)
+                .map_err(anyhow::Error::from)?
+                .ok_or(DurableStoreError::StateConflict("work not found"))?
+                .value()
+                .to_owned();
+            let mut work: WorkRecord =
+                serde_json::from_str(&work_json).map_err(anyhow::Error::from)?;
+            update(&mut work)?;
+            let json = serde_json::to_string(&work).map_err(anyhow::Error::from)?;
+            works
+                .insert(work_id, json.as_str())
+                .map_err(anyhow::Error::from)?;
+        }
+        txn.commit().map_err(anyhow::Error::from)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -406,5 +610,108 @@ mod tests {
             store.get_owner("reserved").unwrap().as_deref(),
             Some("alice")
         );
+    }
+
+    #[test]
+    fn durable_execution_is_idempotent_and_recovers_after_reopen() {
+        use rsclaw_a2a_types::types::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tasks.redb");
+        let task = DurableTaskRecord {
+            task_id: TaskId::new(),
+            fleet_team_id: FleetTeamId::new(),
+            created_at: "2026-09-02T07:36:00.000Z".to_owned(),
+            current_attempt_id: None,
+        };
+        let attempt = AttemptRecord {
+            attempt_id: AttemptId::new(),
+            task_id: task.task_id.clone(),
+            state: AttemptState::Active,
+            created_at: "2026-09-02T07:36:00.000Z".to_owned(),
+        };
+        let work = WorkRecord {
+            work_id: WorkId::new(),
+            attempt_id: attempt.attempt_id.clone(),
+            task_id: task.task_id.clone(),
+            agent_id: AgentId::new(),
+            state: WorkState::Leased,
+            delivery_state: DeliveryState::NotDelivered,
+            lease: WorkLease {
+                lease_epoch: 1,
+                expires_at: "2026-09-02T07:37:00.000Z".to_owned(),
+            },
+            outbound_dispatch: "dispatch-1".to_owned(),
+            receipt: None,
+        };
+        let operation = OperationRecord {
+            key: OperationKey {
+                actor: "alice".to_owned(),
+                kind: "CreateTask".to_owned(),
+                operation_id: OperationId::new(),
+            },
+            request_digest: "request-a".to_owned(),
+            result: "accepted".to_owned(),
+        };
+
+        let store = TaskStore::open(&path).unwrap();
+        assert!(matches!(
+            store
+                .create_execution(&operation, &task, &attempt, &work)
+                .unwrap(),
+            OperationAdmission::Applied(_)
+        ));
+        assert!(matches!(
+            store
+                .create_execution(&operation, &task, &attempt, &work)
+                .unwrap(),
+            OperationAdmission::Existing(_)
+        ));
+        let mut conflict = operation.clone();
+        conflict.request_digest = "request-b".to_owned();
+        assert!(matches!(
+            store.create_execution(&conflict, &task, &attempt, &work),
+            Err(DurableStoreError::IdempotencyConflict)
+        ));
+        store
+            .record_outbound_dispatch(work.work_id.as_str(), "dispatch-2")
+            .unwrap();
+        assert!(matches!(
+            store.record_receipt(work.work_id.as_str(), 0, "receipt"),
+            Err(DurableStoreError::Fenced { .. })
+        ));
+        store
+            .record_receipt(work.work_id.as_str(), 1, "receipt")
+            .unwrap();
+        drop(store);
+
+        let reopened = TaskStore::open(&path).unwrap();
+        let recovered = reopened
+            .durable_work(work.work_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.delivery_state, DeliveryState::Delivered);
+        assert_eq!(recovered.receipt.as_deref(), Some("receipt"));
+        assert!(matches!(
+            reopened.advance_lease_epoch(
+                work.work_id.as_str(),
+                1,
+                WorkLease {
+                    lease_epoch: 1,
+                    expires_at: "later".to_owned()
+                }
+            ),
+            Err(DurableStoreError::Fenced { .. })
+        ));
+        reopened
+            .advance_lease_epoch(
+                work.work_id.as_str(),
+                1,
+                WorkLease {
+                    lease_epoch: 2,
+                    expires_at: "later".to_owned(),
+                },
+            )
+            .unwrap();
     }
 }
