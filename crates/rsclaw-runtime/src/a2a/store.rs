@@ -424,6 +424,7 @@ impl TaskStore {
             || operation.task_id != task.task_id
             || operation.attempt_id != attempt.attempt_id
             || operation.work_id != work.work_id
+            || work.operation_id != operation.key.operation_id
             || task.current_attempt_id.as_ref() != Some(&attempt.attempt_id)
             || work.lease.task_id != work.task_id
             || work.lease.attempt_id != work.attempt_id
@@ -916,6 +917,7 @@ impl TaskStore {
             || work.agent_id != dispatch.agent_id
             || work.assigned_repo_id != dispatch.repo_id
             || work.assigned_workspace_id != dispatch.workspace_id
+            || work.operation_id != dispatch.operation_id
             || work.lease.lease_epoch != dispatch.lease.lease_epoch
             || work.lease.expires_at != dispatch.lease.expires_at
             || work.lease.lease_token
@@ -1091,9 +1093,9 @@ mod tests {
     }
 
     use rsclaw_a2a_types::types::{
-        AgentId, AttemptId, AttemptState, DeliveryState, FleetTeamId, LeaseToken, MachineId,
-        OperationId, OperationKey, RepoId, TaskEventReplay, TaskId, WorkId, WorkReceipt, WorkState,
-        WorkspaceId,
+        AgentId, AttemptId, AttemptState, DeliveryState, FleetTeamId, FrameId, LeaseToken,
+        MachineId, OperationId, OperationKey, RepoId, TaskEventReplay, TaskId, WorkId, WorkReceipt,
+        WorkState, WorkspaceId,
     };
 
     fn future_timestamp(minutes: i64) -> String {
@@ -1110,6 +1112,7 @@ mod tests {
         let task_id = TaskId::new();
         let attempt_id = AttemptId::new();
         let work_id = WorkId::new();
+        let operation_id = OperationId::new();
         let agent_id = AgentId::new();
         let machine_id = MachineId::new();
         let task = DurableTaskRecord {
@@ -1126,6 +1129,7 @@ mod tests {
         };
         let work = WorkRecord {
             work_id: work_id.clone(),
+            operation_id: operation_id.clone(),
             attempt_id: attempt_id.clone(),
             task_id: task_id.clone(),
             agent_id: agent_id.clone(),
@@ -1151,7 +1155,7 @@ mod tests {
             key: OperationKey {
                 actor: "alice".to_owned(),
                 kind: "CreateTask".to_owned(),
-                operation_id: OperationId::new(),
+                operation_id,
             },
             task_id,
             attempt_id,
@@ -1171,6 +1175,44 @@ mod tests {
             machine_id: work.assigned_machine_id.clone(),
             lease_epoch: work.lease.lease_epoch,
             receipt: value.to_owned(),
+        }
+    }
+
+    fn relay_dispatch(
+        task: &DurableTaskRecord,
+        work: &WorkRecord,
+        operation: &OperationRecord,
+    ) -> rsclaw_a2a_types::durable_relay::RelayFrame {
+        use rsclaw_a2a_types::durable_relay::{
+            DispatchWorkBody, LeaseBody, RelayBody, RelayFrame, RelayKind,
+        };
+
+        RelayFrame {
+            frame_id: FrameId::new(),
+            fleet_team_id: task.fleet_team_id.clone(),
+            machine_id: MachineId::new(),
+            sent_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            kind: RelayKind::DispatchWork,
+            seq: 1,
+            ack: 0,
+            cursor: 0,
+            route: Vec::new(),
+            body: RelayBody::DispatchWork(DispatchWorkBody {
+                task_id: work.task_id.clone(),
+                attempt_id: work.attempt_id.clone(),
+                work_id: work.work_id.clone(),
+                agent_id: work.agent_id.clone(),
+                repo_id: work.assigned_repo_id.clone(),
+                workspace_id: work.assigned_workspace_id.clone(),
+                lease: LeaseBody {
+                    lease_epoch: work.lease.lease_epoch,
+                    expires_at: work.lease.expires_at.clone(),
+                    lease_token: "lease-1".to_owned(),
+                },
+                operation_id: operation.key.operation_id.clone(),
+                hops_remaining: 4,
+                payload: serde_json::json!({"text": "hello"}),
+            }),
         }
     }
 
@@ -1267,6 +1309,72 @@ mod tests {
         assert_eq!(fenced.delivery_state, DeliveryState::NotDelivered);
         assert!(fenced.outbound_dispatch.is_none());
         assert!(fenced.receipt.is_none());
+    }
+
+    #[test]
+    fn durable_relay_dispatch_and_receipt_require_exact_binding() {
+        use rsclaw_a2a_types::durable_relay::{ReceiptBody, RelayBody};
+
+        let tmp = tempfile::tempdir().expect("create temp directory");
+        let path = tmp.path().join("tasks.redb");
+        let (task, attempt, work, operation) = sample_execution();
+        let store = TaskStore::open(&path).expect("open durable task store");
+        store
+            .create_execution(&operation, &task, &attempt, &work, "submitted")
+            .expect("admit execution");
+        let dispatch = relay_dispatch(&task, &work, &operation);
+        let mut wrong_operation = dispatch.clone();
+        let RelayBody::DispatchWork(body) = &mut wrong_operation.body else {
+            panic!("expected dispatch body");
+        };
+        body.operation_id = OperationId::new();
+        assert!(matches!(
+            store.record_relay_dispatch(&wrong_operation),
+            Err(DurableStoreError::StateConflict(
+                "dispatch binding does not match work"
+            ))
+        ));
+        store
+            .record_relay_dispatch(&dispatch)
+            .expect("persist durable relay dispatch");
+
+        let mut receipt = ReceiptBody {
+            work_id: work.work_id.clone(),
+            attempt_id: work.attempt_id.clone(),
+            agent_id: work.agent_id.clone(),
+            lease_epoch: work.lease.lease_epoch,
+            frame_id: FrameId::new(),
+        };
+        assert!(matches!(
+            store.record_relay_receipt(&work.assigned_machine_id, &receipt, "wrong-frame-receipt"),
+            Err(DurableStoreError::StateConflict(
+                "receipt frame binding does not match dispatch"
+            ))
+        ));
+        receipt.frame_id = dispatch.frame_id.clone();
+        assert!(matches!(
+            store.record_relay_receipt(&MachineId::new(), &receipt, "wrong-machine-receipt"),
+            Err(DurableStoreError::StateConflict(
+                "receipt binding does not match work"
+            ))
+        ));
+        let receipt_json = serde_json::to_string(&RelayBody::Receipt(receipt.clone()))
+            .expect("serialize durable receipt");
+        store
+            .record_relay_receipt(&work.assigned_machine_id, &receipt, &receipt_json)
+            .expect("persist exact receipt binding");
+        let persisted = store
+            .durable_work(work.work_id.as_str())
+            .expect("load durable work")
+            .expect("durable work exists");
+        assert_eq!(persisted.delivery_state, DeliveryState::Delivered);
+        assert_eq!(
+            persisted
+                .receipt
+                .as_ref()
+                .map(|value| value.receipt.as_str()),
+            Some(receipt_json.as_str())
+        );
     }
 
     #[test]

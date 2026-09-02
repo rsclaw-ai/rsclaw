@@ -21,7 +21,7 @@ pub struct RouteEntry {
     pub route_epoch: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct RelayFrame {
     pub frame_id: FrameId,
     pub fleet_team_id: FleetTeamId,
@@ -108,6 +108,9 @@ impl RelayFrame {
         if self.route.len() > MAX_ROUTE_ENTRIES {
             return Err(RelayFrameError::RouteTooLong);
         }
+        if self.route.iter().any(|entry| entry.route_epoch == 0) {
+            return Err(RelayFrameError::InvalidBody);
+        }
         let mut seen = std::collections::HashSet::new();
         if self
             .route
@@ -151,17 +154,48 @@ impl RelayFrame {
 
 fn valid_timestamp(timestamp: &str) -> bool {
     let bytes = timestamp.as_bytes();
-    bytes.len() == 24
-        && matches!(bytes.get(4), Some(b'-'))
-        && matches!(bytes.get(7), Some(b'-'))
-        && matches!(bytes.get(10), Some(b'T'))
-        && matches!(bytes.get(13), Some(b':'))
-        && matches!(bytes.get(16), Some(b':'))
-        && matches!(bytes.get(19), Some(b'.'))
-        && matches!(bytes.get(23), Some(b'Z'))
-        && bytes.iter().enumerate().all(|(index, byte)| {
+    if bytes.len() != 24
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || bytes.get(19) != Some(&b'.')
+        || bytes.get(23) != Some(&b'Z')
+        || !bytes.iter().enumerate().all(|(index, byte)| {
             matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 23) || byte.is_ascii_digit()
         })
+    {
+        return false;
+    }
+
+    let parse = |range: std::ops::Range<usize>| {
+        std::str::from_utf8(&bytes[range])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        parse(0..4),
+        parse(5..7),
+        parse(8..10),
+        parse(11..13),
+        parse(14..16),
+        parse(17..19),
+    ) else {
+        return false;
+    };
+    if year == 0 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days_in_month).contains(&day)
 }
 
 fn decrement_hops(hops: &mut u64) -> Result<(), RelayFrameError> {
@@ -170,6 +204,17 @@ fn decrement_hops(hops: &mut u64) -> Result<(), RelayFrameError> {
     }
     *hops -= 1;
     Ok(())
+}
+
+fn valid_lease(lease: &LeaseBody) -> bool {
+    lease.lease_epoch > 0
+        && valid_timestamp(&lease.expires_at)
+        && !lease.lease_token.is_empty()
+        && lease.lease_token.len() <= 1024
+}
+
+fn valid_worker_binding(binding: &WorkerBinding) -> bool {
+    binding.lease_epoch > 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +244,7 @@ pub enum RelayKind {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_durableRelayBody", rename_all = "camelCase")]
 pub enum RelayBody {
     Hello(HelloBody),
@@ -304,15 +349,53 @@ impl RelayBody {
         }
         match self {
             Self::Hello(body) if body.protocol != RELAY_PROTOCOL => Err(RelayFrameError::Protocol),
+            Self::Hello(body) if body.authority_epoch == 0 || !body.auth.is_object() => {
+                Err(RelayFrameError::InvalidBody)
+            }
+            Self::HelloAck(body) if body.authority_epoch == 0 || body.connection_id.is_empty() => {
+                Err(RelayFrameError::InvalidBody)
+            }
             Self::DispatchWork(body) if body.hops_remaining > MAX_HOPS => {
                 Err(RelayFrameError::HopsExhausted)
             }
+            Self::DispatchWork(body) if !valid_lease(&body.lease) => {
+                Err(RelayFrameError::InvalidBody)
+            }
+            Self::Receipt(body) if body.lease_epoch == 0 => Err(RelayFrameError::InvalidBody),
+            Self::WorkStarted(body) if !valid_worker_binding(body) => {
+                Err(RelayFrameError::InvalidBody)
+            }
+            Self::WorkProgress(body) if !valid_worker_binding(&body.binding) => {
+                Err(RelayFrameError::InvalidBody)
+            }
+            Self::WorkTerminal(body)
+                if !valid_worker_binding(&body.binding)
+                    || !matches!(body.outcome.as_str(), "Succeeded" | "Failed" | "Canceled")
+                    || body.result.is_some() == body.failure.is_some() =>
+            {
+                Err(RelayFrameError::InvalidBody)
+            }
+            Self::Event(body) | Self::ReplayEvent(body) if body.event_seq == 0 => {
+                Err(RelayFrameError::InvalidBody)
+            }
+            Self::ReplayRequest(body) if body.limit == 0 || body.limit > 1000 => {
+                Err(RelayFrameError::InvalidBody)
+            }
+            Self::Wake(body) if body.hops_remaining > MAX_HOPS => {
+                Err(RelayFrameError::HopsExhausted)
+            }
+            Self::Ping(body) | Self::Pong(body)
+                if body.nonce.is_empty() || body.nonce.len() > 256 =>
+            {
+                Err(RelayFrameError::InvalidBody)
+            }
+            Self::Control(body) if !body.is_object() => Err(RelayFrameError::InvalidBody),
             _ => Ok(()),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HelloBody {
     pub protocol: String,
@@ -328,14 +411,14 @@ pub struct HelloAckBody {
     pub limits: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LeaseBody {
     pub lease_epoch: u64,
     pub expires_at: String,
     pub lease_token: String,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DispatchWorkBody {
     pub task_id: TaskId,
@@ -432,6 +515,7 @@ pub enum RelayFrameError {
     RouteLoop,
     HopsExhausted,
     BodyDoesNotMatchKind,
+    InvalidBody,
     Protocol,
 }
 
@@ -444,6 +528,7 @@ impl std::fmt::Display for RelayFrameError {
             Self::RouteLoop => "relay route contains a loop",
             Self::HopsExhausted => "relay hops exhausted or invalid",
             Self::BodyDoesNotMatchKind => "relay body does not match kind",
+            Self::InvalidBody => "relay body contains invalid values",
             Self::Protocol => "unsupported relay protocol",
         };
         f.write_str(message)
@@ -475,6 +560,23 @@ mod tests {
         let json = serde_json::to_value(frame).unwrap();
         assert_eq!(json["body"]["nonce"], "n");
         assert!(json["body"].get("_durableRelayBody").is_none());
+    }
+
+    #[test]
+    fn invalid_calendar_timestamp_is_rejected() {
+        let json = serde_json::json!({
+            "frameId": FrameId::new(),
+            "fleetTeamId": FleetTeamId::new(),
+            "machineId": MachineId::new(),
+            "sentAt": "2026-02-30T25:61:61.000Z",
+            "kind": "Ping",
+            "seq": 1,
+            "ack": 0,
+            "cursor": 0,
+            "route": [],
+            "body": { "nonce": "n" }
+        });
+        assert!(serde_json::from_value::<RelayFrame>(json).is_err());
     }
 
     #[test]

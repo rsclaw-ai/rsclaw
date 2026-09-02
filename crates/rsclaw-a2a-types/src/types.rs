@@ -474,6 +474,8 @@ pub struct AttemptRecord {
 #[serde(rename_all = "camelCase")]
 pub struct WorkRecord {
     pub work_id: WorkId,
+    /// Operation that authorized this work dispatch.
+    pub operation_id: OperationId,
     pub attempt_id: AttemptId,
     pub task_id: TaskId,
     pub agent_id: AgentId,
