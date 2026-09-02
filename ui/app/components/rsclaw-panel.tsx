@@ -3767,7 +3767,7 @@ function TauriConfigPageInner() {
               labelZh={"\u89C6\u9891\u751F\u6210\u6A21\u578B"}
               labelEn="Video Generation Model"
               hint={`agents.defaults.model.video (${zh ? "\u7A7A=\u7981\u7528;\u6BCF\u6BB5\u4ED8\u8D39\u4E14\u8017\u65F6" : "empty = disabled; each clip is paid and slow"})`}
-              placeholder="rsclaw/rsclaw-video-v1, doubao/doubao-seedance-2-0-260128"
+              placeholder="rsclaw/rsclaw-video-v3, doubao/doubao-seedance-2-0-260128"
               readChain={readChain}
               writeChain={writeChain}
               healthMap={healthMap}
@@ -3874,7 +3874,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="rsclaw/2026.8.6"
+                              placeholder="rsclaw/2026.8.28"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -3949,7 +3949,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="e.g. rsclaw/2026.8.6"
+                              placeholder="e.g. rsclaw/2026.8.28"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -4004,7 +4004,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="e.g. rsclaw/2026.8.6"
+                              placeholder="e.g. rsclaw/2026.8.28"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);

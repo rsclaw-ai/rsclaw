@@ -29,13 +29,13 @@ use std::{
 };
 
 use anyhow::Result;
+pub use codex::{CodexManifest, CodexPlugin, CodexSkill};
 use futures::future::BoxFuture;
 pub use js_runtime::Plugin;
 pub use manifest::{
     LEGACY_MANIFEST_FILE, MANIFEST_FILE, PluginManifest, PluginSlashCommand, PluginToolDef,
     load_manifest, scan_plugins,
 };
-pub use codex::{CodexManifest, CodexPlugin, CodexSkill};
 pub use slots::{ContextEngineSlot, MemoryItem, MemorySlot, MemoryStoreSlot, SlotRegistry};
 use tracing::{info, warn};
 

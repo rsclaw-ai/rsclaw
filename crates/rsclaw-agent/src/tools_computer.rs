@@ -1630,7 +1630,10 @@ mod tests {
         // must name the alternative rather than just refusing.
         let msg = grounding_error("type").to_string();
         assert!(msg.contains("vlm_drive"), "got: {msg}");
-        assert!(msg.contains("type"), "should name the refused action: {msg}");
+        assert!(
+            msg.contains("type"),
+            "should name the refused action: {msg}"
+        );
     }
 
     #[test]

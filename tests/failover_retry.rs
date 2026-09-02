@@ -502,7 +502,7 @@ async fn test_error_classification_rate_limit_variants() {
             api_keys,
             fallbacks,
             rsclaw::provider::health::ProviderHealthRegistry::new(),
-        RetryConfig::default(),
+            RetryConfig::default(),
         );
 
         let req = simple_request(&format!("{provider_name}/model"));
@@ -559,7 +559,7 @@ async fn test_error_classification_auth_variants() {
             api_keys,
             fallbacks,
             rsclaw::provider::health::ProviderHealthRegistry::new(),
-        RetryConfig::default(),
+            RetryConfig::default(),
         );
 
         let req = simple_request(&format!("{provider_name}/model"));

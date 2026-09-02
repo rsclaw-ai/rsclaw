@@ -45,7 +45,8 @@ pub enum Action {
     /// Double-click at (x, y) (left button).
     DoubleClick { x: i32, y: i32 },
 
-    /// Touch-and-hold at (x, y) for `duration_ms` milliseconds (mobile long-press).
+    /// Touch-and-hold at (x, y) for `duration_ms` milliseconds (mobile
+    /// long-press).
     LongPress { x: i32, y: i32, duration_ms: u32 },
 
     /// Click-drag from start to end.

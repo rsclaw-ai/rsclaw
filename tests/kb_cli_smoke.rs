@@ -12,7 +12,12 @@ use std::{path::Path, process::Command};
 use tempfile::TempDir;
 
 fn rsclaw() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rsclaw"))
+    // Keep these store-isolated smoke tests independent from a developer's
+    // gateway on the default port. `--base-dir` propagates this port to the
+    // child before the KB command probes for HTTP routing.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rsclaw"));
+    command.env("RSCLAW_PORT", "1");
+    command
 }
 
 fn run(cmd: &mut Command) -> (String, String, i32) {

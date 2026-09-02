@@ -58,7 +58,10 @@ async fn native_operator_screenshot_works() {
 #[ignore]
 async fn frontmost_app_returns_a_real_app_name() {
     let op = NativeOperator::new();
-    let front = op.frontmost_app().await.expect("frontmost query must not error");
+    let front = op
+        .frontmost_app()
+        .await
+        .expect("frontmost query must not error");
 
     let name = front.expect(
         "frontmost app should be reported on a signed macOS build with Accessibility \
@@ -183,9 +186,10 @@ impl Operator for ScriptedOperator {
 
     fn frontmost_app(&self) -> FrontmostFut<'_> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        let app = *self.focus.get(n).unwrap_or_else(|| {
-            self.focus.last().expect("focus script must not be empty")
-        });
+        let app = *self
+            .focus
+            .get(n)
+            .unwrap_or_else(|| self.focus.last().expect("focus script must not be empty"));
         Box::pin(async move { Ok(Some(app.to_owned())) })
     }
 
@@ -222,9 +226,7 @@ impl PermissionStore for FixedPermissions {
         app: &'a str,
     ) -> rsclaw::computer::permission::CheckFut<'a> {
         let hit = app == self.allowed;
-        Box::pin(async move {
-            Ok(hit.then_some(PermissionDecision::AllowSession))
-        })
+        Box::pin(async move { Ok(hit.then_some(PermissionDecision::AllowSession)) })
     }
 
     fn record<'a>(
