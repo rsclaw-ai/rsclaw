@@ -5,6 +5,7 @@
 //! pure serde/tokio/dashmap leaves). Pulling them into a leaf crate breaks the
 //! `agent -> a2a` type edge: `AgentMessage.event_tx` now points here, not at
 //! the a2a runtime module, so agent core can later extract independently.
+pub mod durable_relay;
 pub mod event;
 pub mod types;
 

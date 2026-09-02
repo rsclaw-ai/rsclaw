@@ -886,6 +886,86 @@ impl TaskStore {
         })
     }
 
+    /// Records a durable relay dispatch only after validating its exact work
+    /// assignment. The serialized durable frame is the outbound log entry; a
+    /// successful insert deliberately changes delivery to `DeliveryUnknown`.
+    pub fn record_relay_dispatch(
+        &self,
+        frame: &rsclaw_a2a_types::durable_relay::RelayFrame,
+    ) -> std::result::Result<(), DurableStoreError> {
+        use rsclaw_a2a_types::durable_relay::{RelayBody, RelayKind};
+        frame
+            .validate()
+            .map_err(|_| DurableStoreError::StateConflict("invalid relay frame"))?;
+        let RelayBody::DispatchWork(dispatch) = &frame.body else {
+            return Err(DurableStoreError::StateConflict(
+                "relay frame is not DispatchWork",
+            ));
+        };
+        if frame.kind != RelayKind::DispatchWork {
+            return Err(DurableStoreError::StateConflict(
+                "relay kind is not DispatchWork",
+            ));
+        }
+        let work = self
+            .durable_work(dispatch.work_id.as_str())
+            .map_err(DurableStoreError::Storage)?
+            .ok_or(DurableStoreError::StateConflict("work not found"))?;
+        if work.task_id != dispatch.task_id
+            || work.attempt_id != dispatch.attempt_id
+            || work.agent_id != dispatch.agent_id
+            || work.assigned_repo_id != dispatch.repo_id
+            || work.assigned_workspace_id != dispatch.workspace_id
+            || work.lease.lease_epoch != dispatch.lease.lease_epoch
+            || work.lease.expires_at != dispatch.lease.expires_at
+            || work.lease.lease_token
+                != rsclaw_a2a_types::types::LeaseToken::new(dispatch.lease.lease_token.clone())
+        {
+            return Err(DurableStoreError::StateConflict(
+                "dispatch binding does not match work",
+            ));
+        }
+        let serialized = serde_json::to_string(frame).map_err(anyhow::Error::from)?;
+        self.record_outbound_dispatch(work.work_id.as_str(), &serialized)
+    }
+
+    /// Authenticates a durable relay Receipt against the machine that owns the
+    /// current lease, then persists its exact work binding. A receipt cannot
+    /// convert a `NotDelivered` dispatch or an older lease epoch to Delivered.
+    pub fn record_relay_receipt(
+        &self,
+        machine_id: &rsclaw_a2a_types::types::MachineId,
+        receipt: &rsclaw_a2a_types::durable_relay::ReceiptBody,
+        serialized_receipt: &str,
+    ) -> std::result::Result<(), DurableStoreError> {
+        let work = self
+            .durable_work(receipt.work_id.as_str())
+            .map_err(DurableStoreError::Storage)?
+            .ok_or(DurableStoreError::StateConflict("work not found"))?;
+        let outbound =
+            work.outbound_dispatch
+                .as_deref()
+                .ok_or(DurableStoreError::StateConflict(
+                    "receipt arrived before outbound dispatch",
+                ))?;
+        let dispatch: rsclaw_a2a_types::durable_relay::RelayFrame = serde_json::from_str(outbound)
+            .map_err(|_| DurableStoreError::StateConflict("stored outbound dispatch is invalid"))?;
+        if dispatch.frame_id != receipt.frame_id {
+            return Err(DurableStoreError::StateConflict(
+                "receipt frame binding does not match dispatch",
+            ));
+        }
+        self.record_receipt(&WorkReceipt {
+            task_id: work.task_id,
+            attempt_id: receipt.attempt_id.clone(),
+            work_id: receipt.work_id.clone(),
+            agent_id: receipt.agent_id.clone(),
+            machine_id: machine_id.clone(),
+            lease_epoch: receipt.lease_epoch,
+            receipt: serialized_receipt.to_owned(),
+        })
+    }
+
     /// Advances a work fence only with a lease bound to the same work
     /// assignment.
     pub fn advance_lease_epoch(
