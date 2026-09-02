@@ -8,8 +8,10 @@ Accepted — 2026-09-02
 The current relay is a connection-correlated transport: a socket loss can turn an
 already-forwarded request into a terminal route-loss failure. That is insufficient
 for restart-safe execution, unambiguous retries, or a fleet whose workers can be
-replaced. Its protocol v1 is replaced in place; there is no compatibility parser,
-version negotiation, or mixed-v1/v2 deployment.
+replaced. Its **frame schema** is replaced in place while retaining the existing
+`rsclaw.a2a.relay.v1` Hello `protocol` discriminator. There is no compatibility
+parser or version negotiation: an old-schema node and a durable-schema node are
+intentionally incompatible even though both identify with that discriminator.
 
 Google A2A remains the public interoperability surface, but its `Task` is not a
 sufficient internal execution record: A2A has no first-class attempt, work lease,
@@ -88,13 +90,16 @@ LLM, or agent effects. A timed-out or disconnected caller must query operation o
 Task state rather than submit a new operation ID. Retry policies apply only after
 a durable decision and never reinterpret an uncertain execution as not run.
 
-### Relay v2 frame and delivery contract
+### Relay frame and delivery contract
 
-The sole relay wire format is UTF-8 JSON object `RelayFrame` version `2` as
-specified in `docs/interfaces/a2a-durable-execution.md`. It has required envelope
-fields `v`, `frameId`, `fleetTeamId`, `machineId`, `sentAt`, `kind`, `seq`,
-`ack`, `cursor`, `route`, and `body`. Authentication binds the authenticated
-machine to `machineId`; receivers reject a different claimed ID. Unknown required
+The sole durable relay wire format is the UTF-8 JSON object `RelayFrame` specified
+in `docs/interfaces/a2a-durable-execution.md`. Its Hello `protocol` discriminator
+is exactly `rsclaw.a2a.relay.v1`; that retained discriminator does not preserve the
+old schema. Every frame has required envelope fields `frameId`, `fleetTeamId`,
+`machineId`, `sentAt`, `kind`, `seq`, `ack`, `cursor`, `route`, and `body`; the
+Hello body additionally has the required `protocol` discriminator. Authentication
+binds the authenticated machine to `machineId`; receivers reject a different
+claimed ID. Unknown required
 fields, missing fields, noncanonical IDs, unknown kinds, invalid state transitions,
 and frames over a configured limit are rejected without execution.
 
@@ -193,20 +198,33 @@ stops work until it verifies the promoted Hub's signed authority epoch; stale
 Hub epochs are fenced. Different fleets require distinct MachineIds/credentials
 or an explicit separate registration; routes and execution logs never merge.
 
-### Transition
+### Delivery milestones
 
-1. Add durable identity, authority epoch, execution, operation, event, lease, and
-   worker-ledger tables to the Hub's local redb with crash-recovery tests.
-2. Implement RelayFrame v2 and reject v1 at handshake before any route/dispatch;
-   release this as a coordinated all-Hub/all-worker cutover.
-3. Persist outbound frames and receipts, then add cursor replay, compaction floor,
-   and resync snapshots.
-4. Gate dispatch behind leases/fencing/reconciliation, then enable quarantine and
-   bounded route/wake controls.
-5. Replace production relay credentials with machine-key authentication; keep the
-   restricted loopback dev mode as a separately visible configuration.
-6. Document and rehearse passive-standby promotion. Do not advertise HA or
-   multi-master until a separately accepted replication/fencing design exists.
+**Milestone 1 — durable single-Hub dispatch (first implementable release).** Ship
+one authoritative Hub with local redb; stable MachineId/RepoId/WorkspaceId/
+FleetTeamId; durable TaskId -> AttemptId -> WorkId -> AgentId records;
+idempotent Create/Resume/Cancel operations; persisted outbound DispatchWork and
+Receipt with NotDelivered/DeliveryUnknown/Delivered classification; a basic
+unexpired worker lease and stale-epoch rejection; and durable Task snapshots that
+project to existing A2A GetTask/ListTasks/SSE. Replace the existing RelayFrame
+schema atomically while retaining Hello `protocol: "rsclaw.a2a.relay.v1"`. The Hub
+and every worker must upgrade in the same maintenance window: old-schema frames
+using that discriminator are rejected before route registration or dispatch. M1
+uses current authenticated transport only; it does not ship passive standby,
+production machine-key replacement, event replay/compaction, quarantine, or
+multi-home execution.
+
+**Later stages, in order.**
+
+2. Add event sequence ACK/cursor replay, replay floors, compaction, and mandatory
+   resync snapshots.
+3. Add lease renewal, full fencing/reconciliation, worker durable ledgers, Hub and
+   worker restart recovery, quarantine, and bounded route/wake controls.
+4. Replace production relay credentials with machine-key authentication and the
+   separately visible restricted loopback dev mode.
+5. Add passive-standby configuration and a manually fenced promotion drill.
+   Do not advertise HA or multi-master until a separately accepted
+   replication/fencing design exists.
 
 ### Verification requirements
 
@@ -224,5 +242,6 @@ The first durable deployment has a single write authority and therefore a planne
 availability limitation during Hub failure/promotion. In exchange it has explicit
 truth ownership, replayable state, safe uncertainty handling, and a path to later
 replication without pretending that a WebSocket reconnect supplies durability.
-Existing v1 relay clients must upgrade together; they will be rejected rather than
-silently downgraded.
+Existing old-schema relay clients must upgrade together; despite retaining the
+`rsclaw.a2a.relay.v1` discriminator, they are rejected rather than silently
+interpreted or downgraded.

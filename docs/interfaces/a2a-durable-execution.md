@@ -1,10 +1,22 @@
-# Durable A2A execution interface (RelayFrame v2)
+# Durable A2A execution interface (durable RelayFrame schema)
 
-**Status:** authoritative contract for ADR 0003. This replaces relay protocol v1
-in place. A v1 frame, a version-negotiation request, or a mixed-v1/v2 connection
-is a protocol error; no compatibility behavior exists.
+**Status:** authoritative contract for ADR 0003. This replaces the RelayFrame
+schema in place while retaining the existing Hello `protocol` discriminator:
+`rsclaw.a2a.relay.v1`. That string identifies this relay family, not a compatible
+frame layout. An old-schema frame, a version-negotiation request, or a mixed
+old-schema/durable-schema connection is a protocol error; no compatibility behavior
+exists.
 
 ## Normative conventions
+
+**Milestone 1 ships:** a single authoritative Hub with local redb, stable fleet/
+machine/repository/workspace identities, Task/Attempt/Work records, idempotent
+Create/Resume/Cancel, persisted dispatch/receipt delivery classification, a basic
+lease with stale-epoch rejection, and durable A2A task snapshots. The Hub and all
+workers cut over atomically to this schema. **Later stages:** event replay and
+compaction; full renew/fencing/reconciliation, restart recovery and quarantine;
+machine-key authentication plus restricted dev mode; then passive-standby promotion.
+M1 does not ship those later-stage capabilities.
 
 All IDs are non-empty, ASCII, canonical UUIDv7 or ULID strings (one format is
 selected by implementation configuration and remains stable per fleet). Timestamps
@@ -66,7 +78,6 @@ pub type LeaseEpoch = u64;
 pub type AuthorityEpoch = u64;
 
 pub struct RelayFrame {
-    pub v: u8,                       // exactly 2
     pub frame_id: FrameId,
     pub fleet_team_id: FleetTeamId,
     pub machine_id: MachineId,       // must equal authenticated peer identity
@@ -108,15 +119,16 @@ pub struct WorkLease {
 canonical request digest. `PromoteStandby` is manual and must fence the prior
 authority epoch; it is not automatic failover.
 
-## RelayFrame v2 JSON format
+## Durable RelayFrame JSON format
 
-Every frame has exactly these envelope fields; body fields are selected by `kind`.
+Every frame has exactly these envelope fields and body fields are selected by
+`kind`. The required `Hello.body.protocol` is exactly `rsclaw.a2a.relay.v1`,
+retained in its existing discriminator location; it does not select the old schema.
 `seq`, `ack`, and `cursor` are required even on Ping/Pong. `route` is required and
 may be `[]` only before the first Hub forward.
 
 ```json
 {
-  "v": 2,
   "frameId": "018f...",
   "fleetTeamId": "018f...",
   "machineId": "018f...",
@@ -156,8 +168,8 @@ never trusts a sender-provided route to authorize dispatch.
 
 | Kind | Required `body` fields | State effect |
 |---|---|---|
-| `Hello` | `authorityEpoch`, `auth`, `devMode` | authenticate only |
-| `HelloAck` | `authorityEpoch`, `connectionId`, `limits` | establishes v2 session |
+| `Hello` | `protocol` = `rsclaw.a2a.relay.v1`, `authorityEpoch`, `auth`, `devMode` | authenticate only |
+| `HelloAck` | `authorityEpoch`, `connectionId`, `limits` | establishes durable-schema session |
 | `RegisterAgent` | `agentId`, `agentGeneration`, `repoId`, `workspaceId`, `capabilities` | registration, no lease |
 | `Reconcile` | `workerLedger[]` with `workId`, `leaseEpoch`, `localState` | restart reconciliation |
 | `DispatchWork` | task/attempt/work/agent IDs, repo/workspace IDs, `lease`, `operationId`, `payload`, `hopsRemaining` | accepted outbound record; initially NotDelivered |
@@ -246,9 +258,13 @@ export type RelayKind = "Hello" | "HelloAck" | "RegisterAgent" | "Reconcile" |
 
 export interface RouteEntry { machineId: CanonicalId; routeEpoch: number }
 export interface RelayFrame {
-  v: 2; frameId: CanonicalId; fleetTeamId: CanonicalId; machineId: CanonicalId;
+  frameId: CanonicalId; fleetTeamId: CanonicalId; machineId: CanonicalId;
   sentAt: string; kind: RelayKind; seq: number; ack: number; cursor: number;
   route: RouteEntry[]; body: Record<string, unknown>;
+}
+export interface RelayHelloBody {
+  protocol: "rsclaw.a2a.relay.v1"; authorityEpoch: number;
+  auth: unknown; devMode: boolean;
 }
 export interface DurableTaskView {
   taskId: CanonicalId; attemptId?: CanonicalId; workId?: CanonicalId;
@@ -280,7 +296,7 @@ as ordered.
 
 ```rust
 pub enum DurableError {
-    UnsupportedVersion, AuthenticationFailed, AuthorizationDenied,
+    UnsupportedRelayProtocol, SchemaMismatch, AuthenticationFailed, AuthorizationDenied,
     InvalidFrame, InvalidIdentifier, InvalidTimestamp, UnknownKind,
     IdempotencyConflict, OperationExpired, StateConflict, Fenced,
     LeaseExpired, LeaseTokenInvalid, DeliveryUnknown, ReplayGap,
