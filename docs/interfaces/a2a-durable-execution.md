@@ -18,8 +18,8 @@ compaction; full renew/fencing/reconciliation, restart recovery and quarantine;
 machine-key authentication plus restricted dev mode; then passive-standby promotion.
 M1 does not ship those later-stage capabilities.
 
-All IDs are non-empty, ASCII, canonical UUIDv7 or ULID strings (one format is
-selected by implementation configuration and remains stable per fleet). Timestamps
+All durable IDs are non-empty, lowercase ASCII canonical UUID v4 strings. Human
+route aliases remain separate metadata and are never accepted as durable IDs. Timestamps
 are RFC 3339 UTC with milliseconds. Integers are unsigned. JSON fields use
 camelCase. A receiver rejects unknown `kind`, a missing required field, an invalid
 ID, duplicate JSON keys, a non-object top level, or a body not valid for its kind.
@@ -129,28 +129,28 @@ may be `[]` only before the first Hub forward.
 
 ```json
 {
-  "frameId": "018f...",
-  "fleetTeamId": "018f...",
-  "machineId": "018f...",
+  "frameId": "550e8400-e29b-41d4-a716-446655440000",
+  "fleetTeamId": "550e8400-e29b-41d4-a716-446655440000",
+  "machineId": "550e8400-e29b-41d4-a716-446655440000",
   "sentAt": "2026-09-02T07:28:00.000Z",
   "kind": "DispatchWork",
   "seq": 41,
   "ack": 39,
   "cursor": 918,
-  "route": [{ "machineId": "018f...", "routeEpoch": 7 }],
+  "route": [{ "machineId": "550e8400-e29b-41d4-a716-446655440000", "routeEpoch": 7 }],
   "body": {
-    "taskId": "018f...",
-    "attemptId": "018f...",
-    "workId": "018f...",
-    "agentId": "018f...",
-    "repoId": "018f...",
-    "workspaceId": "018f...",
+    "taskId": "550e8400-e29b-41d4-a716-446655440000",
+    "attemptId": "550e8400-e29b-41d4-a716-446655440000",
+    "workId": "550e8400-e29b-41d4-a716-446655440000",
+    "agentId": "550e8400-e29b-41d4-a716-446655440000",
+    "repoId": "550e8400-e29b-41d4-a716-446655440000",
+    "workspaceId": "550e8400-e29b-41d4-a716-446655440000",
     "lease": {
       "leaseEpoch": 12,
       "expiresAt": "2026-09-02T07:29:00.000Z",
       "leaseToken": "opaque-secret"
     },
-    "operationId": "018f...",
+    "operationId": "550e8400-e29b-41d4-a716-446655440000",
     "hopsRemaining": 4,
     "payload": { "encoding": "hub-visible-json", "value": {} }
   }

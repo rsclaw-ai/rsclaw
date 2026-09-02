@@ -77,7 +77,7 @@ exhausted retry budget -> `TASK_STATE_FAILED`. A retrying failure is still
 ### Exactly-once commands, not exactly-once effects
 
 Every mutating operation carries `(FleetTeamId, OperationId, actor)` where
-`OperationId` is an opaque UUID/ULID generated once by the initiator. The Hub
+`OperationId` is an opaque canonical UUID v4 generated once by the initiator. The Hub
 keeps an idempotency record keyed by `(actor, operation kind, OperationId)` with a
 canonical request digest and final/accepted result. Repeating the same key and
 digest returns the recorded result; the same key with a different digest is
