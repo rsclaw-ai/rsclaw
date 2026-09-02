@@ -6,7 +6,8 @@ use anyhow::{Context, Result, anyhow};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use rsclaw_a2a_types::types::{
     A2aArtifact, A2aMessage, A2aTask, AttemptRecord, DurableTaskRecord, OperationRecord,
-    PushNotificationConfig, TaskState, WorkLease, WorkRecord,
+    PushNotificationConfig, TaskEvent, TaskEventPage, TaskEventReplay, TaskEventState, TaskState,
+    WorkLease, WorkReceipt, WorkRecord,
 };
 use thiserror::Error;
 
@@ -24,90 +25,117 @@ const DURABLE_TASKS: TableDefinition<&str, &str> = TableDefinition::new("a2a_dur
 const ATTEMPTS: TableDefinition<&str, &str> = TableDefinition::new("a2a_attempts");
 const WORKS: TableDefinition<&str, &str> = TableDefinition::new("a2a_works");
 const OPERATIONS: TableDefinition<&str, &str> = TableDefinition::new("a2a_operations");
+/// Append-only task events keyed by canonical task ID and zero-padded sequence.
+const TASK_EVENTS: TableDefinition<&str, &str> = TableDefinition::new("a2a_task_events");
+/// Per-task event high-water mark and retained replay floor.
+const TASK_EVENT_STATES: TableDefinition<&str, &str> =
+    TableDefinition::new("a2a_task_event_states");
+/// Consumer cursors keyed by collision-safe task and consumer encoding.
+const TASK_EVENT_CURSORS: TableDefinition<&str, &str> =
+    TableDefinition::new("a2a_task_event_cursors");
+const MAX_EVENT_PAGE: usize = 1000;
+const MAX_EVENT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OPERATION_ACTOR_BYTES: usize = 512;
+const MAX_OPERATION_KIND_BYTES: usize = 64;
+const SHA256_HEX_BYTES: usize = 64;
 
+fn composite_key(parts: &[&str]) -> String {
+    let mut key = String::new();
+    for part in parts {
+        use std::fmt::Write as _;
+        write!(&mut key, "{}:{part}", part.len()).expect("writing to a String cannot fail");
+    }
+    key
+}
+
+fn event_key(task_id: &str, event_seq: u64) -> String {
+    format!("{task_id}:{event_seq:020}")
+}
+
+fn valid_request_digest(digest: &str) -> bool {
+    digest.len() == SHA256_HEX_BYTES
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Errors returned by durable execution persistence operations.
 #[derive(Debug, Error)]
 pub enum DurableStoreError {
+    /// An idempotency key was reused with a different request digest.
     #[error("idempotency conflict")]
     IdempotencyConflict,
+    /// Submitted records or cursors violate durable relationships.
     #[error("state conflict: {0}")]
     StateConflict(&'static str),
+    /// A mutation used a stale or invalid lease epoch.
     #[error("fenced by lease epoch {current_epoch}")]
     Fenced { current_epoch: u64 },
+    /// A receipt or renewal used an expired lease.
+    #[error("work lease expired")]
+    LeaseExpired,
+    /// A consumer cursor decreased or exceeded emitted events.
+    #[error("invalid consumer cursor: {0}")]
+    CursorConflict(&'static str),
+    /// A bounded request exceeded its hard maximum.
+    #[error("limit exceeded: {0}")]
+    LimitExceeded(&'static str),
+    /// Underlying storage or serialization failed.
     #[error(transparent)]
     Storage(#[from] anyhow::Error),
 }
 
+fn lease_expiry(
+    expires_at: &str,
+) -> std::result::Result<chrono::DateTime<chrono::Utc>, DurableStoreError> {
+    chrono::DateTime::parse_from_rfc3339(expires_at)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| DurableStoreError::StateConflict("lease expiry is not RFC 3339"))
+}
+
+fn ensure_unexpired_lease(expires_at: &str) -> std::result::Result<(), DurableStoreError> {
+    if lease_expiry(expires_at)? <= chrono::Utc::now() {
+        return Err(DurableStoreError::LeaseExpired);
+    }
+    Ok(())
+}
+
+/// The outcome of atomically admitting an idempotent operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationAdmission {
+    /// The operation and execution records were newly persisted.
     Applied(OperationRecord),
+    /// A matching prior operation was returned without mutation.
     Existing(OperationRecord),
 }
 
+/// redb-backed A2A task and inactive durable-execution foundation store.
 pub struct TaskStore {
     db: Database,
 }
 
 impl TaskStore {
+    /// Opens the authoritative task database, failing closed after one retry.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("create a2a store dir")?;
         }
         rsclaw_store::upgrade_legacy_if_needed(path)?;
-        // A2A tasks are ephemeral (completed-task records + push configs). If
-        // the existing file can't be opened by the current redb — e.g. a
-        // half-migrated format the legacy upgrader couldn't fix — move it aside
-        // and recreate fresh rather than crashing the gateway on boot. The bad
-        // file is preserved as `.broken-<ts>` for recovery, never deleted.
-        //
-        // BUT: transient I/O errors (permission, disk full, temporary lock)
-        // should NOT trigger a reset. We retry once after a short delay; only
-        // if the second attempt also fails do we move aside + recreate.
+        // Durable tables make this database authoritative. Retrying protects
+        // against transient opens, but every final failure is surfaced unchanged:
+        // moving aside or recreating could silently destroy execution history.
         let builder = Database::builder();
         let db = match rsclaw_store::create_with_lock_retry(&builder, path) {
             Ok(db) => db,
-            // Still locked after the full retry window — a second gateway is
-            // genuinely running against this base dir. Do NOT fall through to
-            // the "move aside + recreate" path below: that resets task history.
-            // Surface the conflict instead so the operator can stop the dupe.
-            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
-                anyhow::bail!(
-                    "a2a task store at {} is locked by another process after retry; \
-                     refusing to reset (is a second gateway running on this base dir?)",
-                    path.display()
-                );
-            }
             Err(first_err) => {
-                // Retry once after 500ms — the error may be transient (disk
-                // hiccup, OS file lock release race).
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %first_err,
-                    "a2a task store open failed, retrying in 500ms"
-                );
+                tracing::warn!(path = %path.display(), error = %first_err, "a2a task store open failed, retrying");
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                match rsclaw_store::create_with_lock_retry(&builder, path) {
-                    Ok(db) => db,
-                    Err(_second_err) => {
-                        // Two consecutive failures — treat as corruption and
-                        // move aside rather than crashing the gateway.
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let aside = path.with_extension(format!("redb.broken-{ts}"));
-                        tracing::error!(
-                            path = %path.display(),
-                            moved_to = %aside.display(),
-                            first_error = %first_err,
-                            "a2a task store unopenable after retry; moving aside and recreating (task history reset)"
-                        );
-                        if path.exists() {
-                            std::fs::rename(path, &aside)
-                                .context("move aside unopenable a2a task store")?;
-                        }
-                        Database::create(path).context("recreate a2a task redb")?
-                    }
-                }
+                rsclaw_store::create_with_lock_retry(&builder, path).map_err(|second_err| {
+                    anyhow!(
+                        "failed to open durable a2a task store at {} after retry: {second_err}",
+                        path.display()
+                    )
+                })?
             }
         };
         let txn = db.begin_write()?;
@@ -119,6 +147,9 @@ impl TaskStore {
             let _ = txn.open_table(ATTEMPTS)?;
             let _ = txn.open_table(WORKS)?;
             let _ = txn.open_table(OPERATIONS)?;
+            let _ = txn.open_table(TASK_EVENTS)?;
+            let _ = txn.open_table(TASK_EVENT_STATES)?;
+            let _ = txn.open_table(TASK_EVENT_CURSORS)?;
         }
         txn.commit()?;
         Ok(Self { db })
@@ -376,28 +407,78 @@ impl TaskStore {
         Ok(n)
     }
 
-    /// Atomically admit an operation and its Task -> Attempt -> Work records.
-    /// A replay with the same key and digest returns the original result; a
-    /// different digest is rejected without changing any table.
+    /// Atomically admits an operation, its Task -> Attempt -> Work records, and
+    /// the first durable task event. A matching operation replay returns the
+    /// original record; a digest mismatch is rejected without mutation.
     pub fn create_execution(
         &self,
         operation: &OperationRecord,
         task: &DurableTaskRecord,
         attempt: &AttemptRecord,
         work: &WorkRecord,
+        initial_event_payload: &str,
     ) -> std::result::Result<OperationAdmission, DurableStoreError> {
         if attempt.task_id != task.task_id
             || work.task_id != task.task_id
             || work.attempt_id != attempt.attempt_id
+            || operation.task_id != task.task_id
+            || operation.attempt_id != attempt.attempt_id
+            || operation.work_id != work.work_id
+            || task.current_attempt_id.as_ref() != Some(&attempt.attempt_id)
+            || work.lease.task_id != work.task_id
+            || work.lease.attempt_id != work.attempt_id
+            || work.lease.work_id != work.work_id
+            || work.lease.agent_id != work.agent_id
+            || work.lease.assigned_machine_id != work.assigned_machine_id
         {
             return Err(DurableStoreError::StateConflict(
-                "invalid task/attempt/work relationship",
+                "invalid task, attempt, work, operation, or lease relationship",
             ));
         }
+        if operation.key.actor.is_empty()
+            || operation.key.actor.len() > MAX_OPERATION_ACTOR_BYTES
+            || operation.key.kind.is_empty()
+            || operation.key.kind.len() > MAX_OPERATION_KIND_BYTES
+            || !valid_request_digest(&operation.request_digest)
+        {
+            return Err(DurableStoreError::StateConflict(
+                "invalid operation identity or request digest",
+            ));
+        }
+        if work.lease.lease_epoch == 0
+            || work.lease.expires_at.is_empty()
+            || work.lease.lease_token.is_empty()
+            || work.delivery_state != rsclaw_a2a_types::types::DeliveryState::NotDelivered
+            || work.outbound_dispatch.is_some()
+            || work.receipt.is_some()
+        {
+            return Err(DurableStoreError::StateConflict(
+                "new work must have a valid unacknowledged lease",
+            ));
+        }
+        ensure_unexpired_lease(&work.lease.expires_at)?;
+        if initial_event_payload.len() > MAX_EVENT_PAYLOAD_BYTES {
+            return Err(DurableStoreError::LimitExceeded(
+                "initial task event payload is too large",
+            ));
+        }
+
+        let initial_event = TaskEvent {
+            task_id: task.task_id.clone(),
+            event_seq: 1,
+            payload: initial_event_payload.to_owned(),
+        };
         let operation_json = serde_json::to_string(operation).map_err(anyhow::Error::from)?;
         let task_json = serde_json::to_string(task).map_err(anyhow::Error::from)?;
         let attempt_json = serde_json::to_string(attempt).map_err(anyhow::Error::from)?;
         let work_json = serde_json::to_string(work).map_err(anyhow::Error::from)?;
+        let initial_event_json =
+            serde_json::to_string(&initial_event).map_err(anyhow::Error::from)?;
+        let event_state_json = serde_json::to_string(&TaskEventState {
+            high_water: 1,
+            replay_floor: 0,
+        })
+        .map_err(anyhow::Error::from)?;
         let key = operation.key.storage_key();
         let txn = self.db.begin_write().map_err(anyhow::Error::from)?;
         let admission = {
@@ -439,6 +520,17 @@ impl TaskStore {
                 works
                     .insert(work.work_id.as_str(), work_json.as_str())
                     .map_err(anyhow::Error::from)?;
+                txn.open_table(TASK_EVENTS)
+                    .map_err(anyhow::Error::from)?
+                    .insert(
+                        event_key(task.task_id.as_str(), 1).as_str(),
+                        initial_event_json.as_str(),
+                    )
+                    .map_err(anyhow::Error::from)?;
+                txn.open_table(TASK_EVENT_STATES)
+                    .map_err(anyhow::Error::from)?
+                    .insert(task.task_id.as_str(), event_state_json.as_str())
+                    .map_err(anyhow::Error::from)?;
                 operations
                     .insert(key.as_str(), operation_json.as_str())
                     .map_err(anyhow::Error::from)?;
@@ -449,6 +541,7 @@ impl TaskStore {
         Ok(admission)
     }
 
+    /// Returns a durable work record by identity.
     pub fn durable_work(&self, work_id: &str) -> Result<Option<WorkRecord>> {
         let txn = self.db.begin_read()?;
         let works = txn.open_table(WORKS)?;
@@ -458,29 +551,328 @@ impl TaskStore {
             .transpose()
     }
 
-    /// Persist that a DispatchWork frame entered the outbound transport log.
-    /// Until a matching receipt this is deliberately DeliveryUnknown.
-    pub fn record_outbound_dispatch(&self, work_id: &str, dispatch: &str) -> Result<()> {
-        self.update_work(work_id, |work| {
-            work.outbound_dispatch = dispatch.to_owned();
+    /// Allocates and appends one immutable event in the same transaction.
+    pub fn append_task_event(
+        &self,
+        task_id: &rsclaw_a2a_types::types::TaskId,
+        payload: &str,
+    ) -> std::result::Result<TaskEvent, DurableStoreError> {
+        if payload.len() > MAX_EVENT_PAYLOAD_BYTES {
+            return Err(DurableStoreError::LimitExceeded(
+                "task event payload is too large",
+            ));
+        }
+        let txn = self.db.begin_write().map_err(anyhow::Error::from)?;
+        let event = {
+            if txn
+                .open_table(DURABLE_TASKS)
+                .map_err(anyhow::Error::from)?
+                .get(task_id.as_str())
+                .map_err(anyhow::Error::from)?
+                .is_none()
+            {
+                return Err(DurableStoreError::StateConflict("task not found"));
+            }
+            let mut states = txn
+                .open_table(TASK_EVENT_STATES)
+                .map_err(anyhow::Error::from)?;
+            let mut state: TaskEventState = states
+                .get(task_id.as_str())
+                .map_err(anyhow::Error::from)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()
+                .map_err(anyhow::Error::from)?
+                .ok_or(DurableStoreError::StateConflict(
+                    "task event state not found",
+                ))?;
+            state.high_water = state
+                .high_water
+                .checked_add(1)
+                .ok_or(DurableStoreError::StateConflict("event sequence exhausted"))?;
+            let event = TaskEvent {
+                task_id: task_id.clone(),
+                event_seq: state.high_water,
+                payload: payload.to_owned(),
+            };
+            let event_json = serde_json::to_string(&event).map_err(anyhow::Error::from)?;
+            txn.open_table(TASK_EVENTS)
+                .map_err(anyhow::Error::from)?
+                .insert(
+                    event_key(task_id.as_str(), event.event_seq).as_str(),
+                    event_json.as_str(),
+                )
+                .map_err(anyhow::Error::from)?;
+            let state_json = serde_json::to_string(&state).map_err(anyhow::Error::from)?;
+            states
+                .insert(task_id.as_str(), state_json.as_str())
+                .map_err(anyhow::Error::from)?;
+            event
+        };
+        txn.commit().map_err(anyhow::Error::from)?;
+        Ok(event)
+    }
+
+    /// Returns no more than 1,000 ordered events strictly after `after`, or
+    /// resync metadata for a compacted gap.
+    pub fn events_after(
+        &self,
+        task_id: &rsclaw_a2a_types::types::TaskId,
+        after: u64,
+        limit: usize,
+    ) -> std::result::Result<TaskEventReplay, DurableStoreError> {
+        let txn = self.db.begin_read().map_err(anyhow::Error::from)?;
+        let states = txn
+            .open_table(TASK_EVENT_STATES)
+            .map_err(anyhow::Error::from)?;
+        let state: TaskEventState = states
+            .get(task_id.as_str())
+            .map_err(anyhow::Error::from)?
+            .map(|v| serde_json::from_str(v.value()))
+            .transpose()
+            .map_err(anyhow::Error::from)?
+            .ok_or(DurableStoreError::StateConflict("task not found"))?;
+        if after < state.replay_floor {
+            return Ok(TaskEventReplay::ResyncRequired {
+                replay_floor: state.replay_floor,
+                high_water: state.high_water,
+            });
+        }
+        if limit > MAX_EVENT_PAGE {
+            return Err(DurableStoreError::LimitExceeded(
+                "task event replay page exceeds 1,000 entries",
+            ));
+        }
+        let Some(first_seq) = after.checked_add(1) else {
+            return Ok(TaskEventReplay::Events(TaskEventPage {
+                events: Vec::new(),
+                high_water: state.high_water,
+            }));
+        };
+        let prefix = format!("{}:", task_id.as_str());
+        let start = event_key(task_id.as_str(), first_seq);
+        let events_table = txn.open_table(TASK_EVENTS).map_err(anyhow::Error::from)?;
+        let mut events = Vec::with_capacity(limit);
+        for entry in events_table
+            .range(start.as_str()..)
+            .map_err(anyhow::Error::from)?
+        {
+            let (key, value) = entry.map_err(anyhow::Error::from)?;
+            if !key.value().starts_with(&prefix) || events.len() == limit {
+                break;
+            }
+            events.push(serde_json::from_str(value.value()).map_err(anyhow::Error::from)?);
+        }
+        Ok(TaskEventReplay::Events(TaskEventPage {
+            events,
+            high_water: state.high_water,
+        }))
+    }
+
+    /// Advances a consumer's contiguous cursor, rejecting decreases and values
+    /// above the task high-water mark.
+    pub fn acknowledge_events(
+        &self,
+        task_id: &rsclaw_a2a_types::types::TaskId,
+        consumer: &str,
+        cursor: u64,
+    ) -> std::result::Result<(), DurableStoreError> {
+        if consumer.is_empty() || consumer.len() > MAX_OPERATION_ACTOR_BYTES {
+            return Err(DurableStoreError::CursorConflict(
+                "consumer identity is empty or too large",
+            ));
+        }
+        let txn = self.db.begin_write().map_err(anyhow::Error::from)?;
+        {
+            let state: TaskEventState = txn
+                .open_table(TASK_EVENT_STATES)
+                .map_err(anyhow::Error::from)?
+                .get(task_id.as_str())
+                .map_err(anyhow::Error::from)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()
+                .map_err(anyhow::Error::from)?
+                .ok_or(DurableStoreError::StateConflict("task not found"))?;
+            if cursor > state.high_water {
+                return Err(DurableStoreError::CursorConflict(
+                    "cursor exceeds high-water",
+                ));
+            }
+            if cursor < state.replay_floor {
+                return Err(DurableStoreError::CursorConflict(
+                    "cursor precedes replay floor",
+                ));
+            }
+            let key = composite_key(&[task_id.as_str(), consumer]);
+            let mut cursors = txn
+                .open_table(TASK_EVENT_CURSORS)
+                .map_err(anyhow::Error::from)?;
+            if let Some(previous) = cursors.get(key.as_str()).map_err(anyhow::Error::from)? {
+                if cursor
+                    < previous
+                        .value()
+                        .parse::<u64>()
+                        .map_err(anyhow::Error::from)?
+                {
+                    return Err(DurableStoreError::CursorConflict("cursor moved backwards"));
+                }
+            }
+            let value = cursor.to_string();
+            cursors
+                .insert(key.as_str(), value.as_str())
+                .map_err(anyhow::Error::from)?;
+        }
+        txn.commit().map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    /// Returns the durable cursor for one task consumer.
+    pub fn event_cursor(
+        &self,
+        task_id: &rsclaw_a2a_types::types::TaskId,
+        consumer: &str,
+    ) -> std::result::Result<Option<u64>, DurableStoreError> {
+        let key = composite_key(&[task_id.as_str(), consumer]);
+        let txn = self.db.begin_read().map_err(anyhow::Error::from)?;
+        let cursors = txn
+            .open_table(TASK_EVENT_CURSORS)
+            .map_err(anyhow::Error::from)?;
+        cursors
+            .get(key.as_str())
+            .map_err(anyhow::Error::from)?
+            .map(|value| value.value().parse::<u64>().map_err(anyhow::Error::from))
+            .transpose()
+            .map_err(DurableStoreError::Storage)
+    }
+
+    /// Returns the durable event high-water mark and replay floor for a task.
+    pub fn task_event_state(
+        &self,
+        task_id: &rsclaw_a2a_types::types::TaskId,
+    ) -> std::result::Result<Option<TaskEventState>, DurableStoreError> {
+        let txn = self.db.begin_read().map_err(anyhow::Error::from)?;
+        let states = txn
+            .open_table(TASK_EVENT_STATES)
+            .map_err(anyhow::Error::from)?;
+        states
+            .get(task_id.as_str())
+            .map_err(anyhow::Error::from)?
+            .map(|value| serde_json::from_str(value.value()).map_err(anyhow::Error::from))
+            .transpose()
+            .map_err(DurableStoreError::Storage)
+    }
+
+    /// Advances the logical replay floor; callers must compact payloads
+    /// separately and never move it backwards.
+    pub fn advance_replay_floor(
+        &self,
+        task_id: &rsclaw_a2a_types::types::TaskId,
+        replay_floor: u64,
+    ) -> std::result::Result<(), DurableStoreError> {
+        let txn = self.db.begin_write().map_err(anyhow::Error::from)?;
+        {
+            let cursor_prefix = composite_key(&[task_id.as_str()]);
+            let cursors = txn
+                .open_table(TASK_EVENT_CURSORS)
+                .map_err(anyhow::Error::from)?;
+            for entry in cursors
+                .range(cursor_prefix.as_str()..)
+                .map_err(anyhow::Error::from)?
+            {
+                let (key, value) = entry.map_err(anyhow::Error::from)?;
+                if !key.value().starts_with(&cursor_prefix) {
+                    break;
+                }
+                let cursor = value.value().parse::<u64>().map_err(anyhow::Error::from)?;
+                if cursor < replay_floor {
+                    return Err(DurableStoreError::CursorConflict(
+                        "replay floor exceeds an active consumer cursor",
+                    ));
+                }
+            }
+            drop(cursors);
+            let mut states = txn
+                .open_table(TASK_EVENT_STATES)
+                .map_err(anyhow::Error::from)?;
+            let mut state: TaskEventState = states
+                .get(task_id.as_str())
+                .map_err(anyhow::Error::from)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()
+                .map_err(anyhow::Error::from)?
+                .ok_or(DurableStoreError::StateConflict("task not found"))?;
+            if replay_floor < state.replay_floor || replay_floor > state.high_water {
+                return Err(DurableStoreError::StateConflict("invalid replay floor"));
+            }
+            state.replay_floor = replay_floor;
+            let json = serde_json::to_string(&state).map_err(anyhow::Error::from)?;
+            states
+                .insert(task_id.as_str(), json.as_str())
+                .map_err(anyhow::Error::from)?;
+        }
+        txn.commit().map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    /// Persists that a dispatch entered the outbound log and is
+    /// delivery-unknown until receipt. Identical repeats are idempotent;
+    /// conflicting payloads are rejected.
+    pub fn record_outbound_dispatch(
+        &self,
+        work_id: &str,
+        dispatch: &str,
+    ) -> std::result::Result<(), DurableStoreError> {
+        if dispatch.len() > MAX_EVENT_PAYLOAD_BYTES {
+            return Err(DurableStoreError::LimitExceeded(
+                "outbound dispatch is too large",
+            ));
+        }
+        self.update_durable_work(work_id, |work| {
+            if let Some(existing) = &work.outbound_dispatch {
+                if existing != dispatch {
+                    return Err(DurableStoreError::StateConflict(
+                        "conflicting outbound dispatch",
+                    ));
+                }
+                return Ok(());
+            }
+            if work.delivery_state != rsclaw_a2a_types::types::DeliveryState::NotDelivered {
+                return Err(DurableStoreError::StateConflict(
+                    "dispatch state changed without an outbound record",
+                ));
+            }
+            work.outbound_dispatch = Some(dispatch.to_owned());
             work.delivery_state = rsclaw_a2a_types::types::DeliveryState::DeliveryUnknown;
             Ok(())
         })
     }
 
-    /// Persist an authenticated receipt. A lower lease epoch is fenced; a
-    /// duplicate receipt at the current epoch is a no-op when identical.
+    /// Persists a receipt only when its typed task, attempt, work, agent,
+    /// machine, and epoch binding matches the current unexpired lease.
     pub fn record_receipt(
         &self,
-        work_id: &str,
-        lease_epoch: u64,
-        receipt: &str,
+        receipt: &WorkReceipt,
     ) -> std::result::Result<(), DurableStoreError> {
-        self.update_durable_work(work_id, |work| {
-            if lease_epoch != work.lease.lease_epoch {
+        self.update_durable_work(receipt.work_id.as_str(), |work| {
+            if receipt.task_id != work.task_id
+                || receipt.attempt_id != work.attempt_id
+                || receipt.work_id != work.work_id
+                || receipt.agent_id != work.agent_id
+                || receipt.machine_id != work.assigned_machine_id
+            {
+                return Err(DurableStoreError::StateConflict(
+                    "receipt binding does not match work",
+                ));
+            }
+            if receipt.lease_epoch != work.lease.lease_epoch {
                 return Err(DurableStoreError::Fenced {
                     current_epoch: work.lease.lease_epoch,
                 });
+            }
+            ensure_unexpired_lease(&work.lease.expires_at)?;
+            if work.outbound_dispatch.is_none() {
+                return Err(DurableStoreError::StateConflict(
+                    "receipt arrived before outbound dispatch",
+                ));
             }
             if let Some(existing) = &work.receipt {
                 if existing != receipt {
@@ -488,13 +880,14 @@ impl TaskStore {
                 }
                 return Ok(());
             }
-            work.receipt = Some(receipt.to_owned());
+            work.receipt = Some(receipt.clone());
             work.delivery_state = rsclaw_a2a_types::types::DeliveryState::Delivered;
             Ok(())
         })
     }
 
-    /// Advance a work fence. Epochs never move backwards or remain unchanged.
+    /// Advances a work fence only with a lease bound to the same work
+    /// assignment.
     pub fn advance_lease_epoch(
         &self,
         work_id: &str,
@@ -507,20 +900,25 @@ impl TaskStore {
                     current_epoch: work.lease.lease_epoch,
                 });
             }
+            if lease.task_id != work.task_id
+                || lease.attempt_id != work.attempt_id
+                || lease.work_id != work.work_id
+                || lease.agent_id != work.agent_id
+                || lease.assigned_machine_id != work.assigned_machine_id
+                || lease.lease_token.is_empty()
+            {
+                return Err(DurableStoreError::StateConflict(
+                    "lease binding does not match work",
+                ));
+            }
+            ensure_unexpired_lease(&lease.expires_at)?;
             work.lease = lease;
+            work.state = rsclaw_a2a_types::types::WorkState::Recovering;
+            work.delivery_state = rsclaw_a2a_types::types::DeliveryState::NotDelivered;
+            work.outbound_dispatch = None;
+            work.receipt = None;
             Ok(())
         })
-    }
-
-    fn update_work(
-        &self,
-        work_id: &str,
-        update: impl FnOnce(&mut WorkRecord) -> Result<()>,
-    ) -> Result<()> {
-        self.update_durable_work(work_id, |work| {
-            update(work).map_err(DurableStoreError::Storage)
-        })
-        .map_err(|error| anyhow!(error))
     }
 
     fn update_durable_work(
@@ -612,36 +1010,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn durable_execution_is_idempotent_and_recovers_after_reopen() {
-        use rsclaw_a2a_types::types::*;
+    use rsclaw_a2a_types::types::{
+        AgentId, AttemptId, AttemptState, DeliveryState, FleetTeamId, LeaseToken, MachineId,
+        OperationId, OperationKey, RepoId, TaskEventReplay, TaskId, WorkId, WorkReceipt, WorkState,
+        WorkspaceId,
+    };
 
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("tasks.redb");
+    fn future_timestamp(minutes: i64) -> String {
+        (chrono::Utc::now() + chrono::Duration::minutes(minutes))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    fn sample_execution() -> (
+        DurableTaskRecord,
+        AttemptRecord,
+        WorkRecord,
+        OperationRecord,
+    ) {
+        let task_id = TaskId::new();
+        let attempt_id = AttemptId::new();
+        let work_id = WorkId::new();
+        let agent_id = AgentId::new();
+        let machine_id = MachineId::new();
         let task = DurableTaskRecord {
-            task_id: TaskId::new(),
+            task_id: task_id.clone(),
             fleet_team_id: FleetTeamId::new(),
-            created_at: "2026-09-02T07:36:00.000Z".to_owned(),
-            current_attempt_id: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            current_attempt_id: Some(attempt_id.clone()),
         };
         let attempt = AttemptRecord {
-            attempt_id: AttemptId::new(),
-            task_id: task.task_id.clone(),
+            attempt_id: attempt_id.clone(),
+            task_id: task_id.clone(),
             state: AttemptState::Active,
-            created_at: "2026-09-02T07:36:00.000Z".to_owned(),
+            created_at: chrono::Utc::now().to_rfc3339(),
         };
         let work = WorkRecord {
-            work_id: WorkId::new(),
-            attempt_id: attempt.attempt_id.clone(),
-            task_id: task.task_id.clone(),
-            agent_id: AgentId::new(),
+            work_id: work_id.clone(),
+            attempt_id: attempt_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: agent_id.clone(),
+            assigned_machine_id: machine_id.clone(),
+            assigned_repo_id: RepoId::new(),
+            assigned_workspace_id: WorkspaceId::new(),
             state: WorkState::Leased,
             delivery_state: DeliveryState::NotDelivered,
             lease: WorkLease {
+                task_id: task_id.clone(),
+                attempt_id: attempt_id.clone(),
+                work_id: work_id.clone(),
+                agent_id: agent_id.clone(),
+                assigned_machine_id: machine_id,
                 lease_epoch: 1,
-                expires_at: "2026-09-02T07:37:00.000Z".to_owned(),
+                expires_at: future_timestamp(10),
+                lease_token: LeaseToken::new("lease-1"),
             },
-            outbound_dispatch: "dispatch-1".to_owned(),
+            outbound_dispatch: None,
             receipt: None,
         };
         let operation = OperationRecord {
@@ -650,68 +1073,215 @@ mod tests {
                 kind: "CreateTask".to_owned(),
                 operation_id: OperationId::new(),
             },
-            request_digest: "request-a".to_owned(),
+            task_id,
+            attempt_id,
+            work_id,
+            request_digest: "a".repeat(SHA256_HEX_BYTES),
             result: "accepted".to_owned(),
         };
+        (task, attempt, work, operation)
+    }
 
-        let store = TaskStore::open(&path).unwrap();
+    fn receipt_for(work: &WorkRecord, value: &str) -> WorkReceipt {
+        WorkReceipt {
+            task_id: work.task_id.clone(),
+            attempt_id: work.attempt_id.clone(),
+            work_id: work.work_id.clone(),
+            agent_id: work.agent_id.clone(),
+            machine_id: work.assigned_machine_id.clone(),
+            lease_epoch: work.lease.lease_epoch,
+            receipt: value.to_owned(),
+        }
+    }
+
+    #[test]
+    fn durable_execution_is_idempotent_fenced_and_recovered_after_reopen() {
+        let tmp = tempfile::tempdir().expect("create temp directory");
+        let path = tmp.path().join("tasks.redb");
+        let (task, attempt, work, operation) = sample_execution();
+        let store = TaskStore::open(&path).expect("open durable task store");
+
         assert!(matches!(
             store
-                .create_execution(&operation, &task, &attempt, &work)
-                .unwrap(),
+                .create_execution(&operation, &task, &attempt, &work, "submitted")
+                .expect("admit first operation"),
             OperationAdmission::Applied(_)
         ));
         assert!(matches!(
             store
-                .create_execution(&operation, &task, &attempt, &work)
-                .unwrap(),
+                .create_execution(&operation, &task, &attempt, &work, "ignored duplicate")
+                .expect("deduplicate operation"),
             OperationAdmission::Existing(_)
         ));
         let mut conflict = operation.clone();
-        conflict.request_digest = "request-b".to_owned();
+        conflict.request_digest = "b".repeat(SHA256_HEX_BYTES);
         assert!(matches!(
-            store.create_execution(&conflict, &task, &attempt, &work),
+            store.create_execution(&conflict, &task, &attempt, &work, "conflict"),
             Err(DurableStoreError::IdempotencyConflict)
         ));
-        store
-            .record_outbound_dispatch(work.work_id.as_str(), "dispatch-2")
-            .unwrap();
+
+        let receipt = receipt_for(&work, "receipt-1");
         assert!(matches!(
-            store.record_receipt(work.work_id.as_str(), 0, "receipt"),
-            Err(DurableStoreError::Fenced { .. })
+            store.record_receipt(&receipt),
+            Err(DurableStoreError::StateConflict(
+                "receipt arrived before outbound dispatch"
+            ))
         ));
         store
-            .record_receipt(work.work_id.as_str(), 1, "receipt")
-            .unwrap();
+            .record_outbound_dispatch(work.work_id.as_str(), "dispatch-1")
+            .expect("persist outbound dispatch");
+        store
+            .record_outbound_dispatch(work.work_id.as_str(), "dispatch-1")
+            .expect("deduplicate outbound dispatch");
+        assert!(matches!(
+            store.record_outbound_dispatch(work.work_id.as_str(), "dispatch-2"),
+            Err(DurableStoreError::StateConflict(
+                "conflicting outbound dispatch"
+            ))
+        ));
+        let mut stale_receipt = receipt.clone();
+        stale_receipt.lease_epoch = 0;
+        assert!(matches!(
+            store.record_receipt(&stale_receipt),
+            Err(DurableStoreError::Fenced { current_epoch: 1 })
+        ));
+        store
+            .record_receipt(&receipt)
+            .expect("persist matching receipt");
+        store
+            .record_receipt(&receipt)
+            .expect("deduplicate matching receipt");
+        let mut conflicting_receipt = receipt.clone();
+        conflicting_receipt.receipt = "receipt-2".to_owned();
+        assert!(matches!(
+            store.record_receipt(&conflicting_receipt),
+            Err(DurableStoreError::StateConflict("conflicting receipt"))
+        ));
         drop(store);
 
-        let reopened = TaskStore::open(&path).unwrap();
+        let reopened = TaskStore::open(&path).expect("reopen durable task store");
         let recovered = reopened
             .durable_work(work.work_id.as_str())
-            .unwrap()
-            .unwrap();
+            .expect("load work")
+            .expect("work exists");
         assert_eq!(recovered.delivery_state, DeliveryState::Delivered);
-        assert_eq!(recovered.receipt.as_deref(), Some("receipt"));
+        assert_eq!(recovered.receipt.as_ref(), Some(&receipt));
+
+        let mut renewed = work.lease.clone();
+        renewed.lease_epoch = 2;
+        renewed.expires_at = future_timestamp(20);
+        renewed.lease_token = LeaseToken::new("lease-2");
         assert!(matches!(
-            reopened.advance_lease_epoch(
-                work.work_id.as_str(),
-                1,
-                WorkLease {
-                    lease_epoch: 1,
-                    expires_at: "later".to_owned()
-                }
-            ),
-            Err(DurableStoreError::Fenced { .. })
+            reopened.advance_lease_epoch(work.work_id.as_str(), 0, renewed.clone()),
+            Err(DurableStoreError::Fenced { current_epoch: 1 })
         ));
         reopened
-            .advance_lease_epoch(
-                work.work_id.as_str(),
-                1,
-                WorkLease {
-                    lease_epoch: 2,
-                    expires_at: "later".to_owned(),
-                },
-            )
-            .unwrap();
+            .advance_lease_epoch(work.work_id.as_str(), 1, renewed)
+            .expect("advance work fence");
+        let fenced = reopened
+            .durable_work(work.work_id.as_str())
+            .expect("load fenced work")
+            .expect("fenced work exists");
+        assert_eq!(fenced.lease.lease_epoch, 2);
+        assert_eq!(fenced.state, WorkState::Recovering);
+        assert_eq!(fenced.delivery_state, DeliveryState::NotDelivered);
+        assert!(fenced.outbound_dispatch.is_none());
+        assert!(fenced.receipt.is_none());
+    }
+
+    #[test]
+    fn durable_event_replay_cursor_and_resync_survive_reopen() {
+        let tmp = tempfile::tempdir().expect("create temp directory");
+        let path = tmp.path().join("tasks.redb");
+        let (task, attempt, work, operation) = sample_execution();
+        let store = TaskStore::open(&path).expect("open durable task store");
+        store
+            .create_execution(&operation, &task, &attempt, &work, "submitted")
+            .expect("admit execution");
+        let second = store
+            .append_task_event(&task.task_id, "working")
+            .expect("append second event");
+        let third = store
+            .append_task_event(&task.task_id, "completed")
+            .expect("append third event");
+        assert_eq!((second.event_seq, third.event_seq), (2, 3));
+
+        let replay = store
+            .events_after(&task.task_id, 1, 1)
+            .expect("replay bounded suffix");
+        let TaskEventReplay::Events(page) = replay else {
+            panic!("expected replay page");
+        };
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event_seq, 2);
+        assert_eq!(page.high_water, 3);
+        assert!(matches!(
+            store.events_after(&task.task_id, 0, MAX_EVENT_PAGE + 1),
+            Err(DurableStoreError::LimitExceeded(_))
+        ));
+
+        store
+            .acknowledge_events(&task.task_id, "consumer-a", 2)
+            .expect("advance cursor");
+        assert!(matches!(
+            store.acknowledge_events(&task.task_id, "consumer-a", 1),
+            Err(DurableStoreError::CursorConflict("cursor moved backwards"))
+        ));
+        assert!(matches!(
+            store.acknowledge_events(&task.task_id, "consumer-a", 4),
+            Err(DurableStoreError::CursorConflict(
+                "cursor exceeds high-water"
+            ))
+        ));
+        assert!(matches!(
+            store.advance_replay_floor(&task.task_id, 3),
+            Err(DurableStoreError::CursorConflict(_))
+        ));
+        store
+            .acknowledge_events(&task.task_id, "consumer-a", 3)
+            .expect("acknowledge terminal event");
+        store
+            .advance_replay_floor(&task.task_id, 3)
+            .expect("advance replay floor");
+        assert!(matches!(
+            store.events_after(&task.task_id, 2, 10),
+            Ok(TaskEventReplay::ResyncRequired {
+                replay_floor: 3,
+                high_water: 3
+            })
+        ));
+        drop(store);
+
+        let reopened = TaskStore::open(&path).expect("reopen durable task store");
+        assert_eq!(
+            reopened
+                .event_cursor(&task.task_id, "consumer-a")
+                .expect("load consumer cursor"),
+            Some(3)
+        );
+        assert_eq!(
+            reopened
+                .task_event_state(&task.task_id)
+                .expect("load event state"),
+            Some(TaskEventState {
+                high_water: 3,
+                replay_floor: 3
+            })
+        );
+    }
+
+    #[test]
+    fn durable_store_refuses_to_replace_corrupt_history() {
+        let tmp = tempfile::tempdir().expect("create temp directory");
+        let path = tmp.path().join("tasks.redb");
+        let original = b"not-a-redb-database";
+        std::fs::write(&path, original).expect("write corrupt fixture");
+
+        assert!(TaskStore::open(&path).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("read corrupt fixture"),
+            original
+        );
+        assert!(!tmp.path().join("tasks.redb.broken").exists());
     }
 }

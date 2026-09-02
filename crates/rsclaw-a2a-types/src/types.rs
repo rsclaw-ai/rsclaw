@@ -237,16 +237,19 @@ impl fmt::Display for InvalidCanonicalId {
 impl std::error::Error for InvalidCanonicalId {}
 
 macro_rules! durable_id {
-    ($name:ident) => {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
         impl $name {
+            /// Generates a new canonical UUID v4 identity.
             pub fn new() -> Self {
                 Self(Uuid::new_v4().to_string())
             }
 
+            /// Parses a lowercase canonical UUID v4 identity.
             pub fn parse(value: impl AsRef<str>) -> Result<Self, InvalidCanonicalId> {
                 let value = value.as_ref();
                 let parsed = Uuid::parse_str(value).map_err(|_| InvalidCanonicalId)?;
@@ -256,74 +259,109 @@ macro_rules! durable_id {
                 Ok(Self(value.to_owned()))
             }
 
+            /// Returns the canonical UUID string.
             pub fn as_str(&self) -> &str {
                 &self.0
             }
         }
 
         impl Default for $name {
-            fn default() -> Self {
-                Self::new()
-            }
+            fn default() -> Self { Self::new() }
         }
 
         impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(&self.0)
-            }
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.0) }
         }
 
         impl FromStr for $name {
             type Err = InvalidCanonicalId;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Self::parse(value)
-            }
+            fn from_str(value: &str) -> Result<Self, Self::Err> { Self::parse(value) }
         }
 
         impl TryFrom<String> for $name {
             type Error = InvalidCanonicalId;
-
-            fn try_from(value: String) -> Result<Self, Self::Error> {
-                Self::parse(value)
-            }
+            fn try_from(value: String) -> Result<Self, Self::Error> { Self::parse(value) }
         }
     };
 }
 
-durable_id!(MachineId);
-durable_id!(RepoId);
-durable_id!(WorkspaceId);
-durable_id!(FleetTeamId);
-durable_id!(TaskId);
-durable_id!(AttemptId);
-durable_id!(WorkId);
-durable_id!(AgentId);
-durable_id!(OperationId);
-durable_id!(FrameId);
+durable_id!(
+    /// Stable identity assigned to a worker installation.
+    MachineId
+);
+durable_id!(
+    /// Stable identity assigned to a repository.
+    RepoId
+);
+durable_id!(
+    /// Stable identity assigned to a workspace.
+    WorkspaceId
+);
+durable_id!(
+    /// Stable identity of a durable execution fleet.
+    FleetTeamId
+);
+durable_id!(
+    /// Stable identity of a durable task.
+    TaskId
+);
+durable_id!(
+    /// Stable identity of a task attempt.
+    AttemptId
+);
+durable_id!(
+    /// Stable identity of a work dispatch.
+    WorkId
+);
+durable_id!(
+    /// Identity of an agent within its assigned machine.
+    AgentId
+);
+durable_id!(
+    /// Caller-provided idempotency operation identity.
+    OperationId
+);
+durable_id!(
+    /// Stable identity of a relay frame.
+    FrameId
+);
 
 /// The persisted delivery classification for an outbound work dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryState {
+    /// The dispatch has not entered the outbound transport log.
     NotDelivered,
+    /// The dispatch entered the log but has no authenticated receipt.
     DeliveryUnknown,
+    /// An authenticated matching receipt was persisted.
     Delivered,
 }
 
+/// The lifecycle state of one work dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkState {
+    /// Work is queued for dispatch.
     Queued,
+    /// Work has an active lease.
     Leased,
+    /// The worker has started execution.
     Running,
+    /// The worker needs external input.
     WaitingInput,
+    /// The work is being reconciled.
     Recovering,
+    /// The work completed successfully.
     Succeeded,
+    /// The work failed.
     Failed,
+    /// The work was canceled.
     Canceled,
+    /// The work is quarantined.
     Quarantined,
 }
 
 impl WorkState {
+    /// Returns whether this state cannot transition further.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -332,24 +370,86 @@ impl WorkState {
     }
 }
 
+/// The lifecycle state of a task attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttemptState {
+    /// The attempt has not started.
     Pending,
+    /// The attempt is active.
     Active,
+    /// The attempt is awaiting retry.
     Retrying,
+    /// The attempt succeeded.
     Succeeded,
+    /// The attempt failed.
     Failed,
+    /// The attempt was canceled.
     Canceled,
 }
 
-/// A basic Hub lease. Tokens intentionally do not live in this M1 record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkLease {
-    pub lease_epoch: u64,
-    pub expires_at: String,
+/// Opaque lease secret that serializes for transport but is redacted in debug
+/// output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LeaseToken(String);
+
+impl LeaseToken {
+    /// Wraps an already-generated opaque lease token.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns whether the opaque token is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
+impl fmt::Debug for LeaseToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LeaseToken(REDACTED)")
+    }
+}
+
+/// A fenced work lease bound to one task, attempt, agent, and machine.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkLease {
+    /// Bound task identity.
+    pub task_id: TaskId,
+    /// Bound attempt identity.
+    pub attempt_id: AttemptId,
+    /// Bound work identity.
+    pub work_id: WorkId,
+    /// Assigned agent identity.
+    pub agent_id: AgentId,
+    /// Machine authorized to use this lease.
+    pub assigned_machine_id: MachineId,
+    /// Monotonic fencing epoch.
+    pub lease_epoch: u64,
+    /// RFC 3339 lease expiry.
+    pub expires_at: String,
+    /// Opaque secret required to exercise the lease.
+    pub lease_token: LeaseToken,
+}
+
+impl fmt::Debug for WorkLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkLease")
+            .field("task_id", &self.task_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("work_id", &self.work_id)
+            .field("agent_id", &self.agent_id)
+            .field("assigned_machine_id", &self.assigned_machine_id)
+            .field("lease_epoch", &self.lease_epoch)
+            .field("expires_at", &self.expires_at)
+            .field("lease_token", &"REDACTED")
+            .finish()
+    }
+}
+
+/// Durable task record owned by a fleet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DurableTaskRecord {
@@ -359,6 +459,7 @@ pub struct DurableTaskRecord {
     pub current_attempt_id: Option<AttemptId>,
 }
 
+/// Durable attempt record belonging to one task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttemptRecord {
@@ -368,6 +469,7 @@ pub struct AttemptRecord {
     pub created_at: String,
 }
 
+/// Durable work record with its assigned execution resources.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkRecord {
@@ -375,13 +477,30 @@ pub struct WorkRecord {
     pub attempt_id: AttemptId,
     pub task_id: TaskId,
     pub agent_id: AgentId,
+    pub assigned_machine_id: MachineId,
+    pub assigned_repo_id: RepoId,
+    pub assigned_workspace_id: WorkspaceId,
     pub state: WorkState,
     pub delivery_state: DeliveryState,
     pub lease: WorkLease,
-    /// Serialized DispatchWork frame/body, retained before transport insertion.
-    pub outbound_dispatch: String,
-    /// Serialized Receipt frame/body after authenticated acknowledgement.
-    pub receipt: Option<String>,
+    /// Serialized DispatchWork frame/body after durable outbound-log insertion.
+    pub outbound_dispatch: Option<String>,
+    /// Authenticated acknowledgement after exact binding validation.
+    pub receipt: Option<WorkReceipt>,
+}
+
+/// Typed receipt binding that must exactly match the assigned work lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkReceipt {
+    pub task_id: TaskId,
+    pub attempt_id: AttemptId,
+    pub work_id: WorkId,
+    pub agent_id: AgentId,
+    pub machine_id: MachineId,
+    pub lease_epoch: u64,
+    /// Serialized authenticated receipt frame/body.
+    pub receipt: String,
 }
 
 /// The idempotency key required for every durable state mutation.
@@ -394,22 +513,66 @@ pub struct OperationKey {
 }
 
 impl OperationKey {
+    /// Returns an unambiguous length-prefixed storage key for arbitrary actor
+    /// and kind strings.
     pub fn storage_key(&self) -> String {
         format!(
-            "{}\u{1f}{}\u{1f}{}",
-            self.actor, self.kind, self.operation_id
+            "{}:{}{}:{}{}",
+            self.actor.len(),
+            self.actor,
+            self.kind.len(),
+            self.kind,
+            self.operation_id
         )
     }
 }
 
+/// Persisted idempotency result explicitly bound to its execution records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationRecord {
     pub key: OperationKey,
+    pub task_id: TaskId,
+    pub attempt_id: AttemptId,
+    pub work_id: WorkId,
     /// Canonical caller-supplied request digest (opaque to the store).
     pub request_digest: String,
     /// Canonical serialized accepted/final result (opaque to the store).
     pub result: String,
+}
+
+/// One immutable, per-task durable event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskEvent {
+    pub task_id: TaskId,
+    pub event_seq: u64,
+    /// Opaque canonical serialized event payload.
+    pub payload: String,
+}
+
+/// Durable event stream bounds for one task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskEventState {
+    pub high_water: u64,
+    pub replay_floor: u64,
+}
+
+/// A bounded ordered page of replayable task events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskEventPage {
+    pub events: Vec<TaskEvent>,
+    pub high_water: u64,
+}
+
+/// Result of requesting events after a cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskEventReplay {
+    /// Events are available in full after the requested cursor.
+    Events(TaskEventPage),
+    /// The cursor precedes retained history and requires a snapshot resync.
+    ResyncRequired { replay_floor: u64, high_water: u64 },
 }
 
 #[cfg(test)]
@@ -421,6 +584,37 @@ mod durable_tests {
         assert!(TaskId::parse("550e8400-e29b-41d4-a716-446655440000").is_ok());
         assert!(TaskId::parse("550E8400-E29B-41D4-A716-446655440000").is_err());
         assert!(TaskId::parse("550e8400-e29b-11d4-a716-446655440000").is_err());
+    }
+
+    #[test]
+    fn generated_durable_ids_are_canonical_v4() {
+        let id = WorkId::new();
+        assert_eq!(WorkId::parse(id.as_str()), Ok(id));
+    }
+
+    #[test]
+    fn operation_storage_keys_are_unambiguous() {
+        let operation_id = OperationId::new();
+        let left = OperationKey {
+            actor: "a".to_owned(),
+            kind: "bc".to_owned(),
+            operation_id: operation_id.clone(),
+        };
+        let right = OperationKey {
+            actor: "ab".to_owned(),
+            kind: "c".to_owned(),
+            operation_id,
+        };
+        assert_ne!(left.storage_key(), right.storage_key());
+    }
+
+    #[test]
+    fn lease_token_debug_is_redacted() {
+        let token = LeaseToken::new("secret-lease-token");
+        let debug = format!("{token:?}");
+        assert!(!token.is_empty());
+        assert!(!debug.contains("secret-lease-token"));
+        assert!(debug.contains("REDACTED"));
     }
 }
 
