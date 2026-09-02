@@ -968,6 +968,129 @@ impl TaskStore {
         })
     }
 
+    /// Persists a worker terminal report and its replayable task event before
+    /// the hub forwards it. The authenticated source machine and every fenced
+    /// binding must match the currently delivered lease; stale terminals are
+    /// rejected rather than changing a newer attempt's state.
+    pub fn record_relay_terminal(
+        &self,
+        machine_id: &rsclaw_a2a_types::types::MachineId,
+        terminal: &rsclaw_a2a_types::durable_relay::WorkTerminalBody,
+        serialized_terminal: &str,
+    ) -> std::result::Result<TaskEvent, DurableStoreError> {
+        use rsclaw_a2a_types::types::{AttemptState, DeliveryState, WorkState};
+
+        if serialized_terminal.len() > MAX_EVENT_PAYLOAD_BYTES {
+            return Err(DurableStoreError::LimitExceeded(
+                "terminal event is too large",
+            ));
+        }
+        let terminal_state = match terminal.outcome.as_str() {
+            "Succeeded" => (WorkState::Succeeded, AttemptState::Succeeded),
+            "Failed" => (WorkState::Failed, AttemptState::Failed),
+            "Canceled" => (WorkState::Canceled, AttemptState::Canceled),
+            _ => return Err(DurableStoreError::StateConflict("invalid terminal outcome")),
+        };
+        let txn = self.db.begin_write().map_err(anyhow::Error::from)?;
+        let event = {
+            let mut works = txn.open_table(WORKS).map_err(anyhow::Error::from)?;
+            let work_json = works
+                .get(terminal.binding.work_id.as_str())
+                .map_err(anyhow::Error::from)?
+                .ok_or(DurableStoreError::StateConflict("work not found"))?
+                .value()
+                .to_owned();
+            let mut work: WorkRecord =
+                serde_json::from_str(&work_json).map_err(anyhow::Error::from)?;
+            if &work.assigned_machine_id != machine_id
+                || work.work_id != terminal.binding.work_id
+                || work.attempt_id != terminal.binding.attempt_id
+                || work.agent_id != terminal.binding.agent_id
+            {
+                return Err(DurableStoreError::StateConflict(
+                    "terminal binding does not match work",
+                ));
+            }
+            if work.lease.lease_epoch != terminal.binding.lease_epoch {
+                return Err(DurableStoreError::Fenced {
+                    current_epoch: work.lease.lease_epoch,
+                });
+            }
+            ensure_unexpired_lease(&work.lease.expires_at)?;
+            if work.delivery_state != DeliveryState::Delivered {
+                return Err(DurableStoreError::StateConflict(
+                    "terminal arrived before receipt",
+                ));
+            }
+            if work.state.is_terminal() {
+                return Err(DurableStoreError::StateConflict("work is already terminal"));
+            }
+
+            let mut attempts = txn.open_table(ATTEMPTS).map_err(anyhow::Error::from)?;
+            let attempt_json = attempts
+                .get(work.attempt_id.as_str())
+                .map_err(anyhow::Error::from)?
+                .ok_or(DurableStoreError::StateConflict("attempt not found"))?
+                .value()
+                .to_owned();
+            let mut attempt: AttemptRecord =
+                serde_json::from_str(&attempt_json).map_err(anyhow::Error::from)?;
+            if attempt.task_id != work.task_id || attempt.state != AttemptState::Active {
+                return Err(DurableStoreError::StateConflict(
+                    "attempt is not active for work",
+                ));
+            }
+
+            let mut states = txn
+                .open_table(TASK_EVENT_STATES)
+                .map_err(anyhow::Error::from)?;
+            let mut event_state: TaskEventState = states
+                .get(work.task_id.as_str())
+                .map_err(anyhow::Error::from)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()
+                .map_err(anyhow::Error::from)?
+                .ok_or(DurableStoreError::StateConflict(
+                    "task event state not found",
+                ))?;
+            event_state.high_water = event_state
+                .high_water
+                .checked_add(1)
+                .ok_or(DurableStoreError::StateConflict("event sequence exhausted"))?;
+            let event = TaskEvent {
+                task_id: work.task_id.clone(),
+                event_seq: event_state.high_water,
+                payload: serialized_terminal.to_owned(),
+            };
+
+            work.state = terminal_state.0;
+            attempt.state = terminal_state.1;
+            let work_json = serde_json::to_string(&work).map_err(anyhow::Error::from)?;
+            let attempt_json = serde_json::to_string(&attempt).map_err(anyhow::Error::from)?;
+            let event_json = serde_json::to_string(&event).map_err(anyhow::Error::from)?;
+            let state_json = serde_json::to_string(&event_state).map_err(anyhow::Error::from)?;
+            works
+                .insert(work.work_id.as_str(), work_json.as_str())
+                .map_err(anyhow::Error::from)?;
+            attempts
+                .insert(attempt.attempt_id.as_str(), attempt_json.as_str())
+                .map_err(anyhow::Error::from)?;
+            txn.open_table(TASK_EVENTS)
+                .map_err(anyhow::Error::from)?
+                .insert(
+                    event_key(event.task_id.as_str(), event.event_seq).as_str(),
+                    event_json.as_str(),
+                )
+                .map_err(anyhow::Error::from)?;
+            states
+                .insert(event.task_id.as_str(), state_json.as_str())
+                .map_err(anyhow::Error::from)?;
+            event
+        };
+        txn.commit().map_err(anyhow::Error::from)?;
+        Ok(event)
+    }
+
     /// Advances a work fence only with a lease bound to the same work
     /// assignment.
     pub fn advance_lease_epoch(
@@ -1375,6 +1498,65 @@ mod tests {
                 .map(|value| value.receipt.as_str()),
             Some(receipt_json.as_str())
         );
+    }
+
+    #[test]
+    fn durable_terminal_is_fenced_and_appended_before_forwarding() {
+        use rsclaw_a2a_types::durable_relay::{RelayBody, WorkTerminalBody, WorkerBinding};
+
+        let tmp = tempfile::tempdir().expect("create temp directory");
+        let (task, attempt, work, operation) = sample_execution();
+        let store = TaskStore::open(&tmp.path().join("tasks.redb")).expect("open store");
+        store
+            .create_execution(&operation, &task, &attempt, &work, "submitted")
+            .expect("admit");
+        let dispatch = relay_dispatch(&task, &work, &operation);
+        store
+            .record_relay_dispatch(&dispatch)
+            .expect("persist dispatch");
+        let receipt = rsclaw_a2a_types::durable_relay::ReceiptBody {
+            work_id: work.work_id.clone(),
+            attempt_id: work.attempt_id.clone(),
+            agent_id: work.agent_id.clone(),
+            lease_epoch: work.lease.lease_epoch,
+            frame_id: dispatch.frame_id.clone(),
+        };
+        store
+            .record_relay_receipt(&work.assigned_machine_id, &receipt, "receipt")
+            .expect("receipt");
+        let terminal = WorkTerminalBody {
+            binding: WorkerBinding {
+                work_id: work.work_id.clone(),
+                attempt_id: work.attempt_id.clone(),
+                agent_id: work.agent_id.clone(),
+                lease_epoch: work.lease.lease_epoch,
+            },
+            outcome: "Succeeded".to_owned(),
+            result: Some(serde_json::json!({"ok": true})),
+            failure: None,
+        };
+        let terminal_json = serde_json::to_string(&RelayBody::WorkTerminal(terminal.clone()))
+            .expect("serialize terminal");
+        let event = store
+            .record_relay_terminal(&work.assigned_machine_id, &terminal, &terminal_json)
+            .expect("persist terminal");
+        assert_eq!(event.event_seq, 2);
+        assert_eq!(event.payload, terminal_json);
+        assert_eq!(
+            store
+                .durable_work(work.work_id.as_str())
+                .expect("work")
+                .expect("exists")
+                .state,
+            WorkState::Succeeded
+        );
+
+        let mut stale = terminal;
+        stale.binding.lease_epoch += 1;
+        assert!(matches!(
+            store.record_relay_terminal(&work.assigned_machine_id, &stale, "stale"),
+            Err(DurableStoreError::Fenced { current_epoch: 1 })
+        ));
     }
 
     #[test]
