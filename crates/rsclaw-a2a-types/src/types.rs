@@ -457,6 +457,8 @@ pub struct DurableTaskRecord {
     pub fleet_team_id: FleetTeamId,
     pub created_at: String,
     pub current_attempt_id: Option<AttemptId>,
+    /// Standard A2A status projected from the authoritative current attempt.
+    pub projected_state: TaskState,
 }
 
 /// Durable attempt record belonging to one task.
@@ -489,6 +491,10 @@ pub struct WorkRecord {
     pub outbound_dispatch: Option<String>,
     /// Authenticated acknowledgement after exact binding validation.
     pub receipt: Option<WorkReceipt>,
+    /// Durable event sequence assigned to the accepted terminal report.
+    pub terminal_event_seq: Option<u64>,
+    /// Canonical terminal payload used to deduplicate repeated reports.
+    pub terminal_payload: Option<String>,
 }
 
 /// Typed receipt binding that must exactly match the assigned work lease.

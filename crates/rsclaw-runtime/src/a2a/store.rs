@@ -452,6 +452,8 @@ impl TaskStore {
             || work.delivery_state != rsclaw_a2a_types::types::DeliveryState::NotDelivered
             || work.outbound_dispatch.is_some()
             || work.receipt.is_some()
+            || work.terminal_event_seq.is_some()
+            || work.terminal_payload.is_some()
         {
             return Err(DurableStoreError::StateConflict(
                 "new work must have a valid unacknowledged lease",
@@ -540,6 +542,46 @@ impl TaskStore {
         };
         txn.commit().map_err(anyhow::Error::from)?;
         Ok(admission)
+    }
+
+    /// Returns a durable task record by identity.
+    pub fn durable_task(
+        &self,
+        task_id: &rsclaw_a2a_types::types::TaskId,
+    ) -> Result<Option<DurableTaskRecord>> {
+        let txn = self.db.begin_read()?;
+        let tasks = txn.open_table(DURABLE_TASKS)?;
+        tasks
+            .get(task_id.as_str())?
+            .map(|value| serde_json::from_str(value.value()).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Returns a durable attempt record by identity.
+    pub fn durable_attempt(
+        &self,
+        attempt_id: &rsclaw_a2a_types::types::AttemptId,
+    ) -> Result<Option<AttemptRecord>> {
+        let txn = self.db.begin_read()?;
+        let attempts = txn.open_table(ATTEMPTS)?;
+        attempts
+            .get(attempt_id.as_str())?
+            .map(|value| serde_json::from_str(value.value()).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Returns the persisted result for an idempotency operation key.
+    pub fn durable_operation(
+        &self,
+        key: &rsclaw_a2a_types::types::OperationKey,
+    ) -> Result<Option<OperationRecord>> {
+        let storage_key = key.storage_key();
+        let txn = self.db.begin_read()?;
+        let operations = txn.open_table(OPERATIONS)?;
+        operations
+            .get(storage_key.as_str())?
+            .map(|value| serde_json::from_str(value.value()).map_err(Into::into))
+            .transpose()
     }
 
     /// Returns a durable work record by identity.
@@ -986,9 +1028,17 @@ impl TaskStore {
             ));
         }
         let terminal_state = match terminal.outcome.as_str() {
-            "Succeeded" => (WorkState::Succeeded, AttemptState::Succeeded),
-            "Failed" => (WorkState::Failed, AttemptState::Failed),
-            "Canceled" => (WorkState::Canceled, AttemptState::Canceled),
+            "Succeeded" => (
+                WorkState::Succeeded,
+                AttemptState::Succeeded,
+                TaskState::Completed,
+            ),
+            "Failed" => (WorkState::Failed, AttemptState::Failed, TaskState::Failed),
+            "Canceled" => (
+                WorkState::Canceled,
+                AttemptState::Canceled,
+                TaskState::Canceled,
+            ),
             _ => return Err(DurableStoreError::StateConflict("invalid terminal outcome")),
         };
         let txn = self.db.begin_write().map_err(anyhow::Error::from)?;
@@ -1016,14 +1066,33 @@ impl TaskStore {
                     current_epoch: work.lease.lease_epoch,
                 });
             }
+            match (&work.terminal_event_seq, &work.terminal_payload) {
+                (Some(event_seq), Some(payload))
+                    if work.state == terminal_state.0 && payload == serialized_terminal =>
+                {
+                    return Ok(TaskEvent {
+                        task_id: work.task_id.clone(),
+                        event_seq: *event_seq,
+                        payload: payload.clone(),
+                    });
+                }
+                (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) => {
+                    return Err(DurableStoreError::StateConflict(
+                        "conflicting terminal report",
+                    ));
+                }
+                (None, None) if work.state.is_terminal() => {
+                    return Err(DurableStoreError::StateConflict(
+                        "terminal work is missing its durable terminal event",
+                    ));
+                }
+                (None, None) => {}
+            }
             ensure_unexpired_lease(&work.lease.expires_at)?;
             if work.delivery_state != DeliveryState::Delivered {
                 return Err(DurableStoreError::StateConflict(
                     "terminal arrived before receipt",
                 ));
-            }
-            if work.state.is_terminal() {
-                return Err(DurableStoreError::StateConflict("work is already terminal"));
             }
 
             let mut attempts = txn.open_table(ATTEMPTS).map_err(anyhow::Error::from)?;
@@ -1040,6 +1109,46 @@ impl TaskStore {
                     "attempt is not active for work",
                 ));
             }
+
+            let mut tasks = txn.open_table(DURABLE_TASKS).map_err(anyhow::Error::from)?;
+            let task_json = tasks
+                .get(work.task_id.as_str())
+                .map_err(anyhow::Error::from)?
+                .ok_or(DurableStoreError::StateConflict("durable task not found"))?
+                .value()
+                .to_owned();
+            let mut task: DurableTaskRecord =
+                serde_json::from_str(&task_json).map_err(anyhow::Error::from)?;
+            if task.current_attempt_id.as_ref() != Some(&work.attempt_id) {
+                return Err(DurableStoreError::StateConflict(
+                    "work attempt is not the task's current attempt",
+                ));
+            }
+
+            let mut operations = txn.open_table(OPERATIONS).map_err(anyhow::Error::from)?;
+            let mut operation_match: Option<(String, OperationRecord)> = None;
+            for entry in operations.iter().map_err(anyhow::Error::from)? {
+                let (key, value) = entry.map_err(anyhow::Error::from)?;
+                let operation: OperationRecord =
+                    serde_json::from_str(value.value()).map_err(anyhow::Error::from)?;
+                if operation.key.operation_id == work.operation_id
+                    && operation.task_id == work.task_id
+                    && operation.attempt_id == work.attempt_id
+                    && operation.work_id == work.work_id
+                {
+                    if operation_match.is_some() {
+                        return Err(DurableStoreError::StateConflict(
+                            "multiple operations own the same work",
+                        ));
+                    }
+                    operation_match = Some((key.value().to_owned(), operation));
+                }
+            }
+            let Some((operation_key, mut operation)) = operation_match else {
+                return Err(DurableStoreError::StateConflict(
+                    "operation for terminal work not found",
+                ));
+            };
 
             let mut states = txn
                 .open_table(TASK_EVENT_STATES)
@@ -1064,9 +1173,15 @@ impl TaskStore {
             };
 
             work.state = terminal_state.0;
+            work.terminal_event_seq = Some(event.event_seq);
+            work.terminal_payload = Some(serialized_terminal.to_owned());
             attempt.state = terminal_state.1;
+            task.projected_state = terminal_state.2;
+            operation.result = serialized_terminal.to_owned();
             let work_json = serde_json::to_string(&work).map_err(anyhow::Error::from)?;
             let attempt_json = serde_json::to_string(&attempt).map_err(anyhow::Error::from)?;
+            let task_json = serde_json::to_string(&task).map_err(anyhow::Error::from)?;
+            let operation_json = serde_json::to_string(&operation).map_err(anyhow::Error::from)?;
             let event_json = serde_json::to_string(&event).map_err(anyhow::Error::from)?;
             let state_json = serde_json::to_string(&event_state).map_err(anyhow::Error::from)?;
             works
@@ -1074,6 +1189,12 @@ impl TaskStore {
                 .map_err(anyhow::Error::from)?;
             attempts
                 .insert(attempt.attempt_id.as_str(), attempt_json.as_str())
+                .map_err(anyhow::Error::from)?;
+            tasks
+                .insert(task.task_id.as_str(), task_json.as_str())
+                .map_err(anyhow::Error::from)?;
+            operations
+                .insert(operation_key.as_str(), operation_json.as_str())
                 .map_err(anyhow::Error::from)?;
             txn.open_table(TASK_EVENTS)
                 .map_err(anyhow::Error::from)?
@@ -1122,6 +1243,8 @@ impl TaskStore {
             work.delivery_state = rsclaw_a2a_types::types::DeliveryState::NotDelivered;
             work.outbound_dispatch = None;
             work.receipt = None;
+            work.terminal_event_seq = None;
+            work.terminal_payload = None;
             Ok(())
         })
     }
@@ -1243,6 +1366,7 @@ mod tests {
             fleet_team_id: FleetTeamId::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             current_attempt_id: Some(attempt_id.clone()),
+            projected_state: TaskState::Submitted,
         };
         let attempt = AttemptRecord {
             attempt_id: attempt_id.clone(),
@@ -1273,6 +1397,8 @@ mod tests {
             },
             outbound_dispatch: None,
             receipt: None,
+            terminal_event_seq: None,
+            terminal_payload: None,
         };
         let operation = OperationRecord {
             key: OperationKey {
@@ -1542,14 +1668,47 @@ mod tests {
             .expect("persist terminal");
         assert_eq!(event.event_seq, 2);
         assert_eq!(event.payload, terminal_json);
+        let duplicate = store
+            .record_relay_terminal(&work.assigned_machine_id, &terminal, &terminal_json)
+            .expect("deduplicate terminal");
+        assert_eq!(duplicate, event);
+        let persisted_work = store
+            .durable_work(work.work_id.as_str())
+            .expect("work")
+            .expect("exists");
+        assert_eq!(persisted_work.state, WorkState::Succeeded);
+        assert_eq!(persisted_work.terminal_event_seq, Some(2));
         assert_eq!(
             store
-                .durable_work(work.work_id.as_str())
-                .expect("work")
+                .durable_attempt(&attempt.attempt_id)
+                .expect("attempt")
                 .expect("exists")
                 .state,
-            WorkState::Succeeded
+            AttemptState::Succeeded
         );
+        assert_eq!(
+            store
+                .durable_task(&task.task_id)
+                .expect("task")
+                .expect("exists")
+                .projected_state,
+            TaskState::Completed
+        );
+        assert_eq!(
+            store
+                .durable_operation(&operation.key)
+                .expect("operation")
+                .expect("exists")
+                .result,
+            terminal_json
+        );
+        let replay = store
+            .events_after(&task.task_id, 0, 10)
+            .expect("replay task events");
+        let TaskEventReplay::Events(page) = replay else {
+            panic!("expected replay page");
+        };
+        assert_eq!(page.events.len(), 2);
 
         let mut stale = terminal;
         stale.binding.lease_epoch += 1;
