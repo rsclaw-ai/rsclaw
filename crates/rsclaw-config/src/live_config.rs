@@ -61,8 +61,8 @@ impl LiveConfig {
     ///
     /// Behaviour:
     ///   - If the change is hot-safe (only fields whitelisted in
-    ///     `strip_live_fields` differ) the new values are written into all
-    ///     live RwLocks and an empty list is returned.
+    ///     `strip_live_fields` differ) the new values are written into all live
+    ///     RwLocks and an empty list is returned.
     ///   - Otherwise the current live state is left untouched and the changed
     ///     section names are returned. Callers classify them with
     ///     [`classify_change`] to decide between a scoped reload and a restart
@@ -129,13 +129,12 @@ impl LiveConfig {
 /// important the field looks:
 ///
 ///   * [`ChangeImpact::Hot`] — every read site goes through a `LiveConfig`
-///     lock, so `apply` already wrote the new value and nothing else is
-///     needed.
+///     lock, so `apply` already wrote the new value and nothing else is needed.
 ///   * [`ChangeImpact::NeedsReload`] — the value is snapshotted inside a
-///     component (agent handle, provider registry, skill/plugin registry),
-///     so the component must be rebuilt. That is exactly what
-///     `POST /api/v1/reload?scope=…` does: seconds of work at worst, no
-///     dropped listener, no cold DB/KB re-index.
+///     component (agent handle, provider registry, skill/plugin registry), so
+///     the component must be rebuilt. That is exactly what `POST
+///     /api/v1/reload?scope=…` does: seconds of work at worst, no dropped
+///     listener, no cold DB/KB re-index.
 ///   * [`ChangeImpact::NeedsRestart`] — the value is bound to an OS resource
 ///     owned by the process (listening socket, redb file handle + mmap), so
 ///     only a fresh process can pick it up.
@@ -599,7 +598,10 @@ mod tests {
         new.gateway.port = 19999;
         match classify_change(&old, &new) {
             ChangeImpact::NeedsRestart { sections } => {
-                assert!(sections.contains(&"gateway.port".to_owned()), "{sections:?}");
+                assert!(
+                    sections.contains(&"gateway.port".to_owned()),
+                    "{sections:?}"
+                );
             }
             other => panic!("port must be restart-only, got {other:?}"),
         }
@@ -613,14 +615,19 @@ mod tests {
         // surface as a reload-able change carrying the `agents` scope.
         let old = empty_runtime_config();
         let mut new = old.clone();
-        new.raw.agents = Some(serde_json::from_value(serde_json::json!({
-            "list": [{ "id": "main", "model": { "primary": "gpt-5" } }]
-        }))
-        .expect("agents block"));
+        new.raw.agents = Some(
+            serde_json::from_value(serde_json::json!({
+                "list": [{ "id": "main", "model": { "primary": "gpt-5" } }]
+            }))
+            .expect("agents block"),
+        );
 
         match classify_change(&old, &new) {
             ChangeImpact::NeedsReload { sections, scopes } => {
-                assert!(sections.contains(&"config.agents".to_owned()), "{sections:?}");
+                assert!(
+                    sections.contains(&"config.agents".to_owned()),
+                    "{sections:?}"
+                );
                 assert_eq!(scopes, vec!["agents".to_owned()]);
             }
             other => panic!("agent model should be reload-able, got {other:?}"),
@@ -666,8 +673,14 @@ mod tests {
             ChangeImpact::NeedsRestart { sections } => {
                 // Both are reported so the UI can explain everything that
                 // changed, but the remedy is the strictly dominant one.
-                assert!(sections.contains(&"gateway.port".to_owned()), "{sections:?}");
-                assert!(sections.contains(&"config.agents".to_owned()), "{sections:?}");
+                assert!(
+                    sections.contains(&"gateway.port".to_owned()),
+                    "{sections:?}"
+                );
+                assert!(
+                    sections.contains(&"config.agents".to_owned()),
+                    "{sections:?}"
+                );
             }
             other => panic!("restart must dominate, got {other:?}"),
         }

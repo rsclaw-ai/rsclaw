@@ -12,8 +12,8 @@ pub enum ModelsCommand {
     SetImage {
         model: String,
     },
-    /// Set the text-to-video model chain (`agents.defaults.model.video`),
-    /// e.g. `rsclaw/rsclaw-video-v1` or `doubao/doubao-seedance-2-0-260128`.
+    /// Set the text-to-video model chain (`agents.defaults.model.video`).
+    /// Native rsclaw video uses `rsclaw/rsclaw-video-v3`.
     SetVideo {
         model: String,
     },

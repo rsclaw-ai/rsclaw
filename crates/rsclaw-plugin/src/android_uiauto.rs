@@ -32,6 +32,7 @@ const KEYBOARD_VISIBLE_COMMAND: &str = "keyboard-visible";
 const SEND_BUTTON_COMMAND: &str = "send-button";
 const LATEST_MESSAGE_BUBBLE_COMMAND: &str = "latest-message-bubble";
 const INPUT_TEXT_COMMAND: &str = "input-text";
+const CLIPBOARD_SET_COMMAND: &str = "clipboard-set";
 const OCR_REGION_COMMAND: &str = "ocr-region";
 const WAKEUP_SCREEN_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(500),
@@ -201,6 +202,9 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     if command == INPUT_TEXT_COMMAND {
         return input_text(args_json, &config).await;
     }
+    if command == CLIPBOARD_SET_COMMAND {
+        return clipboard_set(args_json, &config).await;
+    }
     if command == OCR_REGION_COMMAND {
         return ocr_region(args_json, &config).await;
     }
@@ -231,6 +235,57 @@ async fn input_text(args_json: &str, config: &Config) -> Result<String, String> 
     let input = input_text_value(args_json)?;
     let args = input_text_args(config, input);
     run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+}
+
+/// Prepare text for a user-visible paste gesture without injecting it into an
+/// editor. The clipboard payload is sent through the allowlisted raw
+/// UIAutomator2 endpoint, whose JSON body is written to a mode-0600 temporary
+/// file rather than exposed in the CLS process argument list.
+fn clipboard_request(args_json: &str) -> Result<(String, String), String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android clipboard: invalid args JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "android clipboard: args JSON must be an object".to_string())?;
+    if !object
+        .keys()
+        .all(|key| matches!(key.as_str(), "sessionId" | "text"))
+    {
+        return Err(
+            "android clipboard: `clipboard-set` accepts only `sessionId` and `text`".to_string(),
+        );
+    }
+    let session_id = object
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or_else(|| "android clipboard: `sessionId` must be a non-empty string".to_string())?;
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "android clipboard: `text` must be a non-empty string".to_string())?;
+    if text.len() > MAX_INPUT_TEXT_BYTES || text.contains('\0') {
+        return Err(format!(
+            "android clipboard: `text` must be 1-{MAX_INPUT_TEXT_BYTES} bytes without NUL"
+        ));
+    }
+    let content = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let body = serde_json::json!({
+        "content": content,
+        "contentType": "plaintext",
+        "label": "rsclaw",
+    })
+    .to_string();
+    Ok((
+        format!("/session/{session_id}/appium/device/set_clipboard"),
+        body,
+    ))
+}
+
+async fn clipboard_set(args_json: &str, _config: &Config) -> Result<String, String> {
+    let (path, body) = clipboard_request(args_json)?;
+    raw("POST", &path, Some(&body)).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1245,8 +1300,7 @@ async fn relaunch_with_adb_foreground_fallback(
     // window. The activity manager is the authoritative foreground signal.
     if wait_for_foreground_package(config, package).await? {
         return Ok(cls_result.unwrap_or_else(|_| {
-            serde_json::json!({ "relaunch": "cls-verified-by-adb", "package": package })
-                .to_string()
+            serde_json::json!({ "relaunch": "cls-verified-by-adb", "package": package }).to_string()
         }));
     }
 
@@ -1271,7 +1325,9 @@ async fn relaunch_with_adb_foreground_fallback(
         tokio::time::sleep(delay).await;
     }
     if foreground_package_matches(config, package).await? {
-        return Ok(serde_json::json!({ "relaunch": "adb-fallback", "package": package }).to_string());
+        return Ok(
+            serde_json::json!({ "relaunch": "adb-fallback", "package": package }).to_string(),
+        );
     }
 
     let cls_context = cls_error
@@ -1317,9 +1373,10 @@ async fn wait_for_foreground_package(config: &Config, package: &str) -> Result<b
 
 /// Verify the target package owns Android's resumed activity or focused window.
 async fn foreground_package_matches(config: &Config, package: &str) -> Result<bool, String> {
-    Ok(foreground_package_from_dump(&foreground_activity_dump(config).await?)
-        .as_deref()
-        == Some(package))
+    Ok(
+        foreground_package_from_dump(&foreground_activity_dump(config).await?).as_deref()
+            == Some(package),
+    )
 }
 
 /// Read Android's current resumed/focused activity through the CLS ADB relay.
@@ -2542,7 +2599,10 @@ mod tests {
             ),
             Some("com.miui.home".to_string())
         );
-        assert_eq!(foreground_package_from_dump("Window{abc u0 com.tencent.mm/.ui.LauncherUI}"), None);
+        assert_eq!(
+            foreground_package_from_dump("Window{abc u0 com.tencent.mm/.ui.LauncherUI}"),
+            None
+        );
     }
 
     #[test]
@@ -2813,5 +2873,23 @@ mod tests {
         assert!(validate_plain_value("node", "android-dev", 256).is_ok());
         assert!(validate_plain_value("activity", "微信主页", 256).is_ok());
         assert!(validate_plain_value("node", "android\ndev", 256).is_err());
+    }
+
+    #[test]
+    fn clipboard_request_uses_private_raw_body_and_rejects_empty_text() {
+        let (path, body) = clipboard_request(r#"{"sessionId":"abc","text":"旭日，你好！"}"#)
+            .expect("valid clipboard request");
+        assert_eq!(path, "/session/abc/appium/device/set_clipboard");
+        let body: Value = serde_json::from_str(&body).expect("clipboard JSON");
+        assert_eq!(body["contentType"], "plaintext");
+        assert_eq!(body["label"], "rsclaw");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(body["content"].as_str().expect("base64 content"))
+                .expect("base64 decodes"),
+            "旭日，你好！".as_bytes()
+        );
+        assert!(clipboard_request(r#"{"sessionId":"abc","text":""}"#).is_err());
+        assert!(clipboard_request(r#"{"sessionId":"abc","text":"x","extra":1}"#).is_err());
     }
 }

@@ -8,11 +8,21 @@ pub enum CronCommand {
     /// Edit a cron job. Pass --schedule / --message / --agent to patch inline;
     /// pass only the ID to open the raw file in $EDITOR.
     Edit(CronEditArgs),
-    Rm { id: String },
-    Enable { id: String },
-    Disable { id: String },
-    Runs { id: String },
-    Run { id: String },
+    Rm {
+        id: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Runs {
+        id: String,
+    },
+    Run {
+        id: String,
+    },
 }
 
 #[derive(Args, Debug)]

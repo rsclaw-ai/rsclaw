@@ -833,8 +833,8 @@ struct OcrHit {
 /// `android_ocr_region` fast path.
 pub fn ocr_image_region(png: &[u8], rect: Option<(u32, u32, u32, u32)>) -> Result<String, String> {
     use image::GenericImageView;
-    let img = image::load_from_memory(png)
-        .map_err(|e| format!("ocr_image_region: decode PNG: {e}"))?;
+    let img =
+        image::load_from_memory(png).map_err(|e| format!("ocr_image_region: decode PNG: {e}"))?;
     let rgb = img.to_rgb8();
     let iw = rgb.width();
     let ih = rgb.height();
@@ -981,7 +981,11 @@ fn ocr_file_hits(path: &std::path::Path, _iw: u32, _ih: u32) -> Result<Vec<OcrHi
         .map_err(|e| format!("Windows OCR parse failed: {e}; out={stdout}"))?;
     let mut hits = Vec::new();
     for row in rows {
-        let text = row.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let text = row
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if text.trim().is_empty() {
             continue;
         }

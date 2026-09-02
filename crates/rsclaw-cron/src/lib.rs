@@ -232,7 +232,10 @@ fn format_every_ms(ms: u64) -> String {
 }
 
 fn format_once_delay(ms: u64) -> String {
-    format!("once in {}", format_every_ms(ms).strip_prefix("every ").unwrap_or("?"))
+    format!(
+        "once in {}",
+        format_every_ms(ms).strip_prefix("every ").unwrap_or("?")
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

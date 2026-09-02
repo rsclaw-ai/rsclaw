@@ -66,7 +66,7 @@ impl AgentRuntime {
     pub(super) async fn dispatch_tool(
         &self,
         ctx: &RunContext,
-        _id: &str,
+        tool_call_id: &str,
         raw_name: &str,
         args: Value,
     ) -> Result<Value> {
@@ -377,7 +377,9 @@ impl AgentRuntime {
             "research_analyze_charts" => return self.tool_research_analyze_charts(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
             "edit_file" | "edit" => return self.tool_edit(args).await,
-            "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
+            "shell" | "execute_command" | "exec" => {
+                return self.tool_exec(ctx, tool_call_id, args).await;
+            }
             "skill_use" => return self.tool_use_skill(args),
             "skill_list" => return self.tool_skill_list(args),
             "skill_search" => return self.tool_skill_search(args).await,
@@ -431,7 +433,7 @@ impl AgentRuntime {
             "computer_use" => return self.tool_computer_use(ctx, args).await,
             "image_gen" | "image" => return self.tool_image(args, ctx).await,
             "ocr" => return self.tool_ocr(args).await,
-            "video_gen" | "video" => return self.tool_video(args, ctx).await,
+            "video_gen" | "video" => return self.tool_video(args, ctx, tool_call_id).await,
             "avatar_gen" | "avatar" => return self.tool_avatar_gen(args, ctx).await,
             "mv_gen" | "mv" => return self.tool_mv_gen(args, ctx).await,
             "music_gen" | "music" => return self.tool_music(args).await,

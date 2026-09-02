@@ -95,18 +95,16 @@ impl LlmProvider for GeminiProvider {
             }
 
             let byte_stream = resp.bytes_stream();
-            let byte_stream = tokio_stream::StreamExt::timeout(
-                byte_stream,
-                std::time::Duration::from_secs(120),
-            );
+            let byte_stream =
+                tokio_stream::StreamExt::timeout(byte_stream, std::time::Duration::from_secs(120));
             let line_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
             let mapped = byte_stream.map(move |r| match r {
-                    Ok(Ok(bytes)) => Ok(bytes),
-                    Ok(Err(e)) => Err(anyhow::anyhow!("Gemini stream read error: {e}")),
-                    Err(_) => Err(anyhow::anyhow!(
-                        "Gemini stream idle for 120s (server stalled mid-generation)"
-                    )),
-                });
+                Ok(Ok(bytes)) => Ok(bytes),
+                Ok(Err(e)) => Err(anyhow::anyhow!("Gemini stream read error: {e}")),
+                Err(_) => Err(anyhow::anyhow!(
+                    "Gemini stream idle for 120s (server stalled mid-generation)"
+                )),
+            });
             let event_stream = mapped
                 .then(move |chunk| {
                     let line_buffer = line_buffer.clone();

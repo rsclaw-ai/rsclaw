@@ -128,11 +128,10 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
     // Shared slots the AppState and AgentSpawner both need. Production wires
     // these in `gateway::startup`; tests build empty equivalents.
     let skills = Arc::new(rsclaw_skill::SkillRegistry::new());
-    let provider_slot: Arc<
-        std::sync::RwLock<Arc<rsclaw_provider::registry::ProviderRegistry>>,
-    > = Arc::new(std::sync::RwLock::new(Arc::new(
-        rsclaw_provider::registry::ProviderRegistry::new(),
-    )));
+    let provider_slot: Arc<std::sync::RwLock<Arc<rsclaw_provider::registry::ProviderRegistry>>> =
+        Arc::new(std::sync::RwLock::new(Arc::new(
+            rsclaw_provider::registry::ProviderRegistry::new(),
+        )));
     let model_health = rsclaw::provider::health::ProviderHealthRegistry::new();
     let queue_store = Arc::new(
         rsclaw_store::redb_store::RedbStore::open(

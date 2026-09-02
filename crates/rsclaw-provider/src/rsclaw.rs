@@ -1310,10 +1310,7 @@ impl RsclawProvider {
                 .to_owned(),
             _ => "rsclaw-agent-v1".to_owned(),
         };
-        body.insert(
-            "model".to_owned(),
-            Value::String(canonical_model),
-        );
+        body.insert("model".to_owned(), Value::String(canonical_model));
         let mut options = serde_json::Map::new();
         if let Some(t) = req.temperature {
             options.insert("temperature".to_owned(), super::json_f32(t));

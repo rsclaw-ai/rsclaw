@@ -76,7 +76,30 @@ pub fn build_client(user_agent: &str, timeout_secs: u64) -> Result<Client> {
 /// the header on each hop. Returns the final non-redirect response
 /// for the caller to drain.
 pub async fn post_json(client: &Client, url: &str, bearer: &str, body: &Value) -> Result<Response> {
-    send_following(client, Method::POST, url, bearer, Some(body)).await
+    send_following(client, Method::POST, url, bearer, Some(body), None).await
+}
+
+/// POST JSON with a stable idempotency key, preserving the key across
+/// same-request 307/308 redirects.
+pub async fn post_json_with_idempotency_key(
+    client: &Client,
+    url: &str,
+    bearer: &str,
+    body: &Value,
+    idempotency_key: &str,
+) -> Result<Response> {
+    if idempotency_key.trim().is_empty() {
+        return Err(anyhow!("rsclaw_http: idempotency key must not be empty"));
+    }
+    send_following(
+        client,
+        Method::POST,
+        url,
+        bearer,
+        Some(body),
+        Some(idempotency_key),
+    )
+    .await
 }
 
 /// GET with Bearer auth; same 307/308 + auth-reattach loop. Use for
@@ -85,7 +108,7 @@ pub async fn post_json(client: &Client, url: &str, bearer: &str, body: &Value) -
 /// resolves the FINAL hop's target URL and hands it back so the caller
 /// can fetch unauthenticated.
 pub async fn get(client: &Client, url: &str, bearer: &str) -> Result<Response> {
-    send_following(client, Method::GET, url, bearer, None).await
+    send_following(client, Method::GET, url, bearer, None, None).await
 }
 
 /// GET an endpoint expected to return a single 307 redirect to an
@@ -134,10 +157,14 @@ async fn send_following(
     initial_url: &str,
     bearer: &str,
     body: Option<&Value>,
+    idempotency_key: Option<&str>,
 ) -> Result<Response> {
     let mut current = initial_url.to_owned();
     for _ in 0..=MAX_HOPS {
         let mut builder = client.request(method.clone(), &current).bearer_auth(bearer);
+        if let Some(key) = idempotency_key {
+            builder = builder.header("Idempotency-Key", key);
+        }
         if let Some(b) = body {
             builder = builder.json(b);
         }
@@ -246,5 +273,43 @@ mod tests {
             .unwrap(),
             "https://api.rsclaw.ai/backend/v1/videos/video_abc"
         );
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_survives_redirect() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/final", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/final"))
+            .and(header("Idempotency-Key", "rsclaw-video-tool-123"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"job_1"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = build_client("test", 10).expect("client");
+        let response = post_json_with_idempotency_key(
+            &client,
+            &format!("{}/start", server.uri()),
+            "secret",
+            &serde_json::json!({"kind":"video"}),
+            "rsclaw-video-tool-123",
+        )
+        .await
+        .expect("request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
     }
 }

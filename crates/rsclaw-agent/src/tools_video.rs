@@ -22,6 +22,7 @@ impl super::runtime::AgentRuntime {
         &self,
         args: Value,
         ctx: &super::runtime::RunContext,
+        tool_call_id: &str,
     ) -> Result<Value> {
         let prompt = args["prompt"]
             .as_str()
@@ -78,10 +79,10 @@ impl super::runtime::AgentRuntime {
             }
         }
 
-        // Optional driving video for v2v (model rsclaw-video-v1 — the server
-        // picks the v2v lane from the driving video; there is no separate
-        // "-ref" model) — local path / data-URI / http URL all accepted (local
-        // files normalised to a data-URI, same as the reference images).
+        // Optional driving video for v2v. Standard rsclaw video always uses
+        // rsclaw-video-v3 and sends this as a typed structure reference. Local
+        // path / data-URI / http URL are accepted; local files are normalized
+        // to a data URI like reference images.
         let video_assets = normalize_gen_assets(&args["video"]).await;
         let video_ref = video_assets.first().map(|s| s.as_str());
 
@@ -111,7 +112,7 @@ impl super::runtime::AgentRuntime {
 
         // No explicit video model configured? Default to the primary LLM
         // provider's first-party video model when it has one (agnes →
-        // agnes-video-v2.0, rsclaw → rsclaw-video-v1). Same opt-in-by-
+        // agnes-video-v2.0, rsclaw → rsclaw-video-v3). Same opt-in-by-
         // primary-provider rule as the image tool.
         if video_chain.is_empty()
             && let Some(def) = self
@@ -305,9 +306,10 @@ impl super::runtime::AgentRuntime {
                         Some(model_id.as_str()),
                         &images,
                         video_ref,
+                        &format!("rsclaw-video-{tool_call_id}"),
                     )
                     .await
-                    .map(|id| ("rsclaw", id)),
+                    .map(|id| ("rsclaw_native", id)),
                     None => Err(anyhow!(
                         "video_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in rsclaw.json5 or export RSCLAW_API_KEY, then retry — or tell the user the rsclaw key is missing."
                     )),
@@ -485,9 +487,9 @@ impl super::runtime::AgentRuntime {
 
     /// Shared submit path for the rsclaw-gen video families (avatar / mv).
     /// POSTs the pre-built `body` to `/v1/videos/{endpoint}`,
-    /// then enqueues an `ExternalJob{ provider: "rsclaw", kind: VideoGen }` so
-    /// the same `poll_rsclaw` loop (GET /v1/videos/{id} → /content) delivers
-    /// the mp4 — no new worker plumbing.
+    /// then enqueues an `ExternalJob{ provider: "rsclaw_legacy", kind: VideoGen
+    /// }`. This remains isolated from standard video's native `/v1/jobs`
+    /// lifecycle.
     async fn submit_rsclaw_gen_video(
         &self,
         endpoint: &str,
@@ -526,7 +528,7 @@ impl super::runtime::AgentRuntime {
                 account: ctx.account.clone(),
             },
             rsclaw_types::ExternalJobOrigin::Agent,
-            "rsclaw",
+            "rsclaw_legacy",
             &task_id,
             rsclaw_types::ExternalJobKind::VideoGen,
             job_label,
@@ -539,7 +541,7 @@ impl super::runtime::AgentRuntime {
 
         Ok(json!({
             "status": "submitted",
-            "provider": "rsclaw",
+            "provider": "rsclaw_legacy",
             "kind": endpoint,
             "task_id": task_id,
             "job_id": job_id,
@@ -607,7 +609,7 @@ pub(crate) async fn normalize_gen_assets(v: &Value) -> Vec<String> {
 /// POST a pre-built body to `{gen_host}/v1/videos/{endpoint}` and return the
 /// rsclaw `video_<id>`. 307/308 from the LB are followed by
 /// `rsclaw_http::post_json` (Bearer re-attached per hop). Polling reuses
-/// `rsclaw_jobs::poll_rsclaw`.
+/// `rsclaw_jobs::poll_rsclaw_legacy`.
 async fn post_rsclaw_gen(endpoint: &str, api_key: &str, body: &Value) -> Result<String> {
     let url = format!(
         "{}/v1/videos/{endpoint}",
@@ -641,26 +643,93 @@ async fn post_rsclaw_gen(endpoint: &str, api_key: &str, body: &Value) -> Result<
     Ok(id)
 }
 
-/// Submit a rsclaw text→video task and return the rsclaw `video_<id>`.
-///
-/// Hits `POST https://api.rsclaw.ai/v1/videos` with the OAI Sora-2 +
-/// Seedance superset body. Polling is handled by
-/// `rsclaw_jobs::poll_rsclaw` after the caller enqueues the corresponding
-/// `ExternalJob{ provider: "rsclaw" }`.
-///
-/// 307/308 redirects from the LB are followed by
-/// `rsclaw_provider::rsclaw_http::post_json` — same protocol as the
-/// LLM-side `src/provider/rsclaw.rs::send_following_redirects` (Bearer
-/// re-attached on each cross-origin hop, max 5 hops).
-/// Map an `aspect_ratio` to a 720p-tier `WxH` for the rsclaw gen `size` field.
-fn rsclaw_video_size(aspect_ratio: &str) -> &'static str {
-    match aspect_ratio {
-        "9:16" => "720x1280",
-        "1:1" => "1024x1024",
-        _ => "1280x720",
+/// Validate a configured rsclaw model against the current native jobs contract.
+fn validate_native_rsclaw_model(model: Option<&str>) -> Result<()> {
+    let Some(model) = model else {
+        return Ok(());
+    };
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    if bare == "rsclaw-video-v3" {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "video_gen: rsclaw native jobs only support `rsclaw-video-v3`; unsupported model `{model}`"
+        ))
     }
 }
 
+/// Convert one normalized generation asset into the typed native jobs shape.
+fn native_video_asset(value: &str) -> Value {
+    if value.starts_with("data:") {
+        json!({"type": "data_uri", "data_uri": value})
+    } else {
+        json!({"type": "url", "url": value})
+    }
+}
+
+/// Build the typed native `/v1/jobs` request for standard rsclaw video.
+fn native_video_body(
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    images: &[String],
+    video_ref: Option<&str>,
+) -> Value {
+    let mut frames = json!({});
+    let mut references = Vec::new();
+    if let Some(video) = video_ref {
+        references.push(json!({
+            "type": "video",
+            "role": "structure",
+            "asset": native_video_asset(video),
+        }));
+        references.extend(images.iter().map(|image| {
+            json!({
+                "type": "image",
+                "role": "subject",
+                "asset": native_video_asset(image),
+            })
+        }));
+    } else if images.len() <= 2 {
+        if let Some(first) = images.first() {
+            frames["start"] = native_video_asset(first);
+        }
+        if let Some(last) = images.get(1) {
+            frames["end"] = native_video_asset(last);
+        }
+    } else {
+        references.extend(images.iter().map(|image| {
+            json!({
+                "type": "image",
+                "role": "subject",
+                "asset": native_video_asset(image),
+            })
+        }));
+    }
+
+    json!({
+        "kind": {
+            "kind": "video",
+            "model": "rsclaw-video-v3",
+            "prompt": prompt,
+            "resolution": "720p",
+            "aspect_ratio": aspect_ratio,
+            "duration_secs": duration,
+            "fps": 24,
+            "steps": 20,
+            "generate_audio": false,
+            "frames": frames,
+            "references": references,
+        },
+        "metadata": {},
+    })
+}
+
+/// Submit a standard rsclaw video task through the typed durable jobs API and
+/// return its native `job_<id>`.
+///
+/// Standard video generation is always `rsclaw-video-v3`; old model ids and the
+/// compatibility `/v1/videos` surface are intentionally not used here.
 async fn submit_rsclaw_video(
     api_key: &str,
     prompt: &str,
@@ -669,78 +738,24 @@ async fn submit_rsclaw_video(
     model_hint: Option<&str>,
     images: &[String],
     video_ref: Option<&str>,
+    idempotency_key: &str,
 ) -> Result<String> {
-    // Default model by input shape: everything without a driving video
-    // (t2v, i2v, ti2v, first-last-frame) defaults to the faster 720p lane;
-    // only v2v (structure transfer from a driving video) needs the base
-    // model. An explicit model hint always wins.
-    let default_model = if video_ref.is_none() {
-        "rsclaw-video-v1-fast"
-    } else {
-        "rsclaw-video-v1"
-    };
-    // Chain entries may arrive prefixed (`rsclaw/rsclaw-video-v1`); strip
-    // the `provider/` segment so the upstream `model` field is the bare id.
-    let model = model_hint
-        .map(|m| m.rsplit('/').next().unwrap_or(m))
-        .filter(|m| !m.is_empty() && *m != "rsclaw")
-        // `rsclaw-video-ref-v1` is NOT a real server model id — v2v is the
-        // base `rsclaw-video-v1` model with a driving video in
-        // `input_references`. Older prompt baselines advertised the bogus id;
-        // remap it so requests work even before the prefix is re-ingested.
-        .map(|m| {
-            if m == "rsclaw-video-ref-v1" {
-                "rsclaw-video-v1"
-            } else {
-                m
-            }
-        })
-        .unwrap_or(default_model);
-    // gen-api.md §2: `seconds` is a STRING, `size` is WxH, and image-to-video
-    // uses `input_reference.image_url` (first frame) + optional
-    // `last_frame_reference.image_url` (last frame → first-last-frame).
-    let size = rsclaw_video_size(aspect_ratio);
-    // The t2v/i2v worker needs explicit `width`/`height` (the `size` string
-    // alone isn't enough), so send both forms.
-    let (w, h) = size
-        .split_once('x')
-        .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
-        .unwrap_or((1280, 720));
-    let mut body = json!({
-        "model": model,
-        "prompt": prompt,
-        "seconds": duration.to_string(),
-        "size": size,
-        "width": w,
-        "height": h,
-    });
-    // v2v structure transfer (model rsclaw-video-v1; the server selects the
-    // v2v lane from the driving video): the driving video goes in
-    // `input_references` as a `video` item; an optional first image sets the
-    // opening frame's look.
-    if let Some(v) = video_ref {
-        let mut refs = vec![json!({ "type": "video", "video_url": v })];
-        if let Some(first) = images.first() {
-            refs.push(json!({ "type": "image", "image_url": first }));
-        }
-        body["input_references"] = json!(refs);
-    } else {
-        if let Some(first) = images.first() {
-            body["input_reference"] = json!({ "image_url": first });
-        }
-        if let Some(last) = images.get(1) {
-            body["last_frame_reference"] = json!({ "image_url": last });
-        }
-    }
-
+    validate_native_rsclaw_model(model_hint)?;
+    let body = native_video_body(prompt, duration, aspect_ratio, images, video_ref);
     let url = format!(
-        "{}/v1/videos",
+        "{}/v1/jobs",
         rsclaw_provider::rsclaw_http::gen_host_base(None)
     );
     let redirect_client =
         rsclaw_provider::rsclaw_http::build_client(rsclaw_provider::DEFAULT_USER_AGENT, 30)?;
-    let resp =
-        rsclaw_provider::rsclaw_http::post_json(&redirect_client, &url, api_key, &body).await?;
+    let resp = rsclaw_provider::rsclaw_http::post_json_with_idempotency_key(
+        &redirect_client,
+        &url,
+        api_key,
+        &body,
+        idempotency_key,
+    )
+    .await?;
     let status = resp.status();
     let bytes = resp
         .bytes()
@@ -768,4 +783,60 @@ async fn submit_rsclaw_video(
         .ok_or_else(|| anyhow!("video_gen: rsclaw no `id` in response: {v}"))?
         .to_owned();
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_rsclaw_accepts_only_v3() {
+        assert!(validate_native_rsclaw_model(Some("rsclaw-video-v3")).is_ok());
+        assert!(validate_native_rsclaw_model(Some("rsclaw/rsclaw-video-v3")).is_ok());
+        assert!(validate_native_rsclaw_model(Some("rsclaw-video-v1")).is_err());
+        assert!(validate_native_rsclaw_model(Some("rsclaw-video-v1-fast")).is_err());
+        assert!(validate_native_rsclaw_model(None).is_ok());
+    }
+
+    #[test]
+    fn native_video_assets_use_typed_protocol_variants() {
+        assert_eq!(
+            native_video_asset("https://example.test/a.png"),
+            json!({"type": "url", "url": "https://example.test/a.png"})
+        );
+        assert_eq!(
+            native_video_asset("data:image/png;base64,AA=="),
+            json!({"type": "data_uri", "data_uri": "data:image/png;base64,AA=="})
+        );
+    }
+
+    #[test]
+    fn native_video_body_matches_jobs_contract_for_frames_and_v2v() {
+        let images = vec![
+            "https://example.test/start.png".to_owned(),
+            "https://example.test/end.png".to_owned(),
+        ];
+        let body = native_video_body("snow", 5, "16:9", &images, None);
+        assert_eq!(body["kind"]["model"], "rsclaw-video-v3");
+        assert_eq!(body["kind"]["duration_secs"], 5);
+        assert_eq!(body["kind"]["frames"]["start"]["type"], "url");
+        assert_eq!(body["kind"]["frames"]["end"]["url"], images[1]);
+        assert!(
+            body["kind"]["references"]
+                .as_array()
+                .expect("references")
+                .is_empty()
+        );
+
+        let body = native_video_body(
+            "transfer",
+            6,
+            "9:16",
+            &["https://example.test/subject.png".to_owned()],
+            Some("https://example.test/drive.mp4"),
+        );
+        assert_eq!(body["kind"]["references"][0]["role"], "structure");
+        assert_eq!(body["kind"]["references"][0]["type"], "video");
+        assert_eq!(body["kind"]["references"][1]["role"], "subject");
+    }
 }

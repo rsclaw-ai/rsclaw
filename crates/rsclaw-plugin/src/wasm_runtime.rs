@@ -2144,7 +2144,8 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
 /// This intentionally overwrites one `/tmp` file and is best-effort: diagnostic
 /// I/O must not affect a plugin's vision request.
 fn save_monitor_badge_vision_payload(prompt: &str, image_data_uri: &str) {
-    if !prompt.contains("这是微信底部导航栏截图。看“微信”和“通讯录”图标右上角") {
+    if !prompt.contains("这是微信底部导航栏截图。看“微信”和“通讯录”图标右上角")
+    {
         return;
     }
     let Some((header, encoded)) = image_data_uri.split_once(";base64,") else {

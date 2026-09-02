@@ -1582,10 +1582,10 @@ pub fn build_tool_list(
             "properties": {
                 "prompt":       {"type": "string", "description": "Video description. Use the user's original language and wording."},
                 "duration":     {"type": "integer", "description": "Duration in seconds (default: 5)", "default": 5},
-                "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)", "default": "16:9"},
+                "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 4:3, 3:4, 21:9, or 1:1 (default: 16:9)", "enum": ["16:9", "9:16", "4:3", "3:4", "21:9", "1:1"], "default": "16:9"},
                 "image":        {"type": "string", "description": "Optional reference image(s) for image-to-video (agnes, doubao, rsclaw). A single image as a string, OR a JSON array: ONE image = first frame (animate this image), TWO = first + last frame (interpolate), THREE+ = reference images (doubao multimodal). Each entry: a LOCAL FILE PATH (e.g. the path returned by image_gen — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI."},
-                "video":        {"type": "string", "description": "Optional DRIVING video for video-to-video structure/motion transfer. A LOCAL FILE PATH (auto-encoded to base64), an https URL, or a data:video/...;base64,... URI. Passing this with model `rsclaw-video-v1` enables v2v — the server selects the v2v lane from the driving video; do NOT pass a separate model id for it."},
-                "model":        {"type": "string", "description": "Video model to use, e.g. doubao seedance, agnes, rsclaw / rsclaw-video-v1 (rsclaw also does v2v when a driving `video` is given), sora-2 (optional, uses configured default)"}
+                "video":        {"type": "string", "description": "Optional DRIVING video for video-to-video structure/motion transfer. A LOCAL FILE PATH (auto-encoded to base64), an https URL, or a data:video/...;base64,... URI. Rsclaw sends it as a typed structure reference to `rsclaw-video-v3`."},
+                "model":        {"type": "string", "description": "Video model to use, e.g. doubao seedance, agnes, rsclaw / rsclaw-video-v3, or sora-2 (optional, uses configured default)"}
             },
             "required": ["prompt"]
         }),

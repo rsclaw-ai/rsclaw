@@ -318,7 +318,6 @@ Follow them unless the user says otherwise.\n\n{}\n",
 #[cfg(test)]
 mod lessons_tests {
     use rsclaw_memory::{MemDocTier, MemoryDoc, MemoryStore};
-
     use rsclaw_platform::MemoryTier;
 
     use super::*;

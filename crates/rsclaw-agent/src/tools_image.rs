@@ -146,7 +146,7 @@ pub(crate) async fn normalize_image_inputs(v: &Value) -> Vec<String> {
 pub(crate) fn default_video_model(provider: &str) -> Option<&'static str> {
     match provider {
         "agnes" => Some("agnes/agnes-video-v2.0"),
-        "rsclaw" => Some("rsclaw/rsclaw-video-v1"),
+        "rsclaw" => Some("rsclaw/rsclaw-video-v3"),
         _ => None,
     }
 }
