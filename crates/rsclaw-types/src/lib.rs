@@ -116,6 +116,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "computer_use",
     "image_gen",
     "video_gen",
+    "video_status",
     "avatar_gen",
     "mv_gen",
     "music_gen",

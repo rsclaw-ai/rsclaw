@@ -434,6 +434,7 @@ impl AgentRuntime {
             "image_gen" | "image" => return self.tool_image(args, ctx).await,
             "ocr" => return self.tool_ocr(args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx, tool_call_id).await,
+            "video_status" => return self.tool_video_status(args).await,
             "avatar_gen" | "avatar" => return self.tool_avatar_gen(args, ctx).await,
             "mv_gen" | "mv" => return self.tool_mv_gen(args, ctx).await,
             "music_gen" | "music" => return self.tool_music(args).await,

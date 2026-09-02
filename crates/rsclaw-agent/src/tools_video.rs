@@ -31,6 +31,7 @@ impl super::runtime::AgentRuntime {
             })?;
         let duration = args["duration"].as_u64().unwrap_or(5);
         let aspect_ratio = args["aspect_ratio"].as_str().unwrap_or("16:9");
+        let resolution = video_resolution(args.get("resolution"))?;
         let generate_audio = match args.get("generate_audio") {
             None | Some(Value::Null) => None,
             Some(value) => Some(value.as_bool().ok_or_else(|| {
@@ -308,6 +309,7 @@ impl super::runtime::AgentRuntime {
                         &key,
                         prompt,
                         duration,
+                        resolution,
                         aspect_ratio,
                         generate_audio,
                         Some(model_id.as_str()),
@@ -407,6 +409,58 @@ impl super::runtime::AgentRuntime {
             "job_id": job_id,
             "message": "Video generation submitted. The finished video will be delivered automatically when ready (typically 30s–5min). The user has been informed; do NOT poll or wait — your turn is complete."
         }))
+    }
+
+    /// Query an existing video task without submitting or mutating it.
+    pub(crate) async fn tool_video_status(&self, args: Value) -> Result<Value> {
+        let job_id = args
+            .get("job_id")
+            .or_else(|| args.get("task_id"))
+            .or_else(|| args.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| anyhow!("video_status: `job_id` is required"))?;
+
+        // `video_gen` returns a gateway-internal UUID as `job_id`. This is the
+        // preferred provider-independent lookup: it works for Seedance, Agnes,
+        // OpenAI, native rsclaw and legacy avatar/MV jobs.
+        if let Some(job) = self
+            .store
+            .db
+            .get_external_job(job_id)
+            .map_err(|error| anyhow!("video_status: read local job: {error}"))?
+        {
+            return Ok(local_video_job_status(&job));
+        }
+
+        // The tool also returns the provider `task_id`. Native rsclaw IDs are
+        // self-describing, so they can be queried directly even when the local
+        // queue row has already been cleaned up.
+        let api_key = || {
+            self.config
+                .model
+                .models
+                .as_ref()
+                .and_then(|models| models.providers.get("rsclaw"))
+                .and_then(|provider| provider.api_key.as_ref())
+                .and_then(|key| key.as_plain().map(str::to_owned))
+                .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "video_status: no rsclaw API key configured; query with the internal `job_id` instead"
+                    )
+                })
+        };
+        let outcome = if job_id.starts_with("job_") {
+            rsclaw_jobs::poll_rsclaw_native(&api_key()?, job_id).await?
+        } else if job_id.starts_with("video_") {
+            rsclaw_jobs::poll_rsclaw_legacy(&api_key()?, job_id).await?
+        } else {
+            return Err(anyhow!(
+                "video_status: unknown job ID `{job_id}`; use the internal `job_id`, native `job_...`, or legacy `video_...` returned by video_gen"
+            ));
+        };
+        Ok(provider_video_status(job_id, outcome))
     }
 
     /// Avatar (数字人) generation — `POST /v1/videos/avatar` (gen-api.md §3).
@@ -650,6 +704,47 @@ async fn post_rsclaw_gen(endpoint: &str, api_key: &str, body: &Value) -> Result<
     Ok(id)
 }
 
+fn local_video_job_status(job: &rsclaw_types::ExternalJob) -> Value {
+    let status = match job.status {
+        rsclaw_types::ExternalJobStatus::Pending => "pending",
+        rsclaw_types::ExternalJobStatus::Polling => "in_progress",
+        rsclaw_types::ExternalJobStatus::Done => "completed",
+        rsclaw_types::ExternalJobStatus::Failed => "failed",
+        rsclaw_types::ExternalJobStatus::TimedOut => "timed_out",
+    };
+    json!({
+        "status": status,
+        "job_id": job.id,
+        "task_id": job.external_task_id,
+        "provider": job.provider,
+        "poll_count": job.poll_count,
+        "submitted_at": job.submitted_at,
+        "result_url": job.result_url,
+        "result_path": job.result_path,
+        "error": job.error,
+        "delivery_complete": job.delivered_at.is_some(),
+    })
+}
+
+fn provider_video_status(task_id: &str, outcome: rsclaw_types::PollOutcome) -> Value {
+    match outcome {
+        rsclaw_types::PollOutcome::Pending => json!({
+            "status": "pending",
+            "task_id": task_id,
+        }),
+        rsclaw_types::PollOutcome::Done(url) => json!({
+            "status": "completed",
+            "task_id": task_id,
+            "result_url": url,
+        }),
+        rsclaw_types::PollOutcome::Failed(error) => json!({
+            "status": "failed",
+            "task_id": task_id,
+            "error": error,
+        }),
+    }
+}
+
 /// Validate a configured rsclaw model against the current native jobs contract.
 fn validate_native_rsclaw_model(model: Option<&str>) -> Result<()> {
     let Some(model) = model else {
@@ -662,6 +757,22 @@ fn validate_native_rsclaw_model(model: Option<&str>) -> Result<()> {
         Err(anyhow!(
             "video_gen: rsclaw native jobs only support `rsclaw-video-v3`; unsupported model `{model}`"
         ))
+    }
+}
+
+/// Resolve and validate the native video resolution. The tool-level default is
+/// 480p; external providers continue to use their own quality defaults.
+fn video_resolution(value: Option<&Value>) -> Result<&str> {
+    match value {
+        None | Some(Value::Null) => Ok("480p"),
+        Some(Value::String(value))
+            if matches!(value.as_str(), "480p" | "720p" | "1080p" | "2k") =>
+        {
+            Ok(value)
+        }
+        Some(_) => Err(anyhow!(
+            "video_gen: `resolution` must be one of 480p, 720p, 1080p, or 2k"
+        )),
     }
 }
 
@@ -678,6 +789,7 @@ fn native_video_asset(value: &str) -> Value {
 fn native_video_body(
     prompt: &str,
     duration: u64,
+    resolution: &str,
     aspect_ratio: &str,
     generate_audio: Option<bool>,
     images: &[String],
@@ -719,7 +831,7 @@ fn native_video_body(
         "kind": "video",
         "model": "rsclaw-video-v3",
         "prompt": prompt,
-        "resolution": "720p",
+        "resolution": resolution,
         "aspect_ratio": aspect_ratio,
         "duration_secs": duration,
         "frames": frames,
@@ -740,6 +852,7 @@ async fn submit_rsclaw_video(
     api_key: &str,
     prompt: &str,
     duration: u64,
+    resolution: &str,
     aspect_ratio: &str,
     generate_audio: Option<bool>,
     model_hint: Option<&str>,
@@ -751,6 +864,7 @@ async fn submit_rsclaw_video(
     let body = native_video_body(
         prompt,
         duration,
+        resolution,
         aspect_ratio,
         generate_audio,
         images,
@@ -813,6 +927,37 @@ mod tests {
     }
 
     #[test]
+    fn video_status_maps_provider_outcomes_without_resubmitting() {
+        assert_eq!(
+            provider_video_status("job_1", rsclaw_types::PollOutcome::Pending)["status"],
+            "pending"
+        );
+        let completed = provider_video_status(
+            "job_1",
+            rsclaw_types::PollOutcome::Done("https://example.test/video.mp4".to_owned()),
+        );
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["result_url"], "https://example.test/video.mp4");
+        let failed = provider_video_status(
+            "job_1",
+            rsclaw_types::PollOutcome::Failed("backend_failure".to_owned()),
+        );
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error"], "backend_failure");
+    }
+
+    #[test]
+    fn native_video_resolution_defaults_to_480p_and_validates_values() {
+        assert_eq!(video_resolution(None).expect("default resolution"), "480p");
+        assert_eq!(
+            video_resolution(Some(&json!("1080p"))).expect("explicit resolution"),
+            "1080p"
+        );
+        assert!(video_resolution(Some(&json!("4k"))).is_err());
+        assert!(video_resolution(Some(&json!(1080))).is_err());
+    }
+
+    #[test]
     fn native_video_assets_use_typed_protocol_variants() {
         assert_eq!(
             native_video_asset("https://example.test/a.png"),
@@ -830,8 +975,9 @@ mod tests {
             "https://example.test/start.png".to_owned(),
             "https://example.test/end.png".to_owned(),
         ];
-        let body = native_video_body("snow", 5, "16:9", None, &images, None);
+        let body = native_video_body("snow", 5, "480p", "16:9", None, &images, None);
         assert_eq!(body["kind"]["model"], "rsclaw-video-v3");
+        assert_eq!(body["kind"]["resolution"], "480p");
         assert_eq!(body["kind"]["duration_secs"], 5);
         assert!(body["kind"].get("fps").is_none());
         assert!(body["kind"].get("steps").is_none());
@@ -848,6 +994,7 @@ mod tests {
         let body = native_video_body(
             "transfer",
             6,
+            "1080p",
             "9:16",
             Some(true),
             &["https://example.test/subject.png".to_owned()],
@@ -858,7 +1005,7 @@ mod tests {
         assert_eq!(body["kind"]["references"][0]["type"], "video");
         assert_eq!(body["kind"]["references"][1]["role"], "subject");
 
-        let body = native_video_body("silent", 5, "1:1", Some(false), &[], None);
+        let body = native_video_body("silent", 5, "2k", "1:1", Some(false), &[], None);
         assert_eq!(body["kind"]["generate_audio"], false);
     }
 }
