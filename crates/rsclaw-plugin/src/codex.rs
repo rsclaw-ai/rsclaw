@@ -235,7 +235,7 @@ fn parse_frontmatter_skill(raw: &str, fallback_name: &str) -> Option<CodexSkill>
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
     use super::*;
 
@@ -375,12 +375,12 @@ mod tests {
     fn resolve_command_resolves_relative_paths_against_plugin_dir() {
         let dir = Path::new("/plugins/demo");
         assert_eq!(
-            resolve_command("./scripts/server.py", dir),
-            "/plugins/demo/scripts/server.py"
+            PathBuf::from(resolve_command("./scripts/server.py", dir)),
+            dir.join("scripts/server.py")
         );
         assert_eq!(
-            resolve_command("bin/server", dir),
-            "/plugins/demo/bin/server"
+            PathBuf::from(resolve_command("bin/server", dir)),
+            dir.join("bin/server")
         );
     }
 
