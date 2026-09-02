@@ -261,7 +261,7 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         return input_text(&args_json, &config, options.op_type).await;
     }
     if command == CLIPBOARD_SET_COMMAND {
-        return clipboard_set(args_json, &config).await;
+        return clipboard_set(&args_json, &config).await;
     }
     if command == OCR_REGION_COMMAND {
         return ocr_region(&args_json, &config, options.op_type).await;
