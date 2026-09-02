@@ -81,6 +81,63 @@ impl Drop for PrivateTempFile {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Return a lightweight per-call pseudo-random value without adding a dependency.
+fn input_random() -> u64 {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let mut value = time ^ SEQUENCE.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+    value ^= value >> 12;
+    value ^= value << 25;
+    value ^ (value >> 27)
+}
+
+fn random_signed_offset(min: i32, max: i32) -> i32 {
+    let magnitude = min + (input_random() % (max - min + 1) as u64) as i32;
+    if input_random() & 1 == 0 {
+        magnitude
+    } else {
+        -magnitude
+    }
+}
+
+/// Move through a cubic Bezier path and finish near, rather than exactly on,
+/// the visual target so repeated cached-coordinate clicks do not look synthetic.
+fn human_move(enigo: &mut Enigo, target_x: i32, target_y: i32) -> Result<(), String> {
+    let (start_x, start_y) = enigo.location().unwrap_or((target_x, target_y));
+    let end_x = target_x.saturating_add(random_signed_offset(5, 10)).max(0);
+    let end_y = target_y.saturating_add(random_signed_offset(5, 10)).max(0);
+    let dx = end_x - start_x;
+    let dy = end_y - start_y;
+    let control_1 = (
+        start_x + dx / 3 + random_signed_offset(12, 36),
+        start_y + dy / 3 + random_signed_offset(12, 36),
+    );
+    let control_2 = (
+        start_x + dx * 2 / 3 + random_signed_offset(12, 36),
+        start_y + dy * 2 / 3 + random_signed_offset(12, 36),
+    );
+    let steps = 18 + (input_random() % 9) as i32;
+    for step in 1..=steps {
+        let t = step as f64 / steps as f64;
+        let u = 1.0 - t;
+        let x = u.powi(3) * start_x as f64
+            + 3.0 * u.powi(2) * t * control_1.0 as f64
+            + 3.0 * u * t.powi(2) * control_2.0 as f64
+            + t.powi(3) * end_x as f64;
+        let y = u.powi(3) * start_y as f64
+            + 3.0 * u.powi(2) * t * control_1.1 as f64
+            + 3.0 * u * t.powi(2) * control_2.1 as f64
+            + t.powi(3) * end_y as f64;
+        enigo
+            .move_mouse(x.round() as i32, y.round() as i32, Coordinate::Abs)
+            .map_err(|error| format!("Bezier mouse move: {error}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(5 + input_random() % 7));
+    }
+    Ok(())
+}
+
 /// Construct a fresh `Enigo` or return an error string.
 fn new_enigo() -> Result<Enigo, String> {
     Enigo::new(&Settings::default()).map_err(|e| {
@@ -1008,6 +1065,15 @@ fn ocr_file_hits(_path: &std::path::Path, _iw: u32, _ih: u32) -> Result<Vec<OcrH
 /// Convert a macOS bundle-id to the process name used by System Events.
 /// E.g. "com.tencent.xinWeChat" -> "WeChat", "com.apple.Safari" -> "Safari".
 fn bundle_to_app_name(bundle_id: &str) -> String {
+    // Current Windows Qt builds use Weixin.exe; macOS keeps the WeChat process name.
+    #[cfg(target_os = "windows")]
+    if matches!(
+        bundle_id,
+        "com.tencent.xinWeChat" | "com.tencent.xinWeChat.desktop"
+    ) {
+        return "Weixin".to_string();
+    }
+
     // Common overrides for apps whose process name differs from bundle-id tail.
     match bundle_id {
         "com.tencent.xinWeChat" => "WeChat".to_string(),
@@ -1736,9 +1802,7 @@ end tell"#,
         tokio::task::spawn_blocking(move || {
             let mut enigo = new_enigo()?;
             let (lx, ly) = scale_for_input(x, y);
-            enigo
-                .move_mouse(lx, ly, Coordinate::Abs)
-                .map_err(|e| format!("move_mouse: {e}"))?;
+            human_move(&mut enigo, lx, ly)?;
             enigo
                 .button(Button::Left, Click)
                 .map_err(|e| format!("button click: {e}"))?;
