@@ -183,8 +183,7 @@ impl VlmDriver<'_> {
         // the first action does not re-prompt; `reverify_consent` adds any
         // further app the user approves mid-run. Kept here rather than on
         // the struct so `AllowOnce` is not re-consumed on every action.
-        let mut consented: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut consented: std::collections::HashSet<String> = std::collections::HashSet::new();
         consented.insert(self.initial_consent_target().await);
         self.emit_started(instruction);
 
@@ -377,9 +376,7 @@ impl VlmDriver<'_> {
                 // "you forgot Action:" reminder the model can't act on.
                 // Only exhausted retries fall through to the format-error
                 // path below.
-                if prediction.trim().is_empty()
-                    && empty_retries < MAX_EMPTY_RETRIES
-                {
+                if prediction.trim().is_empty() && empty_retries < MAX_EMPTY_RETRIES {
                     empty_retries += 1;
                     warn!(
                         retries = empty_retries,
@@ -391,8 +388,8 @@ impl VlmDriver<'_> {
                 // The vision worker occasionally emits a run of literal
                 // '?' instead of real tokens — same transient failure as
                 // an empty reply, so retry it the same way.
-                let all_question_marks = !prediction.trim().is_empty()
-                    && prediction.trim().chars().all(|c| c == '?');
+                let all_question_marks =
+                    !prediction.trim().is_empty() && prediction.trim().chars().all(|c| c == '?');
                 if all_question_marks && empty_retries < MAX_EMPTY_RETRIES {
                     empty_retries += 1;
                     warn!(
@@ -591,8 +588,7 @@ impl VlmDriver<'_> {
                 if matches!(
                     action,
                     Action::Type { .. } | Action::Hotkey { .. } | Action::HoldKey { .. }
-                ) && let Some(deny) =
-                    self.reverify_consent(&mut consented, instruction).await?
+                ) && let Some(deny) = self.reverify_consent(&mut consented, instruction).await?
                 {
                     return Ok(deny);
                 }
@@ -732,11 +728,7 @@ impl VlmDriver<'_> {
 
     /// Check-then-prompt for one specific app. Shared by the up-front gate
     /// and the mid-run focus re-verification.
-    async fn ensure_consent(
-        &self,
-        app: &str,
-        instruction: &str,
-    ) -> Result<Option<DriverOutcome>> {
+    async fn ensure_consent(&self, app: &str, instruction: &str) -> Result<Option<DriverOutcome>> {
         let app = app.to_owned();
 
         match self.permission.check(&self.agent_id, &app).await? {

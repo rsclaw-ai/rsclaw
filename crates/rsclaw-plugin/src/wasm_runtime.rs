@@ -1930,6 +1930,99 @@ impl HostState {
 
     /// Execute a browser action by locking the shared browser session.
     /// Auto-starts Chrome if no session exists.
+    async fn run_android_vlm_drive(
+        &mut self,
+        instruction: String,
+        max_steps: u32,
+        action_spaces: Option<Vec<String>>,
+        operator: crate::android_vlm::AndroidUiautoOperator,
+    ) -> Result<String, String> {
+        use std::sync::atomic::AtomicBool;
+
+        use rsclaw_computer::{
+            ActionSpec, CoordSpace, DriverOutcome, VlmDriver,
+            app_rules::AppRuleSet,
+            parser::CoordFormat,
+            permission::{CheckFut, PermissionDecision, PermissionStore, RecordFut},
+        };
+
+        struct PluginPermission;
+        impl PermissionStore for PluginPermission {
+            fn check<'a>(&'a self, _agent_id: &'a str, _app: &'a str) -> CheckFut<'a> {
+                Box::pin(async { Ok(Some(PermissionDecision::AllowOnce)) })
+            }
+            fn record<'a>(
+                &'a self,
+                _agent_id: &'a str,
+                _app: &'a str,
+                _decision: PermissionDecision,
+            ) -> RecordFut<'a> {
+                Box::pin(async { Ok(()) })
+            }
+            fn revoke<'a>(&'a self, _agent_id: &'a str, _app: &'a str) -> RecordFut<'a> {
+                Box::pin(async { Ok(()) })
+            }
+            fn bypass_all(&self) -> bool {
+                true
+            }
+        }
+
+        let registry = self
+            .providers
+            .clone()
+            .ok_or_else(|| "android-vlm-drive: provider registry unavailable".to_string())?;
+        let model_name = self
+            .vision_model
+            .clone()
+            .ok_or_else(|| "android-vlm-drive: vision model unavailable".to_string())?;
+        let (provider_name, _) = registry.resolve_model(&model_name);
+        let provider = registry
+            .get(provider_name)
+            .map_err(|error| format!("android-vlm-drive: {error}"))?;
+        let rules = AppRuleSet::default();
+        let action_spaces_override =
+            action_spaces.map(|specs| specs.into_iter().map(ActionSpec::new).collect());
+        let driver = VlmDriver {
+            operator: &operator,
+            provider,
+            model_name: model_name.clone(),
+            coord_format: CoordFormat::Auto,
+            coord_space: CoordSpace::for_model(&model_name),
+            max_loop: max_steps.clamp(1, 30) as usize,
+            abort: Arc::new(AtomicBool::new(false)),
+            app_rules: &rules,
+            permission: Arc::new(PluginPermission),
+            agent_id: format!("plugin:{}", self.plugin_name),
+            app: "WeChat Android".to_string(),
+            permission_emit: None,
+            headless_auto_allow: true,
+            status_emit: None,
+            run_id: format!("android-vlm-drive-{}", uuid::Uuid::new_v4().simple()),
+            action_spaces_override,
+        };
+        let outcome = driver
+            .run(&instruction)
+            .await
+            .map_err(|error| format!("android-vlm-drive: {error:#}"))?;
+        let value = match outcome {
+            DriverOutcome::Finished { content, steps } => {
+                json!({"kind":"finished","content":content,"steps":steps})
+            }
+            DriverOutcome::CallUser { reason, steps } => {
+                json!({"kind":"call_user","reason":reason,"steps":steps})
+            }
+            DriverOutcome::MaxLoop { steps } => json!({"kind":"max_loop","steps":steps}),
+            DriverOutcome::UserAbort { steps } => json!({"kind":"user_abort","steps":steps}),
+            DriverOutcome::PermissionDenied => json!({"kind":"permission_denied"}),
+            DriverOutcome::OperatorError { message, steps } => {
+                json!({"kind":"operator_error","message":message,"steps":steps})
+            }
+        };
+        Ok(value.to_string())
+    }
+
+    /// Execute a browser action by locking the shared browser session.
+    /// Auto-starts Chrome if no session exists.
     async fn browser_action(&mut self, action: &str, args: Value) -> Result<String, String> {
         let mut guard = self.browser.lock().await;
 
@@ -2144,7 +2237,8 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
 /// This intentionally overwrites one `/tmp` file and is best-effort: diagnostic
 /// I/O must not affect a plugin's vision request.
 fn save_monitor_badge_vision_payload(prompt: &str, image_data_uri: &str) {
-    if !prompt.contains("这是微信底部导航栏截图。看“微信”和“通讯录”图标右上角") {
+    if !prompt.contains("这是微信底部导航栏截图。看“微信”和“通讯录”图标右上角")
+    {
         return;
     }
     let Some((header, encoded)) = image_data_uri.split_once(";base64,") else {
@@ -2363,92 +2457,37 @@ impl rsclaw::plugin::host_android::Host for HostState {
         max_steps: u32,
         action_spaces: Option<Vec<String>>,
     ) -> HostTrapResult<Result<String, String>> {
-        use std::sync::atomic::AtomicBool;
+        Ok(self
+            .run_android_vlm_drive(
+                instruction,
+                max_steps,
+                action_spaces,
+                crate::android_vlm::AndroidUiautoOperator::legacy(),
+            )
+            .await)
+    }
 
-        use rsclaw_computer::{
-            ActionSpec, CoordSpace, DriverOutcome, VlmDriver,
-            app_rules::AppRuleSet,
-            parser::CoordFormat,
-            permission::{CheckFut, PermissionDecision, PermissionStore, RecordFut},
-        };
-
-        struct PluginPermission;
-        impl PermissionStore for PluginPermission {
-            fn check<'a>(&'a self, _agent_id: &'a str, _app: &'a str) -> CheckFut<'a> {
-                Box::pin(async { Ok(Some(PermissionDecision::AllowOnce)) })
-            }
-            fn record<'a>(
-                &'a self,
-                _agent_id: &'a str,
-                _app: &'a str,
-                _decision: PermissionDecision,
-            ) -> RecordFut<'a> {
-                Box::pin(async { Ok(()) })
-            }
-            fn revoke<'a>(&'a self, _agent_id: &'a str, _app: &'a str) -> RecordFut<'a> {
-                Box::pin(async { Ok(()) })
-            }
-            fn bypass_all(&self) -> bool {
-                true
-            }
-        }
-
-        let Some(registry) = self.providers.clone() else {
-            return Ok(Err(
-                "android-vlm-drive: provider registry unavailable".to_string()
-            ));
-        };
-        let Some(model_name) = self.vision_model.clone() else {
-            return Ok(Err(
-                "android-vlm-drive: vision model unavailable".to_string()
-            ));
-        };
-        let (provider_name, _) = registry.resolve_model(&model_name);
-        let provider = match registry.get(provider_name) {
-            Ok(provider) => provider,
-            Err(error) => return Ok(Err(format!("android-vlm-drive: {error}"))),
-        };
-        let operator = crate::android_vlm::AndroidUiautoOperator;
-        let rules = AppRuleSet::default();
-        let action_spaces_override =
-            action_spaces.map(|specs| specs.into_iter().map(ActionSpec::new).collect());
-        let driver = VlmDriver {
-            operator: &operator,
-            provider,
-            model_name: model_name.clone(),
-            coord_format: CoordFormat::Auto,
-            coord_space: CoordSpace::for_model(&model_name),
-            max_loop: max_steps.clamp(1, 30) as usize,
-            abort: Arc::new(AtomicBool::new(false)),
-            app_rules: &rules,
-            permission: Arc::new(PluginPermission),
-            agent_id: format!("plugin:{}", self.plugin_name),
-            app: "WeChat Android".to_string(),
-            permission_emit: None,
-            headless_auto_allow: true,
-            status_emit: None,
-            run_id: format!("android-vlm-drive-{}", uuid::Uuid::new_v4().simple()),
-            action_spaces_override,
-        };
-        let outcome = match driver.run(&instruction).await {
-            Ok(outcome) => outcome,
-            Err(error) => return Ok(Err(format!("android-vlm-drive: {error:#}"))),
-        };
-        let value = match outcome {
-            DriverOutcome::Finished { content, steps } => {
-                json!({"kind":"finished","content":content,"steps":steps})
-            }
-            DriverOutcome::CallUser { reason, steps } => {
-                json!({"kind":"call_user","reason":reason,"steps":steps})
-            }
-            DriverOutcome::MaxLoop { steps } => json!({"kind":"max_loop","steps":steps}),
-            DriverOutcome::UserAbort { steps } => json!({"kind":"user_abort","steps":steps}),
-            DriverOutcome::PermissionDenied => json!({"kind":"permission_denied"}),
-            DriverOutcome::OperatorError { message, steps } => {
-                json!({"kind":"operator_error","message":message,"steps":steps})
-            }
-        };
-        Ok(Ok(value.to_string()))
+    async fn android_vlm_drive_with_options(
+        &mut self,
+        instruction: String,
+        max_steps: u32,
+        action_spaces: Option<Vec<String>>,
+        op_type: String,
+        op_mode: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let options =
+            match crate::android_uiauto::AndroidOperationOptions::parse(&op_type, &op_mode) {
+                Ok(options) => options,
+                Err(error) => return Ok(Err(error)),
+            };
+        Ok(self
+            .run_android_vlm_drive(
+                instruction,
+                max_steps,
+                action_spaces,
+                crate::android_vlm::AndroidUiautoOperator::with_options(options),
+            )
+            .await)
     }
 }
 

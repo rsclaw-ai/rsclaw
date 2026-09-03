@@ -204,6 +204,11 @@ interface host-android {
     /// operator's built-in action space.
     android-vlm-drive: func(instruction: string, max-steps: u32, action-spaces: option<list<string>>) -> result<string, string>;
 
+    /// Run the VLM driver with an explicit operation transport and targeting
+    /// policy. `op-type` is auto, a11y, u2, or adb. `op-mode` is vision or
+    /// selector. Explicit transports fail closed instead of falling back.
+    android-vlm-drive-with-options: func(instruction: string, max-steps: u32, action-spaces: option<list<string>>, op-type: string, op-mode: string) -> result<string, string>;
+
     /// Push a local artifact file to device shared storage through the CLS
     /// ADB tunnel. `media-kind` is one of `image`, `file`, or `audio`.
     /// Returns the staged device path.

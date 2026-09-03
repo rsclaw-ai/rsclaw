@@ -1,4 +1,3 @@
-
 use rsclaw_config::schema::{ContextPruningConfig, HardClearConfig, SoftTrimConfig};
 use rsclaw_provider::{Message, MessageContent, Role};
 use rsclaw_skill::SkillRegistry;
@@ -383,6 +382,7 @@ fn build_tool_list_contains_builtins() {
         "read_file",
         "write_file",
         "shell",
+        "video_status",
     ] {
         assert!(
             names.contains(expected),

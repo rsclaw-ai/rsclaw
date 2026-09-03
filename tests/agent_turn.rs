@@ -239,13 +239,16 @@ async fn start_echo_server(addr: SocketAddr) {
             None,
             None,
         ),
-        task_queue: Arc::new(rsclaw::gateway::task_queue::TaskQueueManager::new(Arc::new(
-            rsclaw_store::redb_store::RedbStore::open(
-                &std::env::temp_dir().join(format!("rsclaw-test-tq-{}.redb", std::process::id())),
-                MemoryTier::Low,
-            )
-            .expect("task queue store"),
-        ))),
+        task_queue: Arc::new(rsclaw::gateway::task_queue::TaskQueueManager::new(
+            Arc::new(
+                rsclaw_store::redb_store::RedbStore::open(
+                    &std::env::temp_dir()
+                        .join(format!("rsclaw-test-tq-{}.redb", std::process::id())),
+                    MemoryTier::Low,
+                )
+                .expect("task queue store"),
+            ),
+        )),
         providers: Arc::new(tokio::sync::RwLock::new(Arc::new(
             rsclaw_provider::registry::ProviderRegistry::new(),
         ))),

@@ -181,14 +181,26 @@ impl ExternalJobsWorker {
                     error!(job_id = %job.id, "update (pending) failed: {e:#}");
                 }
             }
+            Ok(PollOutcome::InProgress(progress)) => {
+                let now = chrono::Utc::now().timestamp();
+                job.next_poll_at = now + job.next_poll_delay_secs() as i64;
+                job.status = ExternalJobStatus::Pending;
+                job.error = None;
+                if let Some(progress) = progress {
+                    job.progress = Some(progress);
+                }
+                if let Err(e) = self.store.update_external_job(&job) {
+                    error!(job_id = %job.id, "update (in-progress) failed: {e:#}");
+                }
+            }
             Ok(PollOutcome::Done(url)) => {
+                job.progress = Some(1.0);
                 job.result_url = Some(url.clone());
-                // rsclaw VIDEO artifacts are served inline behind Bearer at
-                // `/v1/videos/{id}/content` (no authless R2 presign), so they
-                // must be downloaded WITH the rsclaw key (following the LB hop).
-                // Everything else (agnes / openai / seedance public URLs, and
-                // the rsclaw_image signed url) is fetched authless.
-                let dl = if job.provider == "rsclaw" {
+                // Native jobs and current legacy responses return signed URLs;
+                // never send Bearer to those URLs. Only a legacy fallback to a
+                // bare `/content` endpoint needs the authenticated downloader.
+                let signed = url.contains("exp=") && url.contains("sig=");
+                let dl = if job.provider == "rsclaw_legacy" && !signed {
                     let key = self
                         .resolve_provider_key("rsclaw", "RSCLAW_API_KEY")
                         .unwrap_or_default();
@@ -341,11 +353,17 @@ impl ExternalJobsWorker {
                 })?;
                 rsclaw_jobs::poll_kling(&self.client, &ak, &sk, &job.external_task_id).await
             }
-            "rsclaw" => {
+            "rsclaw_native" => {
                 let key = self
                     .resolve_provider_key("rsclaw", "RSCLAW_API_KEY")
                     .ok_or_else(|| anyhow!("rsclaw: no API key configured"))?;
-                rsclaw_jobs::poll_rsclaw(&key, &job.external_task_id).await
+                rsclaw_jobs::poll_rsclaw_native(&key, &job.external_task_id).await
+            }
+            "rsclaw_legacy" => {
+                let key = self
+                    .resolve_provider_key("rsclaw", "RSCLAW_API_KEY")
+                    .ok_or_else(|| anyhow!("rsclaw: no API key configured"))?;
+                rsclaw_jobs::poll_rsclaw_legacy(&key, &job.external_task_id).await
             }
             "agnes" => {
                 let key = self

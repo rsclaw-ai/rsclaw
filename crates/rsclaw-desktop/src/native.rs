@@ -81,6 +81,65 @@ impl Drop for PrivateTempFile {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Return a lightweight per-call pseudo-random value without adding a
+/// dependency.
+fn input_random() -> u64 {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let mut value = time ^ SEQUENCE.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+    value ^= value >> 12;
+    value ^= value << 25;
+    value ^ (value >> 27)
+}
+
+fn random_signed_offset(min: i32, max: i32) -> i32 {
+    let magnitude = min + (input_random() % (max - min + 1) as u64) as i32;
+    if input_random() & 1 == 0 {
+        magnitude
+    } else {
+        -magnitude
+    }
+}
+
+/// Move through a cubic Bezier path and finish near, rather than exactly on,
+/// the visual target so repeated cached-coordinate clicks do not look
+/// synthetic.
+fn human_move(enigo: &mut Enigo, target_x: i32, target_y: i32) -> Result<(), String> {
+    let (start_x, start_y) = enigo.location().unwrap_or((target_x, target_y));
+    let end_x = target_x.saturating_add(random_signed_offset(5, 10)).max(0);
+    let end_y = target_y.saturating_add(random_signed_offset(5, 10)).max(0);
+    let dx = end_x - start_x;
+    let dy = end_y - start_y;
+    let control_1 = (
+        start_x + dx / 3 + random_signed_offset(12, 36),
+        start_y + dy / 3 + random_signed_offset(12, 36),
+    );
+    let control_2 = (
+        start_x + dx * 2 / 3 + random_signed_offset(12, 36),
+        start_y + dy * 2 / 3 + random_signed_offset(12, 36),
+    );
+    let steps = 18 + (input_random() % 9) as i32;
+    for step in 1..=steps {
+        let t = step as f64 / steps as f64;
+        let u = 1.0 - t;
+        let x = u.powi(3) * start_x as f64
+            + 3.0 * u.powi(2) * t * control_1.0 as f64
+            + 3.0 * u * t.powi(2) * control_2.0 as f64
+            + t.powi(3) * end_x as f64;
+        let y = u.powi(3) * start_y as f64
+            + 3.0 * u.powi(2) * t * control_1.1 as f64
+            + 3.0 * u * t.powi(2) * control_2.1 as f64
+            + t.powi(3) * end_y as f64;
+        enigo
+            .move_mouse(x.round() as i32, y.round() as i32, Coordinate::Abs)
+            .map_err(|error| format!("Bezier mouse move: {error}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(5 + input_random() % 7));
+    }
+    Ok(())
+}
+
 /// Construct a fresh `Enigo` or return an error string.
 fn new_enigo() -> Result<Enigo, String> {
     Enigo::new(&Settings::default()).map_err(|e| {
@@ -833,8 +892,8 @@ struct OcrHit {
 /// `android_ocr_region` fast path.
 pub fn ocr_image_region(png: &[u8], rect: Option<(u32, u32, u32, u32)>) -> Result<String, String> {
     use image::GenericImageView;
-    let img = image::load_from_memory(png)
-        .map_err(|e| format!("ocr_image_region: decode PNG: {e}"))?;
+    let img =
+        image::load_from_memory(png).map_err(|e| format!("ocr_image_region: decode PNG: {e}"))?;
     let rgb = img.to_rgb8();
     let iw = rgb.width();
     let ih = rgb.height();
@@ -981,7 +1040,11 @@ fn ocr_file_hits(path: &std::path::Path, _iw: u32, _ih: u32) -> Result<Vec<OcrHi
         .map_err(|e| format!("Windows OCR parse failed: {e}; out={stdout}"))?;
     let mut hits = Vec::new();
     for row in rows {
-        let text = row.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let text = row
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if text.trim().is_empty() {
             continue;
         }
@@ -1008,6 +1071,16 @@ fn ocr_file_hits(_path: &std::path::Path, _iw: u32, _ih: u32) -> Result<Vec<OcrH
 /// Convert a macOS bundle-id to the process name used by System Events.
 /// E.g. "com.tencent.xinWeChat" -> "WeChat", "com.apple.Safari" -> "Safari".
 fn bundle_to_app_name(bundle_id: &str) -> String {
+    // Current Windows Qt builds use Weixin.exe; macOS keeps the WeChat process
+    // name.
+    #[cfg(target_os = "windows")]
+    if matches!(
+        bundle_id,
+        "com.tencent.xinWeChat" | "com.tencent.xinWeChat.desktop"
+    ) {
+        return "Weixin".to_string();
+    }
+
     // Common overrides for apps whose process name differs from bundle-id tail.
     match bundle_id {
         "com.tencent.xinWeChat" => "WeChat".to_string(),
@@ -1299,101 +1372,25 @@ impl NativeDesktopSession {
     /// pixels through the clipboard. Avoids GDI/PrintWindow (which WeChat
     /// blanks via WDA_EXCLUDEFROMCAPTURE) and the screen-capture
     /// risk-control that white-screens / force-logs-out the client.
-    async fn wechat_builtin_screenshot(&self, bundle_id: &str) -> Result<String, String> {
-        // 1. Find WeChat's HWND and window bounds, then force-focus using
-        //    AttachThreadInput (plain SetForegroundWindow is ignored from a background
-        //    gateway process).
-        let bl = bundle_id.to_lowercase();
-        let proc_name = if bl.contains("weixin") {
-            "Weixin"
-        } else {
-            "WeChat"
-        };
-        let ps_focus = format!(
-            r#"$sig=@'
-using System; using System.Runtime.InteropServices;
-public class FW2 {{
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);
-  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a,uint b,bool f);
-  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out RECT r);
-  [StructLayout(LayoutKind.Sequential)] public struct RECT{{public int L,T,R,B;}}
-  public static string Go(IntPtr h){{
-    ShowWindow(h,5);
-    IntPtr fg=GetForegroundWindow(); uint pid; uint fgT=GetWindowThreadProcessId(fg,out pid);
-    uint cur=GetCurrentThreadId(); AttachThreadInput(cur,fgT,true);
-    BringWindowToTop(h); SetForegroundWindow(h); AttachThreadInput(cur,fgT,false);
-    RECT r; GetWindowRect(h,out r);
-    return r.L+","+r.T+","+(r.R-r.L)+","+(r.B-r.T);
-  }}
-}}
-'@
-Add-Type $sig -ErrorAction SilentlyContinue
-$p=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*' -and $_.MainWindowHandle -ne 0}} | Select-Object -First 1
-if(-not $p){{
-  # WeChat is in the system tray (no visible window). Launch the exe to restore it.
-  $wx=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*'}} | Select-Object -First 1
-  if($wx){{
-    $path=$wx.Path
-    if($path){{ Start-Process $path }}
-  }}
-  Start-Sleep -Milliseconds 1500
-  $p=Get-Process | Where-Object {{$_.ProcessName -like '*{proc}*' -and $_.MainWindowHandle -ne 0}} | Select-Object -First 1
-}}
-if($p){{ [FW2]::Go($p.MainWindowHandle) }} else {{ "0,0,1200,800" }}"#,
-            proc = proc_name
-        );
-        let (cx, cy) = tokio::task::spawn_blocking({
-            let ps = ps_focus.clone();
-            move || -> (u32, u32) {
-                let mut cmd = Command::new("powershell");
-                cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x08000000);
-                }
-                let out = cmd.output().unwrap_or(std::process::Output {
-                    status: std::process::ExitStatus::default(),
-                    stdout: vec![],
-                    stderr: vec![],
-                });
-                let s = String::from_utf8_lossy(&out.stdout);
-                let parts: Vec<i64> = s
-                    .trim()
-                    .split(',')
-                    .filter_map(|p| p.trim().parse().ok())
-                    .collect();
-                if parts.len() == 4 {
-                    let x = parts[0].max(0) as u32;
-                    let y = parts[1].max(0) as u32;
-                    let w = parts[2].max(1) as u32;
-                    let h = parts[3].max(1) as u32;
-                    (x + w / 2, y + h / 2)
-                } else {
-                    (700, 450)
-                }
-            }
-        })
-        .await
-        .unwrap_or((700, 450));
+    #[cfg(target_os = "windows")]
+    async fn wechat_builtin_screenshot(&self, _bundle_id: &str) -> Result<String, String> {
+        // The operator keeps WeChat frontmost and maximised. Derive the click
+        // point from physical screen metrics only; never discover or enumerate
+        // windows.
+        let (_, _, width, height) = virtual_screen_rect();
+        let (cx, cy) = (width / 2, height / 2);
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        // 2. Clear clipboard so we don't read a stale image.
+        // Clear clipboard so we don't read a stale image.
         let _ = self.clipboard_set("").await;
-        // 3. Trigger WeChat screenshot overlay: Alt+A.
+        // Trigger WeChat screenshot overlay: Alt+A.
         self.key_press("a", &["alt".to_string()]).await?;
         tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-        // 4. Move cursor over the WeChat window center so the overlay hover-selects it.
+        // Move to the physical screen center so maximised WeChat is selected.
         let _ = self.mouse_move(cx, cy).await;
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        // 5. Press Enter to confirm the highlighted window capture → clipboard.
+        // Enter confirms the highlighted capture into the clipboard.
         let _ = self.key_press("Return", &[]).await;
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        // 6. Read the screenshot from the clipboard.
         self.clipboard_get_image().await
     }
 }
@@ -1469,6 +1466,13 @@ end tell"#,
                 }
                 Ok("ok".to_string()) // Return ok even if frontmost check fails
             } else if cfg!(target_os = "windows") {
+                let lower = bundle_id.to_ascii_lowercase();
+                if lower.contains("wechat") || lower.contains("weixin") {
+                    // The operator keeps maximised WeChat frontmost. Do not query
+                    // HWNDs or enumerate processes/windows; VLM screenshot checks
+                    // are the authority before every action.
+                    return Ok("ok".to_string());
+                }
                 let escaped = bundle_id
                     .replace('`', "``")
                     .replace('*', "`*")
@@ -1634,17 +1638,27 @@ end tell"#,
     }
 
     async fn screenshot_window(&self, bundle_id: &str) -> Result<String, String> {
-        // Windows WeChat blanks GDI/PrintWindow captures (WDA_EXCLUDEFROMCAPTURE),
-        // and repeated GDI screen capture trips its risk-control (white-screen /
-        // forced logout). Use WeChat's OWN built-in screenshot (Alt+A → clipboard),
-        // which can capture itself and is a sanctioned user action.
-        if cfg!(target_os = "windows") {
+        // A maximised Windows WeChat is the full-screen visual target. Capture
+        // the interactive desktop directly without discovering a HWND. Only if
+        // that capture is blank/blocked use WeChat's own Alt+A screenshot.
+        #[cfg(target_os = "windows")]
+        {
             let bl = bundle_id.to_lowercase();
             if bl.contains("wechat") || bl.contains("weixin") || bl.contains("xinwechat") {
-                match self.wechat_builtin_screenshot(bundle_id).await {
-                    Ok(img) => return Ok(img),
-                    Err(e) => warn!("wechat builtin screenshot failed ({e}); falling back"),
+                let system_capture = tokio::task::spawn_blocking(|| {
+                    let png = capture::capture_full_png().map_err(|error| error.to_string())?;
+                    if looks_blank(&png) {
+                        return Err("system full-screen capture is blank".to_string());
+                    }
+                    Ok(capture::png_to_data_uri(&png))
+                })
+                .await
+                .map_err(|error| format!("full-screen capture join failed: {error}"))?;
+                match system_capture {
+                    Ok(image) => return Ok(image),
+                    Err(error) => warn!("{error}; using WeChat Alt+A screenshot"),
                 }
+                return self.wechat_builtin_screenshot(bundle_id).await;
             }
         }
         // Primary path: direct window-backing-store capture (overlap-proof,
@@ -1736,9 +1750,7 @@ end tell"#,
         tokio::task::spawn_blocking(move || {
             let mut enigo = new_enigo()?;
             let (lx, ly) = scale_for_input(x, y);
-            enigo
-                .move_mouse(lx, ly, Coordinate::Abs)
-                .map_err(|e| format!("move_mouse: {e}"))?;
+            human_move(&mut enigo, lx, ly)?;
             enigo
                 .button(Button::Left, Click)
                 .map_err(|e| format!("button click: {e}"))?;

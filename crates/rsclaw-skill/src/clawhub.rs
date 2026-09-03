@@ -612,7 +612,11 @@ impl ClawhubClient {
                 _ => false,
             }) && !path_os.is_absolute();
             if !safe {
-                tracing::warn!(skill_id, path, "skills.sh: file path escapes install directory, skipping");
+                tracing::warn!(
+                    skill_id,
+                    path,
+                    "skills.sh: file path escapes install directory, skipping"
+                );
                 continue;
             }
 

@@ -329,15 +329,15 @@ fn seq_from_message_key(key: &str, session_key: &str) -> Option<u64> {
     None
 }
 
-/// Parse an archive key of shape `archive<sep><session_key><sep>gen<N><sep><seq>`
-/// (separator `\0` or `:`) into `(generation, seq)`. Returns `None` for keys
-/// that don't match the shape or whose numbers don't parse.
+/// Parse an archive key of shape
+/// `archive<sep><session_key><sep>gen<N><sep><seq>` (separator `\0` or `:`)
+/// into `(generation, seq)`. Returns `None` for keys that don't match the shape
+/// or whose numbers don't parse.
 fn parse_archive_key(key: &str, session_key: &str) -> Option<(u32, u64)> {
     for sep in [KEY_SEP, LEGACY_KEY_SEP] {
         if let Some(after) = key.strip_prefix(&format!("archive{sep}{session_key}{sep}gen")) {
             if let Some((gen_str, seq_str)) = after.split_once(sep) {
-                if let (Ok(generation), Ok(seq)) =
-                    (gen_str.parse::<u32>(), seq_str.parse::<u64>())
+                if let (Ok(generation), Ok(seq)) = (gen_str.parse::<u32>(), seq_str.parse::<u64>())
                 {
                     return Some((generation, seq));
                 }
@@ -559,7 +559,8 @@ impl RedbStore {
         };
 
         let msg_key = format!("{session_key}{KEY_SEP}{seq:016}");
-        let archive_key = format!("archive{KEY_SEP}{session_key}{KEY_SEP}gen{generation}{KEY_SEP}{seq:016}");
+        let archive_key =
+            format!("archive{KEY_SEP}{session_key}{KEY_SEP}gen{generation}{KEY_SEP}{seq:016}");
 
         {
             let mut msgs = write.open_table(MESSAGES)?;
@@ -641,9 +642,8 @@ impl RedbStore {
                         let suffix = seq_from_message_key(key, session_key)
                             .unwrap_or(0)
                             .to_string();
-                        let archive_key = format!(
-                            "archive{KEY_SEP}{session_key}{KEY_SEP}gen1{KEY_SEP}{suffix}"
-                        );
+                        let archive_key =
+                            format!("archive{KEY_SEP}{session_key}{KEY_SEP}gen1{KEY_SEP}{suffix}");
                         let json_str = serde_json::to_string(val).unwrap_or_default();
                         if let Err(e) = msgs_table.insert(archive_key.as_str(), json_str.as_str()) {
                             tracing::error!(error = %e, key = %archive_key, "failed to insert archive entry");
@@ -689,8 +689,7 @@ impl RedbStore {
         let prefixes = match generation {
             Some(g) => [KEY_SEP, LEGACY_KEY_SEP]
                 .map(|sep| format!("archive{sep}{session_key}{sep}gen{g}{sep}")),
-            None => [KEY_SEP, LEGACY_KEY_SEP]
-                .map(|sep| format!("archive{sep}{session_key}{sep}")),
+            None => [KEY_SEP, LEGACY_KEY_SEP].map(|sep| format!("archive{sep}{session_key}{sep}")),
         };
         let mut out = Vec::new();
         for prefix in prefixes {

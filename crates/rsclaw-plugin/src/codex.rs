@@ -1,11 +1,11 @@
-//! Codex plugin loader: parses `.codex-plugin/plugin.json`, scans `skills/*.md`,
-//! and reads `.mcp.json` into the existing MCP/skill infrastructure.
+//! Codex plugin loader: parses `.codex-plugin/plugin.json`, scans
+//! `skills/*.md`, and reads `.mcp.json` into the existing MCP/skill
+//! infrastructure.
 //!
 //! Codex plugins are static content bundles — no subprocess runtime needed.
 //! They provide skills (markdown prompt templates) and MCP server declarations.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result};
 use rsclaw_config::schema::McpServerConfig;
@@ -74,7 +74,8 @@ struct McpJsonServer {
 }
 
 impl CodexPlugin {
-    /// Load a Codex plugin from `dir` (the directory containing `.codex-plugin/`).
+    /// Load a Codex plugin from `dir` (the directory containing
+    /// `.codex-plugin/`).
     pub fn load(dir: &Path) -> Result<Self> {
         let manifest = Self::load_manifest(dir)?;
         let skills = Self::load_skills(dir, &manifest)?;
@@ -234,8 +235,9 @@ fn parse_frontmatter_skill(raw: &str, fallback_name: &str) -> Option<CodexSkill>
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use super::*;
-    use std::fs;
 
     fn fixture_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -314,7 +316,12 @@ mod tests {
             Some(&["-y".to_owned(), "@mcp/github".to_owned()][..])
         );
         assert_eq!(
-            server.env.as_ref().unwrap().get("TOKEN").map(|s| s.as_str()),
+            server
+                .env
+                .as_ref()
+                .unwrap()
+                .get("TOKEN")
+                .map(|s| s.as_str()),
             Some("abc")
         );
     }
@@ -368,12 +375,12 @@ mod tests {
     fn resolve_command_resolves_relative_paths_against_plugin_dir() {
         let dir = Path::new("/plugins/demo");
         assert_eq!(
-            resolve_command("./scripts/server.py", dir),
-            "/plugins/demo/scripts/server.py"
+            PathBuf::from(resolve_command("./scripts/server.py", dir)),
+            dir.join("scripts/server.py")
         );
         assert_eq!(
-            resolve_command("bin/server", dir),
-            "/plugins/demo/bin/server"
+            PathBuf::from(resolve_command("bin/server", dir)),
+            dir.join("bin/server")
         );
     }
 

@@ -18,7 +18,7 @@ use base64::Engine as _;
 use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-const DEFAULT_UIAUTO_PORT: u16 = 6790;
+const DEFAULT_UIAUTO_PORT: u16 = 6666;
 const MAX_ARGS_BYTES: usize = 64 * 1024;
 const MAX_RAW_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
@@ -32,6 +32,7 @@ const KEYBOARD_VISIBLE_COMMAND: &str = "keyboard-visible";
 const SEND_BUTTON_COMMAND: &str = "send-button";
 const LATEST_MESSAGE_BUBBLE_COMMAND: &str = "latest-message-bubble";
 const INPUT_TEXT_COMMAND: &str = "input-text";
+const CLIPBOARD_SET_COMMAND: &str = "clipboard-set";
 const OCR_REGION_COMMAND: &str = "ocr-region";
 const WAKEUP_SCREEN_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(500),
@@ -52,11 +53,78 @@ struct Config {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AndroidOpType {
+    Auto,
+    A11y,
+    U2,
+    Adb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AndroidOpMode {
+    Vision,
+    Selector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AndroidOperationOptions {
+    pub(crate) op_type: AndroidOpType,
+    pub(crate) op_mode: Option<AndroidOpMode>,
+}
+
+impl Default for AndroidOperationOptions {
+    fn default() -> Self {
+        Self {
+            op_type: AndroidOpType::Auto,
+            op_mode: None,
+        }
+    }
+}
+
+impl AndroidOperationOptions {
+    pub(crate) fn parse(op_type: &str, op_mode: &str) -> Result<Self, String> {
+        let op_type = match op_type {
+            "auto" => AndroidOpType::Auto,
+            "a11y" => AndroidOpType::A11y,
+            "u2" => AndroidOpType::U2,
+            "adb" => AndroidOpType::Adb,
+            other => return Err(format!("android operation: unsupported opType `{other}`")),
+        };
+        let op_mode = match op_mode {
+            "vision" => Some(AndroidOpMode::Vision),
+            "selector" => Some(AndroidOpMode::Selector),
+            other => return Err(format!("android operation: unsupported opMode `{other}`")),
+        };
+        Ok(Self { op_type, op_mode })
+    }
+
+    pub(crate) fn inject_into(self, value: &mut Value) -> Result<(), String> {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| "android operation: args JSON must be an object".to_string())?;
+        let op_type = match self.op_type {
+            AndroidOpType::Auto => "auto",
+            AndroidOpType::A11y => "a11y",
+            AndroidOpType::U2 => "u2",
+            AndroidOpType::Adb => "adb",
+        };
+        object.insert("opType".to_string(), Value::String(op_type.to_string()));
+        if let Some(op_mode) = self.op_mode {
+            let op_mode = match op_mode {
+                AndroidOpMode::Vision => "vision",
+                AndroidOpMode::Selector => "selector",
+            };
+            object.insert("opMode".to_string(), Value::String(op_mode.to_string()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArgKind {
     Integer,
     Unsigned,
     String,
-    Boolean,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,17 +169,6 @@ const DRAG_ARGS: &[ArgSpec] = &[
     ArgSpec::new("x2", "--x2", ArgKind::Integer, true),
     ArgSpec::new("y2", "--y2", ArgKind::Integer, true),
 ];
-const CLEAR_TEXT_ARGS: &[ArgSpec] = &[
-    ArgSpec::new("x", "--x", ArgKind::Integer, true),
-    ArgSpec::new("y", "--y", ArgKind::Integer, true),
-];
-const TYPE_AT_ARGS: &[ArgSpec] = &[
-    ArgSpec::new("x", "--x", ArgKind::Integer, true),
-    ArgSpec::new("y", "--y", ArgKind::Integer, true),
-    ArgSpec::new("text", "--text", ArgKind::String, true),
-    ArgSpec::new("replace", "--replace", ArgKind::Boolean, false),
-];
-
 impl ArgSpec {
     const fn new(key: &'static str, flag: &'static str, kind: ArgKind, required: bool) -> Self {
         Self {
@@ -174,63 +231,201 @@ impl Drop for TempJsonFile {
     }
 }
 
-/// Run one allowlisted UIAutomator2 operation.
+/// Run one allowlisted Android operation through the requested CLS transport.
 pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, String> {
     if args_json.len() > MAX_ARGS_BYTES {
         return Err(format!(
             "android uiauto: args exceed {MAX_ARGS_BYTES} bytes"
         ));
     }
+    let (args_json, options) = split_operation_options(args_json)?;
+    validate_operation_mode(command, options)?;
     let config = Config::from_env()?;
     if command == CONTACT_BADGE_COMMAND {
-        validate_no_args(command, args_json)?;
-        return detect_contact_badge(&config).await;
+        validate_no_args(command, &args_json)?;
+        return detect_contact_badge(&config, options.op_type).await;
     }
     if command == KEYBOARD_VISIBLE_COMMAND {
-        validate_no_args(command, args_json)?;
-        return detect_keyboard_visible(&config).await;
+        validate_no_args(command, &args_json)?;
+        return detect_keyboard_visible(&config, options.op_type).await;
     }
     if command == SEND_BUTTON_COMMAND {
-        validate_no_args(command, args_json)?;
-        return detect_send_button(&config).await;
+        validate_no_args(command, &args_json)?;
+        return detect_send_button(&config, options.op_type).await;
     }
     if command == LATEST_MESSAGE_BUBBLE_COMMAND {
-        validate_no_args(command, args_json)?;
-        return detect_latest_message_bubble(&config).await;
+        validate_no_args(command, &args_json)?;
+        return detect_latest_message_bubble(&config, options.op_type).await;
     }
     if command == INPUT_TEXT_COMMAND {
-        return input_text(args_json, &config).await;
+        return input_text(&args_json, &config, options.op_type).await;
+    }
+    if command == CLIPBOARD_SET_COMMAND {
+        return clipboard_set(&args_json, &config).await;
     }
     if command == OCR_REGION_COMMAND {
-        return ocr_region(args_json, &config).await;
+        return ocr_region(&args_json, &config, options.op_type).await;
     }
     if command == "foreground-package" {
-        validate_no_args(command, args_json)?;
+        validate_no_args(command, &args_json)?;
+        if options.op_type != AndroidOpType::Auto {
+            return Err(
+                "android operation: foreground-package supports only opType=auto".to_string(),
+            );
+        }
         return foreground_package(&config).await;
     }
     if command == "keyevent" {
-        let keycode = keyevent_keycode(args_json)?;
-        let mut args = uiauto_base_args(&config, "key");
-        args.push("--keycode".to_string());
-        args.push(keycode.to_string());
-        return run_cls(&config.cls_bin, &args, Duration::from_secs(15)).await;
+        let keycode = keyevent_keycode(&args_json)?;
+        return run_keycode(&config, options.op_type, keycode).await;
     }
-    let args = build_call_args(&config, command, args_json)?;
     if command == "screenshot" {
-        return screenshot_with_wakeup(&config).await;
+        validate_no_args(command, &args_json)?;
+        return screenshot_with_wakeup(&config, options.op_type).await;
     }
-    if command == "relaunch" {
-        return relaunch_with_adb_foreground_fallback(&config, &args).await;
-    }
-    run_cls(&config.cls_bin, &args, deadline_for(command)).await
+    run_high_level_operation(&config, options.op_type, command, &args_json).await
 }
 
-/// Type through CLS's native text path, optionally focusing a visual-only
-/// field.
-async fn input_text(args_json: &str, config: &Config) -> Result<String, String> {
+fn split_operation_options(args_json: &str) -> Result<(String, AndroidOperationOptions), String> {
+    let mut value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android operation: invalid args JSON: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "android operation: args JSON must be an object".to_string())?;
+    let op_type = match object.remove("opType").as_ref().and_then(Value::as_str) {
+        None | Some("auto") => AndroidOpType::Auto,
+        Some("a11y") => AndroidOpType::A11y,
+        Some("u2") => AndroidOpType::U2,
+        Some("adb") => AndroidOpType::Adb,
+        Some(other) => return Err(format!("android operation: unsupported opType `{other}`")),
+    };
+    let op_mode = match object.remove("opMode").as_ref().and_then(Value::as_str) {
+        None => None,
+        Some("vision") => Some(AndroidOpMode::Vision),
+        Some("selector") => Some(AndroidOpMode::Selector),
+        Some(other) => return Err(format!("android operation: unsupported opMode `{other}`")),
+    };
+    let sanitized = serde_json::to_string(&value)
+        .map_err(|error| format!("android operation: serialize args: {error}"))?;
+    Ok((sanitized, AndroidOperationOptions { op_type, op_mode }))
+}
+
+fn validate_operation_mode(command: &str, options: AndroidOperationOptions) -> Result<(), String> {
+    if options.op_mode == Some(AndroidOpMode::Vision)
+        && !matches!(
+            command,
+            "status"
+                | "screenshot"
+                | "tap"
+                | "swipe"
+                | "long-press"
+                | "double-tap"
+                | "drag"
+                | "key"
+                | "keyevent"
+                | "launch"
+                | "relaunch"
+                | INPUT_TEXT_COMMAND
+                | OCR_REGION_COMMAND
+                | CONTACT_BADGE_COMMAND
+                | KEYBOARD_VISIBLE_COMMAND
+                | SEND_BUTTON_COMMAND
+                | LATEST_MESSAGE_BUBBLE_COMMAND
+        )
+    {
+        return Err(format!(
+            "android operation: `{command}` is unavailable in opMode=vision"
+        ));
+    }
+    Ok(())
+}
+
+/// Type through the requested CLS text path, optionally focusing a
+/// screenshot-grounded field first.
+async fn input_text(
+    args_json: &str,
+    config: &Config,
+    op_type: AndroidOpType,
+) -> Result<String, String> {
     let input = input_text_value(args_json)?;
-    let args = input_text_args(config, input);
-    run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+    match op_type {
+        AndroidOpType::Auto => {
+            let args = input_text_args(config, input);
+            run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+        }
+        AndroidOpType::A11y => {
+            if let Some((x, y)) = input.point {
+                let tap = explicit_base_args(config, AndroidOpType::A11y, "tap")?;
+                let tap = append_xy(tap, x, y);
+                run_cls(&config.cls_bin, &tap, Duration::from_secs(20)).await?;
+            }
+            let mut args = explicit_base_args(config, AndroidOpType::A11y, "text")?;
+            args.push("--value".to_string());
+            args.push(input.text);
+            args.push("--method".to_string());
+            args.push("auto".to_string());
+            run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+        }
+        AndroidOpType::U2 => {
+            let args = uiauto_visual_text_args(config, input)?;
+            run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+        }
+        AndroidOpType::Adb => Err(
+            "android operation: input-text is unavailable for opType=adb in vision mode"
+                .to_string(),
+        ),
+    }
+}
+
+/// Prepare text for a user-visible paste gesture without injecting it into an
+/// editor. The clipboard payload is sent through the allowlisted raw
+/// UIAutomator2 endpoint, whose JSON body is written to a mode-0600 temporary
+/// file rather than exposed in the CLS process argument list.
+fn clipboard_request(args_json: &str) -> Result<(String, String), String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android clipboard: invalid args JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "android clipboard: args JSON must be an object".to_string())?;
+    if !object
+        .keys()
+        .all(|key| matches!(key.as_str(), "sessionId" | "text"))
+    {
+        return Err(
+            "android clipboard: `clipboard-set` accepts only `sessionId` and `text`".to_string(),
+        );
+    }
+    let session_id = object
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or_else(|| "android clipboard: `sessionId` must be a non-empty string".to_string())?;
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "android clipboard: `text` must be a non-empty string".to_string())?;
+    if text.len() > MAX_INPUT_TEXT_BYTES || text.contains('\0') {
+        return Err(format!(
+            "android clipboard: `text` must be 1-{MAX_INPUT_TEXT_BYTES} bytes without NUL"
+        ));
+    }
+    let content = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let body = serde_json::json!({
+        "content": content,
+        "contentType": "plaintext",
+        "label": "rsclaw",
+    })
+    .to_string();
+    Ok((
+        format!("/session/{session_id}/appium/device/set_clipboard"),
+        body,
+    ))
+}
+
+async fn clipboard_set(args_json: &str, _config: &Config) -> Result<String, String> {
+    let (path, body) = clipboard_request(args_json)?;
+    raw("POST", &path, Some(&body)).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -252,13 +447,182 @@ fn input_text_args(config: &Config, input: InputText) -> Vec<String> {
     args
 }
 
+fn uiauto_visual_text_args(config: &Config, input: InputText) -> Result<Vec<String>, String> {
+    let (x, y) = input.point.ok_or_else(|| {
+        "android operation: opType=u2 input-text requires screenshot-grounded `x` and `y`"
+            .to_string()
+    })?;
+    let mut args = explicit_base_args(config, AndroidOpType::U2, "type-at")?;
+    args.extend([
+        "--x".to_string(),
+        x.to_string(),
+        "--y".to_string(),
+        y.to_string(),
+        "--text".to_string(),
+        input.text,
+        "--replace".to_string(),
+    ]);
+    Ok(args)
+}
+
+fn append_xy(mut args: Vec<String>, x: u32, y: u32) -> Vec<String> {
+    args.push("--x".to_string());
+    args.push(x.to_string());
+    args.push("--y".to_string());
+    args.push(y.to_string());
+    args
+}
+
+async fn run_keycode(
+    config: &Config,
+    op_type: AndroidOpType,
+    keycode: i32,
+) -> Result<String, String> {
+    let args = match op_type {
+        AndroidOpType::Auto | AndroidOpType::U2 => {
+            let mut args = explicit_base_args(config, op_type, "key")?;
+            args.push("--keycode".to_string());
+            args.push(keycode.to_string());
+            args
+        }
+        AndroidOpType::Adb => {
+            let mut args = adb_base_args(config, "key");
+            args.push(keycode.to_string());
+            args
+        }
+        AndroidOpType::A11y => {
+            let key = match keycode {
+                4 => "BACK",
+                3 => "HOME",
+                _ => {
+                    return Err(format!(
+                        "android operation: keycode {keycode} is unavailable for opType=a11y"
+                    ));
+                }
+            };
+            let mut args = explicit_base_args(config, AndroidOpType::A11y, "key")?;
+            args.push(key.to_string());
+            args
+        }
+    };
+    run_cls(&config.cls_bin, &args, Duration::from_secs(15)).await
+}
+
+async fn run_high_level_operation(
+    config: &Config,
+    op_type: AndroidOpType,
+    command: &str,
+    args_json: &str,
+) -> Result<String, String> {
+    match (op_type, command) {
+        (AndroidOpType::A11y, "double-tap") => {
+            let value: Value = serde_json::from_str(args_json)
+                .map_err(|error| format!("android operation: invalid double-tap args: {error}"))?;
+            let x = json_u32(&value, "x")?;
+            let y = json_u32(&value, "y")?;
+            let tap = append_xy(explicit_base_args(config, op_type, "tap")?, x, y);
+            run_cls(&config.cls_bin, &tap, Duration::from_secs(20)).await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            run_cls(&config.cls_bin, &tap, Duration::from_secs(20)).await
+        }
+        (AndroidOpType::A11y, "long-press") => {
+            let value: Value = serde_json::from_str(args_json)
+                .map_err(|error| format!("android operation: invalid long-press args: {error}"))?;
+            let x = json_u32(&value, "x")?;
+            let y = json_u32(&value, "y")?;
+            let duration = value
+                .get("durationMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(800)
+                .min(600_000);
+            let mut args = explicit_base_args(config, op_type, "swipe")?;
+            for (flag, value) in [
+                ("--x1", x.to_string()),
+                ("--y1", y.to_string()),
+                ("--x2", x.to_string()),
+                ("--y2", y.to_string()),
+                ("--duration-ms", duration.to_string()),
+            ] {
+                args.push(flag.to_string());
+                args.push(value);
+            }
+            run_cls(&config.cls_bin, &args, Duration::from_secs(20)).await
+        }
+        (AndroidOpType::A11y, "drag") => {
+            let args = build_explicit_call_args(config, op_type, "swipe", args_json)?;
+            run_cls(&config.cls_bin, &args, deadline_for("swipe")).await
+        }
+        (AndroidOpType::A11y, "key") => {
+            let value: Value = serde_json::from_str(args_json)
+                .map_err(|error| format!("android operation: invalid key args: {error}"))?;
+            let raw = value
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "android operation: key requires `key`".to_string())?;
+            let key = match raw.to_ascii_uppercase().as_str() {
+                "BACK" => "BACK",
+                "HOME" => "HOME",
+                other => {
+                    return Err(format!(
+                        "android operation: key `{other}` is unavailable for opType=a11y"
+                    ));
+                }
+            };
+            let mut args = explicit_base_args(config, op_type, "key")?;
+            args.push(key.to_string());
+            run_cls(&config.cls_bin, &args, deadline_for("key")).await
+        }
+        (AndroidOpType::A11y, "relaunch") => {
+            let args = build_explicit_call_args(config, op_type, "launch", args_json)?;
+            run_cls(&config.cls_bin, &args, deadline_for("launch")).await
+        }
+        (AndroidOpType::Adb, "key") => {
+            let value: Value = serde_json::from_str(args_json)
+                .map_err(|error| format!("android operation: invalid key args: {error}"))?;
+            let key = value
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "android operation: key requires `key`".to_string())?;
+            let mut args = adb_base_args(config, "key");
+            args.push(key.to_string());
+            run_cls(&config.cls_bin, &args, deadline_for("key")).await
+        }
+        (AndroidOpType::Adb, _) => Err(format!(
+            "android operation: `{command}` is not exposed for opType=adb"
+        )),
+        _ => {
+            let args = if op_type == AndroidOpType::Auto {
+                build_call_args(config, command, args_json)?
+            } else {
+                build_explicit_call_args(config, op_type, command, args_json)?
+            };
+            if command == "relaunch" && op_type == AndroidOpType::Auto {
+                return relaunch_with_adb_foreground_fallback(config, &args).await;
+            }
+            run_cls(&config.cls_bin, &args, deadline_for(command)).await
+        }
+    }
+}
+
+fn json_u32(value: &Value, key: &str) -> Result<u32, String> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| format!("android operation: `{key}` must be a u32"))
+}
+
 /// Host-side local OCR for the plugin's fast UI-confirmation path. The plugin
 /// cannot ship a screenshot through the 64KB CLS arg channel, so this captures
 /// a fresh device frame, crops to the requested rect, and runs the native
 /// on-device OCR engine (macOS Vision / Windows.Media.Ocr) — no network OCR
 /// round trip. `imagePath` and `engine` in the args are advisory and ignored;
 /// the host always screenshots fresh and picks the platform engine.
-async fn ocr_region(args_json: &str, config: &Config) -> Result<String, String> {
+async fn ocr_region(
+    args_json: &str,
+    config: &Config,
+    op_type: AndroidOpType,
+) -> Result<String, String> {
     let args: Value = serde_json::from_str(args_json)
         .map_err(|e| format!("android uiauto: ocr-region args: {e}"))?;
     let rect = args.get("rect").and_then(|r| {
@@ -268,7 +632,7 @@ async fn ocr_region(args_json: &str, config: &Config) -> Result<String, String> 
         let height = r.get("height")?.as_u64()? as u32;
         Some((x, y, width, height))
     });
-    let response = screenshot_with_wakeup(config).await?;
+    let response = screenshot_with_wakeup(config, op_type).await?;
     let png = screenshot_png(&response)?;
     tokio::task::spawn_blocking(move || rsclaw_desktop::ocr_image_region(&png, rect))
         .await
@@ -335,8 +699,8 @@ fn keyevent_keycode(args_json: &str) -> Result<i32, String> {
     Ok(keycode as i32)
 }
 
-async fn detect_contact_badge(config: &Config) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config).await?;
+async fn detect_contact_badge(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
+    let response = screenshot_with_wakeup(config, op_type).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -358,8 +722,8 @@ async fn detect_contact_badge(config: &Config) -> Result<String, String> {
     .map_err(|error| format!("android uiauto: encode badge result: {error}"))
 }
 
-async fn detect_send_button(config: &Config) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config).await?;
+async fn detect_send_button(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
+    let response = screenshot_with_wakeup(config, op_type).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -380,8 +744,11 @@ async fn detect_send_button(config: &Config) -> Result<String, String> {
     .map_err(|error| format!("android uiauto: encode send-button result: {error}"))
 }
 
-async fn detect_latest_message_bubble(config: &Config) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config).await?;
+async fn detect_latest_message_bubble(
+    config: &Config,
+    op_type: AndroidOpType,
+) -> Result<String, String> {
+    let response = screenshot_with_wakeup(config, op_type).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -542,8 +909,11 @@ fn latest_message_bubble_probe(
     best
 }
 
-async fn detect_keyboard_visible(config: &Config) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config).await?;
+async fn detect_keyboard_visible(
+    config: &Config,
+    op_type: AndroidOpType,
+) -> Result<String, String> {
+    let response = screenshot_with_wakeup(config, op_type).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -860,11 +1230,16 @@ fn bottom_tab_active_probe(
     }
 }
 
-async fn screenshot_with_wakeup(config: &Config) -> Result<String, String> {
-    let args = uiauto_base_args(config, "screenshot");
+async fn screenshot_with_wakeup(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
+    let args = explicit_base_args(config, op_type, "screenshot")?;
     let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
     if !screenshot_is_black(&response)? {
         return annotate_screenshot(response);
+    }
+    if op_type != AndroidOpType::Auto {
+        return Err(format!(
+            "android operation: screenshot from explicit opType={op_type:?} was black; refusing power-transport fallback"
+        ));
     }
 
     tracing::info!(
@@ -876,7 +1251,7 @@ async fn screenshot_with_wakeup(config: &Config) -> Result<String, String> {
 
     for (index, delay) in WAKEUP_SCREEN_RETRY_DELAYS.iter().enumerate() {
         tokio::time::sleep(*delay).await;
-        let retry = uiauto_base_args(config, "screenshot");
+        let retry = explicit_base_args(config, op_type, "screenshot")?;
         let response = run_cls(&config.cls_bin, &retry, deadline_for("screenshot")).await?;
         if !screenshot_is_black(&response)? {
             return annotate_screenshot(response);
@@ -912,6 +1287,8 @@ fn annotate_screenshot(response: String) -> Result<String, String> {
     let object = value
         .as_object_mut()
         .ok_or_else(|| "android uiauto: screenshot response must be an object".to_string())?;
+    object.insert("width".to_string(), serde_json::json!(image.width()));
+    object.insert("height".to_string(), serde_json::json!(image.height()));
     object.insert(
         "contactBadge".to_string(),
         serde_json::json!({
@@ -1245,8 +1622,7 @@ async fn relaunch_with_adb_foreground_fallback(
     // window. The activity manager is the authoritative foreground signal.
     if wait_for_foreground_package(config, package).await? {
         return Ok(cls_result.unwrap_or_else(|_| {
-            serde_json::json!({ "relaunch": "cls-verified-by-adb", "package": package })
-                .to_string()
+            serde_json::json!({ "relaunch": "cls-verified-by-adb", "package": package }).to_string()
         }));
     }
 
@@ -1271,7 +1647,9 @@ async fn relaunch_with_adb_foreground_fallback(
         tokio::time::sleep(delay).await;
     }
     if foreground_package_matches(config, package).await? {
-        return Ok(serde_json::json!({ "relaunch": "adb-fallback", "package": package }).to_string());
+        return Ok(
+            serde_json::json!({ "relaunch": "adb-fallback", "package": package }).to_string(),
+        );
     }
 
     let cls_context = cls_error
@@ -1317,9 +1695,10 @@ async fn wait_for_foreground_package(config: &Config, package: &str) -> Result<b
 
 /// Verify the target package owns Android's resumed activity or focused window.
 async fn foreground_package_matches(config: &Config, package: &str) -> Result<bool, String> {
-    Ok(foreground_package_from_dump(&foreground_activity_dump(config).await?)
-        .as_deref()
-        == Some(package))
+    Ok(
+        foreground_package_from_dump(&foreground_activity_dump(config).await?).as_deref()
+            == Some(package),
+    )
 }
 
 /// Read Android's current resumed/focused activity through the CLS ADB relay.
@@ -1387,6 +1766,15 @@ impl Config {
 }
 
 fn build_call_args(config: &Config, command: &str, args_json: &str) -> Result<Vec<String>, String> {
+    build_explicit_call_args(config, AndroidOpType::Auto, command, args_json)
+}
+
+fn build_explicit_call_args(
+    config: &Config,
+    op_type: AndroidOpType,
+    command: &str,
+    args_json: &str,
+) -> Result<Vec<String>, String> {
     let specs = command_specs(command)
         .ok_or_else(|| format!("android uiauto: command `{command}` is not allowed"))?;
     let value: Value = serde_json::from_str(args_json)
@@ -1397,11 +1785,12 @@ fn build_call_args(config: &Config, command: &str, args_json: &str) -> Result<Ve
     validate_object_keys(command, object, specs)?;
     validate_command_requirements(command, object, specs)?;
 
-    let mut args = if command == "relaunch" {
-        relaunch_base_args(config)
-    } else {
-        uiauto_base_args(config, command)
-    };
+    let mut args =
+        if command == "relaunch" && matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
+            relaunch_base_args(config)
+        } else {
+            explicit_base_args(config, op_type, command)?
+        };
     for spec in specs {
         let Some(value) = object.get(spec.key) else {
             continue;
@@ -1409,6 +1798,35 @@ fn build_call_args(config: &Config, command: &str, args_json: &str) -> Result<Ve
         append_option(&mut args, *spec, value)?;
     }
     Ok(args)
+}
+
+fn explicit_base_args(
+    config: &Config,
+    op_type: AndroidOpType,
+    command: &str,
+) -> Result<Vec<String>, String> {
+    match op_type {
+        AndroidOpType::Auto => Ok(uiauto_base_args(config, command)),
+        AndroidOpType::A11y => Ok(vec![
+            "android".to_string(),
+            "a11y".to_string(),
+            command.to_string(),
+            "-n".to_string(),
+            config.node.clone(),
+        ]),
+        AndroidOpType::U2 => Ok(vec![
+            "android".to_string(),
+            "uiauto".to_string(),
+            command.to_string(),
+            "-n".to_string(),
+            config.node.clone(),
+            "--port".to_string(),
+            config.port.to_string(),
+        ]),
+        AndroidOpType::Adb => Err(format!(
+            "android operation: `{command}` requires a dedicated opType=adb mapping"
+        )),
+    }
 }
 
 fn uiauto_base_args(config: &Config, command: &str) -> Vec<String> {
@@ -1529,11 +1947,6 @@ fn append_option(args: &mut Vec<String>, spec: ArgSpec, value: &Value) -> Result
             validate_plain_value(spec.key, string, MAX_STRING_ARG_BYTES)?;
             args.push(spec.flag.to_string());
             args.push(string.to_string());
-        }
-        ArgKind::Boolean => {
-            if value.as_bool().unwrap_or(false) {
-                args.push(spec.flag.to_string());
-            }
         }
     }
     Ok(())
@@ -2213,7 +2626,7 @@ mod tests {
                 "-n",
                 "android-dev",
                 "--port",
-                "6790",
+                "6666",
                 "--x",
                 "123",
                 "--y",
@@ -2221,6 +2634,46 @@ mod tests {
                 "--text",
                 "你好",
             ]
+        );
+    }
+
+    #[test]
+    fn explicit_u2_visual_text_uses_canonical_uiauto_type_at() {
+        assert_eq!(
+            uiauto_visual_text_args(
+                &config(),
+                InputText {
+                    text: "你好".to_string(),
+                    point: Some((123, 456)),
+                },
+            )
+            .expect("visual text arguments"),
+            [
+                "android",
+                "uiauto",
+                "type-at",
+                "-n",
+                "android-dev",
+                "--port",
+                "6666",
+                "--x",
+                "123",
+                "--y",
+                "456",
+                "--text",
+                "你好",
+                "--replace",
+            ]
+        );
+        assert!(
+            uiauto_visual_text_args(
+                &config(),
+                InputText {
+                    text: "你好".to_string(),
+                    point: None,
+                },
+            )
+            .is_err()
         );
     }
 
@@ -2235,6 +2688,52 @@ mod tests {
         assert!(input_text_value(r#"{"text":"ok","x":-1,"y":456}"#).is_err());
         assert!(input_text_value(r#"{"text":""}"#).is_err());
         assert!(input_text_value("{\"text\":\"a\\u0000b\"}").is_err());
+    }
+
+    #[test]
+    fn operation_options_preserve_legacy_auto_and_strip_routing_fields() {
+        let (legacy, options) =
+            split_operation_options(r#"{"x":1,"y":2}"#).expect("legacy options");
+        assert_eq!(options, AndroidOperationOptions::default());
+        assert_eq!(legacy, r#"{"x":1,"y":2}"#);
+
+        let (args, options) =
+            split_operation_options(r#"{"x":1,"y":2,"opType":"a11y","opMode":"vision"}"#)
+                .expect("explicit options");
+        assert_eq!(
+            options,
+            AndroidOperationOptions {
+                op_type: AndroidOpType::A11y,
+                op_mode: Some(AndroidOpMode::Vision),
+            }
+        );
+        assert_eq!(args, r#"{"x":1,"y":2}"#);
+    }
+
+    #[test]
+    fn explicit_transport_is_fail_closed_and_vision_rejects_selectors() {
+        assert!(AndroidOperationOptions::parse("uiauto", "vision").is_err());
+        assert!(AndroidOperationOptions::parse("a11y", "xml").is_err());
+        let vision = AndroidOperationOptions::parse("a11y", "vision").expect("a11y vision options");
+        assert!(validate_operation_mode("tap", vision).is_ok());
+        assert!(validate_operation_mode("dump", vision).is_err());
+        assert_eq!(
+            explicit_base_args(&config(), AndroidOpType::A11y, "tap").expect("a11y tap args"),
+            ["android", "a11y", "tap", "-n", "android-dev"]
+        );
+        assert_eq!(
+            explicit_base_args(&config(), AndroidOpType::U2, "tap").expect("u2 tap args"),
+            [
+                "android",
+                "uiauto",
+                "tap",
+                "-n",
+                "android-dev",
+                "--port",
+                "6666",
+            ]
+        );
+        assert!(explicit_base_args(&config(), AndroidOpType::Adb, "tap").is_err());
     }
 
     #[test]
@@ -2440,7 +2939,7 @@ mod tests {
         Config {
             cls_bin: "cls".to_string(),
             node: "android-dev".to_string(),
-            port: 6790,
+            port: 6666,
         }
     }
 
@@ -2456,7 +2955,7 @@ mod tests {
                 "-n",
                 "android-dev",
                 "--port",
-                "6790",
+                "6666",
                 "--x",
                 "20",
                 "--y",
@@ -2485,7 +2984,7 @@ mod tests {
                 "-n",
                 "android-dev",
                 "--port",
-                "6790",
+                "6666",
                 "--package",
                 "org.example.app",
             ]
@@ -2542,7 +3041,10 @@ mod tests {
             ),
             Some("com.miui.home".to_string())
         );
-        assert_eq!(foreground_package_from_dump("Window{abc u0 com.tencent.mm/.ui.LauncherUI}"), None);
+        assert_eq!(
+            foreground_package_from_dump("Window{abc u0 com.tencent.mm/.ui.LauncherUI}"),
+            None
+        );
     }
 
     #[test]
@@ -2799,10 +3301,10 @@ mod tests {
 
     #[test]
     fn config_validation_fails_closed() {
-        assert!(Config::new("cls".to_string(), String::new(), 6790).is_err());
+        assert!(Config::new("cls".to_string(), String::new(), 6666).is_err());
         assert!(Config::new("cls".to_string(), "android-dev".to_string(), 0).is_err());
         assert_eq!(
-            Config::new("cls".to_string(), "android-dev".to_string(), 6790)
+            Config::new("cls".to_string(), "android-dev".to_string(), 6666)
                 .expect("valid configuration"),
             config()
         );
@@ -2813,5 +3315,23 @@ mod tests {
         assert!(validate_plain_value("node", "android-dev", 256).is_ok());
         assert!(validate_plain_value("activity", "微信主页", 256).is_ok());
         assert!(validate_plain_value("node", "android\ndev", 256).is_err());
+    }
+
+    #[test]
+    fn clipboard_request_uses_private_raw_body_and_rejects_empty_text() {
+        let (path, body) = clipboard_request(r#"{"sessionId":"abc","text":"旭日，你好！"}"#)
+            .expect("valid clipboard request");
+        assert_eq!(path, "/session/abc/appium/device/set_clipboard");
+        let body: Value = serde_json::from_str(&body).expect("clipboard JSON");
+        assert_eq!(body["contentType"], "plaintext");
+        assert_eq!(body["label"], "rsclaw");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(body["content"].as_str().expect("base64 content"))
+                .expect("base64 decodes"),
+            "旭日，你好！".as_bytes()
+        );
+        assert!(clipboard_request(r#"{"sessionId":"abc","text":""}"#).is_err());
+        assert!(clipboard_request(r#"{"sessionId":"abc","text":"x","extra":1}"#).is_err());
     }
 }

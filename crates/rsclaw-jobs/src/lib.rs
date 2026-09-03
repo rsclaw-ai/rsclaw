@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use rsclaw_types::{ExternalJobKind, PollOutcome};
-use serde_json::json;
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Seedance (ByteDance ARK) — async submit + poll
@@ -771,20 +771,78 @@ pub async fn poll_rsclaw_image(client: &reqwest::Client, signed_url: &str) -> Re
 // `agent::tools_video::submit_rsclaw_video`) + poll here.
 // ---------------------------------------------------------------------------
 
-/// Poll a rsclaw `video_<id>` job and resolve to an authless download
-/// URL on completion.
-///
-/// Flow:
-/// 1. `GET https://api.rsclaw.ai/v1/videos/{id}` (with Bearer; 307/308
-///    re-attached by `rsclaw_http::get`) → JSON `{id, status, …}`.
-/// 2. `status == "completed"` → `GET https://api.rsclaw.ai/v1/videos/{id}/content`
-///    (with Bearer) returns 307 to a Cloudflare R2 presigned URL — we DON'T
-///    follow that hop here so Authorization never crosses to R2. The presigned
-///    URL is handed back as `PollOutcome::Done(url)`; the caller's
-///    `download_artifact` GETs it without auth.
-/// 3. `status` in {"failed","cancelled"} → `PollOutcome::Failed(reason)`.
-/// 4. Else (`queued` / `in_progress`) → `PollOutcome::Pending`.
-pub async fn poll_rsclaw(api_key: &str, video_id: &str) -> Result<PollOutcome> {
+/// Poll a standard rsclaw native `job_<id>` and return its signed artifact URL
+/// when `status.state` becomes `completed`.
+pub async fn poll_rsclaw_native(api_key: &str, job_id: &str) -> Result<PollOutcome> {
+    let host = rsclaw_provider::rsclaw_http::gen_host_base(None);
+    let client =
+        rsclaw_provider::rsclaw_http::build_client(rsclaw_provider::DEFAULT_USER_AGENT, 30)?;
+    let status_url = format!("{host}/v1/jobs/{job_id}");
+    let resp = rsclaw_provider::rsclaw_http::get(&client, &status_url, api_key).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "rsclaw-native: status {status}: {}",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|error| anyhow!("rsclaw-native: status parse: {error}"))?;
+    parse_rsclaw_native_poll(value)
+}
+
+fn parse_rsclaw_native_poll(value: Value) -> Result<PollOutcome> {
+    let state = value
+        .pointer("/status/state")
+        .and_then(|state| state.as_str())
+        .unwrap_or("unknown");
+    match state {
+        "completed" => {
+            let url = value
+                .pointer("/status/outputs/0/url")
+                .and_then(|url| url.as_str())
+                .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+                .ok_or_else(|| anyhow!("rsclaw-native: completed job has no output URL: {value}"))?
+                .to_owned();
+            Ok(PollOutcome::Done(url))
+        }
+        "failed" => {
+            let code = value
+                .pointer("/status/error")
+                .and_then(|error| error.as_str())
+                .unwrap_or("unknown");
+            let message = value
+                .pointer("/status/message")
+                .and_then(|message| message.as_str())
+                .filter(|message| !message.is_empty());
+            let detail = message.map_or_else(
+                || format!("failed: {code}"),
+                |message| format!("failed: {code}: {message}"),
+            );
+            Ok(PollOutcome::Failed(detail))
+        }
+        "cancelled" => Ok(PollOutcome::Failed("cancelled".to_owned())),
+        "queued" => Ok(PollOutcome::Pending),
+        "in_progress" => {
+            let progress = value
+                .pointer("/status/progress")
+                .and_then(Value::as_f64)
+                .filter(|progress| progress.is_finite())
+                .map(|progress| progress.clamp(0.0, 1.0) as f32);
+            Ok(PollOutcome::InProgress(progress))
+        }
+        other => Err(anyhow!(
+            "rsclaw-native: unknown or missing job state `{other}`: {value}"
+        )),
+    }
+}
+
+/// Poll a legacy rsclaw `video_<id>` job used only by avatar and music-video
+/// routes.
+pub async fn poll_rsclaw_legacy(api_key: &str, video_id: &str) -> Result<PollOutcome> {
     let host = rsclaw_provider::rsclaw_http::gen_host_base(None);
     let client =
         rsclaw_provider::rsclaw_http::build_client(rsclaw_provider::DEFAULT_USER_AGENT, 30)?;
@@ -832,5 +890,67 @@ pub async fn poll_rsclaw(api_key: &str, video_id: &str) -> Result<PollOutcome> {
         }
         // queued / in_progress / anything else the server may add later
         _ => Ok(PollOutcome::Pending),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_poll_maps_pending_completed_and_failed_states() {
+        assert!(matches!(
+            parse_rsclaw_native_poll(json!({"status":{"state":"queued"}})),
+            Ok(PollOutcome::Pending)
+        ));
+        assert!(matches!(
+            parse_rsclaw_native_poll(json!({
+                "status": {"state": "in_progress", "progress": 0.83}
+            })),
+            Ok(PollOutcome::InProgress(Some(progress)))
+                if (progress - 0.83).abs() < f32::EPSILON
+        ));
+        assert!(matches!(
+            parse_rsclaw_native_poll(json!({
+                "status": {"state": "in_progress"}
+            })),
+            Ok(PollOutcome::InProgress(None))
+        ));
+        assert!(matches!(
+            parse_rsclaw_native_poll(json!({
+                "status": {
+                    "state": "completed",
+                    "outputs": [{"url": "https://api.example.test/video.mp4"}]
+                }
+            })),
+            Ok(PollOutcome::Done(url)) if url == "https://api.example.test/video.mp4"
+        ));
+        assert!(matches!(
+            parse_rsclaw_native_poll(json!({
+                "status": {
+                    "state": "failed",
+                    "error": "backend_failure",
+                    "message": "worker failed"
+                }
+            })),
+            Ok(PollOutcome::Failed(message))
+                if message == "failed: backend_failure: worker failed"
+        ));
+    }
+
+    #[test]
+    fn native_poll_rejects_completed_job_without_http_output() {
+        assert!(
+            parse_rsclaw_native_poll(json!({
+                "status": {"state": "completed", "outputs": [{"url": "s3blob://private"}]}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_poll_rejects_unknown_or_missing_state() {
+        assert!(parse_rsclaw_native_poll(json!({"status":{"state":"paused"}})).is_err());
+        assert!(parse_rsclaw_native_poll(json!({"status":{}})).is_err());
     }
 }
