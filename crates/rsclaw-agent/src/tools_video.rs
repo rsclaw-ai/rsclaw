@@ -12,6 +12,8 @@
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
+const RSCLAW_NATIVE_VIDEO_TIMEOUT_SECS: i64 = 60 * 60;
+
 impl super::runtime::AgentRuntime {
     /// Generate a video from a text prompt.
     ///
@@ -377,7 +379,7 @@ impl super::runtime::AgentRuntime {
             }
         };
 
-        let job = rsclaw_types::ExternalJob::new_submitted(
+        let mut job = rsclaw_types::ExternalJob::new_submitted(
             ctx.session_key.clone(),
             rsclaw_types::ExternalJobDelivery {
                 channel: ctx.channel.clone(),
@@ -396,6 +398,7 @@ impl super::runtime::AgentRuntime {
             rsclaw_types::ExternalJobKind::VideoGen,
             prompt,
         );
+        set_video_job_timeout(&mut job);
         let job_id = job.id.clone();
         self.store
             .db
@@ -611,6 +614,16 @@ impl super::runtime::AgentRuntime {
     }
 }
 
+/// Apply the longer timeout only to standard video submitted through the native
+/// rsclaw jobs API. Other providers and rsclaw legacy video keep the default.
+fn set_video_job_timeout(job: &mut rsclaw_types::ExternalJob) {
+    if job.provider == "rsclaw_native"
+        && matches!(job.kind, rsclaw_types::ExternalJobKind::VideoGen)
+    {
+        job.timeout_at = job.submitted_at + RSCLAW_NATIVE_VIDEO_TIMEOUT_SECS;
+    }
+}
+
 /// Normalize gen asset input(s) — image OR audio. http(s)/data: pass through;
 /// a LOCAL FILE PATH is read and base64-encoded into a `data:<mime>;base64,...`
 /// URI with the mime inferred from the extension (image + audio + video).
@@ -706,6 +719,7 @@ async fn post_rsclaw_gen(endpoint: &str, api_key: &str, body: &Value) -> Result<
 
 fn local_video_job_status(job: &rsclaw_types::ExternalJob) -> Value {
     let status = match job.status {
+        rsclaw_types::ExternalJobStatus::Pending if job.progress.is_some() => "in_progress",
         rsclaw_types::ExternalJobStatus::Pending => "pending",
         rsclaw_types::ExternalJobStatus::Polling => "in_progress",
         rsclaw_types::ExternalJobStatus::Done => "completed",
@@ -722,6 +736,7 @@ fn local_video_job_status(job: &rsclaw_types::ExternalJob) -> Value {
         "result_url": job.result_url,
         "result_path": job.result_path,
         "error": job.error,
+        "progress": job.progress,
         "delivery_complete": job.delivered_at.is_some(),
     })
 }
@@ -731,6 +746,11 @@ fn provider_video_status(task_id: &str, outcome: rsclaw_types::PollOutcome) -> V
         rsclaw_types::PollOutcome::Pending => json!({
             "status": "pending",
             "task_id": task_id,
+        }),
+        rsclaw_types::PollOutcome::InProgress(progress) => json!({
+            "status": "in_progress",
+            "task_id": task_id,
+            "progress": progress,
         }),
         rsclaw_types::PollOutcome::Done(url) => json!({
             "status": "completed",
@@ -918,6 +938,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_rsclaw_video_timeout_is_one_hour_without_extending_others() {
+        let delivery = rsclaw_types::ExternalJobDelivery {
+            channel: "test".to_owned(),
+            target_id: "target".to_owned(),
+            is_group: false,
+            reply_to: None,
+            account: None,
+        };
+        let mut native = rsclaw_types::ExternalJob::new_submitted(
+            "session",
+            delivery.clone(),
+            rsclaw_types::ExternalJobOrigin::Agent,
+            "rsclaw_native",
+            "job_1",
+            rsclaw_types::ExternalJobKind::VideoGen,
+            "prompt",
+        );
+        set_video_job_timeout(&mut native);
+        assert_eq!(
+            native.timeout_at - native.submitted_at,
+            RSCLAW_NATIVE_VIDEO_TIMEOUT_SECS
+        );
+
+        let mut other = rsclaw_types::ExternalJob::new_submitted(
+            "session",
+            delivery.clone(),
+            rsclaw_types::ExternalJobOrigin::Agent,
+            "rsclaw_legacy",
+            "task_1",
+            rsclaw_types::ExternalJobKind::VideoGen,
+            "prompt",
+        );
+        set_video_job_timeout(&mut other);
+        assert_eq!(
+            other.timeout_at - other.submitted_at,
+            rsclaw_types::DEFAULT_TIMEOUT_SECS as i64
+        );
+
+        let mut non_video = rsclaw_types::ExternalJob::new_submitted(
+            "session",
+            delivery.clone(),
+            rsclaw_types::ExternalJobOrigin::Agent,
+            "rsclaw_native",
+            "job_2",
+            rsclaw_types::ExternalJobKind::ImageGen,
+            "prompt",
+        );
+        set_video_job_timeout(&mut non_video);
+        assert_eq!(
+            non_video.timeout_at - non_video.submitted_at,
+            rsclaw_types::DEFAULT_TIMEOUT_SECS as i64
+        );
+    }
+
+    #[test]
     fn native_rsclaw_accepts_only_v3() {
         assert!(validate_native_rsclaw_model(Some("rsclaw-video-v3")).is_ok());
         assert!(validate_native_rsclaw_model(Some("rsclaw/rsclaw-video-v3")).is_ok());
@@ -932,6 +1007,10 @@ mod tests {
             provider_video_status("job_1", rsclaw_types::PollOutcome::Pending)["status"],
             "pending"
         );
+        let running =
+            provider_video_status("job_1", rsclaw_types::PollOutcome::InProgress(Some(0.5)));
+        assert_eq!(running["status"], "in_progress");
+        assert_eq!(running["progress"], 0.5);
         let completed = provider_video_status(
             "job_1",
             rsclaw_types::PollOutcome::Done("https://example.test/video.mp4".to_owned()),

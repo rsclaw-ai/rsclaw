@@ -825,7 +825,15 @@ fn parse_rsclaw_native_poll(value: Value) -> Result<PollOutcome> {
             Ok(PollOutcome::Failed(detail))
         }
         "cancelled" => Ok(PollOutcome::Failed("cancelled".to_owned())),
-        "queued" | "in_progress" => Ok(PollOutcome::Pending),
+        "queued" => Ok(PollOutcome::Pending),
+        "in_progress" => {
+            let progress = value
+                .pointer("/status/progress")
+                .and_then(Value::as_f64)
+                .filter(|progress| progress.is_finite())
+                .map(|progress| progress.clamp(0.0, 1.0) as f32);
+            Ok(PollOutcome::InProgress(progress))
+        }
         other => Err(anyhow!(
             "rsclaw-native: unknown or missing job state `{other}`: {value}"
         )),
@@ -894,6 +902,19 @@ mod tests {
         assert!(matches!(
             parse_rsclaw_native_poll(json!({"status":{"state":"queued"}})),
             Ok(PollOutcome::Pending)
+        ));
+        assert!(matches!(
+            parse_rsclaw_native_poll(json!({
+                "status": {"state": "in_progress", "progress": 0.83}
+            })),
+            Ok(PollOutcome::InProgress(Some(progress)))
+                if (progress - 0.83).abs() < f32::EPSILON
+        ));
+        assert!(matches!(
+            parse_rsclaw_native_poll(json!({
+                "status": {"state": "in_progress"}
+            })),
+            Ok(PollOutcome::InProgress(None))
         ));
         assert!(matches!(
             parse_rsclaw_native_poll(json!({

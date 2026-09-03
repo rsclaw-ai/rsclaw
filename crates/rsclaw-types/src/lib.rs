@@ -414,6 +414,10 @@ pub struct ExternalJob {
     pub status: ExternalJobStatus,
     /// Last error message (transient or terminal).
     pub error: Option<String>,
+    /// Latest provider-reported completion fraction in the inclusive 0..=1
+    /// range.
+    #[serde(default)]
+    pub progress: Option<f32>,
     /// Result URL from the provider (set when Done).
     pub result_url: Option<String>,
     /// Local file path after download (set when Done — so reconnect-replay
@@ -440,8 +444,10 @@ pub struct ExternalJob {
 /// `crate::gateway::external_jobs::PollOutcome`.
 #[derive(Debug, Clone)]
 pub enum PollOutcome {
-    /// Provider says the job is still in progress — schedule another poll.
+    /// Provider says the job is queued — schedule another poll.
     Pending,
+    /// Provider says the job is running, optionally with a completion fraction.
+    InProgress(Option<f32>),
     /// Provider returned the artifact URL.
     Done(String),
     /// Provider reported a non-recoverable failure.
@@ -487,6 +493,7 @@ impl ExternalJob {
             timeout_at: now + DEFAULT_TIMEOUT_SECS as i64,
             status: ExternalJobStatus::Pending,
             error: None,
+            progress: None,
             result_url: None,
             result_path: None,
             delivered_at: None,

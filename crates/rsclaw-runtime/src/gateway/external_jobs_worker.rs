@@ -181,7 +181,20 @@ impl ExternalJobsWorker {
                     error!(job_id = %job.id, "update (pending) failed: {e:#}");
                 }
             }
+            Ok(PollOutcome::InProgress(progress)) => {
+                let now = chrono::Utc::now().timestamp();
+                job.next_poll_at = now + job.next_poll_delay_secs() as i64;
+                job.status = ExternalJobStatus::Pending;
+                job.error = None;
+                if let Some(progress) = progress {
+                    job.progress = Some(progress);
+                }
+                if let Err(e) = self.store.update_external_job(&job) {
+                    error!(job_id = %job.id, "update (in-progress) failed: {e:#}");
+                }
+            }
             Ok(PollOutcome::Done(url)) => {
+                job.progress = Some(1.0);
                 job.result_url = Some(url.clone());
                 // Native jobs and current legacy responses return signed URLs;
                 // never send Bearer to those URLs. Only a legacy fallback to a
