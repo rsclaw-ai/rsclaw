@@ -373,7 +373,8 @@ impl AgentRuntime {
                 ));
             }
             // Stock tools (astock-core integration)
-            "stock_quote" | "stock_select" | "stock_lhb" | "stock_iwencai" => {
+            "stock_quote" | "stock_select" | "stock_lhb" | "stock_iwencai"
+            | "stock_holdings" => {
                 return crate::tools_stock::dispatch_stock_tool(name, &args, None).await;
             }
             "stock_debate" => {

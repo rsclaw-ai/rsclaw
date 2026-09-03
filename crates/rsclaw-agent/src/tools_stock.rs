@@ -132,6 +132,22 @@ pub fn stock_tool_defs() -> Vec<rsclaw_provider::ToolDef> {
                 "required": ["question"]
             }),
         },
+        rsclaw_provider::ToolDef {
+            name: "stock_holdings".to_owned(),
+            description: "Manage the user's A-share holdings and watchlist. Use action=list to inspect entries before changing an unknown stock. action=add requires code and name; shares=0 means watchlist-only. action=update and action=remove select an entry by code. Codes may be six digits or use a .SH/.SZ suffix.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "add", "update", "remove"]},
+                    "code": {"type": "string", "description": "Six-digit stock code, optionally with .SH or .SZ suffix."},
+                    "name": {"type": "string", "description": "Stock name. Required for add; optional for update."},
+                    "cost": {"type": "number", "minimum": 0, "description": "Position cost. Defaults to 0 when adding."},
+                    "shares": {"type": "integer", "minimum": 0, "description": "Share count. Use 0 for watchlist-only entries."}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -432,6 +448,7 @@ pub async fn dispatch_stock_tool(name: &str, args: &Value, ctx: Option<&StockToo
             handle_stock_debate(args, ctx).await
         }
         "stock_iwencai" => handle_stock_iwencai(args).await,
+        "stock_holdings" => crate::stock_holdings::handle(args).await,
         _ => bail!("Unknown stock tool: {}", name),
     }
 }

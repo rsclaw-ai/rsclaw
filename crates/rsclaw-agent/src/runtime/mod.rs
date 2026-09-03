@@ -195,6 +195,7 @@ fn is_stock_tool_name(name: &str) -> bool {
             | "stock_query"
             | "stock_chart"
             | "stock_watchlist"
+            | "stock_holdings"
     )
 }
 
