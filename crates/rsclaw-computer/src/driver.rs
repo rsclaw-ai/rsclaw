@@ -593,6 +593,30 @@ impl VlmDriver<'_> {
                     return Ok(deny);
                 }
 
+                if let Err(error) = self.operator.validate_action(&pa, &action, &ctx) {
+                    let step = Step {
+                        thought: pa.thought.clone(),
+                        action_summary: summary,
+                        result_ok: false,
+                        result_message: Some(format!(
+                            "Action was not executed: {error}. Correct the action and provide the required coordinates."
+                        )),
+                    };
+                    warn!(
+                        step = steps + 1,
+                        action = %step.action_summary,
+                        error = %error,
+                        "VLM action rejected by operator validation"
+                    );
+                    self.emit_step(steps + 1, &step);
+                    history.push(step);
+                    steps += 1;
+                    if steps >= self.max_loop {
+                        return Ok(DriverOutcome::MaxLoop { steps });
+                    }
+                    continue;
+                }
+
                 let exec_result = match self.operator.execute(&action, &ctx).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -1364,6 +1388,17 @@ mod tests {
     }
 
     #[test]
+    fn maps_exact_box_center_to_physical_coordinates() {
+        let parsed = parse_vlm_response(
+            "Thought: target\nAction: click(start_box='<box>400,400,600,600</box>')",
+            CoordFormat::BoxTag,
+        );
+        let action = parsed_to_action(&parsed[0], 800, 632, CoordSpace::Normalized, 1.0)
+            .expect("mapped click");
+        assert_eq!(action.coords(), Some((400, 316)));
+    }
+
+    #[test]
     fn maps_click_centre_of_screen() {
         // (500, 500) on the grid → midpoint of the screen.
         let mut p = pa("click", &[]);
@@ -1594,5 +1629,181 @@ mod tests {
     fn build_user_message_no_history() {
         let msg = build_user_message("open WeChat", &[]);
         assert_eq!(msg, "Task: open WeChat");
+    }
+
+    struct StaticProvider {
+        reply: String,
+    }
+
+    impl LlmProvider for StaticProvider {
+        fn name(&self) -> &str {
+            "static-test"
+        }
+
+        fn stream(
+            &self,
+            _req: LlmRequest,
+        ) -> futures::future::BoxFuture<'_, Result<rsclaw_provider::LlmStream>> {
+            let reply = self.reply.clone();
+            Box::pin(async move {
+                let stream: rsclaw_provider::LlmStream = Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(reply)),
+                    Ok(StreamEvent::Done { usage: None }),
+                ]));
+                Ok(stream)
+            })
+        }
+    }
+
+    struct TestPermission;
+
+    impl PermissionStore for TestPermission {
+        fn check<'a>(
+            &'a self,
+            _agent_id: &'a str,
+            _app: &'a str,
+        ) -> super::super::permission::CheckFut<'a> {
+            Box::pin(async { Ok(Some(PermissionDecision::AllowAlways)) })
+        }
+
+        fn record<'a>(
+            &'a self,
+            _agent_id: &'a str,
+            _app: &'a str,
+            _decision: PermissionDecision,
+        ) -> super::super::permission::RecordFut<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn revoke<'a>(
+            &'a self,
+            _agent_id: &'a str,
+            _app: &'a str,
+        ) -> super::super::permission::RecordFut<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn bypass_all(&self) -> bool {
+            false
+        }
+    }
+
+    struct TestOperator {
+        executions: std::sync::atomic::AtomicUsize,
+        reject: bool,
+    }
+
+    impl Operator for TestOperator {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn action_spaces(&self) -> Vec<ActionSpec> {
+            vec![ActionSpec::new("click(start_box='<box>x1,y1,x2,y2</box>')")]
+        }
+
+        fn screenshot(&self) -> super::super::operator::ScreenshotFut<'_> {
+            Box::pin(async {
+                Ok(super::super::action::Screenshot {
+                    png_bytes: Vec::new(),
+                    logical_size: (800, 632),
+                    physical_size: (800, 632),
+                    scale_factor: 1.0,
+                })
+            })
+        }
+
+        fn validate_action(
+            &self,
+            _parsed: &ParsedAction,
+            _action: &Action,
+            _ctx: &ExecCtx,
+        ) -> Result<()> {
+            if self.reject {
+                anyhow::bail!("click requires start_box='<box>x1,y1,x2,y2</box>'")
+            }
+            Ok(())
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _action: &'a Action,
+            _ctx: &'a ExecCtx,
+        ) -> super::super::operator::ActionFut<'a> {
+            Box::pin(async move {
+                self.executions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(super::super::operator::ActionOutput::ok())
+            })
+        }
+    }
+
+    fn test_driver<'a>(operator: &'a dyn Operator, reply: &str) -> VlmDriver<'a> {
+        VlmDriver {
+            operator,
+            provider: Arc::new(StaticProvider {
+                reply: reply.to_owned(),
+            }),
+            model_name: "test".to_owned(),
+            coord_format: CoordFormat::BoxTag,
+            coord_space: CoordSpace::Normalized,
+            max_loop: 1,
+            abort: Arc::new(AtomicBool::new(false)),
+            app_rules: Box::leak(Box::new(AppRuleSet::default())),
+            permission: Arc::new(TestPermission),
+            agent_id: "test-agent".to_owned(),
+            app: String::new(),
+            permission_emit: None,
+            headless_auto_allow: false,
+            status_emit: None,
+            run_id: "test-run".to_owned(),
+            action_spaces_override: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_rejection_skips_execute_and_consumes_a_step() {
+        let operator = TestOperator {
+            executions: std::sync::atomic::AtomicUsize::new(0),
+            reject: true,
+        };
+        let outcome = test_driver(
+            &operator,
+            "Thought: click row\nAction: click(start_box='<box>150,205</box>')",
+        )
+        .run("test")
+        .await
+        .expect("driver run");
+
+        assert!(matches!(outcome, DriverOutcome::MaxLoop { steps: 1 }));
+        assert_eq!(
+            operator
+                .executions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn default_operator_validation_remains_compatible() {
+        let operator = TestOperator {
+            executions: std::sync::atomic::AtomicUsize::new(0),
+            reject: false,
+        };
+        let outcome = test_driver(
+            &operator,
+            "Thought: click row\nAction: click(start_box='<box>490,490,510,510</box>')",
+        )
+        .run("test")
+        .await
+        .expect("driver run");
+
+        assert!(matches!(outcome, DriverOutcome::MaxLoop { steps: 1 }));
+        assert_eq!(
+            operator
+                .executions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }

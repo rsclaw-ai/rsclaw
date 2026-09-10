@@ -260,6 +260,12 @@ impl ChromeProcess {
             args.push("--headless=new");
         }
 
+        info!(
+            executable = chrome_path,
+            headed,
+            profile = ?profile,
+            "launching Chromium browser"
+        );
         let mut child = tokio::process::Command::new(chrome_path)
             .args(&args)
             .arg(format!("--user-data-dir={}", user_data_dir.display()))
@@ -267,36 +273,41 @@ impl ChromeProcess {
             .stdout(std::process::Stdio::null())
             .stdin(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| anyhow!("failed to launch Chrome at {chrome_path}: {e}"))?;
+            .map_err(|e| anyhow!("failed to launch browser at {chrome_path}: {e}"))?;
 
         // Read stderr until we find the DevTools WebSocket URL.
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| anyhow!("no stderr from Chrome process"))?;
+            .ok_or_else(|| anyhow!("no stderr from browser process at {chrome_path}"))?;
         let mut reader = BufReader::new(stderr).lines();
 
         let ws_url = time::timeout(Duration::from_secs(30), async {
             while let Some(line) = reader.next_line().await? {
-                debug!(line = %line, "chrome stderr");
+                debug!(executable = chrome_path, line = %line, "browser stderr");
                 if let Some(pos) = line.find("ws://") {
                     return Ok::<String, anyhow::Error>(line[pos..].trim().to_owned());
                 }
             }
-            Err(anyhow!("Chrome exited without printing DevTools URL"))
+            Err(anyhow!(
+                "browser at {chrome_path} exited without printing DevTools URL"
+            ))
         })
         .await
         .map_err(|e| {
-            // Chrome launched but didn't give us a WebSocket URL — kill it.
+            // The browser launched but didn't give us a WebSocket URL — kill it.
             let _ = child.start_kill();
-            anyhow!("timed out waiting for Chrome DevTools URL: {}", e)
+            anyhow!("timed out waiting for browser DevTools URL from {chrome_path}: {e}")
         })??;
 
-        debug!(ws_url = %ws_url, "Chrome DevTools URL discovered");
+        debug!(executable = chrome_path, ws_url = %ws_url, "browser DevTools URL discovered");
         ACTIVE_INSTANCES.fetch_add(1, Ordering::Relaxed);
         let active = ACTIVE_INSTANCES.load(Ordering::Relaxed);
         let max = max_instances();
-        info!(active, max, "Chrome instance launched");
+        info!(
+            executable = chrome_path,
+            active, max, "browser instance launched"
+        );
 
         Ok(Self {
             child,
@@ -945,7 +956,8 @@ impl BrowserSession {
         let mut chosen_profile = profile;
         if is_system_chrome(chrome_path) {
             info!(
-                "BrowserSession: launching system Chrome with rsclaw's persistent 'default' profile"
+                executable = chrome_path,
+                "BrowserSession: launching system Chromium browser with rsclaw's persistent 'default' profile"
             );
             chosen_profile = Some("default");
         }
@@ -1194,7 +1206,7 @@ impl BrowserSession {
     /// Resets `last_activity` to "now" before returning so the very next
     /// execute() doesn't immediately re-trigger idle-expiry on the same
     /// stale timestamp (caused a tight restart loop that ended in
-    /// "Chrome exited without printing DevTools URL" — see
+    /// "browser exited without printing DevTools URL" — see
     /// browser/mod.rs::execute checks 1 and 2).
     async fn restart(&mut self) -> Result<()> {
         warn!("restarting Chrome browser session");

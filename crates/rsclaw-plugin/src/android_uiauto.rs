@@ -23,6 +23,7 @@ const MAX_ARGS_BYTES: usize = 64 * 1024;
 const MAX_RAW_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
+const MAX_FALLBACK_CONTEXT_BYTES: usize = 512;
 const MAX_PATH_BYTES: usize = 512;
 const MAX_STRING_ARG_BYTES: usize = 4096;
 const MAX_SELECTOR_BYTES: usize = 64 * 1024;
@@ -258,7 +259,7 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         return detect_latest_message_bubble(&config, options.op_type).await;
     }
     if command == INPUT_TEXT_COMMAND {
-        return input_text(&args_json, &config, options.op_type).await;
+        return input_text(&args_json, &config, options.op_type, options.op_mode).await;
     }
     if command == CLIPBOARD_SET_COMMAND {
         return clipboard_set(&args_json, &config).await;
@@ -346,6 +347,7 @@ async fn input_text(
     args_json: &str,
     config: &Config,
     op_type: AndroidOpType,
+    op_mode: Option<AndroidOpMode>,
 ) -> Result<String, String> {
     let input = input_text_value(args_json)?;
     match op_type {
@@ -367,8 +369,27 @@ async fn input_text(
             run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
         }
         AndroidOpType::U2 => {
-            let args = uiauto_visual_text_args(config, input)?;
-            run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+            let args = uiauto_visual_text_args(config, input.clone())?;
+            match run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await {
+                Ok(response) => Ok(response),
+                Err(original)
+                    if op_mode == Some(AndroidOpMode::Vision)
+                        && is_webdriver_no_such_element_error(&original) =>
+                {
+                    u2_active_element_clipboard_fallback(config, &input.text)
+                        .await
+                        .map_err(|fallback| {
+                            let fallback = rsclaw_util::truncate_str(
+                                &fallback,
+                                MAX_FALLBACK_CONTEXT_BYTES,
+                            );
+                            format!(
+                                "{original}; U2 active-element clipboard fallback failed: {fallback}"
+                            )
+                        })
+                }
+                Err(error) => Err(error),
+            }
         }
         AndroidOpType::Adb => Err(
             "android operation: input-text is unavailable for opType=adb in vision mode"
@@ -423,12 +444,87 @@ fn clipboard_request(args_json: &str) -> Result<(String, String), String> {
     ))
 }
 
-async fn clipboard_set(args_json: &str, _config: &Config) -> Result<String, String> {
+async fn clipboard_set(args_json: &str, config: &Config) -> Result<String, String> {
     let (path, body) = clipboard_request(args_json)?;
-    raw("POST", &path, Some(&body)).await
+    raw_with_config(config, "POST", &path, Some(&body)).await
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// Paste through the already-running UIAutomator2 session only after CLS's
+/// canonical coordinate type-at reports the precise WebDriver active-element
+/// failure. This intentionally creates no session and exposes no new command.
+async fn u2_active_element_clipboard_fallback(
+    config: &Config,
+    text: &str,
+) -> Result<String, String> {
+    let sessions = raw_with_config(config, "GET", "/sessions", None).await?;
+    let session_id = single_u2_session_id(&sessions)?;
+    let clipboard_args = serde_json::json!({ "sessionId": session_id, "text": text }).to_string();
+    clipboard_set(&clipboard_args, config).await?;
+    let path = format!("/session/{session_id}/appium/device/press_keycode");
+    raw_with_config(config, "POST", &path, Some(r#"{"keycode":279}"#)).await
+}
+
+/// Extract exactly one UiAutomator2 session from the W3C GET /sessions
+/// response.
+fn single_u2_session_id(response: &str) -> Result<String, String> {
+    let response: Value = serde_json::from_str(response)
+        .map_err(|error| format!("android uiauto: invalid U2 sessions response: {error}"))?;
+    let sessions = response
+        .as_object()
+        .and_then(|response| response.get("value"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "android uiauto: malformed U2 sessions response".to_string())?;
+    let [session] = sessions.as_slice() else {
+        return Err(format!(
+            "android uiauto: U2 clipboard fallback requires exactly one existing session (got {})",
+            sessions.len()
+        ));
+    };
+    let session_id = session
+        .as_object()
+        .and_then(|session| session.get("sessionId").or_else(|| session.get("id")))
+        .and_then(Value::as_str)
+        .filter(|session_id| is_identifier(session_id))
+        .ok_or_else(|| "android uiauto: malformed U2 session entry".to_string())?;
+    Ok(session_id.to_string())
+}
+
+/// Match only a structured W3C WebDriver `no such element` error, never a
+/// coincidental substring in CLS diagnostics.
+fn is_webdriver_no_such_element_error(error: &str) -> bool {
+    contains_webdriver_no_such_element_json(error)
+        || error.char_indices().any(|(index, character)| {
+            if character != '"' {
+                return false;
+            }
+            let mut strings =
+                serde_json::Deserializer::from_str(&error[index..]).into_iter::<String>();
+            let Some(Ok(decoded)) = strings.next() else {
+                return false;
+            };
+            contains_webdriver_no_such_element_json(&decoded)
+        })
+}
+
+fn contains_webdriver_no_such_element_json(error: &str) -> bool {
+    error.char_indices().any(|(index, character)| {
+        if character != '{' {
+            return false;
+        }
+        let mut values = serde_json::Deserializer::from_str(&error[index..]).into_iter::<Value>();
+        let Some(Ok(value)) = values.next() else {
+            return false;
+        };
+        value
+            .get("value")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+            == Some("no such element")
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct InputText {
     text: String,
     point: Option<(u32, u32)>,
@@ -1495,6 +1591,17 @@ pub(crate) async fn raw(
     json_body: Option<&str>,
 ) -> Result<String, String> {
     let config = Config::from_env()?;
+    raw_with_config(&config, method, path, json_body).await
+}
+
+/// Internal raw transport which shares the public raw endpoint validation and
+/// private request-file handling with host-only fallbacks.
+async fn raw_with_config(
+    config: &Config,
+    method: &str,
+    path: &str,
+    json_body: Option<&str>,
+) -> Result<String, String> {
     let method = validate_raw_request(method, path, json_body)?;
     let request_file = match json_body {
         Some(body) => Some(TempJsonFile::create(body.as_bytes())?),
@@ -2675,6 +2782,49 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn u2_clipboard_fallback_requires_a_single_w3c_session() {
+        assert_eq!(
+            single_u2_session_id(r#"{"value":[{"id":"u2-session_1","capabilities":{}}]}"#)
+                .as_deref(),
+            Ok("u2-session_1")
+        );
+        assert_eq!(
+            single_u2_session_id(r#"{"value":[{"sessionId":"u2-session_2"}]}"#).as_deref(),
+            Ok("u2-session_2")
+        );
+        assert!(single_u2_session_id(r#"{"value":[]}"#).is_err());
+        assert!(single_u2_session_id(r#"{"value":[{"id":"one"},{"id":"two"}]}"#).is_err());
+        assert!(single_u2_session_id(r#"{"value":[{"session":"one"}]}"#).is_err());
+        assert!(single_u2_session_id(r#"{"value":"one"}"#).is_err());
+    }
+
+    #[test]
+    fn u2_clipboard_fallback_matches_only_structured_no_such_element() {
+        assert!(is_webdriver_no_such_element_error(
+            "cls failed: {\"value\":{\"error\":\"no such element\",\"message\":\"active element is unavailable\"}}"
+        ));
+        assert!(is_webdriver_no_such_element_error(
+            "cls failed: {\"value\":{\"error\":\"no such element\",\"message\":\"active element is unavailable\"}} ActiveElement.safeHandle"
+        ));
+        assert!(is_webdriver_no_such_element_error(
+            r#"android uiauto: cls exited with exit code: 1: Error: "cls-service HTTP error: HTTP/1.1 404 Not Found: {\"sessionId\":\"u2-session\",\"value\":{\"error\":\"no such element\",\"message\":\"active element is unavailable\",\"stacktrace\":\"ActiveElement.safeHandle\"}}""#
+        ));
+        assert!(!is_webdriver_no_such_element_error("no such element"));
+        assert!(!is_webdriver_no_such_element_error(
+            r#"Error: \"driver said no such element in plain text\""#
+        ));
+        assert!(!is_webdriver_no_such_element_error(
+            r#"{"value":{"error":"stale element reference"}}"#
+        ));
+        assert!(!is_webdriver_no_such_element_error(
+            r#"{"value":{"error":"no such elements"}}"#
+        ));
+        assert!(!is_webdriver_no_such_element_error(
+            r#"{"error":"no such element"}"#
+        ));
     }
 
     #[test]

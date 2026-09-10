@@ -163,7 +163,7 @@ pub fn detect_chrome() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        // Registry (most reliable for system + per-user installs).
+        // Registry (most reliable for system + per-user Google Chrome installs).
         for key_path in &[
             r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
             r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
@@ -186,36 +186,40 @@ pub fn detect_chrome() -> Option<String> {
                 }
             }
         }
-        let candidates = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-            r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-        ];
-        for path in &candidates {
-            if std::path::Path::new(path).exists() {
-                return Some((*path).to_string());
+
+        // Prefer any real Google Chrome discoverable on PATH before our managed
+        // build, but do not let Edge/Brave/Chromium outrank managed Chrome.
+        for name in &["google-chrome-stable", "google-chrome", "chrome"] {
+            if let Ok(path) = which::which(name) {
+                return Some(path.to_string_lossy().to_string());
             }
         }
-        // Per-user installs under %LOCALAPPDATA%.
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let user_candidates = [
-                format!(r"{local}\Google\Chrome\Application\chrome.exe"),
-                format!(r"{local}\Microsoft\Edge\Application\msedge.exe"),
-                format!(r"{local}\BraveSoftware\Brave-Browser\Application\brave.exe"),
-            ];
-            for path in &user_candidates {
-                if std::path::Path::new(path).exists() {
-                    return Some(path.clone());
-                }
+
+        let local = std::env::var("LOCALAPPDATA").ok();
+        let managed = managed_chrome();
+        for path in windows_browser_candidates(local.as_deref(), managed.as_deref()) {
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+
+        // Other Chromium-family browsers on PATH are the final Windows fallback.
+        for name in &[
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "microsoft-edge",
+            "microsoft-edge-stable",
+        ] {
+            if let Ok(path) = which::which(name) {
+                return Some(path.to_string_lossy().to_string());
             }
         }
     }
 
-    // PATH lookup (all platforms; primary path on Linux). Includes the
-    // distro-specific binary names apt/dnf/snap install under.
+    // PATH lookup (primary path on Unix). Includes the distro-specific binary
+    // names apt/dnf/snap install under.
+    #[cfg(not(target_os = "windows"))]
     for name in &[
         "google-chrome-stable",
         "google-chrome",
@@ -263,6 +267,33 @@ pub fn detect_chrome() -> Option<String> {
     }
 
     None
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_browser_candidates(local: Option<&str>, managed: Option<&str>) -> Vec<String> {
+    let mut candidates = vec![
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_owned(),
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".to_owned(),
+    ];
+    if let Some(local) = local {
+        candidates.push(format!(r"{local}\Google\Chrome\Application\chrome.exe"));
+    }
+    if let Some(managed) = managed {
+        candidates.push(managed.to_owned());
+    }
+    candidates.extend([
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe".to_owned(),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".to_owned(),
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe".to_owned(),
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe".to_owned(),
+    ]);
+    if let Some(local) = local {
+        candidates.extend([
+            format!(r"{local}\Microsoft\Edge\Application\msedge.exe"),
+            format!(r"{local}\BraveSoftware\Brave-Browser\Application\brave.exe"),
+        ]);
+    }
+    candidates
 }
 
 /// Path to the rsclaw-managed Chrome for Testing under
@@ -318,3 +349,27 @@ pub fn detect_ffmpeg() -> Option<String> {
 }
 pub mod capture;
 pub mod install_hints;
+
+#[cfg(test)]
+mod tests {
+    use super::windows_browser_candidates;
+
+    #[test]
+    fn windows_managed_chrome_precedes_edge_and_brave() {
+        let managed = r"C:\Users\test\.rsclaw\tools\chrome\chrome.exe";
+        let candidates =
+            windows_browser_candidates(Some(r"C:\Users\test\AppData\Local"), Some(managed));
+        let managed_index = candidates.iter().position(|path| path == managed).unwrap();
+        let first_alternative = candidates
+            .iter()
+            .position(|path| path.contains("Microsoft\\Edge") || path.contains("BraveSoftware"))
+            .unwrap();
+
+        assert!(managed_index < first_alternative);
+        assert!(
+            candidates[..managed_index]
+                .iter()
+                .all(|path| path.contains("Google\\Chrome"))
+        );
+    }
+}

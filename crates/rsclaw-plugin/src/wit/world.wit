@@ -337,6 +337,12 @@ interface host-desktop {
 
     /// Open a native file dialog. Returns the selected file path or error.
     desktop-file-dialog-open: func(title: string, filters: list<string>) -> result<string, string>;
+
+    /// Run the native Thought/Action VLM driver against `expected-app`.
+    /// `action-spaces` optionally restricts the model to a caller-defined subset.
+    /// The driver verifies the foreground application before every observation
+    /// and input, and fails closed when identity or requested state is uncertain.
+    desktop-vlm-drive: func(expected-app: string, instruction: string, max-steps: u32, action-spaces: option<list<string>>) -> result<string, string>;
 }
 
 interface host-vlm {

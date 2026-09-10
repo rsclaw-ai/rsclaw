@@ -107,9 +107,22 @@ fn random_signed_offset(min: i32, max: i32) -> i32 {
 /// the visual target so repeated cached-coordinate clicks do not look
 /// synthetic.
 fn human_move(enigo: &mut Enigo, target_x: i32, target_y: i32) -> Result<(), String> {
+    human_move_with_jitter(enigo, target_x, target_y, 10)
+}
+
+fn human_move_with_jitter(
+    enigo: &mut Enigo,
+    target_x: i32,
+    target_y: i32,
+    maximum_jitter: i32,
+) -> Result<(), String> {
     let (start_x, start_y) = enigo.location().unwrap_or((target_x, target_y));
-    let end_x = target_x.saturating_add(random_signed_offset(5, 10)).max(0);
-    let end_y = target_y.saturating_add(random_signed_offset(5, 10)).max(0);
+    let end_x = target_x
+        .saturating_add(random_signed_offset(5, maximum_jitter))
+        .max(0);
+    let end_y = target_y
+        .saturating_add(random_signed_offset(5, maximum_jitter))
+        .max(0);
     let dx = end_x - start_x;
     let dy = end_y - start_y;
     let control_1 = (
@@ -237,11 +250,98 @@ fn capture_primary_monitor() -> Result<String, String> {
 /// script-based window list. The list is front-to-back where the OS provides
 /// ordering, so the first match is frontmost — letting one call serve both the
 /// main window and a transient child (e.g. WeChat's merged-record viewer).
-/// Virtual-screen rect (origin + size) via GetSystemMetrics — matches the area
-/// `capture_full_png` grabs
-/// (System.Windows.Forms.SystemInformation.VirtualScreen). Fast (no process
-/// spawn); used so the plugin's full-screen 0-1000 coords convert to correct
-/// screen pixels. SM_*VIRTUALSCREEN = 76..79.
+/// Query only the current input target, without spawning a process or
+/// enumerating windows.
+#[cfg(target_os = "windows")]
+struct ForegroundIdentity {
+    window: isize,
+    process_id: u32,
+    executable: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_identity() -> Result<ForegroundIdentity, String> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetForegroundWindow() -> isize;
+        fn GetWindowThreadProcessId(window: isize, process_id: *mut u32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> isize;
+        fn QueryFullProcessImageNameW(
+            process: isize,
+            flags: u32,
+            path: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe {
+        let window = GetForegroundWindow();
+        if window == 0 {
+            return Err("foreground window is unavailable".to_string());
+        }
+        let mut process_id = 0;
+        GetWindowThreadProcessId(window, &mut process_id);
+        if process_id == 0 {
+            return Err("foreground process id is unavailable".to_string());
+        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if process == 0 {
+            return Err(format!(
+                "open foreground process failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut path = vec![0_u16; 32_768];
+        let mut size = 32_768_u32;
+        let queried = QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut size);
+        let query_error = (queried == 0).then(std::io::Error::last_os_error);
+        CloseHandle(process);
+        if let Some(error) = query_error {
+            return Err(format!("query foreground process failed: {error}"));
+        }
+        Ok(ForegroundIdentity {
+            window,
+            process_id,
+            executable: PathBuf::from(OsString::from_wide(&path[..size as usize])),
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_process_name() -> Result<String, String> {
+    foreground_identity()?
+        .executable
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "foreground process name is unavailable".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn supported_full_screen_layout() -> Result<(u32, u32), String> {
+    unsafe extern "system" {
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+    if unsafe { GetSystemMetrics(80) } != 1
+        || unsafe { GetSystemMetrics(76) } != 0
+        || unsafe { GetSystemMetrics(77) } != 0
+    {
+        return Err("system full-screen capture requires one display at origin (0,0)".to_string());
+    }
+    let (_, _, width, height) = virtual_screen_rect();
+    if width == 0 || height == 0 {
+        return Err("physical full-screen layout has zero dimensions".to_string());
+    }
+    Ok((width, height))
+}
+
 #[cfg(target_os = "windows")]
 fn virtual_screen_rect() -> (i32, i32, u32, u32) {
     unsafe extern "system" {
@@ -1465,57 +1565,142 @@ end tell"#,
                     let _ = Command::new("open").args(["-b", &bundle_id]).output();
                 }
                 Ok("ok".to_string()) // Return ok even if frontmost check fails
-            } else if cfg!(target_os = "windows") {
-                let lower = bundle_id.to_ascii_lowercase();
-                if lower.contains("wechat") || lower.contains("weixin") {
-                    // The operator keeps maximised WeChat frontmost. Do not query
-                    // HWNDs or enumerate processes/windows; VLM screenshot checks
-                    // are the authority before every action.
-                    return Ok("ok".to_string());
-                }
-                let escaped = bundle_id
-                    .replace('`', "``")
-                    .replace('*', "`*")
-                    .replace('?', "`?")
-                    .replace('[', "`[")
-                    .replace(']', "`]")
-                    .replace('\'', "''");
-                let ps = format!(
-                    r#"Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; Get-Process | Where-Object {{$_.ProcessName -like '*{}*'}} | ForEach-Object {{ if ($_.MainWindowHandle -ne 0) {{ [N.W]::SetForegroundWindow($_.MainWindowHandle) }} }}"#,
-                    escaped
-                );
-                #[allow(unused_mut)]
-                let mut ps_cmd = Command::new("powershell");
-                ps_cmd.args(["-NoProfile", "-Command", &ps]);
-                #[cfg(windows)]
+            } else {
+                #[cfg(target_os = "windows")]
                 {
+                    let lower = bundle_id.to_ascii_lowercase();
+                    if lower.contains("wechat") || lower.contains("weixin") {
+                        let actual = foreground_process_name()?.to_ascii_lowercase();
+                        if actual.contains("wechat") || actual.contains("weixin") {
+                            return Ok("ok".to_string());
+                        }
+                        return Err(
+                            "Windows WeChat is not foreground; host visual focus is required"
+                                .to_string(),
+                        );
+                    }
+                    let escaped = bundle_id.replace('`', "``").replace('*', "`*").replace('?', "`?").replace('[', "`[").replace(']', "`]").replace('\'', "''");
+                    let ps = format!(r#"Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; Get-Process | Where-Object {{$_.ProcessName -like '*{}*'}} | ForEach-Object {{ if ($_.MainWindowHandle -ne 0) {{ [N.W]::SetForegroundWindow($_.MainWindowHandle) }} }}"#, escaped);
+                    let mut ps_cmd = Command::new("powershell");
+                    ps_cmd.args(["-NoProfile", "-Command", &ps]);
                     use std::os::windows::process::CommandExt;
                     ps_cmd.creation_flags(0x08000000);
+                    return match ps_cmd.output() {
+                        Ok(out) if out.status.success() => Ok("ok".to_string()),
+                        Ok(out) => Err(format!("powershell failed: {}", String::from_utf8_lossy(&out.stderr))),
+                        Err(e) => Err(format!("powershell spawn failed: {e}")),
+                    };
                 }
-                match ps_cmd.output() {
-                    Ok(out) if out.status.success() => Ok("ok".to_string()),
-                    Ok(out) => Err(format!("powershell failed: {}", String::from_utf8_lossy(&out.stderr))),
-                    Err(e) => Err(format!("powershell spawn failed: {e}")),
-                }
-            } else if cfg!(target_os = "linux") {
-                let wmctrl = Command::new("wmctrl").args(["-a", &bundle_id]).status();
-                if matches!(&wmctrl, Ok(s) if s.success()) {
-                    return Ok("ok".to_string());
-                }
-                match Command::new("xdotool")
-                    .args(["search", "--class", &bundle_id, "windowactivate"])
-                    .status()
+                #[cfg(target_os = "linux")]
                 {
-                    Ok(s) if s.success() => Ok("ok".to_string()),
-                    Ok(s) => Err(format!("xdotool exit status: {s}")),
-                    Err(e) => Err(format!("neither wmctrl nor xdotool worked: {e}")),
+                    let wmctrl = Command::new("wmctrl").args(["-a", &bundle_id]).status();
+                    if matches!(&wmctrl, Ok(s) if s.success()) { return Ok("ok".to_string()); }
+                    return match Command::new("xdotool").args(["search", "--class", &bundle_id, "windowactivate"]).status() {
+                        Ok(s) if s.success() => Ok("ok".to_string()),
+                        Ok(s) => Err(format!("xdotool exit status: {s}")),
+                        Err(e) => Err(format!("neither wmctrl nor xdotool worked: {e}")),
+                    };
                 }
-            } else {
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                 Err("activate_app: unsupported platform".to_string())
             }
         })
         .await
         .map_err(|e| format!("activate_app join failed: {e}"))?
+    }
+
+    async fn is_app_frontmost(&self, expected_app: &str) -> Result<bool, String> {
+        let expected_app = expected_app.trim().to_owned();
+        if expected_app.is_empty() {
+            return Ok(false);
+        }
+        tokio::task::spawn_blocking(move || {
+            #[cfg(target_os = "macos")]
+            {
+                let script = r#"tell application "System Events"
+    set frontProcess to first application process whose frontmost is true
+    try
+        return bundle identifier of frontProcess
+    on error
+        return name of frontProcess
+    end try
+end tell"#;
+                let actual = run_osascript(script)
+                    .map_err(|error| format!("frontmost app query failed: {error}"))?;
+                return Ok(actual.trim().eq_ignore_ascii_case(&expected_app)
+                    || bundle_to_app_name(&expected_app).eq_ignore_ascii_case(actual.trim()));
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let actual = foreground_process_name()?.to_ascii_lowercase();
+                let expected = expected_app.to_ascii_lowercase();
+                let wechat_expected = expected.contains("wechat") || expected.contains("weixin");
+                let wechat_actual = actual.contains("wechat") || actual.contains("weixin");
+                let matches =
+                    expected.eq_ignore_ascii_case(&actual) || (wechat_expected && wechat_actual);
+                if !matches {
+                    warn!(actual_process = %actual, expected_app = %expected,
+                        "desktop foreground identity mismatch");
+                }
+                return Ok(matches);
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                let output = Command::new("xdotool")
+                    .args(["getactivewindow", "getwindowclassname"])
+                    .output()
+                    .map_err(|error| format!("frontmost app query failed: {error}"))?;
+                if !output.status.success() {
+                    return Ok(false);
+                }
+                return Ok(String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .eq_ignore_ascii_case(&expected_app));
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+            {
+                let _ = expected_app;
+                Ok(false)
+            }
+        })
+        .await
+        .map_err(|error| format!("frontmost app query join failed: {error}"))?
+    }
+
+    async fn foreground_identity(&self) -> Result<String, String> {
+        tokio::task::spawn_blocking(|| {
+            #[cfg(target_os = "windows")]
+            {
+                let identity = foreground_identity()?;
+                return Ok(format!(
+                    "{:x}:{}:{}",
+                    identity.window,
+                    identity.process_id,
+                    identity.executable.display()
+                ));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err("foreground identity is currently Windows-only".to_string())
+            }
+        })
+        .await
+        .map_err(|error| format!("foreground identity join failed: {error}"))?
+    }
+
+    async fn full_screen_layout(&self) -> Result<(u32, u32), String> {
+        tokio::task::spawn_blocking(|| {
+            #[cfg(target_os = "windows")]
+            {
+                return supported_full_screen_layout();
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err("physical full-screen layout is currently Windows-only".to_string())
+            }
+        })
+        .await
+        .map_err(|error| format!("full-screen layout join failed: {error}"))?
     }
 
     async fn list_windows(&self, bundle_id: &str) -> Result<String, String> {
@@ -1637,28 +1822,43 @@ end tell"#,
         .map_err(|e| format!("get_main_window join failed: {e}"))?
     }
 
+    async fn screenshot_full(&self) -> Result<String, String> {
+        #[cfg(target_os = "windows")]
+        {
+            tokio::task::spawn_blocking(|| {
+                let layout = supported_full_screen_layout()?;
+                let png = capture::capture_full_png().map_err(|error| error.to_string())?;
+                if supported_full_screen_layout()? != layout {
+                    return Err("display layout changed during full-screen capture".to_string());
+                }
+                if looks_blank(&png) {
+                    return Err("system full-screen capture is blank".to_string());
+                }
+                Ok(capture::png_to_data_uri(&png))
+            })
+            .await
+            .map_err(|error| format!("full-screen capture join failed: {error}"))?
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(
+                "physical full-screen desktop session capture is currently Windows-only"
+                    .to_string(),
+            )
+        }
+    }
+
     async fn screenshot_window(&self, bundle_id: &str) -> Result<String, String> {
         // A maximised Windows WeChat is the full-screen visual target. Capture
-        // the interactive desktop directly without discovering a HWND. Only if
-        // that capture is blank/blocked use WeChat's own Alt+A screenshot.
+        // the interactive desktop directly without discovering a HWND. Fail
+        // closed when unavailable: Alt+A can insert image drafts into the chat.
         #[cfg(target_os = "windows")]
         {
             let bl = bundle_id.to_lowercase();
             if bl.contains("wechat") || bl.contains("weixin") || bl.contains("xinwechat") {
-                let system_capture = tokio::task::spawn_blocking(|| {
-                    let png = capture::capture_full_png().map_err(|error| error.to_string())?;
-                    if looks_blank(&png) {
-                        return Err("system full-screen capture is blank".to_string());
-                    }
-                    Ok(capture::png_to_data_uri(&png))
-                })
-                .await
-                .map_err(|error| format!("full-screen capture join failed: {error}"))?;
-                match system_capture {
-                    Ok(image) => return Ok(image),
-                    Err(error) => warn!("{error}; using WeChat Alt+A screenshot"),
-                }
-                return self.wechat_builtin_screenshot(bundle_id).await;
+                return self.screenshot_full().await.map_err(|error| {
+                    format!("WeChat system full-screen capture unavailable: {error}")
+                });
             }
         }
         // Primary path: direct window-backing-store capture (overlap-proof,
@@ -1751,13 +1951,78 @@ end tell"#,
             let mut enigo = new_enigo()?;
             let (lx, ly) = scale_for_input(x, y);
             human_move(&mut enigo, lx, ly)?;
+            std::thread::sleep(std::time::Duration::from_millis(90));
             enigo
-                .button(Button::Left, Click)
-                .map_err(|e| format!("button click: {e}"))?;
+                .button(Button::Left, Press)
+                .map_err(|e| format!("button press: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(70));
+            enigo
+                .button(Button::Left, Release)
+                .map_err(|e| format!("button release: {e}"))?;
             Ok("ok".to_string())
         })
         .await
         .map_err(|e| format!("mouse_click join failed: {e}"))?
+    }
+
+    async fn focus_guarded_click(
+        &self,
+        x: u32,
+        y: u32,
+        source_identity: &str,
+        layout: (u32, u32),
+    ) -> Result<String, String> {
+        let source_identity = source_identity.trim().to_owned();
+        if source_identity.is_empty() {
+            return Err("guarded visual focus source identity is empty".to_string());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            tokio::task::spawn_blocking(move || {
+                let identity_token = || -> Result<String, String> {
+                    let identity = foreground_identity()?;
+                    Ok(format!(
+                        "{:x}:{}:{}",
+                        identity.window,
+                        identity.process_id,
+                        identity.executable.display()
+                    ))
+                };
+                if identity_token()? != source_identity || supported_full_screen_layout()? != layout
+                {
+                    return Err(
+                        "foreground identity or physical layout changed before guarded movement"
+                            .to_string(),
+                    );
+                }
+                let mut enigo = new_enigo()?;
+                let (lx, ly) = scale_for_input(x, y);
+                human_move_with_jitter(&mut enigo, lx, ly, crate::FOCUS_JITTER_MAX_PX as i32)?;
+                std::thread::sleep(std::time::Duration::from_millis(90));
+                if identity_token()? != source_identity || supported_full_screen_layout()? != layout
+                {
+                    return Err(
+                        "foreground identity or physical layout changed before guarded press"
+                            .to_string(),
+                    );
+                }
+                enigo
+                    .button(Button::Left, Press)
+                    .map_err(|error| format!("guarded button press: {error}"))?;
+                std::thread::sleep(std::time::Duration::from_millis(70));
+                enigo
+                    .button(Button::Left, Release)
+                    .map_err(|error| format!("guarded button release: {error}"))?;
+                Ok("ok".to_string())
+            })
+            .await
+            .map_err(|error| format!("guarded visual focus click join failed: {error}"))?
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (x, y, source_identity, layout);
+            Err("guarded visual focus click is currently Windows-only".to_string())
+        }
     }
 
     async fn mouse_double_click(&self, x: u32, y: u32) -> Result<String, String> {

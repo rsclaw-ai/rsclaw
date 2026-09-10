@@ -182,7 +182,7 @@ struct HostState {
     plugin_config: serde_json::Value,
     /// Desktop session for host-desktop interface (input synthesis,
     /// screenshots).
-    desktop: Box<dyn rsclaw_desktop::DesktopSession>,
+    desktop: Arc<dyn rsclaw_desktop::DesktopSession>,
     /// Optional provider registry for host-vlm interface.
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     /// Default vision model name for host-vlm interface.
@@ -212,7 +212,7 @@ fn new_host_state(
         cdn_rules,
         plugin_name,
         plugin_config,
-        desktop: rsclaw_desktop::create_session(),
+        desktop: Arc::from(rsclaw_desktop::create_session()),
         providers,
         vision_model,
         wda_url: None,
@@ -1928,14 +1928,15 @@ impl HostState {
             })
     }
 
-    /// Execute a browser action by locking the shared browser session.
-    /// Auto-starts Chrome if no session exists.
-    async fn run_android_vlm_drive(
+    /// Execute a host-side VLM action loop with the supplied platform operator.
+    async fn run_plugin_vlm_drive(
         &mut self,
         instruction: String,
         max_steps: u32,
         action_spaces: Option<Vec<String>>,
-        operator: crate::android_vlm::AndroidUiautoOperator,
+        operator: &dyn rsclaw_computer::operator::Operator,
+        label: &str,
+        app: &str,
     ) -> Result<String, String> {
         use std::sync::atomic::AtomicBool;
 
@@ -1970,20 +1971,20 @@ impl HostState {
         let registry = self
             .providers
             .clone()
-            .ok_or_else(|| "android-vlm-drive: provider registry unavailable".to_string())?;
+            .ok_or_else(|| format!("{label}: provider registry unavailable"))?;
         let model_name = self
             .vision_model
             .clone()
-            .ok_or_else(|| "android-vlm-drive: vision model unavailable".to_string())?;
+            .ok_or_else(|| format!("{label}: vision model unavailable"))?;
         let (provider_name, _) = registry.resolve_model(&model_name);
         let provider = registry
             .get(provider_name)
-            .map_err(|error| format!("android-vlm-drive: {error}"))?;
+            .map_err(|error| format!("{label}: {error}"))?;
         let rules = AppRuleSet::default();
         let action_spaces_override =
             action_spaces.map(|specs| specs.into_iter().map(ActionSpec::new).collect());
         let driver = VlmDriver {
-            operator: &operator,
+            operator,
             provider,
             model_name: model_name.clone(),
             coord_format: CoordFormat::Auto,
@@ -1993,17 +1994,17 @@ impl HostState {
             app_rules: &rules,
             permission: Arc::new(PluginPermission),
             agent_id: format!("plugin:{}", self.plugin_name),
-            app: "WeChat Android".to_string(),
+            app: app.to_string(),
             permission_emit: None,
             headless_auto_allow: true,
             status_emit: None,
-            run_id: format!("android-vlm-drive-{}", uuid::Uuid::new_v4().simple()),
+            run_id: format!("{label}-{}", uuid::Uuid::new_v4().simple()),
             action_spaces_override,
         };
         let outcome = driver
             .run(&instruction)
             .await
-            .map_err(|error| format!("android-vlm-drive: {error:#}"))?;
+            .map_err(|error| format!("{label}: {error:#}"))?;
         let value = match outcome {
             DriverOutcome::Finished { content, steps } => {
                 json!({"kind":"finished","content":content,"steps":steps})
@@ -2022,26 +2023,28 @@ impl HostState {
     }
 
     /// Execute a browser action by locking the shared browser session.
-    /// Auto-starts Chrome if no session exists.
+    /// Auto-starts a browser if no session exists.
     async fn browser_action(&mut self, action: &str, args: Value) -> Result<String, String> {
         let mut guard = self.browser.lock().await;
 
         // Auto-start browser if not initialized.
         if guard.is_none() {
             tracing::info!("WASM plugin: auto-starting browser session");
-            let chrome_path = rsclaw_platform::detect_chrome()
+            let browser_path = rsclaw_platform::detect_chrome()
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Chrome not found; run: rsclaw tools install chrome")
+                    anyhow::anyhow!(
+                        "No supported Chromium browser found; install Chrome for Testing with: rsclaw tools install chrome"
+                    )
                 })
-                .map_err(|e| format!("failed to obtain Chrome: {e:#}"))?;
+                .map_err(|e| format!("failed to obtain browser executable: {e:#}"))?;
             // All plugins share one Chrome profile so that auth state
             // (cookies, localStorage) is reused across the session — e.g.
             // a single login to Bytedance covers jimeng + douyin + xianyu,
             // a single Taobao login covers travel + jimeng. Callers should
             // treat this as an opaque shared identifier.
-            let session = BrowserSession::start(&chrome_path, true, Some(SHARED_BROWSER_PROFILE))
+            let session = BrowserSession::start(&browser_path, true, Some(SHARED_BROWSER_PROFILE))
                 .await
-                .map_err(|e| format!("failed to start Chrome: {e:#}"))?;
+                .map_err(|e| format!("failed to start browser at {browser_path}: {e:#}"))?;
             *guard = Some(session);
         }
 
@@ -2067,11 +2070,68 @@ impl HostState {
 // host-desktop trait implementation
 // ---------------------------------------------------------------------------
 
+fn is_windows_wechat_app(app: &str) -> bool {
+    matches!(
+        app.trim().to_ascii_lowercase().as_str(),
+        "com.tencent.xinwechat" | "wechat" | "weixin" | "wechat.exe" | "weixin.exe"
+    )
+}
+
+#[test]
+fn visual_focus_dispatch_accepts_plugin_bundle_without_substring_matching() {
+    for app in [
+        "com.tencent.xinWeChat",
+        "WeChat",
+        "Weixin",
+        "WeChat.exe",
+        "Weixin.exe",
+    ] {
+        assert!(is_windows_wechat_app(app));
+    }
+    for app in ["", "explorer", "fake-wechat", "wechat.exe.evil"] {
+        assert!(!is_windows_wechat_app(app));
+    }
+}
+
+struct HostVisualFocusObserver<'a> {
+    state: &'a mut HostState,
+}
+
+impl crate::desktop_focus::VisualFocusObserver for HostVisualFocusObserver<'_> {
+    fn locate_safe_patch(
+        &mut self,
+        image_data_uri: String,
+        prompt: String,
+    ) -> futures::future::BoxFuture<'_, Result<String, String>> {
+        Box::pin(async move {
+            <HostState as rsclaw::plugin::host_vlm::Host>::vlm_parse(
+                self.state,
+                image_data_uri,
+                prompt,
+                256,
+            )
+            .await
+            .map_err(|error| format!("visual focus vision call failed: {error}"))?
+        })
+    }
+}
+
 impl rsclaw::plugin::host_desktop::Host for HostState {
     async fn desktop_activate_app(
         &mut self,
         bundle_id: String,
     ) -> wasmtime::Result<Result<String, String>> {
+        if cfg!(target_os = "windows") && is_windows_wechat_app(&bundle_id) {
+            let session =
+                crate::desktop_focus::DesktopVisualFocusSession::new(Arc::clone(&self.desktop));
+            let mut observer = HostVisualFocusObserver { state: self };
+            return Ok(crate::desktop_focus::focus_windows_wechat(
+                &session,
+                &mut observer,
+                &bundle_id,
+            )
+            .await);
+        }
         Ok(self.desktop.activate_app(&bundle_id).await)
     }
 
@@ -2225,6 +2285,32 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         filters: Vec<String>,
     ) -> wasmtime::Result<Result<String, String>> {
         Ok(self.desktop.file_dialog_open(&title, &filters).await)
+    }
+
+    async fn desktop_vlm_drive(
+        &mut self,
+        expected_app: String,
+        instruction: String,
+        max_steps: u32,
+        action_spaces: Option<Vec<String>>,
+    ) -> wasmtime::Result<Result<String, String>> {
+        let operator = match crate::desktop_vlm::DesktopSessionOperator::new(
+            Arc::clone(&self.desktop),
+            expected_app.clone(),
+        ) {
+            Ok(operator) => operator,
+            Err(error) => return Ok(Err(format!("desktop-vlm-drive: {error}"))),
+        };
+        Ok(self
+            .run_plugin_vlm_drive(
+                instruction,
+                max_steps,
+                action_spaces,
+                &operator,
+                "desktop-vlm-drive",
+                &expected_app,
+            )
+            .await)
     }
 }
 
@@ -2457,12 +2543,15 @@ impl rsclaw::plugin::host_android::Host for HostState {
         max_steps: u32,
         action_spaces: Option<Vec<String>>,
     ) -> HostTrapResult<Result<String, String>> {
+        let operator = crate::android_vlm::AndroidUiautoOperator::legacy();
         Ok(self
-            .run_android_vlm_drive(
+            .run_plugin_vlm_drive(
                 instruction,
                 max_steps,
                 action_spaces,
-                crate::android_vlm::AndroidUiautoOperator::legacy(),
+                &operator,
+                "android-vlm-drive",
+                "WeChat Android",
             )
             .await)
     }
@@ -2480,12 +2569,15 @@ impl rsclaw::plugin::host_android::Host for HostState {
                 Ok(options) => options,
                 Err(error) => return Ok(Err(error)),
             };
+        let operator = crate::android_vlm::AndroidUiautoOperator::with_options(options);
         Ok(self
-            .run_android_vlm_drive(
+            .run_plugin_vlm_drive(
                 instruction,
                 max_steps,
                 action_spaces,
-                crate::android_vlm::AndroidUiautoOperator::with_options(options),
+                &operator,
+                "android-vlm-drive",
+                "WeChat Android",
             )
             .await)
     }

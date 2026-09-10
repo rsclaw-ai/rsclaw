@@ -170,7 +170,7 @@ impl HostMethodRegistry {
 
     // ---- A2 browser helper ----
 
-    /// Lock the shared browser session, auto-starting Chrome on first use,
+    /// Lock the shared browser session, auto-starting a browser on first use,
     /// and dispatch the action. Returns the raw JSON the browser produced.
     ///
     /// The profile name MUST match `SHARED_BROWSER_PROFILE` in
@@ -182,14 +182,16 @@ impl HostMethodRegistry {
 
         if guard.is_none() {
             tracing::info!("JS plugin: auto-starting browser session");
-            let chrome_path = rsclaw_platform::detect_chrome()
+            let browser_path = rsclaw_platform::detect_chrome()
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Chrome not found; run: rsclaw tools install chrome")
+                    anyhow::anyhow!(
+                        "No supported Chromium browser found; install Chrome for Testing with: rsclaw tools install chrome"
+                    )
                 })
-                .map_err(|e| anyhow::anyhow!("failed to obtain Chrome: {e:#}"))?;
-            let session = BrowserSession::start(&chrome_path, true, Some(PROFILE))
+                .map_err(|e| anyhow::anyhow!("failed to obtain browser executable: {e:#}"))?;
+            let session = BrowserSession::start(&browser_path, true, Some(PROFILE))
                 .await
-                .map_err(|e| anyhow::anyhow!("failed to start Chrome: {e:#}"))?;
+                .map_err(|e| anyhow::anyhow!("failed to start browser at {browser_path}: {e:#}"))?;
             *guard = Some(session);
         }
 

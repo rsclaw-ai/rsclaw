@@ -132,8 +132,16 @@ struct ToolDef {
 const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "chrome",
-        display: "Chrome for Testing (browser automation)",
-        detect_cmd: &["google-chrome", "chromium", "chromium-browser", "chrome"],
+        display: "Chromium browser automation (Chrome/Edge/Brave)",
+        detect_cmd: &[
+            "google-chrome",
+            "chromium",
+            "chromium-browser",
+            "chrome",
+            "brave-browser",
+            "microsoft-edge",
+            "microsoft-edge-stable",
+        ],
         local_bin: "chrome",
         optional: false,
     },
@@ -600,6 +608,50 @@ fn is_tool_installed_locally(def: &ToolDef) -> bool {
     local_tool_binary_exists(&tools_dir(), def)
 }
 
+fn is_browser_in_standard_location() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let mut candidates = vec![
+            PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+            PathBuf::from(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            PathBuf::from(
+                r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+            ),
+        ];
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            candidates.extend([
+                PathBuf::from(&local).join(r"Google\Chrome\Application\chrome.exe"),
+                PathBuf::from(&local).join(r"Microsoft\Edge\Application\msedge.exe"),
+                PathBuf::from(local).join(r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+            ]);
+        }
+        return candidates.iter().any(|path| path.is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots = vec![PathBuf::from("/Applications")];
+        if let Some(home) = dirs_next::home_dir() {
+            roots.push(home.join("Applications"));
+        }
+        let applications = [
+            "Google Chrome.app/Contents/MacOS/Google Chrome",
+            "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "Brave Browser.app/Contents/MacOS/Brave Browser",
+            "Chromium.app/Contents/MacOS/Chromium",
+        ];
+        return roots
+            .iter()
+            .any(|root| applications.iter().any(|app| root.join(app).is_file()));
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    false
+}
+
 fn local_tool_binary_exists(tools_dir: &std::path::Path, def: &ToolDef) -> bool {
     local_tool_binary_probes(tools_dir, def)
         .iter()
@@ -650,14 +702,26 @@ fn local_tool_binary_probes(tools_dir: &std::path::Path, def: &ToolDef) -> Vec<P
     probes
 }
 
-fn tool_status(def: &ToolDef) -> &'static str {
-    if is_tool_installed_locally(def) {
+fn classify_tool_status(
+    installed_locally: bool,
+    found_in_path: bool,
+    browser_detected: bool,
+) -> &'static str {
+    if installed_locally {
         "installed"
-    } else if is_tool_in_path(def) {
+    } else if found_in_path || browser_detected {
         "system"
     } else {
         "missing"
     }
+}
+
+fn tool_status(def: &ToolDef) -> &'static str {
+    classify_tool_status(
+        is_tool_installed_locally(def),
+        is_tool_in_path(def),
+        def.name == "chrome" && is_browser_in_standard_location(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1477,5 +1541,12 @@ mod tests {
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
         std::fs::write(&bin, b"").unwrap();
         assert!(local_tool_binary_exists(tmp.path(), bun));
+    }
+
+    #[test]
+    fn browser_detector_marks_system_browser_available() {
+        assert_eq!(classify_tool_status(false, false, true), "system");
+        assert_eq!(classify_tool_status(false, false, false), "missing");
+        assert_eq!(classify_tool_status(true, false, true), "installed");
     }
 }

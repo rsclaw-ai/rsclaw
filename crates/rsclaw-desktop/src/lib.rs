@@ -6,6 +6,10 @@
 
 use anyhow::Result;
 
+/// Maximum per-axis endpoint jitter for the guarded, single-focus click.
+/// Shared with visual patch validation so narrow titlebars remain safe.
+pub const FOCUS_JITTER_MAX_PX: u32 = 7;
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -16,6 +20,24 @@ pub trait DesktopSession: Send + Sync {
     /// Activate an application by bundle-id (macOS), exe name (Windows), or
     /// WM_CLASS (Linux). Returns "ok" on success.
     async fn activate_app(&self, bundle_id: &str) -> Result<String, String>;
+
+    /// Verify that the expected application currently owns the foreground.
+    /// Unknown identity or a mismatch returns `false`; callers must fail
+    /// closed.
+    async fn is_app_frontmost(&self, expected_app: &str) -> Result<bool, String>;
+
+    /// Return an opaque identity for the current foreground window and process.
+    /// The value is only suitable for equality comparisons within one
+    /// operation.
+    async fn foreground_identity(&self) -> Result<String, String> {
+        Err("foreground identity is unsupported by this desktop session".to_string())
+    }
+
+    /// Return the supported physical full-screen layout dimensions.
+    /// Unsupported or ambiguous layouts must fail closed.
+    async fn full_screen_layout(&self) -> Result<(u32, u32), String> {
+        Err("physical full-screen layout is unsupported by this desktop session".to_string())
+    }
 
     /// List all windows of the target app. Returns JSON array:
     /// `[{"idx":1,"title":"...","x":0,"y":0,"w":900,"h":600}]`
@@ -30,6 +52,12 @@ pub trait DesktopSession: Send + Sync {
 
     /// Screenshot the app's main window. Returns `data:image/png;base64,...`.
     async fn screenshot_window(&self, bundle_id: &str) -> Result<String, String>;
+
+    /// Capture the physical system screen at origin (0, 0), without app-window
+    /// discovery or clipboard fallback. Unsupported layouts must fail closed.
+    async fn screenshot_full(&self) -> Result<String, String> {
+        Err("system full-screen capture is unsupported by this desktop session".to_string())
+    }
 
     /// Screenshot a screen region. Returns data URI.
     async fn screenshot_region(&self, x: u32, y: u32, w: u32, h: u32) -> Result<String, String>;
@@ -64,6 +92,19 @@ pub trait DesktopSession: Send + Sync {
 
     /// Mouse left-click at absolute screen coordinates.
     async fn mouse_click(&self, x: u32, y: u32) -> Result<String, String>;
+
+    /// Click a vision-selected safe patch only while the original foreground
+    /// identity and physical layout remain unchanged. Unsupported sessions fail
+    /// closed.
+    async fn focus_guarded_click(
+        &self,
+        _x: u32,
+        _y: u32,
+        _source_identity: &str,
+        _layout: (u32, u32),
+    ) -> Result<String, String> {
+        Err("guarded visual focus click is unsupported by this desktop session".to_string())
+    }
 
     /// Mouse double-click at absolute screen coordinates.
     async fn mouse_double_click(&self, x: u32, y: u32) -> Result<String, String>;
