@@ -130,9 +130,8 @@ impl SseSource {
 }
 
 /// Cheap synchronous pre-check so obviously bad SSE targets fail at
-/// `/watch` time instead of on the first connect. The authoritative SSRF
-/// check (DNS resolution + address vetting) runs on every connect in
-/// `sse::run_sse_single_tracking`.
+/// `/watch` time instead of on the first connect. Private addresses are
+/// allowed: `/watch` is owner-only.
 fn validate_sse_url_static(raw: &str) -> Result<(), WatchStartError> {
     let parsed = url::Url::parse(raw).map_err(|e| WatchStartError::InvalidUrl(e.to_string()))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -141,24 +140,8 @@ fn validate_sse_url_static(raw: &str) -> Result<(), WatchStartError> {
             parsed.scheme()
         )));
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| WatchStartError::InvalidUrl("missing host".to_owned()))?;
-    let host_l = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_ascii_lowercase();
-    if host_l == "localhost" || host_l.ends_with(".localhost") || host_l.ends_with(".local") {
-        return Err(WatchStartError::InvalidUrl(format!(
-            "host `{host}` is a local address"
-        )));
-    }
-    if let Ok(ip) = host_l.parse::<std::net::IpAddr>()
-        && !rsclaw_util::net::is_public_ip(&ip)
-    {
-        return Err(WatchStartError::InvalidUrl(format!(
-            "host `{host}` is not a public address"
-        )));
+    if parsed.host_str().is_none() {
+        return Err(WatchStartError::InvalidUrl("missing host".to_owned()));
     }
     Ok(())
 }

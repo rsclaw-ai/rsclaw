@@ -356,19 +356,15 @@ impl FailoverManager {
 
     /// Profiles to try for `provider_name`, in `auth.order`.
     ///
-    /// Providers are built with ONE baked-in credential and `stream()` has
-    /// no per-call key, so every profile of a provider sends the identical
-    /// request with the identical key. Rotating through them would re-issue
-    /// the same (rate-limited / rejected) request N times and bypass the
-    /// cooldown just set on the first profile. Until providers accept a
-    /// per-call key, only the first configured profile is used.
+    /// NOTE: providers are built with ONE baked-in credential and `stream()`
+    /// has no per-call key, so today every profile re-sends the same request
+    /// with the same key (an immediate retry). Kept for OpenClaw config
+    /// compatibility until providers accept a per-profile credential.
     fn effective_profiles(&self, provider_name: &str) -> Vec<String> {
-        let first = self
-            .order
+        self.order
             .get(provider_name)
-            .and_then(|p| p.first().cloned())
-            .unwrap_or_else(|| "default".to_owned());
-        vec![first]
+            .cloned()
+            .unwrap_or_else(|| vec!["default".to_owned()])
     }
 
     fn is_cooling_down(&mut self, provider_name: &str, profile_id: &str) -> bool {
@@ -501,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn profiles_collapse_to_one_credential() {
+    fn profiles_follow_auth_order() {
         let mut order = HashMap::new();
         order.insert(
             "kimi".to_owned(),
@@ -514,7 +510,10 @@ mod tests {
             crate::health::ProviderHealthRegistry::default(),
             RetryConfig::default(),
         );
-        assert_eq!(mgr.effective_profiles("kimi"), vec!["p1".to_owned()]);
+        assert_eq!(
+            mgr.effective_profiles("kimi"),
+            vec!["p1".to_owned(), "p2".to_owned(), "p3".to_owned()]
+        );
         assert_eq!(mgr.effective_profiles("other"), vec!["default".to_owned()]);
     }
 

@@ -7787,6 +7787,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "dirs-next",
+ "iana-time-zone",
  "json5",
  "libc",
  "regex",
@@ -7797,6 +7798,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.0+spec-1.1.0",
+ "toml_edit 0.22.27",
  "tracing",
  "url",
 ]
@@ -7811,6 +7813,7 @@ dependencies = [
  "json5",
  "regex",
  "rsclaw-config",
+ "rsclaw-platform",
  "rsclaw-store",
  "serde",
  "serde_json",
@@ -7853,6 +7856,7 @@ dependencies = [
  "rust_xlsxwriter",
  "serde_json",
  "tokio",
+ "tracing",
  "zip 2.4.2",
 ]
 
@@ -8074,6 +8078,7 @@ dependencies = [
  "dirs-next",
  "ed25519-dalek",
  "futures",
+ "hmac",
  "json5",
  "rand 0.9.2",
  "reqwest",
@@ -8335,6 +8340,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "jieba-rs",
  "md-5",
  "redb 2.6.3",
  "redb 4.1.0",
@@ -8399,7 +8405,10 @@ dependencies = [
  "anyhow",
  "dirs-next",
  "image",
+ "reqwest",
  "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -8426,6 +8435,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 

@@ -45,27 +45,22 @@ async fn run_sse_single_tracking(
     out_last_id: &mut Option<String>,
     out_backoff_ms: &mut u64,
 ) -> SseOutcome {
-    // SSRF guard: re-resolve and vet the host on every (re)connect so a DNS
-    // answer that flips to a private address between attempts is caught.
-    // The client is pinned to the vetted addresses and never follows
-    // redirects (a 3xx is treated as fatal below).
+    // `/watch` is an owner-only command (enforced in gateway preparse), so
+    // private / loopback targets are allowed: watching a local dev server or
+    // a LAN event stream is a legitimate use. Redirects are still not
+    // followed (a 3xx is treated as fatal below).
     let parsed = match url::Url::parse(&src.url) {
         Ok(u) => u,
         Err(e) => return SseOutcome::Fatal(format!("invalid url: {e}")),
     };
-    let addrs = match rsclaw_util::net::resolve_public_url(&parsed).await {
-        Ok(a) => a,
-        Err(e) => return SseOutcome::Fatal(format!("url rejected: {e}")),
-    };
-    // `pinned_client` applies a whole-request timeout; SSE streams are
-    // long-lived, so use a very long one and rely on the 90s heartbeat
-    // watchdog below for stall detection.
-    let client = match rsclaw_util::net::pinned_client(
-        reqwest::Client::builder().connect_timeout(Duration::from_secs(15)),
-        &parsed,
-        &addrs,
-        SSE_STREAM_MAX_LIFETIME,
-    ) {
+    // No whole-request timeout: SSE streams are long-lived; the 90s
+    // heartbeat watchdog below handles stall detection.
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(SSE_STREAM_MAX_LIFETIME)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return SseOutcome::Disconnect(format!("client build: {e}")),
     };

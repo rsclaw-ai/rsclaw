@@ -6,7 +6,7 @@
 # any entries you added yourself; the previous file is saved as defaults.toml.bak.*.
 
 [meta]
-defaults_version = "2026.6.18"
+defaults_version = "2026.9.30"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Providers
@@ -676,8 +676,8 @@ primary_download_url = "https://api.skillhub.cn/api/v1/skills"
 # at request time (matches the [[providers]] env_var pattern).
 [skill_registries.iwencai]
 label                = "iWenCai SkillHub (同花顺金融技能库)"
-list_url             = "http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square"
-install_url_template = "http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name={slug}"
+list_url             = "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square"
+install_url_template = "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name={slug}"
 # These are the MARKETPLACE URLs (ms.10jqka.com.cn, unauthenticated). They are
 # NOT rebased by `IWENCAI_BASE_URL` — that env points at the openapi.iwencai.com
 # DATA gateway (which an installed skill calls at runtime with IWENCAI_API_KEY +
