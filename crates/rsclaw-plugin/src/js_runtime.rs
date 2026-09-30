@@ -76,13 +76,19 @@ impl JsPlugin {
             );
         }
 
-        let mut child = Command::new(&runtime)
-            .arg(&entry)
+        let mut cmd = Command::new(&runtime);
+        cmd.arg(&entry)
             .current_dir(&manifest.dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.as_std_mut().creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let mut child = cmd
             .spawn()
             .with_context(|| {
                 format!(
@@ -132,6 +138,17 @@ impl JsPlugin {
                         error!(plugin = %reader_name, "stdout read error: {e:#}");
                         break;
                     }
+                }
+            }
+            // Fail every in-flight call right away instead of letting each
+            // caller wait out its full timeout on a dead subprocess.
+            let drained: Vec<_> = reader_pending.lock().await.drain().collect();
+            for (_, tx) in drained {
+                if tx
+                    .send(Err(format!("plugin `{reader_name}` exited")))
+                    .is_err()
+                {
+                    debug!(plugin = %reader_name, "pending caller already gone");
                 }
             }
         });

@@ -453,7 +453,10 @@ impl TabSession {
             sel = serde_json::to_string(selector)?,
             ms = timeout_secs * 1000,
         );
-        let _ = tokio::time::timeout(
+        // Best-effort wait: a selector that never appears is not an error
+        // (callers proceed with whatever loaded), but a broken CDP transport
+        // is and must be surfaced.
+        match tokio::time::timeout(
             Duration::from_secs(timeout_secs + 1),
             self.cdp.send(
                 "Runtime.evaluate",
@@ -463,8 +466,20 @@ impl TabSession {
                 }),
             ),
         )
-        .await;
-        Ok(())
+        .await
+        {
+            Err(_) => {
+                tracing::debug!(selector, "wait_for_selector: timed out");
+                Ok(())
+            }
+            Ok(Ok(resp)) => {
+                if resp.get("exceptionDetails").is_some() {
+                    tracing::debug!(selector, "wait_for_selector: selector not found in time");
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e.context(format!("wait_for_selector `{selector}`"))),
+        }
     }
 
     /// Execute JavaScript and return the result.

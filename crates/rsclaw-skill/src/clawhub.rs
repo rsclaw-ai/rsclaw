@@ -179,13 +179,13 @@ fn iwencai_urls() -> IwencaiUrls {
             .and_then(|v| v.get("install_url_template"))
             .and_then(|v| v.as_str())
             .unwrap_or(
-                "http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name={slug}",
+                "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name={slug}",
             )
             .to_owned();
         let list_url = entry
             .and_then(|v| v.get("list_url"))
             .and_then(|v| v.as_str())
-            .unwrap_or("http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square")
+            .unwrap_or("https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square")
             .to_owned();
         // Marketplace-specific override ONLY — never IWENCAI_BASE_URL (that's
         // the data-API gateway and 401s these endpoints). Unset → ms.10jqka.
@@ -193,11 +193,36 @@ fn iwencai_urls() -> IwencaiUrls {
             .ok()
             .filter(|s| !s.is_empty());
         IwencaiUrls {
-            install_template: rebase_url(&install_template, env_override.as_deref()),
-            list: rebase_url(&list_url, env_override.as_deref()),
+            install_template: upgrade_market_scheme(rebase_url(
+                &install_template,
+                env_override.as_deref(),
+            )),
+            list: upgrade_market_scheme(rebase_url(&list_url, env_override.as_deref())),
         }
     });
     URLS.clone()
+}
+
+/// Host of the iwencai skill marketplace; it serves the same endpoints over
+/// https, so legacy `http://` URLs (older defaults.toml) are upgraded.
+const IWENCAI_MARKET_HOST: &str = "ms.10jqka.com.cn";
+
+/// Upgrade the known marketplace host to https and warn about any other
+/// plain-http marketplace URL (downloaded archives are installed as skills,
+/// so a plaintext hop lets a network attacker swap the content).
+fn upgrade_market_scheme(url: String) -> String {
+    if let Some(rest) = url.strip_prefix("http://") {
+        if rest.starts_with(IWENCAI_MARKET_HOST)
+            && rest[IWENCAI_MARKET_HOST.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| matches!(c, '/' | '?'))
+        {
+            return format!("https://{rest}");
+        }
+        tracing::warn!(url = %url, "iwencai marketplace URL uses plain http");
+    }
+    url
 }
 
 /// Replace the scheme+authority of `url` with `base` when set. Keeps the
@@ -362,7 +387,9 @@ impl ClawhubClient {
         let meta = self.fetch_meta(slug).await?;
         // Use the slug's last component as dir name (e.g., "pskoett/foo" → "foo").
         let dir_name = slug.rsplit('/').next().unwrap_or(slug);
-        let install_dir = skills_dir.join(dir_name);
+        if !rsclaw_util::fs_guard::is_safe_slug(dir_name) {
+            bail!("invalid skill slug: {slug:?}");
+        }
 
         debug!(slug, version = %meta.version, "installing skill from clawhub");
 
@@ -382,18 +409,14 @@ impl ClawhubClient {
             .send()
             .await
             .with_context(|| format!("download {download_url}"))?
+            .error_for_status()
+            .with_context(|| format!("download {download_url}"))?
             .bytes()
             .await
             .context("read download body")?;
 
-        // Extract into `install_dir`.
-        std::fs::create_dir_all(&install_dir)
-            .with_context(|| format!("create {}", install_dir.display()))?;
-
-        // Try ZIP first, then fall back to tarball.
-        if extract_zip(&bytes, &install_dir).is_err() {
-            extract_tarball(&bytes, &install_dir)?;
-        }
+        // Extract into a staging dir and swap it in (upgrade in place).
+        let install_dir = extract_and_swap(&bytes, skills_dir, dir_name)?;
 
         // Compute checksum of the installed SKILL.md.
         let skill_md = install_dir.join("SKILL.md");
@@ -548,6 +571,9 @@ impl ClawhubClient {
         skill_id: &str,
         skills_dir: &Path,
     ) -> Result<LockedSkill> {
+        if !rsclaw_util::fs_guard::is_safe_slug(skill_id) {
+            bail!("invalid skills.sh skill id: {skill_id:?}");
+        }
         let url = format!(
             "https://skills.sh/api/download/{}/{}/{}",
             super::registry::url_encode(owner),
@@ -575,7 +601,7 @@ impl ClawhubClient {
         // Skip install if the remote hash matches what is already on disk.
         if let Some(remote_hash) = body.get("hash").and_then(|v| v.as_str()) {
             if let Some(existing) = Self::find_installed(skills_dir, skill_id) {
-                let short_hash = &remote_hash[..8.min(remote_hash.len())];
+                let short_hash = rsclaw_util::truncate_str(remote_hash, 8);
                 if existing.version == short_hash {
                     debug!(
                         skill_id,
@@ -638,7 +664,7 @@ impl ClawhubClient {
         let version = body
             .get("hash")
             .and_then(|v| v.as_str())
-            .map(|h| h[..8.min(h.len())].to_owned()) // first 8 chars of hash
+            .map(|h| rsclaw_util::truncate_str(h, 8).to_owned()) // first 8 chars of hash
             .unwrap_or_else(|| "latest".to_owned());
 
         let slug = format!("{owner}/{repo}@{skill_id}");
@@ -661,58 +687,12 @@ impl ClawhubClient {
 
     /// Install a skill from a direct URL (tar.gz or zip).
     async fn install_from_url(&self, url: &str, skills_dir: &Path) -> Result<LockedSkill> {
-        // Derive dir name from URL.
-        //   1) `?slug=` (skillhub) or `?name=` (iwencai) query param.
-        //   2) Last non-query path segment, but skip generic terminators that aren't
-        //      real skill names. Without the skip, skillhub COS URLs like
-        //      `.../skills/<slug>/files` produced `~/.rsclaw/skills/files/` empty dirs
-        //      because `files` was taken as the slug; iwencai pre-fix had the same
-        //      issue with `square`/`download`.
-        const GENERIC_TERMINATORS: &[&str] = &[
-            "files", "download", "archive", "latest", "main", "master", "tarball", "zipball",
-            "raw", "blob", "release",
-        ];
-        let trim_endings = |s: &str| -> String {
-            s.trim_end_matches(".tar.gz")
-                .trim_end_matches(".tgz")
-                .trim_end_matches(".zip")
-                .trim_end_matches(".tar")
-                .to_owned()
-        };
-        let from_query = url.split('?').nth(1).and_then(|qs| {
-            qs.split('&')
-                .find_map(|p| p.strip_prefix("slug=").or_else(|| p.strip_prefix("name=")))
-        });
-        let dir_name = if let Some(s) = from_query {
-            trim_endings(s)
-        } else {
-            // Walk path segments from the right, skipping anything that
-            // looks like a generic terminator (e.g. `/skills/foo/files`
-            // → use `foo`, not `files`).
-            let segs: Vec<&str> = url
-                .split('?')
-                .next()
-                .unwrap_or("")
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .collect();
-            let mut chosen: &str = "unknown-skill";
-            for s in segs.iter().rev() {
-                let lower = s.to_lowercase();
-                if !GENERIC_TERMINATORS.iter().any(|t| *t == lower) {
-                    chosen = s;
-                    break;
-                }
-            }
-            trim_endings(chosen)
-        };
-        let install_dir = skills_dir.join(&dir_name);
-
-        // Skip re-download if the skill is already installed and SKILL.md matches.
-        if let Some(existing) = Self::find_installed(skills_dir, &dir_name) {
-            debug!(dir_name, "already installed and up to date, skipping");
-            return Ok(existing);
+        // Derive dir name from URL (see `dir_name_from_url`).
+        let dir_name = dir_name_from_url(url);
+        if !rsclaw_util::fs_guard::is_safe_slug(&dir_name) {
+            bail!("refusing to install skill with unsafe name {dir_name:?} (from {url})");
         }
+        let install_dir = skills_dir.join(&dir_name);
 
         debug!(url, dir = %install_dir.display(), "installing skill from URL");
 
@@ -722,16 +702,25 @@ impl ClawhubClient {
             .send()
             .await
             .with_context(|| format!("download {url}"))?
+            .error_for_status()
+            .with_context(|| format!("download {url}"))?
             .bytes()
             .await
             .context("read download body")?;
+        let archive_sha = sha256_bytes(&bytes);
 
-        std::fs::create_dir_all(&install_dir)
-            .with_context(|| format!("create {}", install_dir.display()))?;
-
-        if extract_zip(&bytes, &install_dir).is_err() {
-            extract_tarball(&bytes, &install_dir)?;
+        // Skip only when the same source URL delivered byte-identical content
+        // and the installed SKILL.md is untouched. A different URL or new
+        // content (e.g. an allowlist upgrade) is installed in place.
+        if read_source_marker(&install_dir).is_some_and(|m| m.url == url && m.sha256 == archive_sha)
+            && let Some(existing) = Self::find_installed(skills_dir, &dir_name)
+        {
+            debug!(dir_name, "already installed and up to date, skipping");
+            return Ok(existing);
         }
+
+        let install_dir = extract_and_swap(&bytes, skills_dir, &dir_name)?;
+        write_source_marker(&install_dir, url, &archive_sha);
 
         let skill_md = install_dir.join("SKILL.md");
         let checksum = if skill_md.exists() {
@@ -812,11 +801,192 @@ impl Default for ClawhubClient {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Derive the install directory name from a download URL.
+///   1) `?slug=` (skillhub) or `?name=` (iwencai) query param.
+///   2) Last non-query path segment, skipping generic terminators that aren't
+///      real skill names. Without the skip, skillhub COS URLs like
+///      `.../skills/<slug>/files` produced `~/.rsclaw/skills/files/` empty dirs,
+///      and GitHub `.../<repo>/archive/refs/heads/main.tar.gz` produced `main`.
+fn dir_name_from_url(url: &str) -> String {
+    const GENERIC_TERMINATORS: &[&str] = &[
+        "files", "download", "archive", "latest", "main", "master", "tarball", "zipball",
+        "raw", "blob", "release", "refs", "heads", "tags",
+    ];
+    let trim_endings = |s: &str| -> String {
+        s.trim_end_matches(".tar.gz")
+            .trim_end_matches(".tgz")
+            .trim_end_matches(".zip")
+            .trim_end_matches(".tar")
+            .to_owned()
+    };
+    let from_query = url.split('?').nth(1).and_then(|qs| {
+        qs.split('&')
+            .find_map(|p| p.strip_prefix("slug=").or_else(|| p.strip_prefix("name=")))
+    });
+    if let Some(s) = from_query {
+        return trim_endings(s);
+    }
+    // Walk path segments from the right (after the scheme+host), skipping
+    // anything that looks like a generic terminator.
+    let path = url.split('?').next().unwrap_or("");
+    let path = match path.find("://") {
+        Some(i) => path[i + 3..].split_once('/').map(|(_, p)| p).unwrap_or(""),
+        None => path,
+    };
+    for s in path.split('/').filter(|s| !s.is_empty()).rev() {
+        let trimmed = trim_endings(s);
+        let lower = trimmed.to_lowercase();
+        if !trimmed.is_empty() && !GENERIC_TERMINATORS.iter().any(|t| *t == lower) {
+            return trimmed;
+        }
+    }
+    "unknown-skill".to_owned()
+}
+
+/// Provenance marker written into an installed skill dir so a re-install can
+/// tell "same source, same bytes" (skip) from an upgrade (replace).
+const SOURCE_MARKER: &str = ".rsclaw-source.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SourceMarker {
+    url: String,
+    sha256: String,
+}
+
+fn read_source_marker(install_dir: &Path) -> Option<SourceMarker> {
+    let raw = std::fs::read_to_string(install_dir.join(SOURCE_MARKER)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_source_marker(install_dir: &Path, url: &str, sha256: &str) {
+    let marker = SourceMarker {
+        url: url.to_owned(),
+        sha256: sha256.to_owned(),
+    };
+    let res = serde_json::to_string(&marker)
+        .map_err(anyhow::Error::from)
+        .and_then(|s| Ok(std::fs::write(install_dir.join(SOURCE_MARKER), s)?));
+    if let Err(e) = res {
+        tracing::warn!(dir = %install_dir.display(), error = %e, "failed to write skill source marker");
+    }
+}
+
+/// Extract `bytes` (zip, else gzip tarball) into a staging dir under
+/// `skills_dir/.clawhub/staging/` and atomically swap it into
+/// `skills_dir/<dir_name>`. A failed extraction leaves any existing install
+/// untouched; a successful one replaces it entirely (no stale files).
+fn extract_and_swap(bytes: &[u8], skills_dir: &Path, dir_name: &str) -> Result<PathBuf> {
+    if !rsclaw_util::fs_guard::is_safe_slug(dir_name) {
+        bail!("invalid skill dir name: {dir_name:?}");
+    }
+    let install_dir = skills_dir.join(dir_name);
+    let staging_root = skills_dir.join(LOCK_FILE_SUBDIR).join("staging");
+    std::fs::create_dir_all(&staging_root)
+        .with_context(|| format!("create {}", staging_root.display()))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tag = format!("{dir_name}-{}-{nanos:x}", std::process::id());
+    let staging = staging_root.join(format!("{tag}.new"));
+    std::fs::create_dir_all(&staging).with_context(|| format!("create {}", staging.display()))?;
+
+    let extracted = match extract_zip(bytes, &staging) {
+        Ok(()) => Ok(()),
+        Err(zip_err) => {
+            // Not a zip (or a bad one): clear any partial output, try tar.gz.
+            if let Err(e) = std::fs::remove_dir_all(&staging)
+                .and_then(|_| std::fs::create_dir_all(&staging))
+            {
+                tracing::warn!(dir = %staging.display(), error = %e, "failed to reset staging dir");
+            }
+            extract_tarball(bytes, &staging)
+                .with_context(|| format!("not a usable zip ({zip_err:#}) or tar.gz archive"))
+        }
+    };
+    if let Err(e) = extracted {
+        if let Err(rm) = std::fs::remove_dir_all(&staging) {
+            tracing::warn!(dir = %staging.display(), error = %rm, "failed to remove staging dir");
+        }
+        return Err(e);
+    }
+
+    // Swap: move the old install aside, move the new one in, drop the old.
+    let backup = staging_root.join(format!("{tag}.old"));
+    let had_old = install_dir.exists();
+    if had_old {
+        std::fs::rename(&install_dir, &backup)
+            .with_context(|| format!("move aside {}", install_dir.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&staging, &install_dir) {
+        if had_old && let Err(re) = std::fs::rename(&backup, &install_dir) {
+            tracing::warn!(dir = %install_dir.display(), error = %re, "failed to restore previous skill install");
+        }
+        if let Err(rm) = std::fs::remove_dir_all(&staging) {
+            tracing::warn!(dir = %staging.display(), error = %rm, "failed to remove staging dir");
+        }
+        return Err(anyhow::Error::from(e))
+            .with_context(|| format!("install {}", install_dir.display()));
+    }
+    if had_old && let Err(e) = std::fs::remove_dir_all(&backup) {
+        tracing::warn!(dir = %backup.display(), error = %e, "failed to remove previous skill install");
+    }
+    Ok(install_dir)
+}
+
+/// Return the single top-level directory shared by every archive entry, if
+/// any. Entries are archive paths (a trailing `/` marks a directory). A
+/// root-level file means the archive is flat and nothing is stripped.
+fn common_top_dir<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut top: Option<&str> = None;
+    let mut has_child = false;
+    for raw in names {
+        let is_dir = raw.ends_with('/');
+        let name = raw.trim_end_matches('/');
+        let first = match name.split_once('/') {
+            Some((first, rest)) => {
+                if !rest.is_empty() {
+                    has_child = true;
+                }
+                first
+            }
+            // A bare root-level name is fine only for the top dir itself.
+            None if is_dir => name,
+            None => return None,
+        };
+        if first.is_empty() {
+            return None;
+        }
+        match top {
+            None => top = Some(first),
+            Some(t) if t == first => {}
+            Some(_) => return None,
+        }
+    }
+    if has_child { top.map(str::to_owned) } else { None }
+}
+
+/// Strip `top` (when set) from `name`; `None` means "nothing left to write".
+fn strip_top<'a>(name: &'a str, top: Option<&str>) -> Option<&'a str> {
+    let rel = match top {
+        Some(t) => name.strip_prefix(t)?.strip_prefix('/')?,
+        None => name,
+    };
+    (!rel.is_empty()).then_some(rel)
+}
+
 fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     use std::io::Cursor;
 
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).context("not a valid ZIP archive")?;
+
+    // Strip the top-level directory only if all entries share one.
+    let top = common_top_dir(
+        archive
+            .file_names()
+            .filter(|n| !n.starts_with("__MACOSX")),
+    );
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
@@ -826,12 +996,14 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
         if name.ends_with('/') || name.starts_with("__MACOSX") {
             continue;
         }
-
-        // Strip the top-level directory if all entries share one.
-        let rel_path = name.split_once('/').map(|(_, rest)| rest).unwrap_or(&name);
-        if rel_path.is_empty() {
+        if file.is_symlink() {
+            tracing::warn!(entry = %name, "skipping symlink entry in skill zip");
             continue;
         }
+
+        let Some(rel_path) = strip_top(&name, top.as_deref()) else {
+            continue;
+        };
 
         // Zip Slip guard: an entry like `pkg/../../.ssh/authorized_keys` would
         // otherwise resolve outside `dest` and write into the home dir. Reject
@@ -861,16 +1033,72 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
 }
 
 fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
-    use std::io::Cursor;
+    let open = || tar::Archive::new(flate2::read::GzDecoder::new(std::io::Cursor::new(bytes)));
 
-    let cursor = Cursor::new(bytes);
-    // Try gzip-compressed tarball first.
-    let decoder = flate2::read::GzDecoder::new(cursor);
-    let mut archive = tar::Archive::new(decoder);
+    // Pass 1: find a shared top-level dir (e.g. GitHub's `repo-main/`) among
+    // the entries we will actually extract. pax/GNU metadata entries (GitHub
+    // tarballs start with `pax_global_header`) are ignored.
+    let mut names: Vec<String> = Vec::new();
+    let mut archive = open();
+    for entry in archive.entries().context("read tarball")? {
+        let entry = entry.context("read tarball entry")?;
+        let et = entry.header().entry_type();
+        if et.is_file() || et.is_dir() {
+            let p = entry.path().context("tar entry path")?;
+            let mut n = p.to_string_lossy().trim_end_matches('/').to_owned();
+            if et.is_dir() {
+                n.push('/');
+            }
+            names.push(n);
+        }
+    }
+    let top = common_top_dir(names.iter().map(String::as_str));
 
-    archive
-        .unpack(dest)
-        .with_context(|| format!("extract tarball to {}", dest.display()))
+    // Pass 2: extract regular files and dirs only; symlinks, hardlinks and
+    // special files are rejected.
+    let mut archive = open();
+    for entry in archive.entries().context("read tarball")? {
+        let mut entry = entry.context("read tarball entry")?;
+        let et = entry.header().entry_type();
+        let raw = entry.path().context("tar entry path")?.to_string_lossy().into_owned();
+        if et.is_symlink() || et.is_hard_link() {
+            tracing::warn!(entry = %raw, "skipping link entry in skill tarball");
+            continue;
+        }
+        if !(et.is_file() || et.is_dir()) {
+            continue;
+        }
+        let name = raw.trim_end_matches('/');
+        let Some(rel_path) = strip_top(name, top.as_deref()) else {
+            continue;
+        };
+        let rel = Path::new(rel_path);
+        if rel.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        }) {
+            bail!("refusing tar entry with unsafe path: {raw:?}");
+        }
+        let out_path = dest.join(rel);
+        if et.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        entry
+            .unpack(&out_path)
+            .with_context(|| format!("extract {raw:?} to {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -956,5 +1184,79 @@ mod tests {
             !outer.path().join("evil.txt").exists(),
             "zip slip: file escaped the destination directory"
         );
+    }
+
+    #[test]
+    fn clawhub_zip_strips_only_shared_top_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wrapped = make_zip(&[("pkg/SKILL.md", b"# a"), ("pkg/scripts/run.sh", b"x")]);
+        extract_zip(&wrapped, tmp.path()).expect("wrapped");
+        assert!(tmp.path().join("SKILL.md").exists());
+        assert!(tmp.path().join("scripts/run.sh").exists());
+
+        let tmp2 = tempfile::tempdir().expect("tempdir");
+        let flat = make_zip(&[("SKILL.md", b"# a"), ("scripts/run.sh", b"x")]);
+        extract_zip(&flat, tmp2.path()).expect("flat");
+        assert!(tmp2.path().join("SKILL.md").exists());
+        assert!(tmp2.path().join("scripts/run.sh").exists());
+    }
+
+    #[test]
+    fn clawhub_dir_name_and_slug_validation() {
+        assert_eq!(
+            dir_name_from_url("https://github.com/owner/my-skill/archive/refs/heads/main.tar.gz"),
+            "my-skill"
+        );
+        assert_eq!(
+            dir_name_from_url("https://x.example/skills/foo/files"),
+            "foo"
+        );
+        assert_eq!(dir_name_from_url("https://x.example/dl?slug=bar"), "bar");
+        let evil = dir_name_from_url("https://x.example/dl?slug=../../.ssh");
+        assert!(!rsclaw_util::fs_guard::is_safe_slug(&evil));
+    }
+
+    #[test]
+    fn clawhub_tarball_strips_top_and_skips_links() {
+        let mut buf = Vec::new();
+        {
+            let gz = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
+            let mut b = tar::Builder::new(gz);
+            let mut d = tar::Header::new_gnu();
+            d.set_size(0);
+            d.set_mode(0o755);
+            d.set_entry_type(tar::EntryType::Directory);
+            b.append_data(&mut d, "repo-main/", std::io::empty()).expect("dir");
+            let mut h = tar::Header::new_gnu();
+            h.set_size(3);
+            h.set_mode(0o644);
+            b.append_data(&mut h, "repo-main/SKILL.md", &b"# a"[..]).expect("file");
+            let mut l = tar::Header::new_gnu();
+            l.set_size(0);
+            l.set_entry_type(tar::EntryType::Symlink);
+            b.append_link(&mut l, "repo-main/evil", "/etc").expect("link");
+            b.into_inner().expect("tar").finish().expect("gz");
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        extract_tarball(&buf, tmp.path()).expect("extract");
+        assert!(tmp.path().join("SKILL.md").exists());
+        assert!(tmp.path().join("evil").symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn clawhub_extract_and_swap_replaces_old_install() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old_dir = tmp.path().join("s1");
+        std::fs::create_dir_all(&old_dir).expect("mkdir");
+        std::fs::write(old_dir.join("stale.txt"), b"old").expect("write");
+        let zip = make_zip(&[("pkg/SKILL.md", b"# new")]);
+        let dir = extract_and_swap(&zip, tmp.path(), "s1").expect("swap");
+        assert_eq!(dir, old_dir);
+        assert!(dir.join("SKILL.md").exists());
+        assert!(!dir.join("stale.txt").exists());
+        assert!(extract_and_swap(&zip, tmp.path(), "../x").is_err());
+        // Garbage input leaves the existing install untouched.
+        assert!(extract_and_swap(b"not an archive", tmp.path(), "s1").is_err());
+        assert!(dir.join("SKILL.md").exists());
     }
 }

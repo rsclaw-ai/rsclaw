@@ -288,6 +288,27 @@ impl Default for PluginRegistry {
 // Unified Loader
 // ---------------------------------------------------------------------------
 
+/// Require a WASM plugin's manifest `name` to be a safe slug equal to its
+/// install directory name, so the name used to scope per-plugin storage is
+/// unique and cannot impersonate another installed plugin.
+fn check_wasm_plugin_identity(manifest: &PluginManifest) -> std::result::Result<(), String> {
+    let dir_name = manifest
+        .dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("plugin dir {} has no UTF-8 name", manifest.dir.display()))?;
+    if !rsclaw_util::fs_guard::is_safe_slug(dir_name) {
+        return Err(format!("plugin dir name `{dir_name}` is not a safe identifier"));
+    }
+    if manifest.name != dir_name {
+        return Err(format!(
+            "manifest name `{}` does not match install dir `{dir_name}`",
+            manifest.name
+        ));
+    }
+    Ok(())
+}
+
 /// Scan a plugin directory, load all plugins (JS + WASM), and build a registry.
 ///
 /// Dispatches each plugin to the appropriate runtime based on the `runtime`
@@ -345,8 +366,18 @@ pub async fn load_all_plugins(
         }
 
         if manifest.is_wasm() {
-            // WASM runtime
-            let engine = wasm_engine.as_ref().expect("wasm engine initialized");
+            // WASM plugin identity scopes its SQLite DB, KV store, private
+            // var dir and derived device key. The manifest `name` is
+            // self-declared, so bind it to the install directory name: a
+            // plugin cannot claim another plugin's name and read its data.
+            if let Err(e) = check_wasm_plugin_identity(&manifest) {
+                warn!(plugin = %manifest.name, "refusing to load WASM plugin: {e}");
+                continue;
+            }
+            let Some(engine) = wasm_engine.as_ref() else {
+                warn!(plugin = %manifest.name, "wasm engine not initialized; skipping plugin");
+                continue;
+            };
             match load_wasm_plugin(
                 &manifest,
                 engine,
@@ -356,7 +387,14 @@ pub async fn load_all_plugins(
             )
             .await
             {
-                Ok(plugin) => {
+                Ok(mut plugin) => {
+                    if let Some(user_config) = config
+                        .and_then(|c| c.entries.as_ref())
+                        .and_then(|e| e.get(&manifest.name))
+                        .and_then(|e| e.extra.get("config"))
+                    {
+                        plugin.apply_user_config(user_config);
+                    }
                     info!(
                         plugin = %plugin.name,
                         tools = plugin.tools.len(),

@@ -27,7 +27,32 @@ use super::{bridge, permission};
 /// Per-turn timeout for a coding-agent driver run. A hung CLI can't tie
 /// up the actor indefinitely. Used by both task-mode (`actor_loop`) and
 /// live-mode (`live::actor_loop`) retry loops.
-pub(crate) const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+///
+/// Real coding tasks (build + test cycles) routinely exceed 5 minutes, so
+/// the budget is 9 minutes: long enough for typical work, still below the
+/// 10-minute live-session idle GC. A timed-out turn is NEVER replayed —
+/// the agent may already have edited files or run commands, and replaying
+/// would execute those side effects twice.
+pub(crate) const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(540);
+
+/// Progress observed during one turn attempt. Used to decide whether a
+/// failed (or empty) turn can be replayed without duplicating side effects.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct TurnProgress {
+    /// Any event other than `Ready` arrived, i.e. the agent started working
+    /// on the prompt.
+    pub(crate) any_event: bool,
+    /// A tool call or permission request was observed.
+    pub(crate) tool_activity: bool,
+}
+
+impl TurnProgress {
+    /// True when the attempt failed before the agent produced anything, so
+    /// a replay on a fresh driver cannot repeat side effects.
+    pub(crate) fn replay_safe(&self, timed_out: bool) -> bool {
+        !timed_out && !self.any_event
+    }
+}
 
 /// Which coding agent a `tool_cap` call dispatches to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -509,15 +534,17 @@ async fn actor_loop(
                 }));
 
                 // 3-4. Send the prompt + run the turn, with ONE automatic
-                //    retry on driver death (send failure or mid-turn
-                //    exit/timeout). Mirrors the cap_live retry: the first
-                //    `opencode acp` launch on a cold machine can die
-                //    mid-turn; respawning a fresh driver and replaying the
-                //    prompt hides that (and any transient CLI crash). A
-                //    fresh respawn loses in-process context, which is fine
-                //    for a driver that already died. `run_turn` is wrapped
-                //    in a 5-minute timeout so a hung CLI can't tie up the
-                //    actor indefinitely.
+                //    retry on driver death — but only when the driver died
+                //    BEFORE producing any output (send failure, or exit
+                //    before the first event). Mirrors the cap_live retry:
+                //    the first `opencode acp` launch on a cold machine can
+                //    die right after the handshake; respawning a fresh
+                //    driver and replaying the prompt hides that. A turn that
+                //    timed out or already emitted events is never replayed:
+                //    the agent may have edited files or run commands, and a
+                //    replay would execute those side effects twice.
+                //    `run_turn` is wrapped in `TURN_TIMEOUT` so a hung CLI
+                //    can't tie up the actor indefinitely.
                 let mut reply_buf = String::new();
                 let mut attempt = 0u8;
                 let outcome = loop {
@@ -543,40 +570,56 @@ async fn actor_loop(
                         }
                         break Err(anyhow!("cap send: {e}"));
                     }
+                    let mut progress = TurnProgress::default();
+                    let mut timed_out = false;
                     let turn = match tokio::time::timeout(
                         TURN_TIMEOUT,
-                        run_turn(
+                        run_turn_tracked(
                             driver.as_mut(),
                             &bus,
                             &session_id,
                             agent_id,
                             notif.as_ref(),
                             &mut reply_buf,
+                            &mut progress,
                         ),
                     )
                     .await
                     {
                         Ok(r) => r,
-                        Err(_) => Err(anyhow!(
-                            "cap {display}: turn timed out after {}s (driver hang?)",
-                            TURN_TIMEOUT.as_secs()
-                        )),
+                        Err(_) => {
+                            timed_out = true;
+                            Err(anyhow!(
+                                "cap {display}: turn timed out after {}s (driver hang?)",
+                                TURN_TIMEOUT.as_secs()
+                            ))
+                        }
                     };
                     match turn {
                         Ok(()) => break Ok(()),
                         Err(e) => {
                             if attempt == 0
+                                && progress.replay_safe(timed_out)
                                 && respawn_cap_driver(
                                     kind,
                                     &cwd,
                                     &mut driver,
                                     &session_id,
-                                    "exited mid-turn",
+                                    "exited before output",
                                 )
                                 .await
                             {
                                 attempt += 1;
                                 continue;
+                            }
+                            if !progress.replay_safe(timed_out) {
+                                tracing::warn!(
+                                    target: "cap",
+                                    session_id = %session_id,
+                                    agent = agent_id,
+                                    timed_out,
+                                    "cap turn failed after the agent started working; not replaying"
+                                );
                             }
                             break Err(e);
                         }
@@ -662,10 +705,46 @@ pub async fn run_turn(
     notif: Option<&NotifTarget>,
     reply_buf: &mut String,
 ) -> Result<()> {
+    let mut progress = TurnProgress::default();
+    run_turn_tracked(
+        driver,
+        bus,
+        session_id,
+        agent_id,
+        notif,
+        reply_buf,
+        &mut progress,
+    )
+    .await
+}
+
+/// [`run_turn`] that also records what the agent did before the turn ended
+/// or failed, so callers can tell whether a replay is side-effect free.
+pub(crate) async fn run_turn_tracked(
+    driver: &mut dyn Driver,
+    bus: &broadcast::Sender<rsclaw_events::AgentEvent>,
+    session_id: &str,
+    agent_id: &str,
+    notif: Option<&NotifTarget>,
+    reply_buf: &mut String,
+    progress: &mut TurnProgress,
+) -> Result<()> {
     loop {
         let Some(event) = driver.next_event().await else {
             return Err(anyhow!("cap driver exited mid-turn"));
         };
+        if !matches!(event, AgentEvent::Ready { .. }) {
+            progress.any_event = true;
+        }
+        if matches!(
+            event,
+            AgentEvent::ToolCallStart { .. }
+                | AgentEvent::ToolCallDelta { .. }
+                | AgentEvent::ToolCallEnd { .. }
+                | AgentEvent::PermissionRequest { .. }
+        ) {
+            progress.tool_activity = true;
+        }
         if let AgentEvent::PermissionRequest {
             req_id,
             tool,
@@ -999,5 +1078,28 @@ mod tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
             Err(e) => panic!("unexpected recv error: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn cap_turn_progress_blocks_replay_after_output() {
+        let (bus, _rx) = broadcast::channel(8);
+
+        // Driver exits before emitting anything: replay is safe.
+        let mut driver = FakeDriver::new(vec![]);
+        let mut reply = String::new();
+        let mut progress = TurnProgress::default();
+        let res = run_turn_tracked(&mut driver, &bus, "s", "a", None, &mut reply, &mut progress).await;
+        assert!(res.is_err());
+        assert!(progress.replay_safe(false));
+        assert!(!progress.replay_safe(true), "timeouts are never replayed");
+
+        // Driver emitted text then died mid-turn: replay is NOT safe.
+        let mut driver = FakeDriver::new(vec![text("working")]);
+        let mut reply = String::new();
+        let mut progress = TurnProgress::default();
+        let res = run_turn_tracked(&mut driver, &bus, "s", "a", None, &mut reply, &mut progress).await;
+        assert!(res.is_err());
+        assert!(!progress.replay_safe(false));
+        assert!(!progress.tool_activity);
     }
 }

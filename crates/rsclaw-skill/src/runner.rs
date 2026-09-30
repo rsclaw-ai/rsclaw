@@ -113,45 +113,58 @@ async fn do_run(
         .spawn()
         .with_context(|| format!("failed to spawn `{}`", spec.command))?;
 
-    // Write JSON input to stdin when stdin_json is true.
-    if spec.stdin_json
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        let payload = serde_json::to_vec(input)?;
-        stdin
-            .write_all(&payload)
-            .await
-            .context("write to child stdin")?;
-        // stdin is dropped here, signalling EOF.
+    // Write JSON input to stdin in a separate task so a child that emits a
+    // lot of output before draining stdin cannot deadlock us (pipe buffers
+    // are ~64KB). When stdin_json is false, stdin is closed immediately.
+    let stdin_task = match child.stdin.take() {
+        Some(mut stdin) if spec.stdin_json => {
+            let payload = serde_json::to_vec(input)?;
+            // stdin is dropped when the task ends, signalling EOF.
+            Some(tokio::spawn(async move { stdin.write_all(&payload).await }))
+        }
+        _ => None,
+    };
+
+    let stdout = child.stdout.take().context("child stdout not piped")?;
+    let stderr = child.stderr.take().context("child stderr not piped")?;
+    let (stdout_res, stderr_res, status) = tokio::join!(
+        read_bounded(stdout, MAX_OUTPUT_BYTES),
+        read_bounded(stderr, MAX_OUTPUT_BYTES),
+        child.wait(),
+    );
+    let status = status.context("wait for child process")?;
+    let (stdout_buf, stdout_total) = stdout_res.context("read child stdout")?;
+    let (stderr_buf, _) = stderr_res.context("read child stderr")?;
+
+    if let Some(task) = stdin_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            // A child that exits without reading all of stdin is not an error
+            // by itself; its exit status decides.
+            Ok(Err(e)) => warn!(tool = %spec.name, error = %e, "write to child stdin failed"),
+            Err(e) => warn!(tool = %spec.name, error = %e, "stdin writer task failed"),
+        }
     }
 
-    let output = child
-        .wait_with_output()
-        .await
-        .context("wait for child process")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_buf);
         bail!(
             "tool `{}` exited with status {}: {}",
             spec.name,
-            output.status,
+            status,
             stderr.trim()
         );
     }
 
-    // Truncate oversized output.
-    let stdout_bytes = if output.stdout.len() > MAX_OUTPUT_BYTES {
+    if stdout_total > MAX_OUTPUT_BYTES {
         warn!(
             tool = %spec.name,
-            bytes = output.stdout.len(),
+            bytes = stdout_total,
             limit = MAX_OUTPUT_BYTES,
             "tool output truncated"
         );
-        &output.stdout[..MAX_OUTPUT_BYTES]
-    } else {
-        &output.stdout
-    };
+    }
+    let stdout_bytes = &stdout_buf[..];
 
     // Try to parse as JSON; fall back to plain text.
     let result = if stdout_bytes.is_empty() {
@@ -203,6 +216,29 @@ fn shell_split(s: &str) -> Result<Vec<String>> {
     }
 
     Ok(parts)
+}
+
+/// Read `r` to EOF, keeping at most `max` bytes (the rest is drained and
+/// discarded so the child never blocks on a full pipe). Returns the kept
+/// bytes and the total number of bytes seen.
+async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
+    mut r: R,
+    max: usize,
+) -> std::io::Result<(Vec<u8>, usize)> {
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut total = 0usize;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = r.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n);
+        let room = max.saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..n.min(room)]);
+    }
+    Ok((kept, total))
 }
 
 fn json_to_arg(v: &Value) -> String {
@@ -281,5 +317,27 @@ mod tests {
         // We just check it didn't error out due to spawn issues.
         // On CI with /bin/sh available this should be Ok.
         let _ = result; // accept either outcome in unit tests
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn runner_large_stdin_and_stdout_no_deadlock() {
+        // `cat` echoes stdin back while we are still writing it: with a
+        // payload far above the pipe buffer size, writing all of stdin
+        // before reading stdout would deadlock.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let spec = ToolSpec {
+            name: "cat_test".into(),
+            description: "cat".into(),
+            command: "cat".into(),
+            input_schema: None,
+            timeout_seconds: 10,
+            stdin_json: true,
+        };
+        let big = "x".repeat(512 * 1024);
+        let out = run_tool(&spec, tmp.path(), Value::String(big.clone()), &RunOptions::default())
+            .await
+            .expect("run cat");
+        assert_eq!(out, Value::String(big));
     }
 }

@@ -266,7 +266,7 @@ pub fn verify_skill_content(
              (got {}, expected {})",
             entry.slug,
             rsclaw_util::truncate_str(&got, 12),
-            &entry.sha256[..entry.sha256.len().min(12)],
+            rsclaw_util::truncate_str(&entry.sha256, 12),
         );
     }
     Ok(())

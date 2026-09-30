@@ -125,7 +125,11 @@ pub struct PluginManifest {
     pub config: Value,
     /// Capability names requested by this plugin. Dangerous capabilities
     /// such as background workers, outbound push, and tool aliases are
-    /// honored only for trusted plugins.
+    /// honored only for trusted plugins. WASM host functions gated here:
+    /// `http`, `device`, `cron`, `sse`, `pushOutbound`, `submitAgentTurn`,
+    /// `desktop` (all `host-desktop` calls), `vlmDrive` (desktop/android
+    /// VLM loops, limited to the named app) and `vlmDriveBypass` (lets a
+    /// VLM loop act on any app).
     #[serde(default)]
     pub capabilities: Vec<String>,
     /// Slash command prefixes this plugin wants to handle locally.

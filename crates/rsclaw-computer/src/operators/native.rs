@@ -182,6 +182,7 @@ fn capture_primary_screen() -> Result<Screenshot> {
 /// so the driver can feed it into the next turn rather than blowing
 /// up the whole loop.
 fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
+    ensure_dpi_awareness();
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(e) => e,
         Err(e) => {
@@ -320,6 +321,27 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Make the process per-monitor DPI aware once before any input synthesis.
+///
+/// Windows screenshots are captured in physical pixels, but a DPI-unaware
+/// process gets logical metrics from `GetSystemMetrics(SM_CXSCREEN)`, which
+/// enigo uses to normalise absolute mouse coordinates. At >100% scaling the
+/// two spaces diverge and every click lands off-target. After this call both
+/// sides agree on physical pixels. No-op on other platforms.
+fn ensure_dpi_awareness() {
+    #[cfg(target_os = "windows")]
+    {
+        static DPI_ONCE: std::sync::Once = std::sync::Once::new();
+        DPI_ONCE.call_once(|| {
+            if enigo::set_dpi_awareness().is_err() {
+                // E_ACCESSDENIED when the awareness was already set (e.g. by
+                // the app manifest) — harmless, but record it.
+                warn!("SetProcessDpiAwareness failed (already set or unsupported)");
+            }
+        });
+    }
+}
 
 /// Map physical-pixel coordinates from the screenshot into the
 /// coordinate space `enigo` expects on this platform.

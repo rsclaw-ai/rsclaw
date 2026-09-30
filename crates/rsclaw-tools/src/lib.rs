@@ -1174,6 +1174,13 @@ async fn download_and_extract(
         if !got.eq_ignore_ascii_case(exp) {
             bail!("sha256 mismatch for {filename}: expected {exp}, got {got} — refusing");
         }
+    } else {
+        // No content pin available (e.g. model archives: the model catalog
+        // carries no hashes yet). At minimum make sure we got a non-empty file
+        // whose magic bytes match the archive type the URL promises, so an
+        // HTML error page / captive-portal response is never extracted.
+        tracing::warn!(url, "download has no sha256 pin; verifying archive format only");
+        verify_archive_magic(&tmp_path, url)?;
     }
 
     if url.ends_with(".zip") {
@@ -1470,35 +1477,135 @@ fn extract_tar_bz2(archive_path: &std::path::Path, dest: &std::path::Path) -> Re
     extract_tar(bz2_reader, dest)
 }
 
+/// Check that the downloaded file is non-empty and starts with the magic bytes
+/// of the archive format implied by `url`. Unknown formats only need to be
+/// non-empty.
+fn verify_archive_magic(path: &std::path::Path, url: &str) -> Result<()> {
+    use std::io::Read;
+    let mut head = [0u8; 6];
+    let mut f = std::fs::File::open(path)?;
+    let n = f.read(&mut head)?;
+    if n == 0 {
+        bail!("downloaded file from {url} is empty — refusing");
+    }
+    let head = &head[..n];
+    let expected: Option<(&str, &[u8])> = if url.ends_with(".zip") {
+        Some(("zip", b"PK\x03\x04"))
+    } else if url.ends_with(".tar.xz") {
+        Some(("xz", b"\xFD7zXZ\x00"))
+    } else if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+        Some(("gzip", b"\x1F\x8B"))
+    } else if url.ends_with(".tar.bz2") {
+        Some(("bzip2", b"BZh"))
+    } else {
+        None
+    };
+    if let Some((kind, magic)) = expected
+        && !head.starts_with(magic)
+    {
+        bail!("downloaded file from {url} is not a {kind} archive (bad magic bytes) — refusing");
+    }
+    Ok(())
+}
+
+/// Validate a relative archive path: every component must be a plain name.
+fn is_plain_relative(p: &std::path::Path) -> bool {
+    !p.as_os_str().is_empty()
+        && p.components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// True when a symlink stored at `rel_path` (relative to the extraction root)
+/// pointing at `target` stays inside the extraction root.
+fn symlink_target_stays_inside(rel_path: &std::path::Path, target: &std::path::Path) -> bool {
+    use std::path::Component;
+    if target.is_absolute() {
+        return false;
+    }
+    // Depth of the directory that contains the link.
+    let mut depth: i64 = rel_path.components().count() as i64 - 1;
+    for c in target.components() {
+        match c {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
 fn extract_tar<R: std::io::Read>(reader: R, dest: &std::path::Path) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
+    std::fs::create_dir_all(dest)?;
+    let dest_canon = std::fs::canonicalize(dest)?;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = entry.path()?.to_owned();
+        let path = entry.path()?.to_path_buf();
+        let entry_type = entry.header().entry_type();
+
+        // Only regular files, directories and (in-tree) symlinks are
+        // extracted; pax/GNU metadata, devices, FIFOs and hardlinks are not.
+        if !(entry_type.is_file() || entry_type.is_dir() || entry_type.is_symlink()) {
+            if entry_type.is_hard_link() {
+                tracing::warn!(path = %path.display(), "tar: skipping hardlink entry");
+            }
+            continue;
+        }
 
         // Strip top-level directory
         let components: Vec<_> = path.components().collect();
         let rel_path = if components.len() > 1 {
             components[1..].iter().collect::<PathBuf>()
         } else {
-            path.to_path_buf()
+            path.clone()
         };
 
         if rel_path.as_os_str().is_empty() {
             continue;
         }
+        // Tar-slip guard: no `..`, root or prefix components.
+        if !is_plain_relative(&rel_path) {
+            bail!("refusing tar entry with unsafe path: {}", path.display());
+        }
 
         let out_path = dest.join(&rel_path);
 
-        if entry.header().entry_type().is_dir() {
+        if entry_type.is_dir() {
             std::fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            entry.unpack(&out_path)?;
+            continue;
         }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+            // Never write through a symlink that points outside `dest`.
+            let parent_canon = std::fs::canonicalize(parent)?;
+            if !parent_canon.starts_with(&dest_canon) {
+                bail!("refusing tar entry that escapes destination: {}", path.display());
+            }
+        }
+        if entry_type.is_symlink() {
+            // Toolchains (e.g. node's `bin/npm -> ../lib/...`) ship relative
+            // symlinks; keep those, but reject any that leave `dest`.
+            let target = entry
+                .link_name()?
+                .map(|t| t.to_path_buf())
+                .unwrap_or_default();
+            if !symlink_target_stays_inside(&rel_path, &target) {
+                tracing::warn!(
+                    path = %path.display(),
+                    target = %target.display(),
+                    "tar: skipping symlink that points outside the destination"
+                );
+                continue;
+            }
+        }
+        entry.unpack(&out_path)?;
     }
     Ok(())
 }
@@ -1541,6 +1648,47 @@ mod tests {
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
         std::fs::write(&bin, b"").unwrap();
         assert!(local_tool_binary_exists(tmp.path(), bun));
+    }
+
+    #[test]
+    fn tar_extract_rejects_escaping_symlinks() {
+        assert!(symlink_target_stays_inside(
+            std::path::Path::new("bin/npm"),
+            std::path::Path::new("../lib/npm-cli.js")
+        ));
+        assert!(!symlink_target_stays_inside(
+            std::path::Path::new("bin/npm"),
+            std::path::Path::new("../../etc/passwd")
+        ));
+        assert!(!symlink_target_stays_inside(
+            std::path::Path::new("x"),
+            std::path::Path::new("/etc/passwd")
+        ));
+        assert!(!is_plain_relative(std::path::Path::new("a/../../b")));
+
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(2);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            b.append_data(&mut h, "top/lib/a.txt", &b"ok"[..]).unwrap();
+            let mut l = tar::Header::new_gnu();
+            l.set_size(0);
+            l.set_entry_type(tar::EntryType::Symlink);
+            b.append_link(&mut l, "top/bin/good", "../lib/a.txt").unwrap();
+            let mut e = tar::Header::new_gnu();
+            e.set_size(0);
+            e.set_entry_type(tar::EntryType::Symlink);
+            b.append_link(&mut e, "top/evil", "/etc").unwrap();
+            b.finish().unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tar(&buf[..], tmp.path()).unwrap();
+        assert!(tmp.path().join("lib/a.txt").exists());
+        assert!(tmp.path().join("bin/good").symlink_metadata().is_ok());
+        assert!(tmp.path().join("evil").symlink_metadata().is_err());
     }
 
     #[test]

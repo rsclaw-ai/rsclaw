@@ -379,7 +379,7 @@ impl HostMethodRegistry {
         let path = params["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("extract_file_text: `path` required"))?;
-        match crate::wasm_runtime::extract_text_from_plugin_file(path).await {
+        match crate::wasm_runtime::extract_text_from_plugin_file(None, path).await {
             Ok(text) => Ok(Value::String(text)),
             Err(e) => Err(anyhow::anyhow!("{e}")),
         }
@@ -409,47 +409,16 @@ impl HostMethodRegistry {
 
     /// Extract audio from a video/audio file using ffmpeg.
     /// Params: `{ "input_path": "<path>" }`. Mirrors wasm `extract_audio`.
+    ///
+    /// JS plugins run as unsandboxed subprocesses (install-time allowlist
+    /// tier), so the input is not confined here; wasm plugins are.
     async fn host_extract_audio(&self, params: Value) -> Result<Value> {
         let input_path = params["input_path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("extract_audio: `input_path` required"))?;
-
-        let ffmpeg_bin = match rsclaw_platform::detect_ffmpeg() {
-            Some(p) => p,
-            None => {
-                return Ok(json!({"error": "ffmpeg not found. Run: rsclaw tools install ffmpeg"}));
-            }
-        };
-
-        let out_path = match crate::wasm_runtime::allocate_dl_paths("audio.wav", 1) {
-            Ok(mut p) => p.pop().unwrap_or_default(),
-            Err(e) => return Ok(json!({"error": e})),
-        };
-
-        let output = tokio::process::Command::new(&ffmpeg_bin)
-            .args([
-                "-y",
-                "-i",
-                input_path,
-                "-vn",
-                "-acodec",
-                "pcm_s16le",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                &out_path,
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(o) if o.status.success() => Ok(json!({"path": out_path})),
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                Ok(json!({"error": format!("ffmpeg failed: {stderr}")}))
-            }
-            Err(e) => Ok(json!({"error": format!("ffmpeg spawn error: {e}")})),
+        match crate::wasm_runtime::media_extract_audio(input_path, false).await {
+            Ok(path) => Ok(json!({"path": path})),
+            Err(e) => Ok(json!({"error": e})),
         }
     }
 
@@ -460,25 +429,9 @@ impl HostMethodRegistry {
         let audio_path = params["audio_path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("transcribe: `audio_path` required"))?;
-        let _language = params["language"].as_str().unwrap_or("zh-CN");
-
-        let bytes = match tokio::fs::read(audio_path).await {
-            Ok(b) => b,
-            Err(e) => return Ok(json!({"error": format!("read audio file failed: {e}")})),
-        };
-
-        let mime = if audio_path.to_lowercase().ends_with(".wav") {
-            "audio/wav"
-        } else {
-            "audio/mpeg"
-        };
-
-        let client = reqwest::Client::new();
-        match rsclaw_channel::transcription::transcribe_audio(&client, &bytes, audio_path, mime)
-            .await
-        {
+        match crate::wasm_runtime::media_transcribe(audio_path).await {
             Ok(text) => Ok(json!({"text": text})),
-            Err(e) => Ok(json!({"error": format!("transcription failed: {e:#}")})),
+            Err(e) => Ok(json!({"error": e})),
         }
     }
 
@@ -489,69 +442,10 @@ impl HostMethodRegistry {
         let video_path = params["video_path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("extract_keyframes: `video_path` required"))?;
-        let count = params["count"].as_u64().unwrap_or(5).max(1).min(20) as usize;
-
-        let ffmpeg_bin = match rsclaw_platform::detect_ffmpeg() {
-            Some(p) => p,
-            None => {
-                return Ok(json!({"error": "ffmpeg not found. Run: rsclaw tools install ffmpeg"}));
-            }
-        };
-
-        let out_paths = match crate::wasm_runtime::allocate_dl_paths("frame.png", count) {
-            Ok(p) => p,
-            Err(e) => return Ok(json!({"error": e})),
-        };
-
-        // Get video duration.
-        let duration_secs: f64 = {
-            let probe = tokio::process::Command::new(&ffmpeg_bin)
-                .args([
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    video_path,
-                ])
-                .output()
-                .await;
-            match probe {
-                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse()
-                    .unwrap_or(0.0),
-                _ => 0.0,
-            }
-        };
-
-        if duration_secs <= 0.0 {
-            return Ok(json!({"error": "could not determine video duration"}));
-        }
-
-        let interval = duration_secs / count as f64;
-        let out_pattern = out_paths[0].replace(".png", "_%03d.png");
-
-        let output = tokio::process::Command::new(&ffmpeg_bin)
-            .args([
-                "-y",
-                "-i",
-                video_path,
-                "-vf",
-                &format!("fps=1/{interval},scale=480:-1"),
-                &out_pattern,
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(o) if o.status.success() => Ok(json!({"paths": out_paths})),
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                Ok(json!({"error": format!("ffmpeg failed: {stderr}")}))
-            }
-            Err(e) => Ok(json!({"error": format!("ffmpeg spawn error: {e}")})),
+        let count = params["count"].as_u64().unwrap_or(5).clamp(1, 20) as usize;
+        match crate::wasm_runtime::media_extract_keyframes(video_path, count, false).await {
+            Ok(paths) => Ok(json!({"paths": paths})),
+            Err(e) => Ok(json!({"error": e})),
         }
     }
 }
