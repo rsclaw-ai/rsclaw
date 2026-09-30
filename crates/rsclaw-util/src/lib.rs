@@ -1,5 +1,8 @@
 //! Small shared helpers.
 
+pub mod fs_guard;
+pub mod net;
+
 /// Estimate token count for mixed-language text.
 /// - ASCII/Latin: ~4 chars per token
 /// - CJK (Chinese/Japanese/Korean): ~1.5 chars per token
