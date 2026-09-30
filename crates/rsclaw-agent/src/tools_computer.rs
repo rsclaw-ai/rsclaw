@@ -564,6 +564,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             let session_key = ctx.session_key.clone();
             let channel = ctx.channel.clone();
             let peer_id = ctx.peer_id.clone();
+            let turn_trust = ctx.turn_ctx.trust;
             let chat_id = ctx.chat_id.clone();
             let abort_clone = Arc::clone(&abort);
             let task_id_for_log = task_id.clone();
@@ -693,6 +694,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 // `tool_agent_task` in tools_agent.rs.
                 let (wake_tx, wake_rx) = tokio::sync::oneshot::channel::<crate::AgentReply>();
                 let wake_msg = crate::AgentMessage {
+                    trust: turn_trust,
                     session_key: session_key.clone(),
                     text: result_text,
                     channel: channel.clone(),

@@ -468,22 +468,30 @@ impl AgentRuntime {
 
 const MAX_CHART_BATCH: usize = 10;
 
-async fn fetch_image_as_data_uri(client: &reqwest::Client, url: &str) -> Result<String> {
-    let resp = client
-        .get(url)
-        .header("Referer", "https://mp.weixin.qq.com/")
-        .send()
-        .await?
-        .error_for_status()?;
+/// Fetch one chart image. The URL is model-supplied, so the request goes
+/// through the SSRF guard (public targets only, redirects re-validated)
+/// and the body is read with a hard cap.
+async fn fetch_image_as_data_uri(_client: &reqwest::Client, url: &str) -> Result<String> {
+    let mut req = rsclaw_util::net::SafeRequest::get(url);
+    req.timeout = std::time::Duration::from_secs(12);
+    req.headers.insert(
+        reqwest::header::REFERER,
+        reqwest::header::HeaderValue::from_static("https://mp.weixin.qq.com/"),
+    );
+    let resp = rsclaw_util::net::safe_send(
+        || reqwest::Client::builder().user_agent(WECHAT_UA),
+        req,
+    )
+    .await?
+    .error_for_status()?;
     let ctype = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let bytes = resp.bytes().await?;
-    if bytes.len() > 8 * 1024 * 1024 {
-        return Err(anyhow!("image too large ({} bytes)", bytes.len()));
-    }
+    let bytes = rsclaw_util::net::read_body_limited(resp, 8 * 1024 * 1024)
+        .await
+        .map_err(|e| anyhow!("image fetch: {e}"))?;
     // Sniff MIME when the server didn't say. WeChat / mmbiz returns
     // proper content-type usually, but defensive sniffing protects
     // against the rare case of a 200 with no header.

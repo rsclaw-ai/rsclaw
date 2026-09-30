@@ -86,6 +86,7 @@ pub(crate) fn agnes_image_size(requested: &str) -> &'static str {
     let (w, h) = requested
         .split_once('x')
         .and_then(|(a, b)| Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?)))
+        .filter(|(w, h)| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0)
         .unwrap_or((1024.0, 1024.0));
     let ratio = w / h.max(1.0);
     if ratio > 1.15 {
@@ -101,7 +102,10 @@ pub(crate) fn agnes_image_size(requested: &str) -> &'static str {
 /// strings. http(s)/data: entries pass through; a LOCAL FILE PATH (e.g. an
 /// earlier image_gen result) is read and base64-encoded into a `data:` URI so
 /// providers get self-contained input. Unreadable paths are dropped.
-pub(crate) async fn normalize_image_inputs(v: &Value) -> Vec<String> {
+pub(crate) async fn normalize_image_inputs(
+    v: &Value,
+    scope: &super::security::ReadScope,
+) -> Vec<String> {
     let raw: Vec<String> = match v {
         Value::String(s) if !s.is_empty() => vec![s.clone()],
         Value::Array(a) => a
@@ -116,7 +120,21 @@ pub(crate) async fn normalize_image_inputs(v: &Value) -> Vec<String> {
             out.push(img);
             continue;
         }
-        match tokio::fs::read(&img).await {
+        // Local paths are scope-checked: the bytes leave the host (uploaded
+        // to the image provider).
+        let path = match scope.resolve(&img) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(path = %img, error = %e, "image_gen: input image refused, skipping");
+                continue;
+            }
+        };
+        match super::security::read_regular_file_capped(
+            &path,
+            super::security::MAX_LOCAL_BINARY_READ_BYTES,
+        )
+        .await
+        {
             Ok(bytes) => {
                 use base64::Engine;
                 let mime = match std::path::Path::new(&img)
@@ -193,7 +211,8 @@ impl super::runtime::AgentRuntime {
         // base64 data URIs) so every provider branch sees ready-to-send
         // strings in args["image"].
         if !args["image"].is_null() {
-            let imgs = normalize_image_inputs(&args["image"]).await;
+            let scope = self.read_scope(ctx);
+            let imgs = normalize_image_inputs(&args["image"], &scope).await;
             args["image"] = if imgs.is_empty() {
                 Value::Null
             } else {
@@ -438,7 +457,7 @@ impl super::runtime::AgentRuntime {
             .as_ref()
             .and_then(|m| m.providers.get(prov_name))
             .and_then(|p| p.api_key.as_ref())
-            .and_then(|k| k.as_plain().map(str::to_owned));
+            .and_then(|k| k.resolve_full(self.config.ops.secrets.as_ref()));
         let cfg_url = self
             .config
             .model
@@ -619,8 +638,17 @@ impl super::runtime::AgentRuntime {
             let aspect = if size.contains('x') {
                 let parts: Vec<&str> = size.split('x').collect();
                 if parts.len() == 2 {
-                    let w = parts[0].parse::<f32>().unwrap_or(1024.0);
-                    let h = parts[1].parse::<f32>().unwrap_or(1024.0);
+                    // Reject NaN / inf / non-positive sizes ("NaNxNaN" parses
+                    // as f32 NaN) — fall back to square.
+                    let dim = |p: &str| {
+                        p.trim()
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|v| v.is_finite() && *v > 0.0)
+                            .unwrap_or(1024.0)
+                    };
+                    let w = dim(parts[0]);
+                    let h = dim(parts[1]);
                     let ratio = w / h.max(1.0);
                     let candidates = [
                         (1.0_f32, "1:1"),
@@ -633,12 +661,7 @@ impl super::runtime::AgentRuntime {
                     ];
                     candidates
                         .iter()
-                        .min_by(|a, b| {
-                            (a.0 - ratio)
-                                .abs()
-                                .partial_cmp(&(b.0 - ratio).abs())
-                                .unwrap()
-                        })
+                        .min_by(|a, b| (a.0 - ratio).abs().total_cmp(&(b.0 - ratio).abs()))
                         .map(|c| c.1)
                         .unwrap_or("1:1")
                         .to_owned()
@@ -683,9 +706,12 @@ impl super::runtime::AgentRuntime {
                 "1:1"
             };
             let gemini_base = img_url.trim_end_matches('/');
-            let url = format!("{gemini_base}/models/{image_model}:generateContent?key={api_key}");
+            // Key goes in the `x-goog-api-key` header, never the query string
+            // (reqwest error text would otherwise leak it).
+            let url = format!("{gemini_base}/models/{image_model}:generateContent");
             let resp = client
                 .post(&url)
+                .header("x-goog-api-key", api_key.as_str())
                 .json(&json!({
                     "contents": [{ "parts": [{ "text": prompt }] }],
                     "generationConfig": {
@@ -695,12 +721,12 @@ impl super::runtime::AgentRuntime {
                 }))
                 .send()
                 .await
-                .map_err(|e| anyhow!("image: gemini request failed: {e}"))?;
+                .map_err(|e| anyhow!("image: gemini request failed: {}", e.without_url()))?;
             let st = resp.status();
             let body_bytes = resp
                 .bytes()
                 .await
-                .map_err(|e| anyhow!("image: gemini read body: {e}"))?;
+                .map_err(|e| anyhow!("image: gemini read body: {}", e.without_url()))?;
             let body = parse_response_body(st, &body_bytes)?;
             (st, body)
         } else if is_agnes {

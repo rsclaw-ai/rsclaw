@@ -161,14 +161,13 @@ impl AgentRuntime {
         }
         #[cfg(target_os = "windows")]
         {
-            let safe_text = tts_text.replace('\'', "''");
-            let script = format!(
-                "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile('{}'); $s.Speak('{}')",
-                out_str.replace('\'', "''"),
-                safe_text
-            );
+            // Text and path travel via env vars, never interpolated into the
+            // script, so no quoting can break out of the string literal.
+            let script = "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile($env:RSCLAW_TTS_OUT); $s.Speak($env:RSCLAW_TTS_TEXT)";
             let output = powershell_hidden()
-                .args(["-Command", &script])
+                .env("RSCLAW_TTS_OUT", &out_str)
+                .env("RSCLAW_TTS_TEXT", tts_text)
+                .args(["-Command", script])
                 .output()
                 .await
                 .map_err(|e| anyhow!("auto-tts: SAPI failed: {e}"))?;
@@ -263,17 +262,20 @@ impl AgentRuntime {
                 }
             }
         } else if is_windows {
-            let script = format!(
-                r#"
+            // Text and output path are passed via env vars, never spliced
+            // into the script: `text` is model-controlled, and a `'` inside
+            // `Speak('...')` would end the literal and run arbitrary
+            // PowerShell.
+            let script = r#"
 Add-Type -AssemblyName System.Speech
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$synth.SetOutputToWaveFile('{}')
-$synth.Speak('{}')
-"#,
-                out_path_str, text
-            );
+$synth.SetOutputToWaveFile($env:RSCLAW_TTS_OUT)
+$synth.Speak($env:RSCLAW_TTS_TEXT)
+"#;
             let output = powershell_hidden()
-                .args(["-Command", &script])
+                .env("RSCLAW_TTS_OUT", &out_path_str)
+                .env("RSCLAW_TTS_TEXT", text)
+                .args(["-Command", script])
                 .output()
                 .await
                 .map_err(|e| anyhow!("tts: PowerShell SAPI failed: {e}"))?;
@@ -322,19 +324,27 @@ $synth.Speak('{}')
             .ok_or_else(|| anyhow!("message: `text` required"))?;
         let channel = args["channel"].as_str().unwrap_or("default");
 
-        // Try to POST to the gateway's own message-send endpoint.
+        // Try to POST to the gateway's own message-send endpoint. The
+        // handler reads `message`; `text` is kept for older gateways. The
+        // endpoint sits behind the gateway Bearer auth when a token is set.
         let port = self.config.gateway.port;
+        let auth_token = self.live.gateway.read().await.auth_token.clone();
 
         let client = reqwest::Client::new();
-        let resp = client
+        let mut req = client
             .post(format!("http://127.0.0.1:{port}/api/v1/message/send"))
+            .header("X-RsClaw-Request", "1")
+            .timeout(std::time::Duration::from_secs(30))
             .json(&json!({
                 "channel": channel,
                 "target": target,
+                "message": text,
                 "text": text
-            }))
-            .send()
-            .await;
+            }));
+        if let Some(token) = auth_token.as_deref().filter(|t| !t.is_empty()) {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
@@ -588,26 +598,18 @@ $synth.Speak('{}')
     // Document & PDF
     // -------------------------------------------------------------------
 
-    pub(crate) async fn tool_doc(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_doc(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let path_str = args["path"]
             .as_str()
             .ok_or_else(|| anyhow!("doc: `path` required"))?;
 
-        let workspace = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
-            .map(super::runtime::expand_tilde)
-            .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"));
-
-        let pb = std::path::PathBuf::from(path_str);
-        let full = if pb.is_absolute() {
-            pb
-        } else {
-            workspace.join(path_str)
-        };
+        // `doc` creates and edits files and is reachable by non-owners, so
+        // the target is confined like write_file (workspace, plus owner
+        // write roots) and vetted against the sensitive-name list.
+        let full = self.resolve_writable_path(ctx, path_str)?;
+        if self.exec_safety_enabled() || !ctx.turn_ctx.trust.is_owner() {
+            super::security::check_write_safety(path_str, &full, "")?;
+        }
         if let Some(parent) = full.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -615,35 +617,54 @@ $synth.Speak('{}')
         super::doc::handle(&args, &full).await
     }
 
-    pub(crate) async fn tool_pdf(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_pdf(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let path = args["path"]
             .as_str()
-            .ok_or_else(|| anyhow!("pdf: `path` required"))?;
+            .ok_or_else(|| anyhow!("pdf: `path` required"))?
+            .trim();
 
-        // If URL, download to temp file first.
+        // If URL, download (SSRF-checked, size-bounded) into a private,
+        // uniquely named temp file that is removed when this call returns.
+        // Otherwise the local path goes through the read scope.
+        let mut _tmp_guard: Option<tempfile::NamedTempFile> = None;
         let local_path = if path.starts_with("http://") || path.starts_with("https://") {
-            let tmp = std::env::temp_dir().join("rsclaw_pdf_download.pdf");
-            let client = reqwest::Client::new();
-            let bytes = client
-                .get(path)
-                .send()
+            let allow_private = super::tools_web::web_allow_private(ctx.turn_ctx.trust);
+            let mut req = rsclaw_util::net::SafeRequest::get(path);
+            req.timeout = std::time::Duration::from_secs(60);
+            let resp = super::tools_web::send_guarded(reqwest::Client::builder, req, allow_private)
                 .await
-                .map_err(|e| anyhow!("pdf: download failed: {e}"))?
-                .bytes()
-                .await
-                .map_err(|e| anyhow!("pdf: download read failed: {e}"))?;
-            tokio::fs::write(&tmp, &bytes)
+                .map_err(|e| anyhow!("pdf: download failed: {e}"))?;
+            if !resp.status().is_success() {
+                bail!("pdf: download failed: HTTP {}", resp.status());
+            }
+            let bytes = rsclaw_util::net::read_body_limited(
+                resp,
+                super::security::MAX_LOCAL_BINARY_READ_BYTES as usize,
+            )
+            .await
+            .map_err(|e| anyhow!("pdf: download read failed: {e}"))?;
+            let tmp = tempfile::Builder::new()
+                .prefix("rsclaw_pdf_")
+                .suffix(".pdf")
+                .tempfile()
+                .map_err(|e| anyhow!("pdf: create temp file failed: {e}"))?;
+            tokio::fs::write(tmp.path(), &bytes)
                 .await
                 .map_err(|e| anyhow!("pdf: write temp file failed: {e}"))?;
-            tmp
+            let p = tmp.path().to_path_buf();
+            _tmp_guard = Some(tmp);
+            p
         } else {
-            std::path::PathBuf::from(path)
+            self.resolve_readable_path(ctx, path)?
         };
 
         // Pure Rust PDF extraction, with pdftotext CLI fallback.
-        let pdf_bytes = tokio::fs::read(&local_path)
-            .await
-            .map_err(|e| anyhow!("pdf: read failed: {e}"))?;
+        let pdf_bytes = super::security::read_regular_file_capped(
+            &local_path,
+            super::security::MAX_LOCAL_BINARY_READ_BYTES,
+        )
+        .await
+        .map_err(|e| anyhow!("pdf: read failed: {e}"))?;
         let text = match crate::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
             Ok(t) => t,
             Err(e) => {
@@ -701,7 +722,7 @@ $synth.Speak('{}')
         let action = args["action"].as_str().unwrap_or("search").trim();
         match action {
             "search" => self.tool_memory_search(ctx, args).await,
-            "get" => self.tool_memory_get(args).await,
+            "get" => self.tool_memory_get(ctx, args).await,
             "put" => self.tool_memory_put(ctx, args).await,
             "delete" => {
                 // Memory deletion only allowed from internal channels (meditation/cron).
@@ -713,7 +734,7 @@ $synth.Speak('{}')
                         "memory delete is not available in conversations. Use the /memory clear command instead."
                     )
                 }
-                self.tool_memory_delete(args).await
+                self.tool_memory_delete(ctx, args).await
             }
             _ => bail!("memory: unknown action '{action}' (search, get, put, delete)"),
         }
@@ -806,26 +827,41 @@ $synth.Speak('{}')
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "rsclaw".to_owned());
 
+        let name = name.trim();
+        if name.is_empty() || name.starts_with('-') {
+            bail!("tool_install: invalid tool name {name:?}");
+        }
+
         let mut cmd = tokio::process::Command::new(&exe);
-        cmd.args(["tools", "install", name])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        cmd.args(["tools", "install", "--", name]);
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| anyhow!("tool_install: failed to run: {e}"))?;
+        // Bounded: large runtimes download for a while, but a wedged
+        // installer must not hang the turn forever (the tree is killed).
+        const INSTALL_TIMEOUT_SECS: u64 = 900;
+        let output = super::exec_pool::run_capped(
+            cmd,
+            std::time::Duration::from_secs(INSTALL_TIMEOUT_SECS),
+            super::exec_pool::EXEC_OUTPUT_CAP,
+            true,
+        )
+        .await
+        .map_err(|e| anyhow!("tool_install: failed to run: {e}"))?;
+        if output.timed_out {
+            bail!(
+                "tool_install: `{name}` did not finish within {INSTALL_TIMEOUT_SECS}s and was stopped. Check the network, then retry."
+            );
+        }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = output.stdout_text();
+        let stderr = output.stderr_text();
 
         // Post-install verification: check that the tool binary actually exists.
         // Prevents reporting success when only an empty directory was created.
-        let verified = if output.status.success() {
+        let verified = if output.status.is_some_and(|s| s.success()) {
             match name {
                 "chrome" => super::platform::detect_chrome().is_some(),
                 "ffmpeg" => super::platform::detect_ffmpeg().is_some(),

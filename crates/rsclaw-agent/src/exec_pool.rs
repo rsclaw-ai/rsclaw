@@ -1,10 +1,15 @@
-//! Async exec pool — runs long-running commands in background without blocking
-//! the agent's main loop. Results are stored per-session for collection on
-//! subsequent turns.
+//! Async exec pool — tracks long-running commands started in the background
+//! by the `exec` tool so they don't block the agent's main loop. Results are
+//! stored per-session for collection on subsequent turns, or polled by
+//! `task_id`.
+//!
+//! Also hosts [`run_capped`], the shared child-process runner used by the
+//! exec / search tools: bounded stdout/stderr capture, own process group,
+//! and whole-tree kill on timeout.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use tokio::sync::RwLock;
+use tokio::{io::AsyncReadExt, sync::RwLock};
 
 /// Result of a completed exec command.
 #[derive(Debug, Clone)]
@@ -19,20 +24,27 @@ pub struct ExecResult {
     pub completed_at: Instant,
 }
 
+/// A background task that is still running.
+#[derive(Debug, Clone)]
+struct RunningTask {
+    session_key: String,
+    #[allow(dead_code)]
+    started_at: Instant,
+}
+
 /// Global exec pool — managed as an Arc on AgentRuntime so all turns
 /// share the same pool and can collect results.
 pub struct ExecPool {
     /// Active tasks. Key is task_id.
-    tasks: RwLock<HashMap<String, Instant>>,
-    /// Completed results pending collection, keyed by session_key.
+    tasks: RwLock<HashMap<String, RunningTask>>,
+    /// Completed results pending collection, keyed by `session:<key>`.
     pending_results: RwLock<HashMap<String, Vec<ExecResult>>>,
-    /// Max concurrent exec tasks.
-    #[allow(dead_code)]
+    /// Max concurrent background tasks (0 = unlimited).
     max_concurrent: usize,
 }
 
 impl ExecPool {
-    /// Create a new pool with the given concurrency limit.
+    /// Create a new pool with the given concurrency limit (0 = unlimited).
     pub fn new(max_concurrent: usize) -> Arc<Self> {
         Arc::new(Self {
             tasks: RwLock::new(HashMap::new()),
@@ -41,186 +53,51 @@ impl ExecPool {
         })
     }
 
-    /// Spawn a command in the background. The result will be stored
-    /// in `pending_results` keyed by session_key and can be retrieved
-    /// via `collect_pending_for_session()`.
-    pub async fn spawn(
-        self: &Arc<Self>,
-        task_id: String,
-        command: String,
-        cwd: PathBuf,
-        timeout_secs: u64,
-    ) {
-        let started_at = Instant::now();
-
-        // Store the task entry (indicates running)
-        {
-            let mut tasks = self.tasks.write().await;
-            tasks.insert(task_id.clone(), started_at);
+    /// Register a background task as running. Returns `false` (and does not
+    /// register) when the pool is already at `max_concurrent`.
+    pub async fn try_begin(&self, task_id: &str, session_key: &str) -> bool {
+        let mut tasks = self.tasks.write().await;
+        if self.max_concurrent > 0 && tasks.len() >= self.max_concurrent {
+            return false;
         }
-
-        // Spawn the background runner
-        let pool = Arc::clone(self);
-        let tid = task_id.clone();
-        let cmd = command;
-        let cw = cwd;
-
-        tokio::spawn(async move {
-            let completed_at = Instant::now();
-
-            // Determine shell based on platform.
-            // -ExecutionPolicy Bypass: same rationale as the foreground exec
-            // tool — npm/npx resolve to .ps1 wrappers that the default
-            // Restricted policy blocks. Per-process only; doesn't touch the
-            // machine policy. Keep these two shell selections in sync.
-            let (shell, shell_args) = if cfg!(target_os = "windows") {
-                (
-                    "powershell",
-                    vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"],
-                )
-            } else {
-                ("sh", vec!["-c"])
-            };
-
-            // Run the command with timeout
-            // - kill_on_drop ensures process is killed if future is dropped during timeout
-            // - stdin null prevents interactive prompts from blocking (e.g. PowerShell
-            //   waiting for input)
-            #[allow(unused_mut)]
-            let mut exec_cmd = tokio::process::Command::new(shell);
-            exec_cmd
-                .args(&shell_args)
-                .arg(&cmd)
-                .current_dir(&cw)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                exec_cmd.creation_flags(0x08000000);
-            }
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                exec_cmd.output(),
-            )
-            .await;
-
-            let (exit_code, stdout, stderr) = match result {
-                Ok(Ok(output)) => {
-                    let exit_code = output.status.code();
-                    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-                    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                    (exit_code, stdout, stderr)
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(task_id = %tid, "exec background spawn failed: {}", e);
-                    (
-                        None,
-                        String::new(),
-                        format!(
-                            "failed to start shell process - the command never ran: {}. \
-                             If the error is 'No such file or directory', the working directory \
-                             likely does not exist; verify the cwd path or retry without a cwd override",
-                            e
-                        ),
-                    )
-                }
-                Err(_) => {
-                    tracing::warn!(task_id = %tid, timeout_secs, "exec background timed out");
-                    (
-                        None,
-                        String::new(),
-                        format!(
-                            "command killed after exceeding the {}s timeout; any partial output \
-                             was discarded. Re-run with a larger timeout, or split the command \
-                             into smaller steps",
-                            timeout_secs
-                        ),
-                    )
-                }
-            };
-
-            tracing::info!(
-                task_id = %tid,
-                exit_code = ?exit_code,
-                stdout_len = stdout.len(),
-                stderr_len = stderr.len(),
-                "exec background completed"
-            );
-
-            // Remove from running tasks
-            let mut tasks = pool.tasks.write().await;
-            tasks.remove(&tid);
-            drop(tasks);
-
-            // Store result - will be collected by session_key in tool_exec
-            // Note: spawn() is not currently used; tool_exec builds ExecResult directly
-            // with full tool_call_id and command fields.
-            let exec_result = ExecResult {
-                task_id: tid.clone(),
-                tool_call_id: String::new(), // placeholder, not used
-                command: String::new(),      // placeholder, not used
-                exit_code,
-                stdout,
-                stderr,
-                started_at,
-                completed_at,
-            };
-
-            // Store with a placeholder key; tool_exec will re-store with session_key
-            pool.add_pending_for_task(&tid, exec_result).await;
-        });
-
-        tracing::info!(task_id = %task_id, "exec background spawned");
-    }
-
-    /// Add a pending result for a task (internal use).
-    async fn add_pending_for_task(self: &Arc<Self>, task_id: &str, result: ExecResult) {
-        let mut pending = self.pending_results.write().await;
-        pending
-            .entry(format!("task:{}", task_id))
-            .or_insert_with(Vec::new)
-            .push(result);
-    }
-
-    /// Check if a task is still running.
-    pub async fn is_running(&self, task_id: &str) -> bool {
-        let tasks = self.tasks.read().await;
-        let is_running = tasks.contains_key(task_id);
-        tracing::debug!(
-            task_id = %task_id,
-            is_running = is_running,
-            running_count = tasks.len(),
-            "exec_pool: is_running check"
+        tasks.insert(
+            task_id.to_owned(),
+            RunningTask {
+                session_key: session_key.to_owned(),
+                started_at: Instant::now(),
+            },
         );
-        is_running
+        true
     }
 
-    /// Collect a completed result for a task by task_id.
-    pub async fn try_collect_by_task(&self, task_id: &str) -> Option<ExecResult> {
-        tracing::info!(task_id = %task_id, "exec_pool: trying to collect result by task_id");
+    /// Mark a task finished and queue its result for the owning session.
+    pub async fn finish(self: &Arc<Self>, session_key: String, result: ExecResult) {
+        self.tasks.write().await.remove(&result.task_id);
+        self.add_pending_for_session(session_key, result).await;
+    }
+
+    /// Check if a task started by `session_key` is still running.
+    pub async fn is_running(&self, session_key: &str, task_id: &str) -> bool {
+        let tasks = self.tasks.read().await;
+        tasks
+            .get(task_id)
+            .is_some_and(|t| t.session_key == session_key)
+    }
+
+    /// Collect (and remove) the completed result of `task_id`, provided it
+    /// belongs to `session_key`. Collected results are not re-delivered at
+    /// the start of the next turn.
+    pub async fn try_collect_by_task(&self, session_key: &str, task_id: &str) -> Option<ExecResult> {
         let mut pending = self.pending_results.write().await;
-        let key = format!("task:{}", task_id);
-        if let Some(mut results) = pending.remove(&key) {
-            let result = results.pop();
-            tracing::info!(
-                task_id = %task_id,
-                found = result.is_some(),
-                remaining_in_list = results.len(),
-                "exec_pool: result collected from task key"
-            );
-            result
-        } else {
-            // Also try session key format (results stored from runtime.rs spawn)
-            tracing::debug!(
-                task_id = %task_id,
-                pending_keys = ?pending.keys().collect::<Vec<_>>(),
-                "exec_pool: task key not found, showing all pending keys"
-            );
-            None
+        let key = format!("session:{session_key}");
+        let results = pending.get_mut(&key)?;
+        let pos = results.iter().position(|r| r.task_id == task_id)?;
+        let result = results.remove(pos);
+        if results.is_empty() {
+            pending.remove(&key);
         }
+        tracing::debug!(task_id = %task_id, "exec_pool: result collected by task_id");
+        Some(result)
     }
 
     /// Collect all pending results for a session.
@@ -228,34 +105,18 @@ impl ExecPool {
         self: &Arc<Self>,
         session_key: &str,
     ) -> Vec<ExecResult> {
-        tracing::info!(
-            session_key = %session_key,
-            "exec_pool: collecting pending results for session"
-        );
         let mut pending = self.pending_results.write().await;
-        let key = format!("session:{}", session_key);
-
-        tracing::debug!(
-            session_key = %session_key,
-            key = %key,
-            all_keys = ?pending.keys().collect::<Vec<_>>(),
-            "exec_pool: checking pending_results keys"
-        );
-
-        if let Some(results) = pending.remove(&key) {
-            tracing::info!(
-                session_key = %session_key,
-                count = results.len(),
-                task_ids = ?results.iter().map(|r| &r.task_id).collect::<Vec<_>>(),
-                "exec_pool: collected results for session"
-            );
-            results
-        } else {
-            tracing::debug!(
-                session_key = %session_key,
-                "exec_pool: no results found for session key"
-            );
-            Vec::new()
+        let key = format!("session:{session_key}");
+        match pending.remove(&key) {
+            Some(results) => {
+                tracing::info!(
+                    session_key = %session_key,
+                    count = results.len(),
+                    "exec_pool: collected results for session"
+                );
+                results
+            }
+            None => Vec::new(),
         }
     }
 
@@ -268,32 +129,265 @@ impl ExecPool {
         tracing::info!(
             session_key = %session_key,
             task_id = %result.task_id,
-            tool_call_id = %result.tool_call_id,
             exit_code = ?result.exit_code,
             "exec_pool: adding pending result for session"
         );
         let mut pending = self.pending_results.write().await;
-        let key = format!("session:{}", session_key);
-        let entry = pending.entry(key).or_insert_with(Vec::new);
-        let prev_len = entry.len();
-        entry.push(result);
-        tracing::debug!(
-            session_key = %session_key,
-            prev_len = prev_len,
-            new_len = entry.len(),
-            "exec_pool: result added to pending queue"
-        );
+        pending
+            .entry(format!("session:{session_key}"))
+            .or_default()
+            .push(result);
     }
 
     /// Get the number of currently running tasks.
     pub async fn running_count(&self) -> usize {
-        let tasks = self.tasks.read().await;
-        tasks.len()
+        self.tasks.read().await.len()
     }
 
     /// Get the number of pending results.
     pub async fn pending_count(&self) -> usize {
         let pending = self.pending_results.read().await;
         pending.values().map(|v| v.len()).sum()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded child-process runner
+// ---------------------------------------------------------------------------
+
+/// Default per-stream capture cap for agent-run commands.
+pub(crate) const EXEC_OUTPUT_CAP: usize = 1024 * 1024;
+
+/// Output of a command run through [`run_capped`].
+#[derive(Debug, Default)]
+pub(crate) struct CappedOutput {
+    /// Exit status; `None` when the command timed out and was killed.
+    pub(crate) status: Option<std::process::ExitStatus>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
+    pub(crate) timed_out: bool,
+}
+
+impl CappedOutput {
+    /// Exit code, when the process exited normally.
+    pub(crate) fn code(&self) -> Option<i32> {
+        self.status.and_then(|s| s.code())
+    }
+
+    /// Lossy UTF-8 stdout with a truncation note appended when capped.
+    pub(crate) fn stdout_text(&self) -> String {
+        with_trunc_note(&self.stdout, self.stdout_truncated)
+    }
+
+    /// Lossy UTF-8 stderr with a truncation note appended when capped.
+    pub(crate) fn stderr_text(&self) -> String {
+        with_trunc_note(&self.stderr, self.stderr_truncated)
+    }
+}
+
+fn with_trunc_note(bytes: &[u8], truncated: bool) -> String {
+    let mut s = String::from_utf8_lossy(bytes).into_owned();
+    if truncated {
+        s.push_str(&format!(
+            "\n[output truncated at {} bytes — redirect to a file and read it in parts]",
+            bytes.len()
+        ));
+    }
+    s
+}
+
+/// Put the child in its own process group (Unix) so a timeout can kill the
+/// whole tree, not just the direct child (`sh -c` / PowerShell).
+pub(crate) fn isolate_process_group(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _unused = cmd;
+    }
+}
+
+/// Kill the process tree rooted at `pid` (best effort). On Unix the child
+/// must have been started with [`isolate_process_group`], making its pgid
+/// equal to its pid.
+pub(crate) fn kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        let res = std::process::Command::new("kill")
+            .args(["-s", "KILL", "--", &format!("-{pid}")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Err(e) = res {
+            tracing::warn!(pid, error = %e, "kill_process_tree: kill failed");
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let res = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Err(e) = res {
+            tracing::warn!(pid, error = %e, "kill_process_tree: taskkill failed");
+        }
+    }
+}
+
+/// Read `reader` to EOF keeping at most `cap` bytes. Keeps draining past the
+/// cap so the child never blocks on a full pipe.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    reader: Option<R>,
+    cap: usize,
+) -> (Vec<u8>, bool) {
+    let Some(mut r) = reader else {
+        return (Vec::new(), false);
+    };
+    let mut out = Vec::new();
+    let mut truncated = false;
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = cap.saturating_sub(out.len());
+                if n > room {
+                    truncated = true;
+                }
+                out.extend_from_slice(&buf[..n.min(room)]);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "read_capped: pipe read error");
+                break;
+            }
+        }
+    }
+    (out, truncated)
+}
+
+/// Spawn `cmd` and wait for it with a wall-clock `timeout`, capturing at
+/// most `cap` bytes of stdout and of stderr (stdio configuration set by the
+/// caller is overridden to piped; pass `capture_stderr = false` to discard
+/// stderr). The child runs in its own process group; on timeout the whole
+/// tree is killed. `kill_on_drop` is set so a cancelled caller also reaps it.
+pub(crate) async fn run_capped(
+    mut cmd: tokio::process::Command,
+    timeout: std::time::Duration,
+    cap: usize,
+    capture_stderr: bool,
+) -> std::io::Result<CappedOutput> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(if capture_stderr {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .kill_on_drop(true);
+    isolate_process_group(&mut cmd);
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let waited = tokio::time::timeout(timeout, async {
+        tokio::join!(
+            read_capped(stdout, cap),
+            read_capped(stderr, cap),
+            child.wait()
+        )
+    })
+    .await;
+
+    match waited {
+        Ok(((out, out_trunc), (err, err_trunc), status)) => Ok(CappedOutput {
+            status: Some(status?),
+            stdout: out,
+            stderr: err,
+            stdout_truncated: out_trunc,
+            stderr_truncated: err_trunc,
+            timed_out: false,
+        }),
+        Err(_) => {
+            if let Some(pid) = pid {
+                kill_process_tree(pid);
+            }
+            if let Err(e) = child.start_kill() {
+                tracing::debug!(error = %e, "run_capped: start_kill after timeout");
+            }
+            if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+                .await
+                .is_err()
+            {
+                tracing::warn!(?pid, "run_capped: child did not exit after kill");
+            }
+            Ok(CappedOutput {
+                timed_out: true,
+                ..Default::default()
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exec_pool_poll_by_task_is_session_scoped() {
+        let pool = ExecPool::new(1);
+        assert!(pool.try_begin("t1", "s1").await);
+        assert!(!pool.try_begin("t2", "s1").await, "limit enforced");
+        assert!(pool.is_running("s1", "t1").await);
+        assert!(!pool.is_running("s2", "t1").await);
+        let now = Instant::now();
+        pool.finish(
+            "s1".to_owned(),
+            ExecResult {
+                task_id: "t1".to_owned(),
+                tool_call_id: String::new(),
+                command: "true".to_owned(),
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                started_at: now,
+                completed_at: now,
+            },
+        )
+        .await;
+        assert!(!pool.is_running("s1", "t1").await);
+        assert!(pool.try_collect_by_task("s2", "t1").await.is_none());
+        assert!(pool.try_collect_by_task("s1", "t1").await.is_some());
+        assert!(pool.collect_pending_for_session("s1").await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_pool_run_capped_truncates_and_times_out() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "yes | head -c 100000"]);
+        let out = run_capped(cmd, std::time::Duration::from_secs(10), 1000, true)
+            .await
+            .expect("spawn");
+        assert_eq!(out.stdout.len(), 1000);
+        assert!(out.stdout_truncated);
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        let started = Instant::now();
+        let out = run_capped(cmd, std::time::Duration::from_millis(300), 1000, true)
+            .await
+            .expect("spawn");
+        assert!(out.timed_out);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 }

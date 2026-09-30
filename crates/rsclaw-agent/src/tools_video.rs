@@ -64,8 +64,21 @@ impl super::runtime::AgentRuntime {
                 images.push(img);
                 continue;
             }
-            // Treat as a local file path → base64 Data URI.
-            match tokio::fs::read(&img).await {
+            // Treat as a local file path → base64 Data URI. Scope-checked:
+            // the bytes are uploaded to the video provider.
+            let local = match self.resolve_readable_path(ctx, &img) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(path = %img, error = %e, "video_gen: image refused, skipping");
+                    continue;
+                }
+            };
+            match super::security::read_regular_file_capped(
+                &local,
+                super::security::MAX_LOCAL_BINARY_READ_BYTES,
+            )
+            .await
+            {
                 Ok(bytes) => {
                     use base64::Engine;
                     let mime = match std::path::Path::new(&img)
@@ -92,7 +105,8 @@ impl super::runtime::AgentRuntime {
         // rsclaw-video-v3 and sends this as a typed structure reference. Local
         // path / data-URI / http URL are accepted; local files are normalized
         // to a data URI like reference images.
-        let video_assets = normalize_gen_assets(&args["video"]).await;
+        let scope = self.read_scope(ctx);
+        let video_assets = normalize_gen_assets(&args["video"], &scope).await;
         let video_ref = video_assets.first().map(|s| s.as_str());
 
         // Resolve the configured video chain (head + optional fallbacks)
@@ -157,7 +171,7 @@ impl super::runtime::AgentRuntime {
                 .as_ref()
                 .and_then(|m| m.providers.get(prov))
                 .and_then(|p| p.api_key.as_ref())
-                .and_then(|k| k.as_plain().map(str::to_owned))
+                .and_then(|k| k.resolve_full(self.config.ops.secrets.as_ref()))
                 .or_else(|| std::env::var(env_name).ok())
         };
 
@@ -446,7 +460,7 @@ impl super::runtime::AgentRuntime {
                 .as_ref()
                 .and_then(|models| models.providers.get("rsclaw"))
                 .and_then(|provider| provider.api_key.as_ref())
-                .and_then(|key| key.as_plain().map(str::to_owned))
+                .and_then(|key| key.resolve_full(self.config.ops.secrets.as_ref()))
                 .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
                 .ok_or_else(|| {
                     anyhow!(
@@ -477,8 +491,9 @@ impl super::runtime::AgentRuntime {
         args: Value,
         ctx: &super::runtime::RunContext,
     ) -> Result<Value> {
-        let images = normalize_gen_assets(&args["image"]).await;
-        let audio = normalize_gen_assets(&args["audio"]).await;
+        let scope = self.read_scope(ctx);
+        let images = normalize_gen_assets(&args["image"], &scope).await;
+        let audio = normalize_gen_assets(&args["audio"], &scope).await;
         let Some(image_url) = images.first() else {
             return Ok(
                 json!({ "error": "avatar_gen: a character `image` is required (local path, https URL, or data URI)" }),
@@ -487,7 +502,7 @@ impl super::runtime::AgentRuntime {
         // Driving video (animate lane) — local path / data-URI / http URL all
         // accepted (normalised to a data-URI for local files, same as image/
         // audio).
-        let drive = normalize_gen_assets(&args["video"]).await;
+        let drive = normalize_gen_assets(&args["video"], &scope).await;
         let drive_video = drive.first();
         if audio.first().is_none() && drive_video.is_none() {
             return Ok(
@@ -523,7 +538,8 @@ impl super::runtime::AgentRuntime {
         args: Value,
         ctx: &super::runtime::RunContext,
     ) -> Result<Value> {
-        let images = normalize_gen_assets(&args["image"]).await;
+        let scope = self.read_scope(ctx);
+        let images = normalize_gen_assets(&args["image"], &scope).await;
         let Some(image_url) = images.first() else {
             return Ok(
                 json!({ "error": "mv_gen: a character `image` is required (local path, https URL, or data URI)" }),
@@ -568,7 +584,7 @@ impl super::runtime::AgentRuntime {
             .as_ref()
             .and_then(|m| m.providers.get("rsclaw"))
             .and_then(|p| p.api_key.as_ref())
-            .and_then(|k| k.as_plain().map(str::to_owned))
+            .and_then(|k| k.resolve_full(self.config.ops.secrets.as_ref()))
             .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
             .ok_or_else(|| {
                 anyhow!(
@@ -629,7 +645,10 @@ fn set_video_job_timeout(job: &mut rsclaw_types::ExternalJob) {
 /// URI with the mime inferred from the extension (image + audio + video).
 /// Unreadable paths are dropped. The rsclaw gen service accepts URL / data-URI
 /// / multipart for every asset slot, so a data-URI is always safe to send.
-pub(crate) async fn normalize_gen_assets(v: &Value) -> Vec<String> {
+pub(crate) async fn normalize_gen_assets(
+    v: &Value,
+    scope: &super::security::ReadScope,
+) -> Vec<String> {
     let raw: Vec<String> = match v {
         Value::String(s) if !s.is_empty() => vec![s.clone()],
         Value::Array(a) => a
@@ -647,7 +666,21 @@ pub(crate) async fn normalize_gen_assets(v: &Value) -> Vec<String> {
             out.push(asset);
             continue;
         }
-        match tokio::fs::read(&asset).await {
+        // Local paths are scope-checked: the bytes are uploaded to the gen
+        // service.
+        let local = match scope.resolve(&asset) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(path = %asset, error = %e, "gen: asset refused, skipping");
+                continue;
+            }
+        };
+        match super::security::read_regular_file_capped(
+            &local,
+            super::security::MAX_LOCAL_BINARY_READ_BYTES,
+        )
+        .await
+        {
             Ok(bytes) => {
                 use base64::Engine;
                 let mime = match std::path::Path::new(&asset)

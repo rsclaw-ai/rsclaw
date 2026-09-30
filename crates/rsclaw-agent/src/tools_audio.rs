@@ -29,7 +29,7 @@ impl super::runtime::AgentRuntime {
             .as_ref()
             .and_then(|m| m.providers.get("rsclaw"))
             .and_then(|p| p.api_key.as_ref())
-            .and_then(|k| k.as_plain().map(str::to_owned))
+            .and_then(|k| k.resolve_full(self.config.ops.secrets.as_ref()))
             .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
             .ok_or_else(|| {
                 anyhow!(

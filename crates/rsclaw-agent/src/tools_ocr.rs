@@ -11,7 +11,11 @@ use serde_json::{Value, json};
 impl super::runtime::AgentRuntime {
     /// OCR an image to verbatim text via the `kb.ocr` endpoint. Accepts a
     /// workspace/uploads file path, an http(s) URL, or a data URI.
-    pub(crate) async fn tool_ocr(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_ocr(
+        &self,
+        ctx: &super::runtime::RunContext,
+        args: Value,
+    ) -> Result<Value> {
         let image = args["image"].as_str().unwrap_or("").trim();
         if image.is_empty() {
             return Ok(json!({
@@ -34,9 +38,18 @@ impl super::runtime::AgentRuntime {
         {
             image.to_owned()
         } else {
-            let workspace = self.default_workspace();
-            let path = super::runtime::canonicalize_external_path(image, &workspace);
-            let bytes = match tokio::fs::read(&path).await {
+            // Scope-checked: the bytes are uploaded to the OCR endpoint, so
+            // non-owners must not be able to point this at host files.
+            let path = match self.resolve_readable_path(ctx, image) {
+                Ok(p) => p,
+                Err(e) => return Ok(json!({ "error": format!("ocr: {e}") })),
+            };
+            let bytes = match super::security::read_regular_file_capped(
+                &path,
+                super::security::MAX_LOCAL_READ_BYTES,
+            )
+            .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     return Ok(json!({

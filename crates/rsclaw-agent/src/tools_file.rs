@@ -9,8 +9,12 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use super::{
-    runtime::{canonicalize_external_path, expand_tilde, resolve_default_workspace},
-    security::{check_file_content_safety, check_read_safety, check_write_safety},
+    exec_pool::{EXEC_OUTPUT_CAP, run_capped},
+    runtime::{RunContext, resolve_default_workspace},
+    security::{
+        MAX_LOCAL_BINARY_READ_BYTES, MAX_LOCAL_READ_BYTES, ReadScope, check_file_content_safety,
+        check_write_safety, read_regular_file_capped, resolve_write_path,
+    },
 };
 
 /// Fix common LLM shell-writing mistakes around redirects that bash would
@@ -193,6 +197,106 @@ fn describe_fuzzy_diff(original: &str, _normalized: &str) -> String {
         "non-ASCII characters".to_owned()
     } else {
         hits.join(", ")
+    }
+}
+
+/// Device paths that are always fine to mention in a sandboxed command.
+const SANDBOX_SAFE_PATHS: &[&str] = &[
+    "/dev/null",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/stdin",
+    "/dev/tty",
+    "NUL",
+];
+
+/// Split a shell command into path-candidate words for the exec sandbox:
+/// whitespace, quotes, redirections, pipes, separators and `=` (so
+/// `--out=/etc/x` and `2>/etc/x` are both seen).
+fn sandbox_path_tokens(command: &str) -> Vec<String> {
+    command
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(c, '\'' | '"' | '`' | '=' | ';' | '|' | '&' | '(' | ')' | '<' | '>' | ',')
+        })
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `C:\...` / `C:/...` drive paths (absolute on Windows, relative-looking on
+/// Unix).
+fn has_drive_prefix(token: &str) -> bool {
+    let b = token.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
+}
+
+/// Detect references that expand to the home directory (or an arbitrary
+/// location) at run time and therefore escape a path-string sandbox:
+/// `~`, `$HOME`, `${...}` expansions, `%USERPROFILE%`, `$env:USERPROFILE`,
+/// and a bare `cd` (which changes to `$HOME`). Returns the offending piece.
+fn home_reference(command: &str) -> Option<String> {
+    let lower = command.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "$home",
+        "${",
+        "%userprofile%",
+        "%homepath%",
+        "%homedrive%",
+        "%appdata%",
+        "%localappdata%",
+        "$env:userprofile",
+        "$env:homepath",
+        "$env:homedrive",
+        "$env:home",
+        "$env:appdata",
+        "$env:localappdata",
+    ];
+    for m in MARKERS {
+        if lower.contains(m) {
+            return Some((*m).to_owned());
+        }
+    }
+    if let Some(t) = sandbox_path_tokens(command)
+        .into_iter()
+        .find(|t| t.starts_with('~'))
+    {
+        return Some(t);
+    }
+    static BARE_CD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:^|[;&|(\s])(?:cd|pushd)\s*(?:$|[;&|)])").expect("valid regex")
+    });
+    if BARE_CD.is_match(command) {
+        return Some("cd".to_owned());
+    }
+    None
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::{has_drive_prefix, home_reference, sandbox_path_tokens};
+
+    #[test]
+    fn exec_sandbox_detects_home_references() {
+        assert!(home_reference("cat ~/.ssh/id_rsa").is_some());
+        assert!(home_reference("cat $HOME/.rsclaw/rsclaw.json5").is_some());
+        assert!(home_reference("cat ${HOME}/x").is_some());
+        assert!(home_reference("type %USERPROFILE%\\.ssh\\id_rsa").is_some());
+        assert!(home_reference("Get-Content $env:USERPROFILE/x").is_some());
+        assert!(home_reference("cd && cat .ssh/id_rsa").is_some());
+        assert!(home_reference("cd; ls").is_some());
+        assert!(home_reference("ls -la src && cargo build").is_none());
+        assert!(home_reference("cd src && ls").is_none());
+    }
+
+    #[test]
+    fn exec_sandbox_tokens_split_redirects_and_options() {
+        let t = sandbox_path_tokens("echo hi 2>/etc/x --out=/tmp/y 'a b'");
+        assert!(t.contains(&"/etc/x".to_owned()));
+        assert!(t.contains(&"/tmp/y".to_owned()));
+        assert!(has_drive_prefix("C:/Windows"));
+        assert!(has_drive_prefix("d:\\x"));
+        assert!(!has_drive_prefix("https://x"));
     }
 }
 
@@ -480,16 +584,72 @@ impl super::runtime::AgentRuntime {
         )
     }
 
+    /// `tools.exec.safety` (default on).
+    pub(crate) fn exec_safety_enabled(&self) -> bool {
+        self.config
+            .ext
+            .tools
+            .as_ref()
+            .and_then(|t| t.exec.as_ref())
+            .and_then(|e| e.safety)
+            .unwrap_or(true)
+    }
+
+    /// Local-read policy for this turn (see [`ReadScope`]).
+    pub(crate) fn read_scope(&self, ctx: &RunContext) -> ReadScope {
+        ReadScope {
+            trust: ctx.turn_ctx.trust,
+            safety: self.exec_safety_enabled(),
+            workspace: self.default_workspace(),
+        }
+    }
+
+    /// Resolve a model-supplied local path for reading: non-owners are
+    /// confined to the workspace (incl. uploads), owners are kept away from
+    /// secret files. Every tool that reads a local path goes through this.
+    pub(crate) fn resolve_readable_path(
+        &self,
+        ctx: &RunContext,
+        path: &str,
+    ) -> Result<std::path::PathBuf> {
+        self.read_scope(ctx).resolve(path)
+    }
+
+    /// Resolve a model-supplied write target: always inside the agent
+    /// workspace, plus `RSCLAW_WRITE_ROOTS` for owners. Owners who turned
+    /// `tools.exec.safety` off keep unrestricted writes.
+    pub(crate) fn resolve_writable_path(
+        &self,
+        ctx: &RunContext,
+        path: &str,
+    ) -> Result<std::path::PathBuf> {
+        let workspace = self.default_workspace();
+        if ctx.turn_ctx.trust.is_owner() && !self.exec_safety_enabled() {
+            return Ok(rsclaw_util::canonicalize_external_path(path.trim(), &workspace));
+        }
+        // The workspace must exist for symlink-aware confinement to compare
+        // canonical paths.
+        if let Err(e) = std::fs::create_dir_all(&workspace) {
+            tracing::warn!(workspace = %workspace.display(), error = %e, "cannot create workspace");
+        }
+        let mut roots = vec![workspace];
+        if ctx.turn_ctx.trust.is_owner() {
+            roots.extend(super::security::extra_write_roots());
+        }
+        resolve_write_path(path, &roots)
+    }
+
     /// List files and directories in a path (structured alternative to `exec
     /// ls`). Uses [`safe_walk`] so a huge or pathological tree (symlink
     /// loops, deeply nested `node_modules`) cannot wedge the worker.
-    pub(crate) async fn tool_list_dir(&self, args: Value) -> Result<Value> {
-        let default_ws = self.default_workspace();
-        let path = args["path"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .map(expand_tilde)
-            .unwrap_or(default_ws);
+    pub(crate) async fn tool_list_dir(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let path = match args["path"].as_str().filter(|s| !s.trim().is_empty()) {
+            Some(p) => match self.resolve_readable_path(ctx, p) {
+                Ok(full) => full,
+                Err(e) => return Ok(json!({"error": e.to_string()})),
+            },
+            None => self.default_workspace(),
+        };
         let recursive = args["recursive"].as_bool().unwrap_or(false);
         let pattern_raw = args["pattern"].as_str().unwrap_or("*");
         // "*" means "no filter"; safe_walk treats None as "any entry"
@@ -570,13 +730,14 @@ impl super::runtime::AgentRuntime {
     /// with `node_modules` symlink loops or huge `target/` dirs because
     /// the iterator's blocking syscalls never yielded back to tokio for
     /// the dispatch_tool timeout to take effect.
-    pub(crate) async fn tool_search_file(&self, args: Value) -> Result<Value> {
-        let default_ws = self.default_workspace();
-        let root_path = args["path"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .map(expand_tilde)
-            .unwrap_or(default_ws);
+    pub(crate) async fn tool_search_file(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let root_path = match args["path"].as_str().filter(|s| !s.trim().is_empty()) {
+            Some(p) => match self.resolve_readable_path(ctx, p) {
+                Ok(full) => full,
+                Err(e) => return Ok(json!({"error": e.to_string()})),
+            },
+            None => self.default_workspace(),
+        };
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| anyhow!("search_file: `pattern` required"))?
@@ -645,13 +806,18 @@ impl super::runtime::AgentRuntime {
     /// and `multiline`). Falls back to `grep -rn` on Unix / `Select-String`
     /// on Windows when `rg` is not installed; `output_mode` and `multiline`
     /// are ignored on that path.
-    pub(crate) async fn tool_search_content(&self, args: Value) -> Result<Value> {
-        let default_ws = self.default_workspace();
-        let root_path = args["path"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .map(expand_tilde)
-            .unwrap_or(default_ws);
+    pub(crate) async fn tool_search_content(
+        &self,
+        ctx: &RunContext,
+        args: Value,
+    ) -> Result<Value> {
+        let root_path = match args["path"].as_str().filter(|s| !s.trim().is_empty()) {
+            Some(p) => match self.resolve_readable_path(ctx, p) {
+                Ok(full) => full,
+                Err(e) => return Ok(json!({"error": e.to_string()})),
+            },
+            None => self.default_workspace(),
+        };
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| anyhow!("search_content: `pattern` required"))?;
@@ -684,13 +850,22 @@ impl super::runtime::AgentRuntime {
             if let Some(inc) = include {
                 cmd.arg("--include").arg(inc);
             }
+            // Secret files never show up in results (added after `include`
+            // so an include glob cannot re-admit them).
+            for name in SEARCH_EXCLUDE_FILES {
+                cmd.arg(format!("--exclude={name}"));
+            }
+            for dir in SEARCH_EXCLUDE_DIRS {
+                cmd.arg(format!("--exclude-dir={dir}"));
+            }
             cmd.arg("--").arg(pattern).arg(root_path.as_os_str());
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::null());
-            tokio::time::timeout(Duration::from_secs(15), cmd.output())
+            let out = run_capped(cmd, Duration::from_secs(15), EXEC_OUTPUT_CAP, false)
                 .await
-                .map_err(|_| anyhow!("search_content: grep timed out after 15s. Narrow `path` to a smaller directory or add an `include` filter, then retry."))?
-                .map_err(|e| anyhow!("search_content: {e}"))?
+                .map_err(|e| anyhow!("search_content: {e}"))?;
+            if out.timed_out {
+                bail!("search_content: grep timed out after 15s. Narrow `path` to a smaller directory or add an `include` filter, then retry.");
+            }
+            out
         };
 
         #[cfg(target_os = "windows")]
@@ -706,23 +881,29 @@ impl super::runtime::AgentRuntime {
             // PowerShell injection.
             let safe_path = root_path.display().to_string().replace('\'', "''");
             let safe_pattern = pattern.replace('\'', "''");
+            let exclude = SEARCH_EXCLUDE_FILES
+                .iter()
+                .map(|n| format!("'{}'", n.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
             let ps_cmd = format!(
-                "Get-ChildItem -Path '{safe_path}' -Recurse{inc_filter} -File | Select-String -Pattern '{safe_pattern}'{case_flag} | Select-Object -First {max_results} | ForEach-Object {{ \"$($_.Path)\t$($_.LineNumber)\t$($_.Line)\" }}"
+                "Get-ChildItem -Path '{safe_path}' -Recurse{inc_filter} -Exclude {exclude} -File | Select-String -Pattern '{safe_pattern}'{case_flag} | Select-Object -First {max_results} | ForEach-Object {{ \"$($_.Path)\t$($_.LineNumber)\t$($_.Line)\" }}"
             );
             ps_args.push(ps_cmd);
             let mut cmd = tokio::process::Command::new("powershell");
             cmd.args(&ps_args);
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::null());
             #[cfg(target_os = "windows")]
             {
                 use std::os::windows::process::CommandExt;
                 cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
             }
-            tokio::time::timeout(Duration::from_secs(15), cmd.output())
+            let out = run_capped(cmd, Duration::from_secs(15), EXEC_OUTPUT_CAP, false)
                 .await
-                .map_err(|_| anyhow!("search_content: Select-String timed out after 15s. Narrow `path` to a smaller directory or add an `include` filter, then retry."))?
-                .map_err(|e| anyhow!("search_content: {e}"))?
+                .map_err(|e| anyhow!("search_content: {e}"))?;
+            if out.timed_out {
+                bail!("search_content: Select-String timed out after 15s. Narrow `path` to a smaller directory or add an `include` filter, then retry.");
+            }
+            out
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -759,34 +940,22 @@ impl super::runtime::AgentRuntime {
     }
 
     /// Read a file, with special handling for PDF and Office documents.
-    pub(crate) async fn tool_read(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_read(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let path = args["path"]
             .as_str()
             .or_else(|| args["file_path"].as_str())
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
             .ok_or_else(|| anyhow!("read: `path` required"))?;
-        let workspace = self.default_workspace();
 
-        let full = canonicalize_external_path(path, &workspace);
-
-        // Safety: block reading sensitive files
-        let safety_enabled = self
-            .config
-            .ext
-            .tools
-            .as_ref()
-            .and_then(|t| t.exec.as_ref())
-            .and_then(|e| e.safety)
-            .unwrap_or(true);
-        if safety_enabled {
-            check_read_safety(path, &full)?;
-        }
+        // Scope: non-owners stay inside the workspace; secret files are
+        // refused for everyone (unless an owner disabled tools.exec.safety).
+        let full = self.resolve_readable_path(ctx, path)?;
 
         let lower = path.to_lowercase();
         // Binary file types: extract text instead of raw read
         if lower.ends_with(".pdf") {
-            let pdf_bytes = tokio::fs::read(&full)
+            let pdf_bytes = read_regular_file_capped(&full, MAX_LOCAL_BINARY_READ_BYTES)
                 .await
                 .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
             let content = match crate::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
@@ -817,7 +986,7 @@ impl super::runtime::AgentRuntime {
             return Ok(json!({"content": content, "path": path}));
         }
         if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
-            let bytes = tokio::fs::read(&full)
+            let bytes = read_regular_file_capped(&full, MAX_LOCAL_BINARY_READ_BYTES)
                 .await
                 .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
             if let Some(text) = rsclaw_channel::extract_office_text(path, &bytes) {
@@ -829,9 +998,18 @@ impl super::runtime::AgentRuntime {
             );
         }
 
-        let content = tokio::fs::read_to_string(&full)
+        // Regular files only (a FIFO would hang, `/dev/zero` would OOM), and
+        // bounded: huge logs should be searched or sliced, not slurped.
+        let bytes = read_regular_file_capped(&full, MAX_LOCAL_READ_BYTES)
             .await
-            .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
+            .map_err(|e| {
+                anyhow!(
+                    "read `{path}`: {e}. For very large files use search_content, or shell `head`/`tail`/`sed -n` to read a slice."
+                )
+            })?;
+        let content = String::from_utf8(bytes).map_err(|e| {
+            anyhow!("read `{}`: file is not valid UTF-8 text: {e}", full.display())
+        })?;
 
         // Pagination: 1-indexed `offset` line + `limit` lines (default 2000).
         // Cheap path: when neither is set AND the file is small, skip the
@@ -891,7 +1069,7 @@ impl super::runtime::AgentRuntime {
     }
 
     /// Write content to a file, creating parent directories as needed.
-    pub(crate) async fn tool_write(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_write(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         // Check if this is a malformed JSON case from streaming
         if let Some(parse_error) = args.get("_parse_error").and_then(|v| v.as_str()) {
             tracing::warn!("tool_write: received malformed JSON from model");
@@ -964,20 +1142,10 @@ impl super::runtime::AgentRuntime {
                 }));
             }
         }
-        let workspace = self.default_workspace();
-
-        let full = canonicalize_external_path(&path, &workspace);
-
-        // Safety: block sensitive paths (only when tools.exec.safety = true)
-        let safety_enabled = self
-            .config
-            .ext
-            .tools
-            .as_ref()
-            .and_then(|t| t.exec.as_ref())
-            .and_then(|e| e.safety)
-            .unwrap_or(true);
-        if safety_enabled {
+        // Confinement: the target must resolve inside the workspace (or an
+        // owner write root); then the sensitive-name / content checks.
+        let full = self.resolve_writable_path(ctx, &path)?;
+        if self.exec_safety_enabled() || !ctx.turn_ctx.trust.is_owner() {
             check_write_safety(&path, &full, &content)?;
         }
 
@@ -990,10 +1158,11 @@ impl super::runtime::AgentRuntime {
         Ok(json!({"written": true, "path": path, "bytes": content.len()}))
     }
 
-    /// Poll a background exec task by task_id.
-    async fn exec_poll_task(&self, task_id: &str) -> Result<Value> {
+    /// Poll a background exec task by task_id (only tasks started from the
+    /// same session are visible).
+    async fn exec_poll_task(&self, session_key: &str, task_id: &str) -> Result<Value> {
         // Check if still running
-        if self.exec_pool.is_running(task_id).await {
+        if self.exec_pool.is_running(session_key, task_id).await {
             return Ok(json!({
                 "task_id": task_id,
                 "status": "running",
@@ -1001,7 +1170,11 @@ impl super::runtime::AgentRuntime {
             }));
         }
         // Try to collect result
-        if let Some(result) = self.exec_pool.try_collect_by_task(task_id).await {
+        if let Some(result) = self
+            .exec_pool
+            .try_collect_by_task(session_key, task_id)
+            .await
+        {
             let is_error = result.exit_code.map(|c| c != 0).unwrap_or(true);
             let mut payload = json!({
                 "task_id": task_id,
@@ -1039,7 +1212,7 @@ impl super::runtime::AgentRuntime {
 
         // Poll existing task
         if let Some(task_id) = args["task_id"].as_str() {
-            return self.exec_poll_task(task_id).await;
+            return self.exec_poll_task(&ctx.session_key, task_id.trim()).await;
         }
         // Default to synchronous: most commands (osascript, grep, ls) finish in
         // seconds. Background is an explicit opt-in for long-running tasks.
@@ -1084,14 +1257,7 @@ impl super::runtime::AgentRuntime {
         let command = command.as_str();
 
         // Safety check (only when tools.exec.safety = true)
-        let safety_enabled = self
-            .config
-            .ext
-            .tools
-            .as_ref()
-            .and_then(|t| t.exec.as_ref())
-            .and_then(|e| e.safety)
-            .unwrap_or(true);
+        let safety_enabled = self.exec_safety_enabled();
 
         if safety_enabled {
             let preparse = crate::preparse::PreParseEngine::load_with_safety(true);
@@ -1131,7 +1297,10 @@ impl super::runtime::AgentRuntime {
         // Interpreter file scan + sandbox (only when safety enabled)
         if safety_enabled {
             let cmd_tokens: Vec<&str> = command.split_whitespace().collect();
-            const INTERPRETERS: &[&str] = &[
+            // Only shell interpreters get a content pre-scan: the safety
+            // rules are shell-command regexes, so scanning Python/JS sources
+            // would reject ordinary code (`def shutdown()`).
+            const SHELL_INTERPRETERS: &[&str] = &[
                 "bash",
                 "sh",
                 "zsh",
@@ -1139,19 +1308,11 @@ impl super::runtime::AgentRuntime {
                 "dash",
                 "csh",
                 "tcsh",
-                "python",
-                "python3",
-                "python2",
-                "ruby",
-                "perl",
-                "node",
-                "bun",
-                "deno",
                 "powershell",
                 "pwsh",
             ];
             if let Some(first) = cmd_tokens.first() {
-                if INTERPRETERS
+                if SHELL_INTERPRETERS
                     .iter()
                     .any(|i| first.ends_with(i) || *first == *i)
                 {
@@ -1173,8 +1334,21 @@ impl super::runtime::AgentRuntime {
             } else {
                 workspace.clone()
             };
-            for token in command.split_whitespace() {
-                let is_abs = std::path::Path::new(token).is_absolute();
+            if let Some(reason) = home_reference(command) {
+                bail!(
+                    "[sandbox] access denied: `{reason}` refers to a location outside the workspace `{}`. Use paths under the workspace, or ask the user to relax `tools.exec.safety` if outside access is intended.",
+                    ws_canon.display()
+                );
+            }
+            for token in sandbox_path_tokens(command) {
+                let token = token.as_str();
+                let is_abs = std::path::Path::new(token).is_absolute()
+                    || token.starts_with('/')
+                    || token.starts_with('\\')
+                    || has_drive_prefix(token);
+                if SANDBOX_SAFE_PATHS.iter().any(|p| token.eq_ignore_ascii_case(p)) {
+                    continue;
+                }
                 if is_abs || token.contains("..") {
                     let resolved = if is_abs {
                         std::path::PathBuf::from(token)
@@ -1291,13 +1465,22 @@ impl super::runtime::AgentRuntime {
                 );
             }
         }
-        cmd.args(&shell_args)
-            .arg(command)
-            .current_dir(&workspace)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+        // Secret hygiene: the child must not inherit provider/channel keys
+        // and tokens from the gateway env (a prompt-injected `env` or
+        // `curl -d "$OPENAI_API_KEY"` would exfiltrate them). Vars the
+        // operator put in the config `env` block, or listed in
+        // RSCLAW_EXEC_PASS_ENV, are deliberately exposed and kept.
+        let explicit_env: std::collections::HashSet<String> = self
+            .config
+            .raw
+            .env
+            .as_ref()
+            .map(|e| e.0.keys().cloned().collect())
+            .unwrap_or_default();
+        for name in super::security::secret_env_to_strip(&explicit_env) {
+            cmd.env_remove(name);
+        }
+        cmd.args(&shell_args).arg(command).current_dir(&workspace);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -1305,33 +1488,32 @@ impl super::runtime::AgentRuntime {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
         let task_id = uuid::Uuid::new_v4().to_string();
+        let timeout = std::time::Duration::from_secs(timeout_secs);
 
         if wait {
-            // Synchronous execution — wait for result.
-            let output = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                cmd.output()
-            )
-            .await
-            .map_err(|_| {
+            // Synchronous execution — wait for result. Output is capped per
+            // stream and the whole process tree is killed on timeout.
+            let output = run_capped(cmd, timeout, EXEC_OUTPUT_CAP, true)
+                .await
+                .map_err(|e| anyhow!("exec `{command}`: {e}"))?;
+            if output.timed_out {
                 tracing::warn!(command = %command, timeout_secs, "exec: timed out");
-                anyhow!(
+                bail!(
                     "Command timed out after {timeout_secs}s. Re-run with `wait: false` to run it in the background (results arrive next turn), or pass a larger `timeout` (up to 300s)."
-                )
-            })?
-            .map_err(|e| anyhow!("exec `{command}`: {e}"))?;
+                );
+            }
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
+            let stdout = output.stdout_text();
+            let stderr = output.stderr_text();
+            tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.code(), stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
 
             let mut result = json!({
                 "task_id": task_id,
-                "exit_code": output.status.code(),
+                "exit_code": output.code(),
                 "stdout": stdout,
                 "stderr": stderr,
             });
-            if output.status.code().map(|c| c != 0).unwrap_or(true)
+            if output.code().map(|c| c != 0).unwrap_or(true)
                 && let Some(hint) = extract_cli_hint(&stderr)
             {
                 result["hint"] = json!(hint);
@@ -1339,41 +1521,39 @@ impl super::runtime::AgentRuntime {
             Ok(result)
         } else {
             // Background execution — spawn and return task_id immediately.
-            // The result will be collected by exec_pool on the next turn.
+            // The result will be collected by exec_pool on the next turn, or
+            // polled with `task_id`.
             let pool = std::sync::Arc::clone(&ctx.exec_pool);
             let session_key = ctx.session_key.clone();
             let tool_call_id_owned = tool_call_id.to_owned();
             let command_owned = command.to_owned();
 
+            if !pool.try_begin(&task_id, &session_key).await {
+                bail!(
+                    "Too many background commands are already running ({} in flight). Wait for one to finish (poll it with its task_id) before starting another, or run this one with `wait: true`.",
+                    pool.running_count().await
+                );
+            }
             tracing::info!(task_id = %task_id, command = %command, "exec: spawning background task");
 
             let tid = task_id.clone();
             tokio::spawn(async move {
                 let started_at = std::time::Instant::now();
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
-                    cmd.output(),
-                )
-                .await;
+                let result = run_capped(cmd, timeout, EXEC_OUTPUT_CAP, true).await;
 
                 let (exit_code, stdout, stderr) = match result {
-                    Ok(Ok(output)) => {
-                        let exit_code = output.status.code();
-                        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-                        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                        (exit_code, stdout, stderr)
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!(task_id = %tid, "exec background spawn failed: {}", e);
-                        (None, String::new(), format!("spawn error: {}", e))
-                    }
-                    Err(_) => {
+                    Ok(output) if output.timed_out => {
                         tracing::warn!(task_id = %tid, timeout_secs, "exec background timed out");
                         (
                             None,
                             String::new(),
                             format!("timed out after {} seconds", timeout_secs),
                         )
+                    }
+                    Ok(output) => (output.code(), output.stdout_text(), output.stderr_text()),
+                    Err(e) => {
+                        tracing::error!(task_id = %tid, "exec background spawn failed: {}", e);
+                        (None, String::new(), format!("spawn error: {}", e))
                     }
                 };
 
@@ -1397,7 +1577,7 @@ impl super::runtime::AgentRuntime {
                     completed_at,
                 };
 
-                pool.add_pending_for_session(session_key, exec_result).await;
+                pool.finish(session_key, exec_result).await;
             });
 
             Ok(json!({
@@ -1414,7 +1594,7 @@ impl super::runtime::AgentRuntime {
     /// Fails fast if `old_string` is absent or non-unique (unless
     /// `replace_all`). The agent is expected to `read_file` first so it can
     /// copy a verbatim substring; the check is not enforced server-side.
-    pub(crate) async fn tool_edit(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_edit(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let path = args["path"]
             .as_str()
             .or_else(|| args["file_path"].as_str())
@@ -1434,20 +1614,18 @@ impl super::runtime::AgentRuntime {
             bail!("edit_file: `old_string` and `new_string` are identical — no change requested");
         }
 
-        let workspace = self.default_workspace();
-        let full = canonicalize_external_path(path, &workspace);
-
-        let safety_enabled = self
-            .config
-            .ext
-            .tools
-            .as_ref()
-            .and_then(|t| t.exec.as_ref())
-            .and_then(|e| e.safety)
-            .unwrap_or(true);
-        let content = tokio::fs::read_to_string(&full)
+        // Resolve and vet the target BEFORE reading it, so an edit cannot be
+        // used to probe files outside the write scope.
+        let full = self.resolve_writable_path(ctx, path)?;
+        let safety_enabled = self.exec_safety_enabled() || !ctx.turn_ctx.trust.is_owner();
+        if safety_enabled {
+            check_write_safety(path, &full, "")?;
+        }
+        let bytes = read_regular_file_capped(&full, MAX_LOCAL_READ_BYTES)
             .await
-            .map_err(|e| anyhow!("edit_file: cannot read `{}`: {e}", full.display()))?;
+            .map_err(|e| anyhow!("edit_file: cannot read `{path}`: {e}"))?;
+        let content = String::from_utf8(bytes)
+            .map_err(|e| anyhow!("edit_file: `{path}` is not valid UTF-8 text: {e}"))?;
 
         let count = content.matches(old_string).count();
         if count == 0 {
@@ -1506,6 +1684,30 @@ impl super::runtime::AgentRuntime {
     }
 }
 
+/// File-name globs excluded from `search_content` (secrets).
+const SEARCH_EXCLUDE_FILES: &[&str] = &[
+    "rsclaw*.json5*",
+    "openclaw*.json*",
+    "auth-profiles.json*",
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "id_rsa*",
+    "id_ed25519*",
+    "id_ecdsa*",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".pgpass",
+    "credentials",
+    "credentials.json",
+];
+
+/// Directory names excluded from `search_content` (secret stores).
+const SEARCH_EXCLUDE_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube", ".docker", "credentials"];
+
 /// Check whether `ripgrep` (`rg`) is on PATH. Re-checked per call (~20 ms);
 /// the cost is dwarfed by the actual search and avoids a global mutable.
 async fn has_ripgrep() -> bool {
@@ -1513,14 +1715,20 @@ async fn has_ripgrep() -> bool {
     let mut rg_cmd = tokio::process::Command::new("rg");
     rg_cmd
         .arg("--version")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         rg_cmd.creation_flags(0x08000000);
     }
-    rg_cmd.status().await.map(|s| s.success()).unwrap_or(false)
+    tokio::time::timeout(Duration::from_secs(5), rg_cmd.status())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .is_some_and(|s| s.success())
 }
 
 /// Run a ripgrep search with full support for `output_mode` and `multiline`.
@@ -1562,14 +1770,23 @@ async fn run_ripgrep(
         cmd.arg("--glob").arg(inc);
     }
 
-    cmd.arg("--").arg(pattern).arg(root);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
+    // Secret files never show up in results. rg: later globs take
+    // precedence, so these come after the caller's `include`.
+    for name in SEARCH_EXCLUDE_FILES {
+        cmd.arg("--glob").arg(format!("!{name}"));
+    }
+    for dir in SEARCH_EXCLUDE_DIRS {
+        cmd.arg("--glob").arg(format!("!{dir}/**"));
+    }
 
-    let output = tokio::time::timeout(Duration::from_secs(15), cmd.output())
+    cmd.arg("--").arg(pattern).arg(root);
+
+    let output = run_capped(cmd, Duration::from_secs(15), EXEC_OUTPUT_CAP, false)
         .await
-        .map_err(|_| anyhow!("search_content: ripgrep timed out after 15s. Narrow `path` to a smaller directory or add an `include` glob, then retry."))?
         .map_err(|e| anyhow!("search_content: {e}"))?;
+    if output.timed_out {
+        bail!("search_content: ripgrep timed out after 15s. Narrow `path` to a smaller directory or add an `include` glob, then retry.");
+    }
 
     let text = String::from_utf8_lossy(&output.stdout);
     let results: Vec<String> = text.lines().take(max_results).map(String::from).collect();

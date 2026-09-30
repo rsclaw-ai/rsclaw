@@ -83,13 +83,43 @@ impl AgentRuntime {
                         let hits = kb
                             .search(&probe_query, &[cid.clone()], 3, 0.0)
                             .unwrap_or_default();
+                        // `hit.score` is a fused RRF / min-max-normalized
+                        // rerank score (RRF ~0.016..0.033; a reranked top hit
+                        // is ~1.0 by construction), so it is NOT a similarity
+                        // and cannot be thresholded. Measure real cosine
+                        // similarity between the probe and each candidate's
+                        // chunk vectors instead (same embedder, doc-side, no
+                        // query instruction — a symmetric comparison).
                         const NEAR_DUP_THRESHOLD: f32 = 0.85;
-                        if let Some(top) = hits.iter().find(|h| h.score >= NEAR_DUP_THRESHOLD) {
+                        let near = if hits.is_empty() {
+                            None
+                        } else {
+                            match kb.embedder().embed_batch(std::slice::from_ref(&probe_query)) {
+                                Ok(mut v) if v.first().is_some_and(|p| p.iter().any(|x| *x != 0.0)) => {
+                                    let probe_vec = v.swap_remove(0);
+                                    hits.iter().find_map(|h| {
+                                        let chunks = kb.doc_chunks(&h.doc_id).ok()?;
+                                        let best = chunks
+                                            .iter()
+                                            .filter(|c| c.vector.len() == probe_vec.len())
+                                            .map(|c| rsclaw_kb::search::cosine_sim(&probe_vec, &c.vector))
+                                            .fold(f32::NEG_INFINITY, f32::max);
+                                        (best >= NEAR_DUP_THRESHOLD).then_some((h, best))
+                                    })
+                                }
+                                Ok(_) => None,
+                                Err(e) => {
+                                    tracing::warn!("kb add: near-duplicate probe embed failed: {e:#}");
+                                    None
+                                }
+                            }
+                        };
+                        if let Some((top, similarity)) = near {
                             return Ok(json!({
                                 "status": "near_duplicate",
                                 "existing_doc_id": top.doc_id,
                                 "existing_title": top.source_title,
-                                "score": top.score,
+                                "score": similarity,
                                 "collection_id": cid,
                                 "hint": "A semantically similar doc already exists. Re-call with `force: true` to add anyway, or `action: delete` the existing doc first.",
                             }));
@@ -196,11 +226,7 @@ impl AgentRuntime {
         if query.is_empty() {
             return Ok(json!({"results": [], "note": "empty query"}));
         }
-        let default_scope = default_memory_scope(&ctx.agent_id, &ctx.channel);
-        let scope = args["scope"]
-            .as_str()
-            .map(|s| normalize_memory_scope(s, &ctx.agent_id))
-            .unwrap_or(default_scope);
+        let scope = caller_memory_scope(ctx, args["scope"].as_str());
         let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 25) as usize;
 
         let Some(ref mem) = self.memory else {
@@ -354,15 +380,19 @@ impl AgentRuntime {
         bundle
     }
 
-    pub(crate) async fn tool_memory_get(&self, args: Value) -> Result<Value> {
-        let id = args["id"].as_str().unwrap_or("").to_owned();
+    pub(crate) async fn tool_memory_get(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let id = args["id"].as_str().unwrap_or("").trim().to_owned();
         let Some(ref mem) = self.memory else {
             return Ok(json!({"error": "memory store not available"}));
         };
         let store = mem.lock().await;
         match store.get(&id).await? {
-            Some(d) => Ok(json!({"id": d.id, "scope": d.scope, "kind": d.kind, "text": d.text})),
-            None => Ok(json!({"error": "not found", "id": id})),
+            // Non-owners only see docs in their own scope; anything else is
+            // reported as missing so ids cannot be probed.
+            Some(d) if memory_scope_visible(ctx, &d.scope) => {
+                Ok(json!({"id": d.id, "scope": d.scope, "kind": d.kind, "text": d.text}))
+            }
+            _ => Ok(json!({"error": "not found", "id": id})),
         }
     }
 
@@ -373,14 +403,14 @@ impl AgentRuntime {
         }
         // Internal channels (heartbeat/cron/system) get a separate scope so
         // their memories don't pollute normal conversation auto-recall.
-        let default_scope = default_memory_scope(&ctx.agent_id, &ctx.channel);
-        let scope = args["scope"]
-            .as_str()
-            .map(|s| normalize_memory_scope(s, &ctx.agent_id))
-            .unwrap_or(default_scope);
+        let scope = caller_memory_scope(ctx, args["scope"].as_str());
         let kind = normalize_memory_kind(args["kind"].as_str());
+        // Non-owners cannot choose ids (that would let them overwrite a doc
+        // in another scope).
         let id = args["id"]
             .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && ctx.turn_ctx.trust.is_owner())
             .map(str::to_owned)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let mut importance = default_memory_importance(&kind);
@@ -444,8 +474,10 @@ impl AgentRuntime {
             tracing::warn!("BM25 index failed for memory_put doc: {e:#}");
         }
         // Only append to MEMORY.md for user-initiated /remember commands,
-        // not for automatic memory_put calls by the model.
-        if kind != "remember" {
+        // not for automatic memory_put calls by the model. MEMORY.md is
+        // loaded into every conversation's prompt, so non-owners never
+        // write it.
+        if kind != "remember" || !ctx.turn_ctx.trust.is_owner() {
             return Ok(
                 json!({"stored": true, "id": effective_id, "scope": effective_scope, "kind": effective_kind}),
             );
@@ -465,11 +497,7 @@ impl AgentRuntime {
                     .to_string_lossy()
                     .into_owned()
             });
-        let ws = if ws_str.starts_with('~') {
-            dirs_next::home_dir().unwrap_or_default().join(&ws_str[2..])
-        } else {
-            std::path::PathBuf::from(&ws_str)
-        };
+        let ws = rsclaw_util::expand_tilde(&ws_str);
         let memory_path = ws.join("MEMORY.md");
         let entry = format!(
             "\n## {}\n{}\n",
@@ -489,15 +517,23 @@ impl AgentRuntime {
         )
     }
 
-    pub(crate) async fn tool_memory_delete(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_memory_delete(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let id = args["id"]
             .as_str()
             .ok_or_else(|| anyhow!("memory_delete: `id` required"))?
+            .trim()
             .to_owned();
         let Some(ref mem) = self.memory else {
             return Ok(json!({"error": "memory store not available"}));
         };
-        mem.lock().await.delete(&id).await?;
+        {
+            let mut store = mem.lock().await;
+            match store.get(&id).await? {
+                Some(d) if memory_scope_visible(ctx, &d.scope) => {}
+                _ => return Ok(json!({"error": "not found", "id": id})),
+            }
+            store.delete(&id).await?;
+        }
         // Also remove from tantivy BM25 index.
         if let Err(e) = self
             .store
@@ -568,6 +604,31 @@ fn rrf_fuse(
         .collect();
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     ranked.into_iter().take(top_k).map(|(_, doc)| doc).collect()
+}
+
+/// Private memory scope of a non-owner sender:
+/// `agent:<id>:peer:<channel>:<peer>`.
+pub(crate) fn peer_memory_scope(agent_id: &str, channel: &str, peer_id: &str) -> String {
+    format!("agent:{agent_id}:peer:{channel}:{peer_id}")
+}
+
+/// Scope a memory tool call operates on. Owners may pass `scope` (default:
+/// the agent scope). Non-owners are pinned to their own peer scope — they
+/// can neither read other scopes nor write into the agent-wide scope that
+/// is auto-recalled into the owner's conversations.
+pub(crate) fn caller_memory_scope(ctx: &RunContext, requested: Option<&str>) -> String {
+    if ctx.turn_ctx.trust.is_owner() {
+        return requested
+            .map(|s| normalize_memory_scope(s, &ctx.agent_id))
+            .unwrap_or_else(|| default_memory_scope(&ctx.agent_id, &ctx.channel));
+    }
+    peer_memory_scope(&ctx.agent_id, &ctx.channel, &ctx.peer_id)
+}
+
+/// Whether a doc in `scope` may be read / deleted by this turn's sender.
+fn memory_scope_visible(ctx: &RunContext, scope: &str) -> bool {
+    ctx.turn_ctx.trust.is_owner()
+        || scope == peer_memory_scope(&ctx.agent_id, &ctx.channel, &ctx.peer_id)
 }
 
 pub(crate) fn default_memory_scope(agent_id: &str, channel: &str) -> String {

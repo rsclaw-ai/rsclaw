@@ -12,7 +12,120 @@ use serde_json::{Value, json};
 use tracing::debug;
 use uuid::Uuid;
 
+// Serializes every read-modify-write of the cron job list made through the
+// agent tool (concurrent turns would otherwise lose each other's updates).
+// This is the process-wide cron lock shared with the HTTP / WS handlers and
+// the cron runner, so tool writes cannot interleave with theirs either.
+use rsclaw_cron::CRON_FILE_LOCK as CRON_RMW_LOCK;
+
+/// Delivery channel name for a turn channel (`ws` turns deliver to the
+/// `desktop` sink).
+fn delivery_channel_for(channel: &str) -> &str {
+    if channel == "ws" { "desktop" } else { channel }
+}
+
+/// Whether the caller may see / change every job: owners on local entry
+/// points (desktop, CLI, API, cron itself).
+fn cron_sees_all(ctx: &super::runtime::RunContext) -> bool {
+    ctx.turn_ctx.trust.is_owner() && crate::trust::is_local_channel(&ctx.channel)
+}
+
+/// True when `job` was created by the caller's channel + peer. Jobs record
+/// `createdBy`; older jobs fall back to their auto-set delivery target.
+fn cron_job_owned_by(job: &Value, ctx: &super::runtime::RunContext) -> bool {
+    if ctx.peer_id.is_empty() {
+        return false;
+    }
+    if let Some(cb) = job.get("createdBy") {
+        return cb["channel"].as_str() == Some(ctx.channel.as_str())
+            && cb["peer"].as_str() == Some(ctx.peer_id.as_str());
+    }
+    job["delivery"]["channel"].as_str() == Some(delivery_channel_for(&ctx.channel))
+        && job["delivery"]["to"].as_str() == Some(ctx.peer_id.as_str())
+}
+
+/// Indices (into the full job list) the caller may see, in list order.
+fn visible_cron_indices(jobs: &[Value], ctx: &super::runtime::RunContext) -> Vec<usize> {
+    let all = cron_sees_all(ctx);
+    jobs.iter()
+        .enumerate()
+        .filter(|(_, j)| all || cron_job_owned_by(j, ctx))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Resolve the `index` (1-based, over the caller's visible jobs) or `id`
+/// argument to a position in the full job list.
+fn resolve_cron_target(
+    jobs: &[Value],
+    visible: &[usize],
+    args: &Value,
+    action: &str,
+) -> Result<usize> {
+    if let Some(index) = args["index"].as_u64() {
+        let idx = index as usize;
+        if idx == 0 || idx > visible.len() {
+            return Err(anyhow!(
+                "cron {action}: index {index} out of range — {} job(s) visible; run action=list to get fresh 1-based indexes (if 0 jobs, there is nothing to change)",
+                visible.len()
+            ));
+        }
+        return Ok(visible[idx - 1]);
+    }
+    if let Some(id) = args["id"].as_str().map(str::trim) {
+        return visible
+            .iter()
+            .copied()
+            .find(|&i| jobs[i]["id"].as_str() == Some(id))
+            .ok_or_else(|| {
+                anyhow!(
+                    "cron {action}: no job with id={id} — ids are often truncated in chat; run action=list and use `index` instead"
+                )
+            });
+    }
+    Err(anyhow!(
+        "cron {action}: `index` or `id` required (index is preferred)"
+    ))
+}
+
+/// Validate a requested target agent: only the current agent, unless the
+/// caller is an owner on a local channel.
+fn cron_target_agent<'a>(
+    requested: Option<&'a str>,
+    ctx: &'a super::runtime::RunContext,
+) -> Result<&'a str> {
+    match requested.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(ctx.agent_id.as_str()),
+        Some(a) if a == ctx.agent_id => Ok(a),
+        Some(a) if cron_sees_all(ctx) => Ok(a),
+        Some(a) => Err(anyhow!(
+            "cron: scheduling jobs for agent `{a}` is not allowed from this conversation; omit agentId to schedule for the current agent"
+        )),
+    }
+}
+
 impl super::runtime::AgentRuntime {
+    /// Ask the running gateway to reload cron jobs after a tool-side write.
+    /// Sends the gateway bearer token (when configured) plus the local
+    /// request marker so the endpoint accepts the call; failures are logged
+    /// and never fail the tool call.
+    async fn notify_cron_reload(&self, action: &str) {
+        let port = self.config.gateway.port;
+        let auth_token = self.live.gateway.read().await.auth_token.clone();
+        let mut req = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
+            .header("X-RsClaw-Request", "1")
+            .timeout(Duration::from_secs(3));
+        if let Some(token) = auth_token.as_deref().filter(|t| !t.is_empty()) {
+            req = req.bearer_auth(token);
+        }
+        match req.send().await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => debug!(status = %r.status(), "cron {action}: gateway reload request rejected"),
+            Err(e) => debug!(err = %e, "cron {action}: failed to notify gateway reload"),
+        }
+    }
+
     pub(crate) async fn tool_cron(
         &self,
         args: Value,
@@ -30,12 +143,14 @@ impl super::runtime::AgentRuntime {
         match action {
             "list" => {
                 let jobs = read_cron_jobs(&cron_path).await;
-                // Add 1-based index to each job for easier reference by LLMs
-                let jobs_with_index: Vec<Value> = jobs
+                // Only the caller's own jobs (everything for local owners);
+                // 1-based index over that view for easier reference by LLMs.
+                let visible = visible_cron_indices(&jobs, ctx);
+                let jobs_with_index: Vec<Value> = visible
                     .iter()
                     .enumerate()
-                    .map(|(i, j)| {
-                        let mut indexed = j.clone();
+                    .map(|(i, &j)| {
+                        let mut indexed = jobs[j].clone();
                         indexed["_index"] = json!(i + 1);
                         indexed
                     })
@@ -50,18 +165,20 @@ impl super::runtime::AgentRuntime {
                     .ok_or_else(|| anyhow!("cron add: `message` required"))?;
                 let name = args["name"].as_str();
                 let tz = args["tz"].as_str();
-                let agent_id = args["agent_id"].as_str().or(args["agentId"].as_str());
-
-                let mut jobs = read_cron_jobs(&cron_path).await;
+                let agent_id = cron_target_agent(
+                    args["agent_id"].as_str().or(args["agentId"].as_str()),
+                    ctx,
+                )?;
 
                 let now_ms = Utc::now().timestamp_millis() as u64;
                 let id = Uuid::new_v4().to_string();
                 let mut job = json!({
                     "id": id,
-                    "agentId": agent_id.unwrap_or("main"),
+                    "agentId": agent_id,
                     "enabled": true,
                     "createdAtMs": now_ms,
                     "updatedAtMs": now_ms,
+                    "createdBy": {"channel": ctx.channel, "peer": ctx.peer_id},
                 });
 
                 // Schedule: support cron expr, delay (once), or interval.
@@ -178,6 +295,11 @@ impl super::runtime::AgentRuntime {
                     if let Err(msg) = rsclaw_cron::validate_cron_expr(sched) {
                         return Err(anyhow!("cron add: invalid schedule: {msg}"));
                     }
+                    // A bad timezone would otherwise silently run in the
+                    // system timezone.
+                    if let Err(msg) = rsclaw_cron::validate_cron_tz(tz) {
+                        return Err(anyhow!("cron add: invalid tz: {msg}"));
+                    }
                     // Standard cron expression or interval.
                     // Always include timezone. Use LLM-provided, config, or auto-detected.
                     let tz_val = tz
@@ -264,20 +386,15 @@ impl super::runtime::AgentRuntime {
                     );
                 }
 
-                jobs.push(job);
-                write_cron_jobs(&cron_path, &jobs).await?;
+                {
+                    let _guard = CRON_RMW_LOCK.lock().await;
+                    let mut jobs = read_cron_jobs(&cron_path).await;
+                    jobs.push(job);
+                    write_cron_jobs(&cron_path, &jobs).await?;
+                }
 
                 // Notify gateway to reload cron jobs
-                let port = self.config.gateway.port;
-                let client = reqwest::Client::new();
-                if let Err(e) = client
-                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                {
-                    debug!(err = %e, "cron add: failed to notify gateway reload");
-                }
+                self.notify_cron_reload(action).await;
 
                 let mut resp = json!({"added": id, "message": message});
                 // Echo back WHAT was scheduled in plain words. The two
@@ -310,133 +427,66 @@ impl super::runtime::AgentRuntime {
                 Ok(resp)
             }
             "remove" => {
-                let mut jobs = read_cron_jobs(&cron_path).await;
-
-                // Support both `id` and `index` parameters (prefer index for reliability)
-                let removed_job = if let Some(index) = args["index"].as_u64() {
-                    // 1-based index
-                    let idx = index as usize;
-                    if idx == 0 || idx > jobs.len() {
-                        return Err(anyhow!(
-                            "cron remove: index {} out of range — {} job(s) exist; run action=list to get fresh 1-based indexes (if 0 jobs, there is nothing to remove)",
-                            index,
-                            jobs.len()
-                        ));
-                    }
-                    let job = jobs.remove(idx - 1);
+                let removed_job = {
+                    let _guard = CRON_RMW_LOCK.lock().await;
+                    let mut jobs = read_cron_jobs(&cron_path).await;
+                    let visible = visible_cron_indices(&jobs, ctx);
+                    let pos = resolve_cron_target(&jobs, &visible, &args, "remove")?;
+                    let job = jobs.remove(pos);
                     write_cron_jobs(&cron_path, &jobs).await?;
                     job
-                } else if let Some(id) = args["id"].as_str() {
-                    let before = jobs.len();
-                    jobs.retain(|j| j["id"].as_str() != Some(id));
-                    let removed = before - jobs.len();
-                    if removed == 0 {
-                        return Err(anyhow!(
-                            "cron remove: no job with id={} — ids are often truncated in chat; run action=list and remove by `index` instead",
-                            id
-                        ));
-                    }
-                    write_cron_jobs(&cron_path, &jobs).await?;
-                    json!({"id": id, "count": removed})
-                } else {
-                    return Err(anyhow!(
-                        "cron remove: `index` or `id` required (index is preferred)"
-                    ));
                 };
 
                 // Notify gateway to reload cron jobs
-                let port = self.config.gateway.port;
-                let client = reqwest::Client::new();
-                if let Err(e) = client
-                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                {
-                    debug!(err = %e, "cron remove: failed to notify gateway reload");
-                }
+                self.notify_cron_reload(action).await;
 
                 Ok(json!({"removed": removed_job}))
             }
             "enable" | "disable" => {
                 let enabled = action == "enable";
-                let mut jobs = read_cron_jobs(&cron_path).await;
-
-                let idx = if let Some(index) = args["index"].as_u64() {
-                    let idx = index as usize;
-                    if idx == 0 || idx > jobs.len() {
-                        return Err(anyhow!(
-                            "cron {}: index {} out of range — {} job(s) exist; run action=list to get fresh 1-based indexes",
-                            action,
-                            index,
-                            jobs.len()
-                        ));
-                    }
-                    idx - 1
-                } else if let Some(id) = args["id"].as_str() {
-                    match jobs.iter().position(|j| j["id"].as_str() == Some(id)) {
-                        Some(pos) => pos,
-                        None => {
-                            return Err(anyhow!("cron {}: job not found with id={}", action, id));
-                        }
-                    }
-                } else {
-                    return Err(anyhow!(
-                        "cron {}: `index` or `id` required (index is preferred)",
-                        action
-                    ));
+                let id = {
+                    let _guard = CRON_RMW_LOCK.lock().await;
+                    let mut jobs = read_cron_jobs(&cron_path).await;
+                    let visible = visible_cron_indices(&jobs, ctx);
+                    let idx = resolve_cron_target(&jobs, &visible, &args, action)?;
+                    let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
+                    jobs[idx]["enabled"] = json!(enabled);
+                    jobs[idx]["updatedAtMs"] = json!(Utc::now().timestamp_millis() as u64);
+                    write_cron_jobs(&cron_path, &jobs).await?;
+                    id
                 };
 
-                let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
-                jobs[idx]["enabled"] = json!(enabled);
-                jobs[idx]["updatedAtMs"] = json!(Utc::now().timestamp_millis() as u64);
-                write_cron_jobs(&cron_path, &jobs).await?;
-
                 // Notify gateway to reload cron jobs
-                let port = self.config.gateway.port;
-                let client = reqwest::Client::new();
-                if let Err(e) = client
-                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                {
-                    debug!(err = %e, "cron {}: failed to notify gateway reload", action);
-                }
+                self.notify_cron_reload(action).await;
 
                 Ok(json!({action: id}))
             }
             "edit" => {
-                let mut jobs = read_cron_jobs(&cron_path).await;
-
-                let idx = if let Some(index) = args["index"].as_u64() {
-                    let idx = index as usize;
-                    if idx == 0 || idx > jobs.len() {
-                        return Err(anyhow!(
-                            "cron edit: index {} out of range — {} job(s) exist; run action=list to get fresh 1-based indexes",
-                            index,
-                            jobs.len()
-                        ));
-                    }
-                    idx - 1
-                } else if let Some(id) = args["id"].as_str() {
-                    match jobs.iter().position(|j| j["id"].as_str() == Some(id)) {
-                        Some(pos) => pos,
-                        None => return Err(anyhow!("cron edit: job not found with id={}", id)),
-                    }
-                } else {
-                    return Err(anyhow!(
-                        "cron edit: `index` or `id` required (index is preferred)"
-                    ));
+                // Validate the target agent before taking the lock.
+                let new_agent = match args["agentId"].as_str().or(args["agent_id"].as_str()) {
+                    Some(a) => Some(cron_target_agent(Some(a), ctx)?.to_owned()),
+                    None => None,
                 };
+                let _guard = CRON_RMW_LOCK.lock().await;
+                let mut jobs = read_cron_jobs(&cron_path).await;
+                let visible = visible_cron_indices(&jobs, ctx);
+                let idx = resolve_cron_target(&jobs, &visible, &args, "edit")?;
 
                 let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
                 if let Some(schedule) = args["schedule"].as_str() {
+                    // Keep the job's existing timezone unless a new one is given.
+                    let tz = args["tz"]
+                        .as_str()
+                        .filter(|t| !t.trim().is_empty())
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            jobs[idx]["schedule"]["tz"].as_str().map(str::to_owned)
+                        });
                     // Same teaching validation as the add path.
-                    if let Err(msg) = rsclaw_cron::validate_cron_expr(schedule) {
+                    if let Err(msg) = rsclaw_cron::validate_cron_expr_tz(schedule, tz.as_deref())
+                    {
                         return Err(anyhow!("cron edit: invalid schedule: {msg}"));
                     }
-                    let tz = args["tz"].as_str();
                     if let Some(tz_val) = tz {
                         jobs[idx]["schedule"] =
                             json!({"kind": "cron", "expr": schedule, "tz": tz_val});
@@ -457,7 +507,7 @@ impl super::runtime::AgentRuntime {
                 if let Some(name) = args["name"].as_str() {
                     jobs[idx]["name"] = json!(name);
                 }
-                if let Some(agent_id) = args["agentId"].as_str().or(args["agent_id"].as_str()) {
+                if let Some(agent_id) = new_agent {
                     jobs[idx]["agentId"] = json!(agent_id);
                 }
                 // Iter list edit. Pass `iter` to replace the items array;
@@ -503,18 +553,10 @@ impl super::runtime::AgentRuntime {
                 }
                 jobs[idx]["updatedAtMs"] = json!(Utc::now().timestamp_millis() as u64);
                 write_cron_jobs(&cron_path, &jobs).await?;
+                drop(_guard);
 
                 // Notify gateway to reload cron jobs
-                let port = self.config.gateway.port;
-                let client = reqwest::Client::new();
-                if let Err(e) = client
-                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                {
-                    debug!(err = %e, "cron edit: failed to notify gateway reload");
-                }
+                self.notify_cron_reload(action).await;
 
                 Ok(json!({"edited": id}))
             }

@@ -16,9 +16,27 @@
 //! - boolean wanted, "true"/"false" string given → parsed
 //! - enum property → trim whitespace (v1 leaks trailing `\n`), then
 //!   case-insensitive snap to the canonical enum value
+//! - path-like string property (`path`, `file`, `url`, `filename`, `dir`,
+//!   ...) → trim surrounding whitespace (same v1 `\n` leak; a path or URL
+//!   never legitimately ends in a newline)
 //! - everything else untouched — no guessing
 
 use serde_json::Value;
+
+/// Property names whose string values are paths or URLs.
+const PATH_LIKE_KEYS: &[&str] = &[
+    "path",
+    "file",
+    "file_path",
+    "filePath",
+    "filename",
+    "dir",
+    "directory",
+    "url",
+    "image",
+    "video",
+    "audio",
+];
 
 /// Repair `args` in place against the tool's JSON schema. Returns a
 /// human-readable note per repair applied (empty = untouched), for
@@ -82,6 +100,18 @@ pub fn sanitize_args(schema: &Value, args: &mut Value) -> Vec<String> {
                 _ => {}
             },
             _ => {}
+        }
+
+        // ---- path-like: trim leaked whitespace/newlines ----
+        if enum_vals.is_none()
+            && PATH_LIKE_KEYS.contains(&key.as_str())
+            && let Value::String(s) = &*val
+        {
+            let trimmed = s.trim();
+            if trimmed.len() != s.len() {
+                notes.push(format!("{key}: trimmed whitespace"));
+                *val = Value::String(trimmed.to_owned());
+            }
         }
 
         // ---- enum snap (after type repair so we match on strings) ----
@@ -161,6 +191,24 @@ mod tests {
         assert!(notes.is_empty(), "{notes:?}");
         assert_eq!(args["content"], json!("plain text\n"));
         assert_eq!(args["free"], json!("  spaced  "));
+    }
+
+    #[test]
+    fn path_like_args_are_trimmed() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "url": {"type": "string"},
+                "content": {"type": "string"}
+            }
+        });
+        let mut args = json!({"path": "notes/a.md\n", "url": " https://x.test/\n", "content": "x\n"});
+        let notes = sanitize_args(&schema, &mut args);
+        assert_eq!(args["path"], json!("notes/a.md"));
+        assert_eq!(args["url"], json!("https://x.test/"));
+        assert_eq!(args["content"], json!("x\n"));
+        assert_eq!(notes.len(), 2, "{notes:?}");
     }
 
     #[test]

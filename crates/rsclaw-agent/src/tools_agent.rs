@@ -44,6 +44,37 @@ impl AgentRuntime {
         prompt
     }
 
+    /// The spawning agent's effective tool allowlist (`None` = unrestricted,
+    /// i.e. toolset "full" with no explicit `tools`). Mirrors the resolution
+    /// in the turn's tool builder: the default agent defaults to "full",
+    /// others to "standard".
+    fn parent_allowed_tools(&self) -> Option<std::collections::HashSet<String>> {
+        let model_cfg = self.handle.config.model.as_ref();
+        let is_default = self.handle.config.default.unwrap_or(false) || self.handle.id == "main";
+        let toolset = model_cfg
+            .and_then(|m| m.toolset.as_deref())
+            .unwrap_or(if is_default { "full" } else { "standard" });
+        crate::tools_builder::toolset_allowed_names(toolset, model_cfg.and_then(|m| m.tools.as_ref()))
+    }
+
+    /// Clamp a requested child toolset to the parent's capabilities: a child
+    /// may never hold a tool its parent lacks. Returns the `(toolset, tools)`
+    /// pair to store on the child and whether clamping happened.
+    fn clamp_child_toolset(&self, requested: &str) -> (String, Option<Vec<String>>, bool) {
+        let Some(parent) = self.parent_allowed_tools() else {
+            return (requested.to_owned(), None, false);
+        };
+        let child = crate::tools_builder::toolset_allowed_names(requested, None);
+        let within = child.as_ref().is_some_and(|c| c.is_subset(&parent));
+        if within {
+            return (requested.to_owned(), None, false);
+        }
+        // Inherit the parent's exact allowlist instead.
+        let mut tools: Vec<String> = parent.into_iter().collect();
+        tools.sort();
+        ("minimal".to_owned(), Some(tools), true)
+    }
+
     async fn tool_agent_spawn(&self, args: Value) -> Result<Value> {
         let spawner = self
             .spawner
@@ -55,7 +86,16 @@ impl AgentRuntime {
         let id = args["id"]
             .as_str()
             .ok_or_else(|| anyhow!("agent_spawn: `id` required"))?
+            .trim()
             .to_owned();
+        // The id becomes a directory name (`workspace-<id>`) and a config
+        // key: only a plain slug is acceptable (`x/../..` would escape
+        // base_dir).
+        if !rsclaw_util::fs_guard::is_safe_slug(&id) {
+            bail!(
+                "agent_spawn: invalid `id` {id:?} — use letters, digits, `-` or `_` (max 64 chars)"
+            );
+        }
         // Named agents are full independent agents → default to primary model.
         // Sub agents (persistent=false) are temporary → resolved below after
         // checking persistent flag.
@@ -76,7 +116,9 @@ impl AgentRuntime {
             .as_str()
             .ok_or_else(|| anyhow!("agent_spawn: `system` required"))?
             .to_owned();
-        let toolset_str = args["toolset"].as_str().unwrap_or("standard").to_owned();
+        let requested_toolset = args["toolset"].as_str().unwrap_or("standard").trim();
+        let (toolset_str, child_tools, toolset_clamped) =
+            self.clamp_child_toolset(requested_toolset);
         let channels: Option<Vec<String>> = args["channels"].as_array().map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_owned()))
@@ -101,7 +143,7 @@ impl AgentRuntime {
                 thinking: None,
                 tools_enabled: None,
                 toolset: Some(toolset_str.clone()),
-                tools: None,
+                tools: child_tools.clone(),
                 plugin_tools: None,
                 plugin_tools_unpin: None,
                 user_tools_cap: None,
@@ -122,6 +164,8 @@ impl AgentRuntime {
             system: None,
             commands: None,
             allowed_commands: None,
+            // Never wider than the parent's non-owner grant.
+            non_owner_tools: self.handle.config.non_owner_tools.clone(),
             opencode: None,
             claudecode: None,
             codex: None,
@@ -156,14 +200,20 @@ impl AgentRuntime {
         }
 
         let needs_restart = persistent && channels.is_some();
-        Ok(json!({
+        let mut out = json!({
             "spawned": id,
             "model": args["model"],
             "persistent": persistent,
             "channels": channels,
             "needs_restart": needs_restart,
             "status": if needs_restart { "saved — restart gateway to bind channels" } else { "ready" }
-        }))
+        });
+        if toolset_clamped {
+            out["toolset_note"] = json!(format!(
+                "requested toolset `{requested_toolset}` exceeds this agent's own tools; the new agent inherits this agent's tool list instead"
+            ));
+        }
+        Ok(out)
     }
 
     /// One-shot task agent: spawn -> send message -> return immediately.
@@ -199,7 +249,9 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("agent_task: `message` required"))?
             .to_owned();
 
-        let toolset_str = args["toolset"].as_str().unwrap_or("standard").to_owned();
+        let requested_toolset = args["toolset"].as_str().unwrap_or("standard").trim();
+        let (toolset_str, child_tools, _toolset_clamped) =
+            self.clamp_child_toolset(requested_toolset);
 
         let short_id = &uuid::Uuid::new_v4().to_string()[..8];
         let id = format!("task-{short_id}");
@@ -227,7 +279,7 @@ impl AgentRuntime {
                 thinking: None,
                 tools_enabled: None,
                 toolset: Some(toolset_str.clone()),
-                tools: None,
+                tools: child_tools.clone(),
                 plugin_tools: None,
                 plugin_tools_unpin: None,
                 user_tools_cap: None,
@@ -248,6 +300,8 @@ impl AgentRuntime {
             system: None,
             commands: None,
             allowed_commands: None,
+            // Never wider than the parent's non-owner grant.
+            non_owner_tools: self.handle.config.non_owner_tools.clone(),
             opencode: None,
             claudecode: None,
             codex: None,
@@ -267,6 +321,7 @@ impl AgentRuntime {
         let task_session = format!("{}:task:{short_id}", ctx.session_key);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
         let msg = AgentMessage {
+            trust: ctx.turn_ctx.trust,
             session_key: task_session,
             text: message.clone(),
             channel: format!("task:{}", ctx.agent_id),
@@ -310,6 +365,7 @@ impl AgentRuntime {
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
         let task_timeout = timeout_secs.min(300); // up to 5 min for background tasks
 
+        let spawn_trust = ctx.turn_ctx.trust;
         tokio::spawn(async move {
             let result_text = match tokio::time::timeout(
                 Duration::from_secs(task_timeout),
@@ -336,6 +392,7 @@ impl AgentRuntime {
             // response gets delivered back to the user via the original channel.
             let (wake_tx, wake_rx) = tokio::sync::oneshot::channel::<AgentReply>();
             let wake_msg = AgentMessage {
+                trust: spawn_trust,
                 session_key: session_key.clone(),
                 text: format!("[async task {task_id} completed]"),
                 channel: channel.clone(),
@@ -438,6 +495,7 @@ impl AgentRuntime {
         let send_session = format!("{}:send:{short_id}", ctx.session_key);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
         let msg = AgentMessage {
+            trust: ctx.turn_ctx.trust,
             session_key: send_session,
             text: message.clone(),
             channel: format!("send:{}", ctx.agent_id),
@@ -481,6 +539,7 @@ impl AgentRuntime {
         let send_id_bg = send_id.clone();
         let target_id_bg = target_id.clone();
 
+        let spawn_trust = ctx.turn_ctx.trust;
         tokio::spawn(async move {
             let result_text = match tokio::time::timeout(
                 Duration::from_secs(send_timeout),
@@ -503,6 +562,7 @@ impl AgentRuntime {
             // Wake parent agent to process result and respond to user.
             let (wake_tx, wake_rx) = tokio::sync::oneshot::channel::<AgentReply>();
             let wake_msg = AgentMessage {
+                trust: spawn_trust,
                 session_key: session_key.clone(),
                 text: format!("[async send {send_id_bg} completed]"),
                 channel: channel.clone(),

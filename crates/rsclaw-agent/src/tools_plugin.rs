@@ -919,6 +919,55 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Why `plugin.tool` must not be invoked on this turn, or `None`.
+    ///
+    /// `plugin_invoke` is the generic path to every installed plugin tool,
+    /// so the per-agent filters that hide a tool from the prompt must also
+    /// apply here, or they are bypassable: `model.plugin_tools_unpin`
+    /// (`<plugin>__<tool>`, `<plugin>.<tool>`, `<plugin>__*` or `<plugin>`),
+    /// `tools.deny`, and a session-level `/plugin` disable.
+    fn plugin_invoke_blocked(
+        &self,
+        ctx: &RunContext,
+        plugin: &str,
+        tool: &str,
+    ) -> Option<&'static str> {
+        let matches = |entry: &str| {
+            let e = entry.trim();
+            e == plugin
+                || e == format!("{plugin}__{tool}")
+                || e == format!("{plugin}.{tool}")
+                || e == format!("{plugin}__*")
+                || e == format!("{plugin}.*")
+        };
+        if let Some(unpin) = self
+            .handle
+            .config
+            .model
+            .as_ref()
+            .and_then(|m| m.plugin_tools_unpin.as_ref())
+            && unpin.iter().any(|e| matches(e))
+        {
+            return Some("unpinned for this agent");
+        }
+        if let Some(deny) = self.config.ext.tools.as_ref().and_then(|t| t.deny.as_ref())
+            && deny.iter().any(|e| matches(e))
+        {
+            return Some("denied by tools.deny");
+        }
+        let disabled = self
+            .handle
+            .plugin_overrides
+            .read()
+            .ok()
+            .and_then(|g| g.get(&ctx.session_key).and_then(|m| m.get(plugin)).map(|o| o.disabled))
+            .unwrap_or(false);
+        if disabled {
+            return Some("disabled in this session");
+        }
+        None
+    }
+
     pub(crate) async fn tool_plugin_invoke(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let plugin_name = args["plugin"].as_str().unwrap_or("").trim();
         let tool_name = args["tool"].as_str().unwrap_or("").trim();
@@ -932,6 +981,11 @@ impl AgentRuntime {
                 "hint": "Use plugin_search to discover installed plugin tools."
             }));
         };
+        if let Some(reason) = self.plugin_invoke_blocked(ctx, plugin_name, tool_name) {
+            return Ok(json!({
+                "error": format!("plugin tool {plugin_name}.{tool_name} is not available to this agent ({reason})"),
+            }));
+        }
         if let Err(err) = Self::validate_plugin_arguments(&info, &arguments) {
             return Ok(err);
         }
