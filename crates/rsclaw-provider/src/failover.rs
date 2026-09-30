@@ -132,11 +132,7 @@ impl FailoverManager {
             let (provider_name, model_id) = registry.resolve_model(model_str);
             req.model = model_id.to_owned();
 
-            let profiles = self
-                .order
-                .get(provider_name)
-                .cloned()
-                .unwrap_or_else(|| vec!["default".to_owned()]);
+            let profiles = self.effective_profiles(provider_name);
 
             let outcome = self
                 .try_model_with_profiles(provider_name, model_id, &profiles, &mut req, registry)
@@ -150,7 +146,7 @@ impl FailoverManager {
                 ChainStep::PropagateError(e) => return Err(e),
                 ChainStep::TryNextModel(e) => {
                     let kind = classify_error(&e);
-                    if kind == ErrorKind::Unknown {
+                    if matches!(kind, ErrorKind::Unknown | ErrorKind::InvalidRequest) {
                         // Ambiguous error — we can't attribute it to the model
                         // being unhealthy (it may be a transient hiccup, a
                         // malformed/empty response, or something model-specific
@@ -322,12 +318,15 @@ impl FailoverManager {
                             continue;
                         }
                         match kind {
+                            // InvalidRequest: never retried in place (the
+                            // identical request cannot succeed); advance.
                             ErrorKind::Balance
                             | ErrorKind::ModelMissing
                             | ErrorKind::Auth
                             | ErrorKind::RateLimit
                             | ErrorKind::Transient
-                            | ErrorKind::Unknown => {
+                            | ErrorKind::Unknown
+                            | ErrorKind::InvalidRequest => {
                                 return ChainStep::TryNextModel(e);
                             }
                             // BadRequest: our serialization fault, not the
@@ -353,6 +352,23 @@ impl FailoverManager {
             Some(e) => ChainStep::TryNextModel(e),
             None => ChainStep::AllProfilesCooling,
         }
+    }
+
+    /// Profiles to try for `provider_name`, in `auth.order`.
+    ///
+    /// Providers are built with ONE baked-in credential and `stream()` has
+    /// no per-call key, so every profile of a provider sends the identical
+    /// request with the identical key. Rotating through them would re-issue
+    /// the same (rate-limited / rejected) request N times and bypass the
+    /// cooldown just set on the first profile. Until providers accept a
+    /// per-call key, only the first configured profile is used.
+    fn effective_profiles(&self, provider_name: &str) -> Vec<String> {
+        let first = self
+            .order
+            .get(provider_name)
+            .and_then(|p| p.first().cloned())
+            .unwrap_or_else(|| "default".to_owned());
+        vec![first]
     }
 
     fn is_cooling_down(&mut self, provider_name: &str, profile_id: &str) -> bool {
@@ -382,9 +398,10 @@ impl FailoverManager {
             .iter()
             .filter_map(|(key, until)| (*until <= now).then_some(key.clone()))
             .collect();
+        // Only the cooldown window expires. `failure_counts` is kept so the
+        // next rate limit backs off longer; it is cleared on success.
         for key in expired {
             self.cooldowns.remove(&key);
-            self.failure_counts.remove(&key);
         }
     }
 }
@@ -410,14 +427,20 @@ enum ChainStep {
     AllProfilesCooling,
 }
 
-/// Detects rejection caused by the request's output-token budget exceeding the
-/// model's context window or the account tier's hard ceiling.
+/// Detects rejection caused by the request's OUTPUT-token budget
+/// (`max_tokens`) exceeding the model's or account tier's ceiling —
+/// fixable by dropping `max_tokens`. A pure prompt/context overflow is NOT
+/// matched here: it is `ErrorKind::ContextExceeded` and must reach the
+/// caller so it can compact. OpenAI's combined overflow ("... in the
+/// messages, N in the completion") is matched since the completion budget
+/// is part of the overflow.
 fn is_max_tokens_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string().to_lowercase();
     msg.contains("max_tokens")
-        || msg.contains("context_length_exceeded")
-        || msg.contains("maximum context length")
-        || msg.contains("context length exceeded")
+        || msg.contains("max_output_tokens")
+        || msg.contains("max_completion_tokens")
+        || msg.contains("maxoutputtokens")
+        || (crate::health::is_context_overflow(&msg) && msg.contains("in the completion"))
 }
 
 fn is_rate_limit(e: &anyhow::Error) -> bool {
@@ -425,6 +448,9 @@ fn is_rate_limit(e: &anyhow::Error) -> bool {
     // error, not a transient rate limit — classify it as the former so we
     // don't cool the profile down and retry pointlessly.
     if is_max_tokens_error(e) {
+        return false;
+    }
+    if crate::health::is_context_overflow(&e.to_string().to_lowercase()) {
         return false;
     }
     let msg = e.to_string().to_lowercase();
@@ -455,18 +481,41 @@ mod tests {
     }
 
     #[test]
-    fn openai_context_length_is_max_tokens_error() {
+    fn openai_completion_overflow_is_max_tokens_error() {
         let e = anyhow!(
-            "This model's maximum context length is 16385 tokens, however you requested 30000"
+            "This model's maximum context length is 16385 tokens, however you requested \
+             30000 tokens (2000 in the messages, 28000 in the completion)"
         );
         assert!(is_max_tokens_error(&e));
         assert!(!is_rate_limit(&e));
     }
 
     #[test]
-    fn openai_context_length_exceeded_code() {
+    fn prompt_overflow_is_not_swallowed_as_max_tokens() {
         let e = anyhow!("error code: context_length_exceeded");
-        assert!(is_max_tokens_error(&e));
+        assert!(!is_max_tokens_error(&e));
+        assert_eq!(classify_error(&e), ErrorKind::ContextExceeded);
+        let e = anyhow!("prompt is too long: 210000 tokens > 200000 maximum");
+        assert!(!is_max_tokens_error(&e));
+        assert_eq!(classify_error(&e), ErrorKind::ContextExceeded);
+    }
+
+    #[test]
+    fn profiles_collapse_to_one_credential() {
+        let mut order = HashMap::new();
+        order.insert(
+            "kimi".to_owned(),
+            vec!["p1".to_owned(), "p2".to_owned(), "p3".to_owned()],
+        );
+        let mgr = FailoverManager::new(
+            order,
+            HashMap::new(),
+            vec![],
+            crate::health::ProviderHealthRegistry::default(),
+            RetryConfig::default(),
+        );
+        assert_eq!(mgr.effective_profiles("kimi"), vec!["p1".to_owned()]);
+        assert_eq!(mgr.effective_profiles("other"), vec!["default".to_owned()]);
     }
 
     #[test]
@@ -566,7 +615,9 @@ mod tests {
             !mgr.cooldowns
                 .contains_key(&cooldown_key("deepseek", "default"))
         );
-        assert_eq!(mgr.hit_count("deepseek", "default"), 0);
+        // The failure count survives cooldown expiry so the next backoff
+        // grows; only success clears it.
+        assert_eq!(mgr.hit_count("deepseek", "default"), 1);
         assert!(mgr.cooldowns.contains_key(&cooldown_key("kimi", "default")));
         assert_eq!(mgr.hit_count("kimi", "default"), 1);
     }

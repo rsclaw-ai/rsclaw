@@ -179,6 +179,10 @@ pub struct OpenAiProvider {
     is_ollama: bool,
     /// API mode: Chat Completions or Responses.
     mode: OpenAiMode,
+    /// Registry name this provider is registered under (e.g. `doubao`).
+    /// Used to strip a routing `name/` prefix from direct callers' model
+    /// ids without touching org segments like `deepseek-ai/DeepSeek-V3`.
+    provider_name: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -189,6 +193,7 @@ impl OpenAiProvider {
             base_url: OPENAI_API_BASE.to_owned(),
             is_ollama: false,
             mode: OpenAiMode::Chat,
+            provider_name: None,
         }
     }
 
@@ -200,6 +205,7 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             is_ollama: false,
             mode: OpenAiMode::Chat,
+            provider_name: None,
         }
     }
 
@@ -211,6 +217,7 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             is_ollama: false,
             mode: OpenAiMode::Chat,
+            provider_name: None,
         }
     }
 
@@ -222,6 +229,7 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             is_ollama: false,
             mode: OpenAiMode::Responses,
+            provider_name: None,
         }
     }
 
@@ -234,6 +242,7 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             is_ollama: true,
             mode: OpenAiMode::Chat,
+            provider_name: None,
         }
     }
 
@@ -249,6 +258,7 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             is_ollama: false,
             mode: OpenAiMode::Chat,
+            provider_name: None,
         }
     }
 
@@ -264,6 +274,7 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             is_ollama: false,
             mode: OpenAiMode::Responses,
+            provider_name: None,
         }
     }
 
@@ -279,8 +290,54 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             is_ollama: true,
             mode: OpenAiMode::Chat,
+            provider_name: None,
         }
     }
+}
+
+impl OpenAiProvider {
+    /// Record the registry name this provider is registered under, so a
+    /// `name/model` id from a direct caller is sent as the bare `model`.
+    pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
+        self.provider_name = Some(name.into());
+        self
+    }
+}
+
+/// Bound on time-to-response-headers for chat / responses requests. Only
+/// the headers phase is bounded — the streamed body is not — so long
+/// generations are never cut. Generous because local servers may hold the
+/// headers until a long prefill finishes.
+const HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Send `builder` (with the one-shot transport retry) bounded by
+/// [`HEADERS_TIMEOUT`].
+async fn send_with_headers_timeout(builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    match tokio::time::timeout(HEADERS_TIMEOUT, super::send_with_transport_retry(builder)).await {
+        Ok(r) => Ok(r?),
+        Err(_) => anyhow::bail!(
+            "request timed out after {}s waiting for response headers",
+            HEADERS_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+/// Model id to put on the wire.
+///
+/// Failover already strips the routing `provider/` segment, but direct
+/// callers still pass `provider/model`. Strip the first segment only when it
+/// names THIS provider (or, when the name is unknown, a builtin provider) —
+/// never the org segment of ids like `deepseek-ai/DeepSeek-V3` or the
+/// `anthropic/...` ids aggregators expect.
+fn wire_model_id<'a>(model: &'a str, provider_name: Option<&str>) -> &'a str {
+    let Some((first, rest)) = model.split_once('/') else {
+        return model;
+    };
+    let strip = match provider_name {
+        Some(name) => first == name,
+        None => crate::defaults::is_known_provider(first),
+    };
+    if strip && !rest.is_empty() { rest } else { model }
 }
 
 impl LlmProvider for OpenAiProvider {
@@ -313,7 +370,12 @@ impl LlmProvider for OpenAiProvider {
                 return self.stream_responses(&req).await;
             }
 
-            let body = build_request_body(&req)?;
+            let mut body = build_request_body(&req, self.provider_name.as_deref())?;
+            // Official OpenAI only reports usage on streams when asked; the
+            // usage then arrives in a final chunk with empty `choices`.
+            if self.base_url.contains("api.openai.com") {
+                body["stream_options"] = json!({ "include_usage": true });
+            }
 
             let body_str = serde_json::to_string(&body).unwrap_or_default();
             tracing::debug!(
@@ -333,7 +395,7 @@ impl LlmProvider for OpenAiProvider {
                 builder = builder.header("authorization", format!("Bearer {key}"));
             }
 
-            let resp = super::send_with_transport_retry(builder.json(&body))
+            let resp = send_with_headers_timeout(builder.json(&body))
                 .await
                 .context("OpenAI request failed")?;
 
@@ -467,7 +529,7 @@ impl OpenAiProvider {
 
         // Build tools if any
         let mut body = json!({
-            "model": req.model,
+            "model": wire_model_id(&req.model, self.provider_name.as_deref()),
             "messages": messages,
             "stream": true,
             // Thinking disabled by default. TODO: make configurable per agent.
@@ -531,106 +593,20 @@ impl OpenAiProvider {
             anyhow::bail!("ollama native API error: {body}");
         }
 
-        // Ollama native streaming: JSONL (one JSON object per line)
+        // Ollama native streaming: JSONL (one JSON object per line). Lines
+        // and multi-byte characters can be split across TCP chunks, so
+        // carry both over between chunks.
         let byte_stream = resp.bytes_stream();
-        // Track whether we are inside a thinking block so we can emit
-        // <think> / </think> boundary tags exactly once.
-        let in_thinking = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let event_stream = byte_stream
             .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
-            .flat_map(move |chunk| {
-                let in_thinking = std::sync::Arc::clone(&in_thinking);
+            .scan(OllamaStreamState::default(), |state, chunk| {
                 let events: Vec<Result<StreamEvent>> = match chunk {
-                    Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        text.lines()
-                            .filter_map(|line| {
-                                let line = line.trim();
-                                if line.is_empty() {
-                                    return None;
-                                }
-                                let v: Value = serde_json::from_str(line).ok()?;
-
-                                // Check for tool calls
-                                if let Some(tc) = v
-                                    .get("message")
-                                    .and_then(|m| m.get("tool_calls"))
-                                    .and_then(|tc| tc.as_array())
-                                    .and_then(|a| a.first())
-                                {
-                                    let func = &tc["function"];
-                                    let name = func["name"].as_str().unwrap_or("").to_owned();
-                                    // ollama native: arguments is a JSON object (not string)
-                                    let input = if func["arguments"].is_object() {
-                                        func["arguments"].clone()
-                                    } else {
-                                        let args_str = func["arguments"].as_str().unwrap_or("{}");
-                                        serde_json::from_str(args_str).unwrap_or(json!({}))
-                                    };
-                                    return Some(Ok(StreamEvent::ToolCall {
-                                        id: format!("call_{}", name),
-                                        name,
-                                        input,
-                                    }));
-                                }
-
-                                // Thinking content (think=true mode)
-                                let thinking = v
-                                    .pointer("/message/thinking")
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or("");
-
-                                // Text content
-                                let content = v
-                                    .pointer("/message/content")
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or("");
-
-                                let done = v["done"].as_bool().unwrap_or(false);
-                                if done {
-                                    // Close thinking block if still open
-                                    if in_thinking.swap(false, std::sync::atomic::Ordering::Relaxed)
-                                    {
-                                        return Some(Ok(StreamEvent::TextDelta(
-                                            "</think>".to_owned(),
-                                        )));
-                                    }
-                                    return Some(Ok(StreamEvent::Done { usage: None }));
-                                }
-
-                                // Emit thinking content with boundary tags
-                                if !thinking.is_empty() {
-                                    let was_thinking = in_thinking
-                                        .swap(true, std::sync::atomic::Ordering::Relaxed);
-                                    if !was_thinking {
-                                        // First thinking chunk: prepend <think>
-                                        return Some(Ok(StreamEvent::TextDelta(format!(
-                                            "<think>{thinking}"
-                                        ))));
-                                    }
-                                    return Some(Ok(StreamEvent::TextDelta(thinking.to_owned())));
-                                }
-
-                                if !content.is_empty() {
-                                    let was_thinking = in_thinking
-                                        .swap(false, std::sync::atomic::Ordering::Relaxed);
-                                    if was_thinking {
-                                        // Transition from thinking to content: close tag
-                                        return Some(Ok(StreamEvent::TextDelta(format!(
-                                            "</think>{content}"
-                                        ))));
-                                    }
-                                    Some(Ok(StreamEvent::TextDelta(content.to_owned())))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    }
+                    Ok(bytes) => state.feed(&bytes).into_iter().map(Ok).collect(),
                     Err(e) => vec![Err(e)],
                 };
-                futures::stream::iter(events)
-            });
+                futures::future::ready(Some(events))
+            })
+            .flat_map(futures::stream::iter);
 
         Ok(Box::pin(event_stream))
     }
@@ -726,10 +702,17 @@ impl OpenAiProvider {
             count = data_uris.len(),
             "upload_images: found data URIs to upload"
         );
-        // Upload each unique data URI
+        // Upload each unique data URI once per process: history images are
+        // resent every turn, so reuse the file_id from an earlier upload.
         for uri in data_uris {
+            let cache_key = self.upload_cache_key(&uri);
+            if let Some(file_id) = uploaded_file_cache_get(&cache_key) {
+                file_id_map.insert(uri, file_id);
+                continue;
+            }
             match self.upload_image_to_files(&uri).await {
                 Ok(file_id) => {
+                    uploaded_file_cache_put(cache_key, file_id.clone());
                     file_id_map.insert(uri, file_id);
                 }
                 Err(e) => {
@@ -741,12 +724,32 @@ impl OpenAiProvider {
         file_id_map
     }
 
+    /// Cache key for an uploaded data URI. File ids are scoped to the
+    /// account, so the key covers the endpoint and a digest of the API key
+    /// as well as a digest + length of the payload.
+    fn upload_cache_key(&self, data_uri: &str) -> String {
+        use std::hash::{Hash, Hasher};
+        let digest = |v: &str| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        format!(
+            "{}|{:016x}|{:016x}|{}",
+            self.base_url,
+            digest(self.api_key.as_deref().unwrap_or("")),
+            digest(data_uri),
+            data_uri.len()
+        )
+    }
+
     /// Stream using the OpenAI Responses API format.
     async fn stream_responses(&self, req: &LlmRequest) -> Result<LlmStream> {
         // Upload data: URI images to Files API before building the request body
         let file_id_map = self.upload_images_for_messages(&req.messages).await;
 
-        let body = build_responses_body(req, &file_id_map)?;
+        let mut body = build_responses_body(req, &file_id_map)?;
+        body["model"] = json!(wire_model_id(&req.model, self.provider_name.as_deref()));
         let body_str = serde_json::to_string(&body).unwrap_or_default();
         tracing::debug!(
             model = %req.model,
@@ -765,7 +768,7 @@ impl OpenAiProvider {
             builder = builder.header("authorization", format!("Bearer {key}"));
         }
 
-        let resp = super::send_with_transport_retry(builder.json(&body))
+        let resp = send_with_headers_timeout(builder.json(&body))
             .await
             .context("OpenAI Responses request failed")?;
 
@@ -839,10 +842,163 @@ impl OpenAiProvider {
 }
 
 // ---------------------------------------------------------------------------
+// Files API upload cache
+// ---------------------------------------------------------------------------
+
+/// Bound on remembered uploads; the map is cleared when it overflows.
+const UPLOADED_FILE_CACHE_CAP: usize = 1024;
+
+fn uploaded_file_cache() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn uploaded_file_cache_get(key: &str) -> Option<String> {
+    let cache = match uploaded_file_cache().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    cache.get(key).cloned()
+}
+
+fn uploaded_file_cache_put(key: String, file_id: String) {
+    let mut cache = match uploaded_file_cache().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if cache.len() >= UPLOADED_FILE_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, file_id);
+}
+
+// ---------------------------------------------------------------------------
+// Ollama native JSONL stream parser
+// ---------------------------------------------------------------------------
+
+/// Per-stream state for the Ollama native `/api/chat` JSONL stream.
+#[derive(Default)]
+struct OllamaStreamState {
+    /// Incomplete trailing line carried to the next chunk.
+    line_buffer: String,
+    /// Incomplete trailing UTF-8 sequence carried to the next chunk.
+    utf8_pending: Vec<u8>,
+    /// Inside a thinking block — emit `<think>` / `</think>` exactly once.
+    in_thinking: bool,
+    /// Tool calls emitted so far — keeps synthesized ids unique when the
+    /// same tool is called several times in one turn.
+    tool_calls_seen: usize,
+}
+
+impl OllamaStreamState {
+    /// Consume one byte chunk; return events for every complete line.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
+        let text = super::decode_utf8_chunk(&mut self.utf8_pending, bytes);
+        self.line_buffer.push_str(&text);
+        let mut events = Vec::new();
+        while let Some(idx) = self.line_buffer.find('\n') {
+            let line: String = self.line_buffer.drain(..=idx).collect();
+            self.parse_line(line.trim(), &mut events);
+        }
+        events
+    }
+
+    fn parse_line(&mut self, line: &str, events: &mut Vec<StreamEvent>) {
+        if line.is_empty() {
+            return;
+        }
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "ollama native: unparseable JSONL line");
+                return;
+            }
+        };
+
+        // Tool calls — a message may carry several parallel calls.
+        if let Some(tcs) = v.pointer("/message/tool_calls").and_then(|tc| tc.as_array()) {
+            for tc in tcs {
+                let func = &tc["function"];
+                let name = func["name"].as_str().unwrap_or("").to_owned();
+                // ollama native: arguments is a JSON object (not string).
+                // A string that fails to parse is passed through raw so the
+                // agent loop's malformed-arguments path reports it.
+                let input = if func["arguments"].is_object() {
+                    func["arguments"].clone()
+                } else {
+                    let args_str = func["arguments"].as_str().unwrap_or("{}");
+                    serde_json::from_str(args_str)
+                        .unwrap_or_else(|_| Value::String(args_str.to_owned()))
+                };
+                let id = tc["id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("call_{}_{}", self.tool_calls_seen, name));
+                self.tool_calls_seen += 1;
+                events.push(StreamEvent::ToolCall { id, name, input });
+            }
+        }
+
+        // Thinking content (think=true mode)
+        let thinking = v
+            .pointer("/message/thinking")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        // Text content
+        let content = v
+            .pointer("/message/content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+
+        // Emit thinking content with boundary tags
+        if !thinking.is_empty() {
+            if self.in_thinking {
+                events.push(StreamEvent::TextDelta(thinking.to_owned()));
+            } else {
+                self.in_thinking = true;
+                events.push(StreamEvent::TextDelta(format!("<think>{thinking}")));
+            }
+        }
+
+        if !content.is_empty() {
+            if self.in_thinking {
+                // Transition from thinking to content: close tag
+                self.in_thinking = false;
+                events.push(StreamEvent::TextDelta(format!("</think>{content}")));
+            } else {
+                events.push(StreamEvent::TextDelta(content.to_owned()));
+            }
+        }
+
+        if v["done"].as_bool().unwrap_or(false) {
+            // Close thinking block if still open, then always finish.
+            if self.in_thinking {
+                self.in_thinking = false;
+                events.push(StreamEvent::TextDelta("</think>".to_owned()));
+            }
+            let usage = match (
+                v["prompt_eval_count"].as_u64(),
+                v["eval_count"].as_u64(),
+            ) {
+                (None, None) => None,
+                (input, output) => Some(TokenUsage {
+                    input: input.unwrap_or(0),
+                    output: output.unwrap_or(0),
+                    ..Default::default()
+                }),
+            };
+            events.push(StreamEvent::Done { usage });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Request body builder
 // ---------------------------------------------------------------------------
 
-fn build_request_body(req: &LlmRequest) -> Result<Value> {
+fn build_request_body(req: &LlmRequest, provider_name: Option<&str>) -> Result<Value> {
     // Thinking-enabled gates how assistant messages serialise — see
     // `serialize_message` and the call site for the field-presence
     // contract (DeepSeek / kimi-style providers reject any assistant
@@ -855,13 +1011,10 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         .map(|m| serialize_message(m, thinking_enabled))
         .collect();
 
-    // Strip provider prefix (e.g. "doubao/doubao-seed-2.0-lite" →
-    // "doubao-seed-2.0-lite") — downstream APIs expect the bare model id.
-    let bare_model = req
-        .model
-        .rsplit_once('/')
-        .map(|(_, m)| m)
-        .unwrap_or(&req.model);
+    // Strip a routing provider prefix (e.g. "doubao/doubao-seed-2.0-lite" →
+    // "doubao-seed-2.0-lite") but keep org segments such as
+    // "deepseek-ai/DeepSeek-V3" — see `wire_model_id`.
+    let bare_model = wire_model_id(&req.model, provider_name);
 
     let mut body = json!({
         "model":      bare_model,
@@ -892,7 +1045,7 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         match req.thinking_budget {
             Some(budget) if budget > 0 => {
                 body["enable_thinking"] = json!(true);
-                body["thinking"] = json!({"type": "disabled"});
+                body["thinking"] = json!({"type": "enabled"});
                 body["thinking_budget"] = json!(budget);
                 body["chat_template_kwargs"] = json!({"enable_thinking": true});
             }
@@ -1322,35 +1475,11 @@ async fn parse_sse_chunk_with_buffer(
         Err(e) => return vec![Err(e)],
     };
 
-    // Prepend any leftover bytes from the previous chunk (incomplete UTF-8
-    // sequence).
-    let mut remainder = utf8_remainder.lock().await;
-    let full_bytes = if remainder.is_empty() {
-        bytes.to_vec()
-    } else {
-        let mut combined = std::mem::take(&mut *remainder);
-        combined.extend_from_slice(&bytes);
-        combined
-    };
-
-    let text = match std::str::from_utf8(&full_bytes) {
-        Ok(t) => {
-            drop(remainder);
-            std::borrow::Cow::Owned(t.to_owned())
-        }
-        Err(e) => {
-            let valid_up_to = e.valid_up_to();
-            *remainder = full_bytes[valid_up_to..].to_vec();
-            drop(remainder);
-            if valid_up_to == 0 {
-                return vec![];
-            }
-            std::borrow::Cow::Owned(
-                std::str::from_utf8(&full_bytes[..valid_up_to])
-                    .expect("valid_up_to guarantees valid UTF-8")
-                    .to_owned(),
-            )
-        }
+    // Stitch onto any incomplete UTF-8 sequence left by the previous chunk;
+    // invalid bytes are skipped so they cannot wedge the remainder.
+    let text = {
+        let mut remainder = utf8_remainder.lock().await;
+        super::decode_utf8_chunk(&mut remainder, &bytes)
     };
 
     // Lock the buffer and append the new text
@@ -1492,7 +1621,7 @@ fn parse_event(data: &str) -> Vec<StreamEvent> {
     };
 
     // Check for error response embedded in SSE stream
-    if let Some(err) = v.get("error") {
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         let msg = err["message"].as_str().unwrap_or("unknown API error");
         return vec![StreamEvent::Error(msg.to_owned())];
     }
@@ -1507,6 +1636,13 @@ fn parse_event(data: &str) -> Vec<StreamEvent> {
     let choice = match choices.first() {
         Some(c) => c,
         None => {
+            // `stream_options.include_usage`: the final chunk carries only
+            // `usage` with an empty `choices` array.
+            if let Some(u) = v["usage"].as_object() {
+                return vec![StreamEvent::Done {
+                    usage: Some(chat_usage(u)),
+                }];
+            }
             tracing::warn!(data, "openai: SSE response has empty choices array");
             return Vec::new();
         }
@@ -1533,13 +1669,17 @@ fn parse_event(data: &str) -> Vec<StreamEvent> {
         events.push(StreamEvent::TextDelta(text.to_owned()));
     }
 
-    // Tool call. `delta.tool_calls` is an array but each chunk
-    // currently carries one entry; the prior single-event return
-    // already only read `.first()` so behaviour for callers that
-    // accumulate by id is unchanged.
-    if let Some(tool_calls) = delta["tool_calls"].as_array()
-        && let Some(tc) = tool_calls.first()
-    {
+    // Tool calls. Streaming chunks usually carry one entry, but some
+    // providers send the whole parallel `tool_calls` array in one chunk —
+    // emit every entry, in `index` order, so none is dropped. Entries
+    // with an id start a new call in the runtime's accumulator;
+    // id-less continuation fragments append to the latest one.
+    let mut tool_calls: Vec<&Value> = delta["tool_calls"]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    tool_calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
+    for tc in tool_calls {
         let func = &tc["function"];
         let id = tc["id"].as_str().unwrap_or("").to_owned();
         // Emit the wire-encoded `rc_...` name as-is. The agent runtime
@@ -1568,26 +1708,31 @@ fn parse_event(data: &str) -> Vec<StreamEvent> {
     // deltas for this turn" signal, so any deltas in the same chunk
     // must precede it.
     if choice["finish_reason"].is_string() {
-        let usage = v["usage"].as_object().map(|u| TokenUsage {
-            input: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-            output: u
-                .get("completion_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            // OpenAI has no separate creation counter; reads land in
-            // prompt_tokens_details.cached_tokens.
-            cache_creation: 0,
-            cache_read: u
-                .get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            ..Default::default()
-        });
+        let usage = v["usage"].as_object().map(chat_usage);
         events.push(StreamEvent::Done { usage });
     }
 
     events
+}
+
+/// Map a Chat Completions `usage` object to [`TokenUsage`].
+fn chat_usage(u: &serde_json::Map<String, Value>) -> TokenUsage {
+    TokenUsage {
+        input: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+        output: u
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        // OpenAI has no separate creation counter; reads land in
+        // prompt_tokens_details.cached_tokens.
+        cache_creation: 0,
+        cache_read: u
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1894,35 +2039,11 @@ async fn parse_responses_sse_chunk_buffered(
         Err(e) => return vec![Err(e)],
     };
 
-    // Prepend any leftover bytes from the previous chunk (incomplete UTF-8
-    // sequence).
-    let mut remainder = utf8_remainder.lock().await;
-    let full_bytes = if remainder.is_empty() {
-        bytes.to_vec()
-    } else {
-        let mut combined = std::mem::take(&mut *remainder);
-        combined.extend_from_slice(&bytes);
-        combined
-    };
-
-    let text = match std::str::from_utf8(&full_bytes) {
-        Ok(t) => {
-            drop(remainder);
-            std::borrow::Cow::Owned(t.to_owned())
-        }
-        Err(e) => {
-            let valid_up_to = e.valid_up_to();
-            *remainder = full_bytes[valid_up_to..].to_vec();
-            drop(remainder);
-            if valid_up_to == 0 {
-                return vec![];
-            }
-            std::borrow::Cow::Owned(
-                std::str::from_utf8(&full_bytes[..valid_up_to])
-                    .expect("valid_up_to guarantees valid UTF-8")
-                    .to_owned(),
-            )
-        }
+    // Stitch onto any incomplete UTF-8 sequence left by the previous chunk;
+    // invalid bytes are skipped so they cannot wedge the remainder.
+    let text = {
+        let mut remainder = utf8_remainder.lock().await;
+        super::decode_utf8_chunk(&mut remainder, &bytes)
     };
 
     let mut buffer = line_buffer.lock().await;
@@ -1970,8 +2091,8 @@ async fn parse_responses_sse_chunk_buffered(
 fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamEvent> {
     let v: Value = serde_json::from_str(data).ok()?;
 
-    // Check for error
-    if let Some(err) = v.get("error") {
+    // Check for error (nested `error` object; `null` means no error)
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         let msg = err["message"]
             .as_str()
             .unwrap_or("unknown API error")
@@ -1983,6 +2104,47 @@ fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamE
     let evt_type = event_type.or_else(|| v["type"].as_str()).unwrap_or("");
 
     match evt_type {
+        // Top-level stream error: `{"type":"error","code":..,"message":..}`.
+        "error" => {
+            let msg = v["message"].as_str().unwrap_or("unknown API error");
+            let code = v["code"].as_str().unwrap_or("");
+            Some(StreamEvent::Error(if code.is_empty() {
+                msg.to_owned()
+            } else {
+                format!("{code}: {msg}")
+            }))
+        }
+
+        // The response terminated with an error.
+        "response.failed" => {
+            let err = &v["response"]["error"];
+            let msg = err["message"].as_str().unwrap_or("response failed");
+            let code = err["code"].as_str().unwrap_or("");
+            Some(StreamEvent::Error(if code.is_empty() {
+                format!("response failed: {msg}")
+            } else {
+                format!("response failed ({code}): {msg}")
+            }))
+        }
+
+        // The response stopped early. Output-token exhaustion still yields a
+        // usable (truncated) answer; any other reason (e.g. content filter)
+        // is surfaced as an error so it is not mistaken for a clean finish.
+        "response.incomplete" => {
+            let reason = v
+                .pointer("/response/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if reason == "max_output_tokens" {
+                tracing::warn!(reason, "openai-responses: response incomplete (truncated)");
+                Some(StreamEvent::Done {
+                    usage: responses_usage(&v),
+                })
+            } else {
+                Some(StreamEvent::Error(format!("response incomplete: {reason}")))
+            }
+        }
+
         // Text delta
         "response.output_text.delta" => {
             // Handle delta as String, Number, or Bool — some providers send
@@ -2022,24 +2184,9 @@ fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamE
         }
 
         // Stream completed — extract usage
-        "response.completed" | "response.done" => {
-            let usage = v
-                .pointer("/response/usage")
-                .or_else(|| v.get("usage"))
-                .and_then(|u| u.as_object())
-                .map(|u| TokenUsage {
-                    input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-                    output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
-                    cache_creation: 0,
-                    cache_read: u
-                        .get("input_tokens_details")
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    ..Default::default()
-                });
-            Some(StreamEvent::Done { usage })
-        }
+        "response.completed" | "response.done" => Some(StreamEvent::Done {
+            usage: responses_usage(&v),
+        }),
 
         // Ignore other Responses API events (content_part.added, etc.)
         _ if evt_type.starts_with("response.") => None,
@@ -2048,6 +2195,24 @@ fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamE
         // Some providers claim Responses API but return Chat Completions SSE.
         _ => parse_completions_fallback(&v),
     }
+}
+
+/// Extract Responses API usage from a terminal event.
+fn responses_usage(v: &Value) -> Option<TokenUsage> {
+    v.pointer("/response/usage")
+        .or_else(|| v.get("usage"))
+        .and_then(|u| u.as_object())
+        .map(|u| TokenUsage {
+            input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+            output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+            cache_creation: 0,
+            cache_read: u
+                .get("input_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            ..Default::default()
+        })
 }
 
 /// Fallback parser for providers that return Chat Completions format
@@ -2128,7 +2293,7 @@ mod tests {
     #[test]
     fn request_serializes_model() {
         let req = make_request();
-        let body = build_request_body(&req).unwrap();
+        let body = build_request_body(&req, None).unwrap();
         assert_eq!(body["model"].as_str().unwrap(), "gpt-4o");
     }
 
@@ -2173,7 +2338,7 @@ mod tests {
             }],
             ..make_request()
         };
-        let body = build_request_body(&req).unwrap();
+        let body = build_request_body(&req, None).unwrap();
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"].as_str().unwrap(), "user");
     }
@@ -2629,5 +2794,95 @@ mod tests {
             Ok(StreamEvent::TextDelta(text)) => assert_eq!(text, "incomplete"),
             other => panic!("Expected TextDelta, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn wire_model_id_keeps_org_segment() {
+        assert_eq!(
+            wire_model_id("deepseek-ai/DeepSeek-V3", Some("siliconflow")),
+            "deepseek-ai/DeepSeek-V3"
+        );
+        assert_eq!(
+            wire_model_id("siliconflow/deepseek-ai/DeepSeek-V3", Some("siliconflow")),
+            "deepseek-ai/DeepSeek-V3"
+        );
+        assert_eq!(
+            wire_model_id("anthropic/claude-sonnet-4.6", Some("openrouter")),
+            "anthropic/claude-sonnet-4.6"
+        );
+        assert_eq!(
+            wire_model_id("doubao/doubao-seed-2.0-lite", None),
+            "doubao-seed-2.0-lite"
+        );
+        assert_eq!(wire_model_id("gpt-4o", Some("openai")), "gpt-4o");
+    }
+
+    #[test]
+    fn thinking_enabled_sends_enabled_type() {
+        let req = LlmRequest {
+            thinking_budget: Some(2048),
+            ..make_request()
+        };
+        let body = build_request_body(&req, None).unwrap();
+        assert_eq!(body["thinking"]["type"].as_str(), Some("enabled"));
+        assert_eq!(body["enable_thinking"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn parse_event_emits_every_parallel_tool_call() {
+        let data = r#"{"choices":[{"delta":{"tool_calls":[
+            {"index":1,"id":"call_b","function":{"name":"b","arguments":"{}"}},
+            {"index":0,"id":"call_a","function":{"name":"a","arguments":"{\"x\":1}"}}
+        ]}}]}"#;
+        let events = parse_event(data);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::ToolCall { id, .. } if id == "call_a"));
+        assert!(matches!(&events[1], StreamEvent::ToolCall { id, .. } if id == "call_b"));
+    }
+
+    #[test]
+    fn parse_event_usage_only_chunk_emits_done() {
+        let data = r#"{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
+        match parse_event(data).as_slice() {
+            [StreamEvent::Done { usage: Some(u) }] => {
+                assert_eq!(u.input, 11);
+                assert_eq!(u.output, 7);
+            }
+            other => panic!("expected Done with usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_failed_and_error_events_surface_errors() {
+        let failed = r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"boom"}}}"#;
+        assert!(matches!(
+            parse_responses_event(failed, None),
+            Some(StreamEvent::Error(m)) if m.contains("boom")
+        ));
+        let err = r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#;
+        assert!(matches!(
+            parse_responses_event(err, Some("error")),
+            Some(StreamEvent::Error(m)) if m.contains("slow down")
+        ));
+        let incomplete = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#;
+        assert!(matches!(
+            parse_responses_event(incomplete, None),
+            Some(StreamEvent::Done { .. })
+        ));
+    }
+
+    #[test]
+    fn ollama_stream_buffers_split_lines_and_finishes_after_thinking() {
+        let mut st = OllamaStreamState::default();
+        let line1 = "{\"message\":{\"thinking\":\"思考\"},\"done\":false}\n";
+        let bytes = line1.as_bytes();
+        let cut = line1.find('思').expect("cjk") + 1;
+        assert!(st.feed(&bytes[..cut]).is_empty());
+        let ev = st.feed(&bytes[cut..]);
+        assert!(matches!(ev.as_slice(), [StreamEvent::TextDelta(t)] if t == "<think>思考"));
+        let ev = st.feed(b"{\"message\":{\"content\":\"\"},\"done\":true}\n");
+        assert_eq!(ev.len(), 2);
+        assert!(matches!(&ev[0], StreamEvent::TextDelta(t) if t == "</think>"));
+        assert!(matches!(&ev[1], StreamEvent::Done { .. }));
     }
 }

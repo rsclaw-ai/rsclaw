@@ -138,6 +138,60 @@ pub(crate) async fn send_with_transport_retry(
     }
 }
 
+/// Incrementally decode a streamed byte chunk as UTF-8.
+///
+/// `pending` carries bytes left over from the previous chunk. The function
+/// appends `bytes`, returns every fully decodable character, and stashes an
+/// INCOMPLETE trailing multi-byte sequence back into `pending` so a CJK /
+/// emoji character split across two TCP chunks decodes intact. Bytes that
+/// can never become valid (`Utf8Error::error_len() == Some(n)`) are replaced
+/// with U+FFFD and skipped — without that advance, a single stray invalid
+/// byte would be re-stitched onto every later chunk, the remainder would
+/// grow without bound and the stream would stall forever.
+pub(crate) fn decode_utf8_chunk(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
+    let buf: Vec<u8> = if pending.is_empty() {
+        bytes.to_vec()
+    } else {
+        let mut combined = std::mem::take(pending);
+        combined.extend_from_slice(bytes);
+        combined
+    };
+    let mut out = String::with_capacity(buf.len());
+    let mut start = 0usize;
+    while start < buf.len() {
+        match std::str::from_utf8(&buf[start..]) {
+            Ok(s) => {
+                out.push_str(s);
+                break;
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                out.push_str(
+                    std::str::from_utf8(&buf[start..start + valid_up_to])
+                        .expect("valid_up_to guarantees valid UTF-8"),
+                );
+                match e.error_len() {
+                    // Incomplete sequence at the tail: wait for the next chunk.
+                    None => {
+                        *pending = buf[start + valid_up_to..].to_vec();
+                        break;
+                    }
+                    // Invalid bytes: they will never decode, skip past them.
+                    Some(n) => {
+                        tracing::warn!(
+                            invalid_bytes = n,
+                            "stream: skipping invalid UTF-8 bytes in provider response"
+                        );
+                        out.push('\u{FFFD}');
+                        start += valid_up_to + n;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Build a `reqwest::Client` with a custom or default User-Agent.
 ///
 /// Tuning notes:
@@ -577,6 +631,25 @@ mod tests {
             d1 < d2,
             "attempt 1 ({d1:?}) should be less than attempt 2 ({d2:?})"
         );
+    }
+
+    #[test]
+    fn decode_utf8_chunk_stitches_split_cjk_and_skips_invalid() {
+        let mut pending = Vec::new();
+        let bytes = "中文".as_bytes();
+        // Split the first 3-byte char across two chunks.
+        let a = decode_utf8_chunk(&mut pending, &bytes[..2]);
+        assert_eq!(a, "");
+        assert_eq!(pending.len(), 2);
+        let b = decode_utf8_chunk(&mut pending, &bytes[2..]);
+        assert_eq!(b, "中文");
+        assert!(pending.is_empty());
+        // A stray invalid byte must not wedge the remainder.
+        let c = decode_utf8_chunk(&mut pending, &[b'a', 0xFF, b'b']);
+        assert_eq!(c, "a\u{FFFD}b");
+        assert!(pending.is_empty());
+        let d = decode_utf8_chunk(&mut pending, b"c");
+        assert_eq!(d, "c");
     }
 
     #[test]

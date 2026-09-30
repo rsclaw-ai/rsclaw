@@ -71,7 +71,10 @@ impl LlmProvider for GeminiProvider {
                 self.base_url, req.model
             );
 
-            let resp = self
+            // Bound only time-to-headers; a `RequestBuilder::timeout` would
+            // also cover the streamed body and cut long generations. The body
+            // is guarded by the per-chunk idle timeout below.
+            let send_fut = self
                 .client
                 .post(&url)
                 .header("content-type", "application/json")
@@ -82,10 +85,15 @@ impl LlmProvider for GeminiProvider {
                         .as_deref()
                         .unwrap_or(super::DEFAULT_USER_AGENT),
                 )
-                .timeout(std::time::Duration::from_secs(120))
                 .json(&body)
-                .send()
+                .send();
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(120), send_fut)
                 .await
+                .map_err(|_| {
+                    anyhow::anyhow!("Gemini request timed out after 120s waiting for response headers")
+                })?
+                // `without_url` keeps the request URL out of the error text.
+                .map_err(reqwest::Error::without_url)
                 .context("Gemini request failed")?;
 
             let status = resp.status();
@@ -97,20 +105,18 @@ impl LlmProvider for GeminiProvider {
             let byte_stream = resp.bytes_stream();
             let byte_stream =
                 tokio_stream::StreamExt::timeout(byte_stream, std::time::Duration::from_secs(120));
-            let line_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
             let mapped = byte_stream.map(move |r| match r {
                 Ok(Ok(bytes)) => Ok(bytes),
-                Ok(Err(e)) => Err(anyhow::anyhow!("Gemini stream read error: {e}")),
+                Ok(Err(e)) => Err(anyhow::anyhow!("Gemini stream read error: {}", e.without_url())),
                 Err(_) => Err(anyhow::anyhow!(
                     "Gemini stream idle for 120s (server stalled mid-generation)"
                 )),
             });
             let event_stream = mapped
-                .then(move |chunk| {
-                    let line_buffer = line_buffer.clone();
-                    async move { parse_sse_chunk_buffered(chunk, &line_buffer).await }
+                .scan(SseBuffers::default(), |buffers, chunk| {
+                    futures::future::ready(Some(parse_sse_chunk_buffered(chunk, buffers)))
                 })
-                .flat_map(|events| futures::stream::iter(events));
+                .flat_map(futures::stream::iter);
 
             let stream: LlmStream = Box::pin(event_stream);
             Ok(stream)
@@ -255,42 +261,37 @@ fn serialize_part(part: &ContentPart) -> Value {
 // SSE parser (Gemini streaming format)
 // ---------------------------------------------------------------------------
 
-/// Buffered SSE parser — handles TCP chunk boundaries that split lines.
+/// Per-stream carry-over between chunks: the incomplete trailing line and
+/// the incomplete trailing UTF-8 sequence.
+#[derive(Default)]
+struct SseBuffers {
+    line: String,
+    utf8_pending: Vec<u8>,
+}
+
+/// Buffered SSE parser — handles TCP chunk boundaries that split lines and
+/// multi-byte characters.
 // TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs,
 // gemini.rs — extract shared utility
-async fn parse_sse_chunk_buffered(
+fn parse_sse_chunk_buffered(
     chunk: Result<bytes::Bytes>,
-    line_buffer: &tokio::sync::Mutex<String>,
+    buffers: &mut SseBuffers,
 ) -> Vec<Result<StreamEvent>> {
     let bytes = match chunk {
         Ok(b) => b,
         Err(e) => return vec![Err(e)],
     };
 
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => std::borrow::Cow::Borrowed(t),
-        Err(e) => {
-            tracing::warn!(
-                "gemini: UTF-8 decode error at byte {}, replacing: {}",
-                e.valid_up_to(),
-                e
-            );
-            std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
-        }
-    };
+    let text = super::decode_utf8_chunk(&mut buffers.utf8_pending, &bytes);
+    buffers.line.push_str(&text);
 
-    let mut buffer = line_buffer.lock().await;
-    buffer.push_str(&text);
-
-    let last_newline_pos = match buffer.rfind('\n') {
+    let last_newline_pos = match buffers.line.rfind('\n') {
         Some(pos) => pos,
         None => return vec![],
     };
 
-    let complete_portion = buffer[..last_newline_pos].to_owned();
-    let incomplete_portion = buffer[last_newline_pos + 1..].to_owned();
-    buffer.clear();
-    buffer.push_str(&incomplete_portion);
+    let complete_portion = buffers.line[..last_newline_pos].to_owned();
+    buffers.line.drain(..=last_newline_pos);
 
     let mut events = Vec::new();
     for line in complete_portion.lines() {
@@ -299,27 +300,31 @@ async fn parse_sse_chunk_buffered(
         } else {
             continue;
         };
-        if let Some(event) = parse_event(data) {
-            events.push(Ok(event));
-        }
+        events.extend(parse_event(data).into_iter().map(Ok));
     }
 
     events
 }
 
-fn parse_event(data: &str) -> Option<StreamEvent> {
-    let v: Value = serde_json::from_str(data).ok()?;
+/// Parse one streamed `GenerateContentResponse` into every event it
+/// carries. A single chunk can hold several parallel `functionCall` parts,
+/// text, and the terminal `finishReason` + `usageMetadata` together.
+fn parse_event(data: &str) -> Vec<StreamEvent> {
+    let Ok(v) = serde_json::from_str::<Value>(data) else {
+        return Vec::new();
+    };
 
     // Check for errors.
     if let Some(err) = v.get("error") {
         let msg = err["message"].as_str().unwrap_or("unknown Gemini error");
-        return Some(StreamEvent::Error(msg.to_owned()));
+        return vec![StreamEvent::Error(msg.to_owned())];
     }
 
-    let candidates = v["candidates"].as_array()?;
-    let candidate = candidates.first()?;
+    let Some(candidate) = v["candidates"].as_array().and_then(|c| c.first()) else {
+        return Vec::new();
+    };
 
-    // Check for function calls.
+    let mut events = Vec::new();
     if let Some(parts) = candidate["content"]["parts"].as_array() {
         for part in parts {
             if let Some(fc) = part.get("functionCall") {
@@ -328,26 +333,25 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
                     .get("args")
                     .cloned()
                     .unwrap_or(Value::Object(Default::default()));
-                return Some(StreamEvent::ToolCall {
+                events.push(StreamEvent::ToolCall {
                     id: name.clone(), // Gemini doesn't use separate IDs
                     name,
                     input: args,
                 });
+            } else if let Some(text) = part["text"].as_str()
+                && !text.is_empty()
+            {
+                if part["thought"].as_bool() == Some(true) {
+                    events.push(StreamEvent::ReasoningDelta(text.to_owned()));
+                } else {
+                    events.push(StreamEvent::TextDelta(text.to_owned()));
+                }
             }
         }
     }
 
-    // Text delta.
-    if let Some(text) = candidate["content"]["parts"]
-        .as_array()
-        .and_then(|parts| parts.first())
-        .and_then(|part| part["text"].as_str())
-        && !text.is_empty()
-    {
-        return Some(StreamEvent::TextDelta(text.to_owned()));
-    }
-
-    // Finish reason.
+    // Finish reason — last, after any deltas in the same chunk, and carrying
+    // the usage that arrives alongside it.
     if candidate.get("finishReason").is_some() {
         let usage = v.get("usageMetadata").map(|u| TokenUsage {
             input: u["promptTokenCount"].as_u64().unwrap_or(0),
@@ -358,10 +362,10 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
             cache_read: u["cachedContentTokenCount"].as_u64().unwrap_or(0),
             ..Default::default()
         });
-        return Some(StreamEvent::Done { usage });
+        events.push(StreamEvent::Done { usage });
     }
 
-    None
+    events
 }
 
 // ---------------------------------------------------------------------------
@@ -446,5 +450,24 @@ mod tests {
         let body = build_request_body(&req).unwrap();
         let decls = &body["tools"][0]["functionDeclarations"];
         assert_eq!(decls[0]["name"].as_str().unwrap(), "search");
+    }
+
+    #[test]
+    fn parallel_function_calls_and_usage_in_one_chunk() {
+        let data = r#"{"candidates":[{"content":{"parts":[
+            {"functionCall":{"name":"a","args":{"x":1}}},
+            {"functionCall":{"name":"b","args":{}}}
+        ]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}"#;
+        let events = parse_event(data);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], StreamEvent::ToolCall { name, .. } if name == "a"));
+        assert!(matches!(&events[1], StreamEvent::ToolCall { name, .. } if name == "b"));
+        match &events[2] {
+            StreamEvent::Done { usage: Some(u) } => {
+                assert_eq!(u.input, 10);
+                assert_eq!(u.output, 5);
+            }
+            other => panic!("expected Done with usage, got {other:?}"),
+        }
     }
 }

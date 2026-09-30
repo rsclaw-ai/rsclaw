@@ -180,7 +180,16 @@ async fn send_following(
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| anyhow!("rsclaw_http: {st} omitted Location"))?
                 .to_owned();
-            current = resolve_location(&current, &loc)?;
+            let next = resolve_location(&current, &loc)?;
+            // The Bearer is re-attached on every hop, so only follow hops
+            // that stay inside the fleet and never downgrade to plain HTTP.
+            if !redirect_allowed(&current, &next) {
+                return Err(anyhow!(
+                    "rsclaw_http: refusing {st} redirect from {current} to {next} \
+                     (cross-site or https->http; bearer would leak)"
+                ));
+            }
+            current = next;
             continue;
         }
         return Ok(resp);
@@ -188,6 +197,42 @@ async fn send_following(
     Err(anyhow!(
         "rsclaw_http: too many redirects starting from {initial_url}"
     ))
+}
+
+/// Registrable-domain approximation: the last two labels of a DNS host
+/// (`backend-a.rsclaw.ai` -> `rsclaw.ai`). IP literals and single-label
+/// hosts are returned whole so they only ever match exactly.
+fn site_of(host: &str) -> &str {
+    if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
+        return host;
+    }
+    let mut dots = host.rmatch_indices('.');
+    match (dots.next(), dots.next()) {
+        (Some(_), Some((idx, _))) => &host[idx + 1..],
+        _ => host,
+    }
+}
+
+/// Whether a credentialed request may follow a redirect from `from` to
+/// `to`: same host or same registrable domain (LB -> backend pool), and
+/// never an https -> http downgrade.
+pub(crate) fn redirect_allowed(from: &str, to: &str) -> bool {
+    let (Ok(from), Ok(to)) = (Url::parse(from), Url::parse(to)) else {
+        return false;
+    };
+    if !matches!(to.scheme(), "http" | "https") {
+        return false;
+    }
+    if from.scheme() == "https" && to.scheme() != "https" {
+        return false;
+    }
+    match (from.host_str(), to.host_str()) {
+        (Some(a), Some(b)) => {
+            let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+            a == b || site_of(&a) == site_of(&b)
+        }
+        _ => false,
+    }
 }
 
 fn resolve_location(current: &str, loc: &str) -> Result<String> {
@@ -273,6 +318,30 @@ mod tests {
             .unwrap(),
             "https://api.rsclaw.ai/backend/v1/videos/video_abc"
         );
+    }
+
+    #[test]
+    fn redirect_policy_blocks_cross_site_and_downgrade() {
+        assert!(redirect_allowed(
+            "https://api.rsclaw.ai/v1/videos",
+            "https://backend-a.rsclaw.ai/v1/videos"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.rsclaw.ai/v1/videos",
+            "https://evil.example.com/v1/videos"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.rsclaw.ai/v1/videos",
+            "http://api.rsclaw.ai/v1/videos"
+        ));
+        assert!(redirect_allowed(
+            "http://127.0.0.1:8080/start",
+            "http://127.0.0.1:8080/final"
+        ));
+        assert!(!redirect_allowed(
+            "http://127.0.0.1:8080/start",
+            "http://10.0.0.1:8080/final"
+        ));
     }
 
     #[tokio::test]

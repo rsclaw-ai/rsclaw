@@ -2,8 +2,14 @@
 //!
 //! Implements streaming via `anthropic-version: 2023-06-01` SSE.
 
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
+
 use anyhow::{Context, Result};
-use futures::{StreamExt, TryStreamExt, future::BoxFuture};
+use futures::{StreamExt, future::BoxFuture};
 use reqwest::Client;
 use serde_json::{Value, json};
 
@@ -15,6 +21,16 @@ use super::{
 pub const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
+/// Minimum `budget_tokens` accepted by budget-style extended thinking.
+const MIN_THINKING_BUDGET: u32 = 1024;
+/// Bound on the time-to-response-headers. The body is NOT covered: a
+/// `RequestBuilder::timeout` would span the whole streamed response and cut
+/// long generations mid-stream.
+const HEADERS_TIMEOUT: Duration = Duration::from_secs(120);
+/// Per-chunk read-idle bound for the SSE body. Anthropic emits `ping`
+/// events while the model is working, so a gap this long means the
+/// connection stalled.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct AnthropicProvider {
     client: Client,
@@ -52,6 +68,21 @@ impl AnthropicProvider {
     }
 }
 
+/// Build the Messages endpoint URL from a configured base.
+///
+/// The builtin / `defaults.toml` base already carries the `/v1` segment
+/// (`https://api.anthropic.com/v1`) while the bare-host constant and some
+/// anthropic-compatible third parties do not. Append only `/messages` when
+/// the base ends with `/v1`, else `/v1/messages` — mirrors the setup probe.
+fn messages_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
 impl LlmProvider for AnthropicProvider {
     fn name(&self) -> &str {
         "anthropic"
@@ -61,13 +92,13 @@ impl LlmProvider for AnthropicProvider {
         Box::pin(async move {
             super::warn_unsupported_kv_cache_mode_2(self.name(), &req);
             let body = build_request_body(&req)?;
-            let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+            let url = messages_url(&self.base_url);
             // Capture model + URL up-front so the failure path can
             // surface them in the error message — a bare "404 Not
             // Found" is otherwise impossible to triage.
             let model_for_log = req.model.clone();
 
-            let resp = self
+            let send_fut = self
                 .client
                 .post(&url)
                 .header("x-api-key", &self.api_key)
@@ -80,9 +111,15 @@ impl LlmProvider for AnthropicProvider {
                         .unwrap_or(super::DEFAULT_USER_AGENT),
                 )
                 .json(&body)
-                .timeout(std::time::Duration::from_secs(120))
-                .send()
+                .send();
+            let resp = tokio::time::timeout(HEADERS_TIMEOUT, send_fut)
                 .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Anthropic request timed out after {}s waiting for response headers (url={url})",
+                        HEADERS_TIMEOUT.as_secs()
+                    )
+                })?
                 .with_context(|| format!("Anthropic request failed (url={url})"))?;
 
             let status = resp.status();
@@ -100,15 +137,20 @@ impl LlmProvider for AnthropicProvider {
                 );
             }
 
-            let byte_stream = resp.bytes_stream();
-            let line_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+            let byte_stream = tokio_stream::StreamExt::timeout(resp.bytes_stream(), STREAM_IDLE_TIMEOUT)
+                .map(|r| match r {
+                    Ok(Ok(bytes)) => Ok(bytes),
+                    Ok(Err(e)) => Err(anyhow::anyhow!("stream read error: {e}")),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Anthropic stream idle for {}s (server stalled mid-generation)",
+                        STREAM_IDLE_TIMEOUT.as_secs()
+                    )),
+                });
             let event_stream = byte_stream
-                .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
-                .then(move |chunk| {
-                    let line_buffer = line_buffer.clone();
-                    async move { parse_sse_chunk_buffered(chunk, &line_buffer).await }
+                .scan(SseState::new(req.model.clone()), |state, chunk| {
+                    futures::future::ready(Some(parse_sse_chunk(chunk, state)))
                 })
-                .flat_map(|events| futures::stream::iter(events));
+                .flat_map(futures::stream::iter);
 
             let stream: LlmStream = Box::pin(event_stream);
             Ok(stream)
@@ -117,16 +159,148 @@ impl LlmProvider for AnthropicProvider {
 }
 
 // ---------------------------------------------------------------------------
+// Model family rules
+// ---------------------------------------------------------------------------
+
+/// Request-shape rules that differ across Claude generations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeFamily {
+    /// Opus 4.7+, Sonnet 5+, Fable, Mythos: thinking is `{type:"adaptive"}`
+    /// only (`budget_tokens` returns 400) and sampling parameters
+    /// (`temperature` / `top_p` / `top_k`) return 400.
+    AdaptiveOnly,
+    /// Opus 4.6 / Sonnet 4.6: adaptive thinking recommended (`budget_tokens`
+    /// deprecated); sampling allowed but not together with thinking.
+    Adaptive,
+    /// Older Claude: budget-style thinking (`budget_tokens` >= 1024 and
+    /// strictly below `max_tokens`); sampling not allowed with thinking.
+    Legacy,
+    /// Not a Claude model id — an anthropic-compatible third party (Kimi,
+    /// MiniMax, GLM, ...). Keep the historical request shape.
+    Other,
+}
+
+fn claude_family(model: &str) -> ClaudeFamily {
+    let m = model.to_ascii_lowercase().replace('.', "-");
+    if m.contains("fable") || m.contains("mythos") {
+        return ClaudeFamily::AdaptiveOnly;
+    }
+    if !m.contains("claude") {
+        return ClaudeFamily::Other;
+    }
+    // Version follows the tier name in current ids (`claude-opus-4-7`,
+    // `claude-sonnet-5`). Legacy ids put it before (`claude-3-5-sonnet-
+    // 20241022`); a date segment there is not a version, so those resolve
+    // to `None` and fall into Legacy.
+    let version = ["opus-", "sonnet-", "haiku-"].iter().find_map(|tier| {
+        let rest = &m[m.find(tier)? + tier.len()..];
+        let mut segs = rest.split('-');
+        let major: u32 = segs
+            .next()
+            .filter(|s| (1..=2).contains(&s.len()))?
+            .parse()
+            .ok()?;
+        let minor: u32 = segs
+            .next()
+            .filter(|s| (1..=2).contains(&s.len()))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        Some((major, minor))
+    });
+    match version {
+        Some((major, _)) if major >= 5 => ClaudeFamily::AdaptiveOnly,
+        Some((4, minor)) if minor >= 7 => ClaudeFamily::AdaptiveOnly,
+        Some((4, 6)) => ClaudeFamily::Adaptive,
+        _ => ClaudeFamily::Legacy,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Thinking-block replay cache
+// ---------------------------------------------------------------------------
+
+/// Bound on remembered assistant turns carrying thinking blocks.
+const THINKING_CACHE_CAP: usize = 256;
+
+/// Process-level cache of the thinking / redacted_thinking blocks (with
+/// their `signature`) that preceded each `tool_use`, keyed by
+/// `(model, tool_use_id)`.
+///
+/// The internal message model only keeps reasoning TEXT, but the Messages
+/// API requires the assistant turn of an in-flight tool loop to be replayed
+/// with its original thinking blocks unchanged (signature included) when
+/// thinking is on. Keyed by model because thinking blocks are bound to the
+/// model that produced them.
+#[derive(Default)]
+struct ThinkingCache {
+    map: HashMap<(String, String), Vec<Value>>,
+    order: VecDeque<(String, String)>,
+}
+
+fn thinking_cache() -> &'static Mutex<ThinkingCache> {
+    static CACHE: OnceLock<Mutex<ThinkingCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ThinkingCache::default()))
+}
+
+fn remember_thinking(model: &str, tool_use_id: &str, blocks: Vec<Value>) {
+    if tool_use_id.is_empty() || blocks.is_empty() {
+        return;
+    }
+    let mut cache = match thinking_cache().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let key = (model.to_owned(), tool_use_id.to_owned());
+    if cache.map.insert(key.clone(), blocks).is_none() {
+        cache.order.push_back(key);
+    }
+    while cache.order.len() > THINKING_CACHE_CAP {
+        if let Some(old) = cache.order.pop_front() {
+            cache.map.remove(&old);
+        }
+    }
+}
+
+fn recall_thinking(model: &str, tool_use_id: &str) -> Option<Vec<Value>> {
+    let cache = match thinking_cache().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    cache
+        .map
+        .get(&(model.to_owned(), tool_use_id.to_owned()))
+        .cloned()
+}
+
+// ---------------------------------------------------------------------------
 // Request body builder
 // ---------------------------------------------------------------------------
 
 fn build_request_body(req: &LlmRequest) -> Result<Value> {
     // Split system messages from conversation messages.
-    let (system, messages) = split_system_messages(&req.messages, req.system.as_deref());
+    let (system, mut messages) =
+        split_system_messages(&req.messages, req.system.as_deref(), &req.model);
+    // Anthropic rejects a tool_result without its tool_use (and vice
+    // versa) and requires results to directly follow their call.
+    repair_tool_pairing(&mut messages);
+
+    let family = claude_family(&req.model);
+    let mut max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    let thinking_requested = req.thinking_budget.is_some_and(|b| b > 0);
+    // When thinking is on, the assistant turn of the in-flight tool loop
+    // must start with its original thinking block. If we cannot replay it
+    // (cache miss after a restart / model switch) run this request without
+    // thinking instead of taking a guaranteed 400.
+    let thinking_on = thinking_requested && trailing_tool_turn_replayable(&messages);
+    if thinking_requested && !thinking_on {
+        tracing::debug!(
+            model = %req.model,
+            "anthropic: thinking blocks for the in-flight tool turn are unavailable; sending this request without thinking"
+        );
+    }
 
     let mut body = json!({
         "model":      req.model,
-        "max_tokens": req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "stream":     true,
         "messages":   messages,
     });
@@ -138,7 +312,17 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     // Inject prompt caching markers (system_and_3 strategy).
     inject_cache_control(&mut body);
 
-    if let Some(t) = req.temperature {
+    // Sampling: rejected outright by AdaptiveOnly models, and incompatible
+    // with thinking on every Claude model. Third-party compatible endpoints
+    // keep the historical behaviour.
+    let sampling_allowed = match family {
+        ClaudeFamily::AdaptiveOnly => false,
+        ClaudeFamily::Adaptive | ClaudeFamily::Legacy => !thinking_on,
+        ClaudeFamily::Other => true,
+    };
+    if let Some(t) = req.temperature
+        && sampling_allowed
+    {
         body["temperature"] = super::json_f32(t);
     }
 
@@ -171,22 +355,169 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         body["tool_choice"] = json!({ "type": "auto" });
     }
 
-    // Extended thinking: if budget > 0, enable thinking with the specified budget.
-    if let Some(budget) = req.thinking_budget
-        && budget > 0
-    {
-        body["thinking"] = json!({
-            "type": "enabled",
-            "budget_tokens": budget,
-        });
+    // Extended thinking. Newer Claude models only accept adaptive thinking;
+    // budget-style thinking needs `1024 <= budget_tokens < max_tokens`.
+    if thinking_on {
+        match family {
+            ClaudeFamily::AdaptiveOnly | ClaudeFamily::Adaptive => {
+                body["thinking"] = json!({ "type": "adaptive" });
+            }
+            ClaudeFamily::Legacy | ClaudeFamily::Other => {
+                let budget = req
+                    .thinking_budget
+                    .unwrap_or(MIN_THINKING_BUDGET)
+                    .max(MIN_THINKING_BUDGET);
+                if budget >= max_tokens {
+                    // max_tokens includes the thinking budget; keep the
+                    // original visible-answer room on top of it.
+                    max_tokens = budget.saturating_add(max_tokens);
+                }
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                });
+            }
+        }
     }
+    body["max_tokens"] = json!(max_tokens);
 
     Ok(body)
+}
+
+/// True unless the last assistant turn carries `tool_use` without leading
+/// thinking blocks — the shape the API rejects when thinking is enabled.
+fn trailing_tool_turn_replayable(messages: &[Value]) -> bool {
+    let Some(last_assistant) = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"].as_str() == Some("assistant"))
+    else {
+        return true;
+    };
+    let Some(blocks) = last_assistant["content"].as_array() else {
+        return true;
+    };
+    let has_tool_use = blocks
+        .iter()
+        .any(|b| b["type"].as_str() == Some("tool_use"));
+    if !has_tool_use {
+        return true;
+    }
+    matches!(
+        blocks.first().and_then(|b| b["type"].as_str()),
+        Some("thinking") | Some("redacted_thinking")
+    )
+}
+
+/// Anthropic counterpart of the OpenAI path's `fix_tool_call_pairing` +
+/// `reorder_tool_messages`:
+///   - drops `tool_result` blocks whose `tool_use` is not in the history,
+///   - drops `tool_use` blocks that never received a result,
+///   - moves every result into a user message directly after its call.
+///
+/// Messages left empty by the pruning are removed (consecutive same-role
+/// turns are merged by the API).
+fn repair_tool_pairing(messages: &mut Vec<Value>) {
+    let block_type = |b: &Value| b["type"].as_str().map(str::to_owned);
+    let mut use_ids: HashSet<String> = HashSet::new();
+    let mut result_ids: HashSet<String> = HashSet::new();
+    for m in messages.iter() {
+        let Some(blocks) = m["content"].as_array() else {
+            continue;
+        };
+        for b in blocks {
+            match (m["role"].as_str(), block_type(b).as_deref()) {
+                (Some("assistant"), Some("tool_use")) => {
+                    if let Some(id) = b["id"].as_str() {
+                        use_ids.insert(id.to_owned());
+                    }
+                }
+                (Some("user"), Some("tool_result")) => {
+                    if let Some(id) = b["tool_use_id"].as_str() {
+                        result_ids.insert(id.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut results: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut rest: Vec<Value> = Vec::with_capacity(messages.len());
+    for mut m in messages.drain(..) {
+        let role = m["role"].as_str().unwrap_or("").to_owned();
+        if let Some(blocks) = m.get_mut("content").and_then(Value::as_array_mut) {
+            if role == "user" {
+                let mut kept = Vec::with_capacity(blocks.len());
+                for b in blocks.drain(..) {
+                    if block_type(&b).as_deref() == Some("tool_result") {
+                        match b["tool_use_id"].as_str() {
+                            Some(id) if use_ids.contains(id) => {
+                                results.entry(id.to_owned()).or_default().push(b);
+                            }
+                            _ => {
+                                tracing::debug!("anthropic: dropping orphaned tool_result");
+                            }
+                        }
+                    } else {
+                        kept.push(b);
+                    }
+                }
+                *blocks = kept;
+            } else if role == "assistant" {
+                blocks.retain(|b| {
+                    block_type(b).as_deref() != Some("tool_use")
+                        || b["id"].as_str().is_some_and(|id| result_ids.contains(id))
+                });
+                // Thinking blocks alone are not a valid turn.
+                if blocks.iter().all(|b| {
+                    matches!(
+                        block_type(b).as_deref(),
+                        Some("thinking") | Some("redacted_thinking")
+                    )
+                }) {
+                    blocks.clear();
+                }
+            }
+            if blocks.is_empty() {
+                continue;
+            }
+        }
+        rest.push(m);
+    }
+
+    for m in rest {
+        let call_ids: Vec<String> = if m["role"].as_str() == Some("assistant") {
+            m["content"]
+                .as_array()
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|b| b["type"].as_str() == Some("tool_use"))
+                        .filter_map(|b| b["id"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        messages.push(m);
+        let mut result_blocks: Vec<Value> = Vec::new();
+        for id in &call_ids {
+            if let Some(r) = results.remove(id) {
+                result_blocks.extend(r);
+            }
+        }
+        if !result_blocks.is_empty() {
+            messages.push(json!({ "role": "user", "content": result_blocks }));
+        }
+    }
 }
 
 fn split_system_messages<'a>(
     messages: &'a [Message],
     extra_system: Option<&'a str>,
+    model: &str,
 ) -> (Option<String>, Vec<Value>) {
     let mut system_parts: Vec<String> =
         extra_system.map(|s| vec![s.to_owned()]).unwrap_or_default();
@@ -201,7 +532,7 @@ fn split_system_messages<'a>(
                 }
             }
             Role::User | Role::Assistant | Role::Tool => {
-                conv.push(serialize_message(msg));
+                conv.push(serialize_message(msg, model));
             }
         }
     }
@@ -218,7 +549,7 @@ fn split_system_messages<'a>(
 // TODO: Tool role maps to "user" but loses the tool_use_id, which Anthropic
 // requires for tool_result blocks. This may cause issues with multi-turn
 // tool-use conversations.
-fn serialize_message(msg: &Message) -> Value {
+fn serialize_message(msg: &Message, model: &str) -> Value {
     let role = match msg.role {
         Role::User | Role::Tool => "user",
         Role::Assistant => "assistant",
@@ -244,7 +575,27 @@ fn serialize_message(msg: &Message) -> Value {
             }
         }
         MessageContent::Parts(parts) => {
-            let serialized: Vec<Value> = parts.iter().map(serialize_part).collect();
+            // Replay the original thinking blocks (with signature) of an
+            // assistant tool turn this process produced. They replace the
+            // plain-text reasoning copy and must come first.
+            let cached_thinking = if msg.role == Role::Assistant {
+                parts.iter().find_map(|p| match p {
+                    ContentPart::ToolUse { id, .. } => recall_thinking(model, id),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            let mut serialized: Vec<Value> = Vec::with_capacity(parts.len());
+            if let Some(blocks) = &cached_thinking {
+                serialized.extend(blocks.iter().cloned());
+            }
+            for part in parts {
+                if cached_thinking.is_some() && matches!(part, ContentPart::Reasoning { .. }) {
+                    continue;
+                }
+                serialized.push(serialize_part(part));
+            }
             // Reject entirely-empty parts arrays, and arrays where
             // every Text/Reasoning part is whitespace.
             let has_meaningful_content = !serialized.is_empty()
@@ -411,42 +762,58 @@ fn tag_last_content_block(msg: &mut Value, marker: &Value) {
 // SSE parser
 // ---------------------------------------------------------------------------
 
-/// Buffered SSE parser — handles TCP chunk boundaries that split lines.
+/// Per-stream parser state (one per HTTP response).
 // TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs,
 // gemini.rs — extract shared utility
-async fn parse_sse_chunk_buffered(
-    chunk: Result<bytes::Bytes>,
-    line_buffer: &tokio::sync::Mutex<String>,
-) -> Vec<Result<StreamEvent>> {
+struct SseState {
+    /// Model id of the request — keys the thinking replay cache.
+    model: String,
+    /// Incomplete trailing line carried to the next chunk.
+    line_buffer: String,
+    /// Incomplete trailing UTF-8 sequence carried to the next chunk.
+    utf8_pending: Vec<u8>,
+    /// Thinking blocks being streamed, by content-block index:
+    /// `(thinking_text, signature)`.
+    open_thinking: HashMap<u64, (String, String)>,
+    /// Completed thinking / redacted_thinking blocks of this message, in
+    /// order — attached to the tool_use blocks that follow them.
+    completed_thinking: Vec<Value>,
+    /// Input-side usage from `message_start` (the final `message_delta`
+    /// only reliably carries `output_tokens`).
+    start_usage: Option<TokenUsage>,
+}
+
+impl SseState {
+    fn new(model: String) -> Self {
+        Self {
+            model,
+            line_buffer: String::new(),
+            utf8_pending: Vec::new(),
+            open_thinking: HashMap::new(),
+            completed_thinking: Vec::new(),
+            start_usage: None,
+        }
+    }
+}
+
+/// Buffered SSE parser — handles TCP chunk boundaries that split lines and
+/// multi-byte characters.
+fn parse_sse_chunk(chunk: Result<bytes::Bytes>, state: &mut SseState) -> Vec<Result<StreamEvent>> {
     let bytes = match chunk {
         Ok(b) => b,
         Err(e) => return vec![Err(e)],
     };
 
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => std::borrow::Cow::Borrowed(t),
-        Err(e) => {
-            tracing::warn!(
-                "anthropic: UTF-8 decode error at byte {}, replacing: {}",
-                e.valid_up_to(),
-                e
-            );
-            std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
-        }
-    };
+    let text = super::decode_utf8_chunk(&mut state.utf8_pending, &bytes);
+    state.line_buffer.push_str(&text);
 
-    let mut buffer = line_buffer.lock().await;
-    buffer.push_str(&text);
-
-    let last_newline_pos = match buffer.rfind('\n') {
+    let last_newline_pos = match state.line_buffer.rfind('\n') {
         Some(pos) => pos,
         None => return vec![],
     };
 
-    let complete_portion = buffer[..last_newline_pos].to_owned();
-    let incomplete_portion = buffer[last_newline_pos + 1..].to_owned();
-    buffer.clear();
-    buffer.push_str(&incomplete_portion);
+    let complete_portion = state.line_buffer[..last_newline_pos].to_owned();
+    state.line_buffer.drain(..=last_newline_pos);
 
     let mut events = Vec::new();
     for line in complete_portion.lines() {
@@ -457,7 +824,7 @@ async fn parse_sse_chunk_buffered(
             if data == "[DONE]" {
                 continue;
             }
-            if let Some(event) = parse_event(data) {
+            if let Some(event) = parse_event(data, state) {
                 events.push(Ok(event));
             }
         }
@@ -466,11 +833,31 @@ async fn parse_sse_chunk_buffered(
     events
 }
 
-fn parse_event(data: &str) -> Option<StreamEvent> {
+fn usage_from(u: &serde_json::Map<String, Value>) -> TokenUsage {
+    TokenUsage {
+        input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+        output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+        cache_creation: u
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_read: u
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        ..Default::default()
+    }
+}
+
+fn parse_event(data: &str, state: &mut SseState) -> Option<StreamEvent> {
     let v: Value = serde_json::from_str(data).ok()?;
     let event_type = v["type"].as_str()?;
 
     match event_type {
+        "message_start" => {
+            state.start_usage = v["message"]["usage"].as_object().map(usage_from);
+            None
+        }
         "content_block_delta" => {
             let delta_type = v["delta"]["type"].as_str()?;
             match delta_type {
@@ -480,11 +867,26 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
                 }
                 "thinking_delta" => {
                     let text = v["delta"]["thinking"].as_str().unwrap_or("").to_owned();
+                    if let Some(index) = v["index"].as_u64()
+                        && let Some(block) = state.open_thinking.get_mut(&index)
+                    {
+                        block.0.push_str(&text);
+                    }
                     if text.is_empty() {
                         None
                     } else {
                         Some(StreamEvent::ReasoningDelta(text))
                     }
+                }
+                "signature_delta" => {
+                    if let Some(index) = v["index"].as_u64()
+                        && let Some(block) = state.open_thinking.get_mut(&index)
+                    {
+                        block
+                            .1
+                            .push_str(v["delta"]["signature"].as_str().unwrap_or(""));
+                    }
+                    None
                 }
                 "input_json_delta" => {
                     // Tool input streaming — emit as ToolCall so the agent loop
@@ -507,34 +909,70 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
             let block = &v["content_block"];
             match block["type"].as_str() {
                 Some("tool_use") => {
+                    let id = block["id"].as_str().unwrap_or("").to_owned();
+                    // Remember the thinking that led to this call so the
+                    // next request can replay it unchanged.
+                    remember_thinking(&state.model, &id, state.completed_thinking.clone());
                     // Tool call start — emit immediately so the agent loop knows.
                     Some(StreamEvent::ToolCall {
-                        id: block["id"].as_str().unwrap_or("").to_owned(),
+                        id,
                         name: block["name"].as_str().unwrap_or("").to_owned(),
                         input: serde_json::Value::Object(Default::default()),
                     })
                 }
                 Some("thinking") => {
-                    // Thinking block start — no action needed.
+                    if let Some(index) = v["index"].as_u64() {
+                        state.open_thinking.insert(
+                            index,
+                            (
+                                block["thinking"].as_str().unwrap_or("").to_owned(),
+                                block["signature"].as_str().unwrap_or("").to_owned(),
+                            ),
+                        );
+                    }
+                    None
+                }
+                Some("redacted_thinking") => {
+                    state.completed_thinking.push(block.clone());
                     None
                 }
                 _ => None,
             }
         }
+        "content_block_stop" => {
+            if let Some(index) = v["index"].as_u64()
+                && let Some((thinking, signature)) = state.open_thinking.remove(&index)
+            {
+                state.completed_thinking.push(json!({
+                    "type": "thinking",
+                    "thinking": thinking,
+                    "signature": signature,
+                }));
+            }
+            None
+        }
         "message_delta" => {
-            let usage = v["usage"].as_object().map(|u| TokenUsage {
-                input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-                output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
-                cache_creation: u
-                    .get("cache_creation_input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                cache_read: u
-                    .get("cache_read_input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                ..Default::default()
-            });
+            let delta_usage = v["usage"].as_object().map(usage_from);
+            // Merge: `message_start` carries the input side, the final
+            // `message_delta` the output side. Prefer non-zero values.
+            let usage = match (state.start_usage.clone(), delta_usage) {
+                (Some(start), Some(delta)) => Some(TokenUsage {
+                    input: if delta.input > 0 { delta.input } else { start.input },
+                    output: delta.output.max(start.output),
+                    cache_creation: if delta.cache_creation > 0 {
+                        delta.cache_creation
+                    } else {
+                        start.cache_creation
+                    },
+                    cache_read: if delta.cache_read > 0 {
+                        delta.cache_read
+                    } else {
+                        start.cache_read
+                    },
+                    ..Default::default()
+                }),
+                (start, delta) => delta.or(start),
+            };
             if v["delta"]["stop_reason"].is_string() {
                 Some(StreamEvent::Done { usage })
             } else {
@@ -772,5 +1210,198 @@ mod tests {
         let body = build_request_body(&req).expect("build request body");
         let t = body["temperature"].as_f64().expect("temperature is f64");
         assert!((t - 0.7).abs() < 1e-4);
+    }
+
+    #[test]
+    fn messages_url_does_not_double_v1() {
+        assert_eq!(
+            messages_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            messages_url("https://api.anthropic.com/v1/"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            messages_url(ANTHROPIC_API_BASE),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn claude_family_detection() {
+        assert_eq!(claude_family("claude-opus-5"), ClaudeFamily::AdaptiveOnly);
+        assert_eq!(claude_family("claude-opus-4-7"), ClaudeFamily::AdaptiveOnly);
+        assert_eq!(claude_family("claude-sonnet-5"), ClaudeFamily::AdaptiveOnly);
+        assert_eq!(claude_family("claude-fable-5-1"), ClaudeFamily::AdaptiveOnly);
+        assert_eq!(claude_family("claude-sonnet-4.6"), ClaudeFamily::Adaptive);
+        assert_eq!(claude_family("claude-opus-4-6"), ClaudeFamily::Adaptive);
+        assert_eq!(claude_family("claude-haiku-4-5"), ClaudeFamily::Legacy);
+        assert_eq!(
+            claude_family("claude-opus-4-20250514"),
+            ClaudeFamily::Legacy
+        );
+        assert_eq!(
+            claude_family("claude-3-5-sonnet-20241022"),
+            ClaudeFamily::Legacy
+        );
+        assert_eq!(claude_family("kimi-k2"), ClaudeFamily::Other);
+    }
+
+    #[test]
+    fn adaptive_only_model_uses_adaptive_thinking_and_no_temperature() {
+        let req = LlmRequest {
+            model: "claude-opus-4-7".to_owned(),
+            temperature: Some(0.7),
+            thinking_budget: Some(10240),
+            ..Default::default()
+        };
+        let body = build_request_body(&req).expect("build request body");
+        assert_eq!(body["thinking"]["type"].as_str(), Some("adaptive"));
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn legacy_budget_is_kept_below_max_tokens() {
+        let req = LlmRequest {
+            model: "claude-opus-4-20250514".to_owned(),
+            max_tokens: Some(4096),
+            temperature: Some(0.5),
+            thinking_budget: Some(10240),
+            ..Default::default()
+        };
+        let body = build_request_body(&req).expect("build request body");
+        let budget = body["thinking"]["budget_tokens"].as_u64().expect("budget");
+        let max = body["max_tokens"].as_u64().expect("max_tokens");
+        assert!(budget < max, "budget {budget} must be < max_tokens {max}");
+        // Sampling is not allowed together with thinking.
+        assert!(body.get("temperature").is_none());
+    }
+
+    fn tool_turn_request(model: &str, tool_id: &str) -> LlmRequest {
+        LlmRequest {
+            model: model.to_owned(),
+            thinking_budget: Some(4096),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text("run it".to_owned()),
+                    rsclaw_hidden: None,
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Parts(vec![
+                        ContentPart::Reasoning {
+                            text: "plan".to_owned(),
+                        },
+                        ContentPart::ToolUse {
+                            id: tool_id.to_owned(),
+                            name: "shell".to_owned(),
+                            input: json!({"cmd": "ls"}),
+                        },
+                    ]),
+                    rsclaw_hidden: None,
+                },
+                Message {
+                    role: Role::Tool,
+                    content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                        tool_use_id: tool_id.to_owned(),
+                        content: "ok".to_owned(),
+                        is_error: None,
+                    }]),
+                    rsclaw_hidden: None,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn thinking_dropped_when_tool_turn_has_no_replayable_thinking() {
+        let req = tool_turn_request("claude-haiku-4-5", "toolu_no_cache_1");
+        let body = build_request_body(&req).expect("build request body");
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn cached_thinking_blocks_are_replayed_with_signature() {
+        let mut state = SseState::new("claude-haiku-4-5".to_owned());
+        for data in [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig123"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_cached_1","name":"shell","input":{}}}"#,
+        ] {
+            parse_event(data, &mut state);
+        }
+        let req = tool_turn_request("claude-haiku-4-5", "toolu_cached_1");
+        let body = build_request_body(&req).expect("build request body");
+        assert_eq!(body["thinking"]["type"].as_str(), Some("enabled"));
+        let assistant = &body["messages"][1]["content"];
+        assert_eq!(assistant[0]["type"].as_str(), Some("thinking"));
+        assert_eq!(assistant[0]["signature"].as_str(), Some("sig123"));
+        assert_eq!(assistant[1]["type"].as_str(), Some("tool_use"));
+    }
+
+    #[test]
+    fn tool_pairing_drops_orphans_and_reorders_results() {
+        let mut msgs = vec![
+            json!({"role":"user","content":"go"}),
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"a","name":"x","input":{}},
+                {"type":"tool_use","id":"b","name":"y","input":{}}
+            ]}),
+            json!({"role":"user","content":[{"type":"text","text":"interject"}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"1"}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"zzz","content":"orphan"}]}),
+        ];
+        repair_tool_pairing(&mut msgs);
+        // Unanswered tool_use "b" is removed.
+        let calls = msgs[1]["content"].as_array().expect("assistant blocks");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"].as_str(), Some("a"));
+        // Result "a" directly follows its call; orphan "zzz" is gone.
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"].as_str(), Some("a"));
+        assert_eq!(msgs[3]["content"][0]["text"].as_str(), Some("interject"));
+        assert_eq!(msgs.len(), 4);
+    }
+
+    #[test]
+    fn usage_merges_message_start_and_delta() {
+        let mut state = SseState::new("claude-haiku-4-5".to_owned());
+        parse_event(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":80,"output_tokens":1}}}"#,
+            &mut state,
+        );
+        let ev = parse_event(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#,
+            &mut state,
+        );
+        match ev {
+            Some(StreamEvent::Done { usage: Some(u) }) => {
+                assert_eq!(u.input, 120);
+                assert_eq!(u.output, 42);
+                assert_eq!(u.cache_read, 80);
+            }
+            other => panic!("expected Done with usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_chunk_keeps_cjk_split_across_chunks() {
+        let mut state = SseState::new("claude-haiku-4-5".to_owned());
+        let line = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"中文\"}}\n";
+        let bytes = line.as_bytes();
+        // Split inside the first CJK character.
+        let cut = line.find('中').expect("cjk present") + 1;
+        let first = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(&bytes[..cut])), &mut state);
+        assert!(first.is_empty());
+        let second = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(&bytes[cut..])), &mut state);
+        match second.first() {
+            Some(Ok(StreamEvent::TextDelta(t))) => assert_eq!(t, "中文"),
+            other => panic!("expected text delta, got {other:?}"),
+        }
     }
 }

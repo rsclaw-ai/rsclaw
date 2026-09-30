@@ -679,7 +679,9 @@ impl LlmProvider for RsclawProvider {
             // vanilla `/v1/chat/completions`) to bisect protocol-vs-model
             // truncation behavior. No-op when the env var is unset, so
             // production stays untouched.
-            if std::env::var("RSCLAW_DUMP_TURN").is_ok() {
+            if std::env::var("RSCLAW_DUMP_TURN")
+                .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"))
+            {
                 dump_turn_for_debug(&session_key, &entry, &split, &delta, &req);
             }
 
@@ -2039,7 +2041,7 @@ struct SplitRequest<'a> {
 /// Writes one JSON file per turn to:
 ///   `<base_dir>/debug/turn-<unix_ms>-<session_suffix>.json`
 ///
-/// Gated on `RSCLAW_DUMP_TURN` env var being set (any non-empty value).
+/// Gated on `RSCLAW_DUMP_TURN=1` (or `true`).
 /// Write failures are logged at WARN but don't abort the turn.
 fn dump_turn_for_debug(
     session_key: &str,
@@ -2395,30 +2397,11 @@ async fn parse_oneshot_sse_chunk(
     // Carry forward any UTF-8 continuation bytes that landed at the
     // tail of the previous chunk — without this, CJK / emoji
     // characters that straddle a chunk boundary corrupt into U+FFFD.
-    let mut remainder = utf8_remainder.lock().await;
-    let combined = if remainder.is_empty() {
-        bytes.to_vec()
-    } else {
-        let mut c = std::mem::take(&mut *remainder);
-        c.extend_from_slice(&bytes);
-        c
-    };
-    let text: String = match std::str::from_utf8(&combined) {
-        Ok(t) => {
-            drop(remainder);
-            t.to_owned()
-        }
-        Err(e) => {
-            let valid_up_to = e.valid_up_to();
-            *remainder = combined[valid_up_to..].to_vec();
-            drop(remainder);
-            if valid_up_to == 0 {
-                return Vec::new();
-            }
-            // SAFETY: valid_up_to is at a valid UTF-8 boundary by
-            // construction of the `Utf8Error`.
-            unsafe { std::str::from_utf8_unchecked(&combined[..valid_up_to]) }.to_owned()
-        }
+    // Invalid (never-completing) bytes are skipped rather than stashed, so
+    // one stray byte cannot make the remainder grow forever.
+    let text: String = {
+        let mut remainder = utf8_remainder.lock().await;
+        super::decode_utf8_chunk(&mut remainder, &bytes)
     };
 
     let mut buffer = line_buffer.lock().await;
@@ -3085,9 +3068,9 @@ async fn parse_sse_chunk(
             }
             // Close a block. For tool_call: parse the accumulated buf
             // as JSON and emit a single ToolCall event. Malformed JSON
-            // collapses to an empty object so downstream `.as_object()`
-            // consumers never have to match Null; the empty-args path
-            // is the runtime's existing "tool with no args" branch.
+            // is passed through as the raw string: the agent runtime
+            // repairs it or flags `_parse_error` and tells the model,
+            // instead of silently dispatching the tool with no args.
             // Text/thinking already emitted incrementally — block_stop
             // is just a no-op cleanup for them.
             "block_stop" => {
@@ -3100,8 +3083,14 @@ async fn parse_sse_chunk(
                     let input: Value = if b.buf.is_empty() {
                         Value::Object(Default::default())
                     } else {
-                        serde_json::from_str(&b.buf)
-                            .unwrap_or_else(|_| Value::Object(Default::default()))
+                        serde_json::from_str(&b.buf).unwrap_or_else(|e| {
+                            tracing::warn!(
+                                tool = %b.tool_name,
+                                error = %e,
+                                "rsclaw: tool_call arguments are not valid JSON; passing raw string to the runtime"
+                            );
+                            Value::String(b.buf.clone())
+                        })
                     };
                     events.push(Ok(StreamEvent::ToolCall {
                         id: b.tool_id,
@@ -4141,10 +4130,11 @@ data: {"type":"block_stop","index":99}
     }
 
     #[tokio::test]
-    async fn parse_v1_tool_call_malformed_json_falls_back_to_empty_object() {
+    async fn parse_v1_tool_call_malformed_json_passes_raw_string() {
         // Malformed tool_call input must not panic / surface as Err —
-        // the parser falls back to {} so downstream consumers don't
-        // crash. Matches the runtime's "no-args" branch behavior.
+        // the parser passes the raw string through so the runtime's
+        // repair / `_parse_error` path handles it (instead of silently
+        // dispatching the tool with empty args).
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let state = new_state();
@@ -4166,8 +4156,7 @@ data: {"type":"block_stop","index":0}
                 _ => None,
             })
             .expect("expected one ToolCall event");
-        assert!(input.is_object());
-        assert_eq!(input.as_object().unwrap().len(), 0);
+        assert_eq!(input.as_str(), Some("{not valid json"));
     }
 
     #[test]

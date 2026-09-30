@@ -43,14 +43,21 @@ pub enum ErrorKind {
     /// 400/422 with a request-shape problem unrelated to the model
     /// (max_tokens overage etc.). NOT a model fault — caller handles.
     BadRequest,
-    /// 413 `session_ctx_exceeded` from the rsclaw kvCacheMode=2 session
-    /// backend: the conversation (system + tools + history) grew past the
-    /// worker's `--rsclaw-max-session-ctx`. NOT a model fault and NOT a
+    /// The prompt no longer fits the model's context window: rsclaw's 413
+    /// `session_ctx_exceeded` (kvCacheMode=2 session backend), OpenAI
+    /// `context_length_exceeded`, Anthropic "prompt is too long", Gemini
+    /// "input token count exceeds", ... NOT a model fault and NOT a
     /// failover trigger — switching models just masks it (a bigger-ctx
     /// fallback "works" but slowly). The caller (agent loop) must compact
     /// the history or recreate the session and retry the SAME model.
     /// Propagated, never advances the chain, never disables the model.
     ContextExceeded,
+    /// Generic non-retryable 4xx (400 / 404 / 422 that is not auth, rate
+    /// limit, balance, model-missing or context overflow). Retrying the
+    /// identical request cannot succeed, so it is never retried in place;
+    /// the chain advances (another model may accept the request) without
+    /// cooling this model down, since the fault is request-specific.
+    InvalidRequest,
     /// Default bucket for unrecognised errors. Treated as Transient so the
     /// chain still tries the next model, but flagged in logs so we can
     /// extend `classify_error` later.
@@ -393,7 +400,7 @@ pub const MAX_COOLDOWN: Duration = Duration::from_secs(3600);
 pub fn cooling_backoff(consecutive: u32, kind: ErrorKind) -> Duration {
     let base = match kind {
         ErrorKind::RateLimit => 30u64,
-        ErrorKind::Transient | ErrorKind::Unknown => 10u64,
+        ErrorKind::Transient | ErrorKind::Unknown | ErrorKind::InvalidRequest => 10u64,
         // BadRequest / ContextExceeded are caller-handled (propagated, not
         // advanced), so they never actually cool down a profile — this arm
         // only satisfies exhaustiveness.
@@ -426,6 +433,33 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
     classify_str(&s)
 }
 
+/// True when an (already lowercased) error text reports that the prompt
+/// exceeds the model's context window, across provider dialects.
+pub(crate) fn is_context_overflow(lower: &str) -> bool {
+    // rsclaw kvCacheMode=2 session backend (413 envelope / worker body).
+    lower.contains("session_ctx_exceeded")
+        || lower.contains("exceed_context_size_error")
+        || lower.contains("max-session-ctx")
+        // OpenAI and OpenAI-compatible servers.
+        || lower.contains("context_length_exceeded")
+        || lower.contains("maximum context length")
+        || lower.contains("context length exceeded")
+        || lower.contains("reduce the length of the messages")
+        // Anthropic.
+        || lower.contains("prompt is too long")
+        || lower.contains("exceed context limit")
+        || lower.contains("model_context_window_exceeded")
+        // Gemini: "The input token count (N) exceeds the maximum number of
+        // tokens allowed (M)."
+        || (lower.contains("input token count") && lower.contains("exceeds the maximum"))
+        // Generic phrasing (vLLM, llama.cpp, aggregators).
+        || lower.contains("context_window_exceeded")
+        || lower.contains("exceeds the context window")
+        || lower.contains("exceeds context window")
+        || lower.contains("context window exceeded")
+        || lower.contains("exceeds the available context size")
+}
+
 /// Same as `classify_error` but operates on the message string directly —
 /// keeps the classification logic testable without manufacturing
 /// anyhow::Error values.
@@ -440,10 +474,7 @@ pub fn classify_str(s: &str) -> ErrorKind {
     // contains both "exceed_context_size_error" and "max-session-ctx" and
     // we want the dedicated kind, not BadRequest. This is caller-handled
     // (compact / recreate the session), NOT a model failover trigger.
-    if lower.contains("session_ctx_exceeded")
-        || lower.contains("exceed_context_size_error")
-        || lower.contains("max-session-ctx")
-    {
+    if is_context_overflow(&lower) {
         return ErrorKind::ContextExceeded;
     }
 
@@ -511,6 +542,18 @@ pub fn classify_str(s: &str) -> ErrorKind {
     // the model for our serialization mistake.
     if lower.contains("max_tokens") && (lower.contains("400") || lower.contains("exceed")) {
         return ErrorKind::BadRequest;
+    }
+
+    // -------- Generic non-retryable 4xx --------
+    // Matched on the status phrase the providers format into their errors
+    // (`"... error 400 Bad Request: ..."`) rather than a bare "400", which
+    // would also hit token counts in unrelated bodies.
+    if lower.contains("400 bad request")
+        || lower.contains("404 not found")
+        || lower.contains("422 unprocessable")
+        || lower.contains("invalid_request_error")
+    {
+        return ErrorKind::InvalidRequest;
     }
 
     // -------- 5xx / transient --------
@@ -639,6 +682,24 @@ mod tests {
         // so the dedicated kind doesn't over-capture generic context errors.
         let body = r#"400 Bad Request: max_tokens exceeds model ceiling"#;
         assert_eq!(classify_str(body), ErrorKind::BadRequest);
+    }
+
+    #[test]
+    fn classify_context_overflow_across_providers() {
+        let openai = r#"OpenAI API error 400 Bad Request: {"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.","code":"context_length_exceeded"}}"#;
+        assert_eq!(classify_str(openai), ErrorKind::ContextExceeded);
+        let anthropic = r#"Anthropic API error 400 Bad Request: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#;
+        assert_eq!(classify_str(anthropic), ErrorKind::ContextExceeded);
+        let gemini = r#"Gemini API error 400 Bad Request: {"error":{"message":"The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."}}"#;
+        assert_eq!(classify_str(gemini), ErrorKind::ContextExceeded);
+    }
+
+    #[test]
+    fn classify_generic_4xx_is_invalid_request() {
+        let body = r#"OpenAI API error 400 Bad Request: {"error":{"message":"Invalid value for 'tool_choice'"}}"#;
+        assert_eq!(classify_str(body), ErrorKind::InvalidRequest);
+        let body = r#"OpenAI API error 422 Unprocessable Entity: bad field"#;
+        assert_eq!(classify_str(body), ErrorKind::InvalidRequest);
     }
 
     #[test]

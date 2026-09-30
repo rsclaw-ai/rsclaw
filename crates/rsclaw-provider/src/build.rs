@@ -35,10 +35,12 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             // local endpoint" (let it through, current behaviour).
             let user_specified_key = provider_cfg.api_key.is_some();
             let mut unresolved_placeholder: Option<String> = None;
+            // `resolve_full`, not `as_plain`: an apiKey written as a SecretRef
+            // (`{ source: "env", id: "X" }`, file, exec) must resolve too.
             let api_key = provider_cfg
                 .api_key
                 .as_ref()
-                .and_then(|k| k.as_plain().map(str::to_owned))
+                .and_then(|k| k.resolve_full(config.ops.secrets.as_ref()))
                 .filter(|s| {
                     if s.contains("${") && s.contains('}') {
                         unresolved_placeholder = Some(s.clone());
@@ -131,7 +133,7 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     let url = base_url.unwrap_or_else(|| anthropic::ANTHROPIC_API_BASE.to_owned());
                     Arc::new(AnthropicProvider::with_user_agent(key, url, user_agent))
                 }
-                ("gemini", _) => {
+                ("gemini", _) | (_, &rsclaw_config::schema::ApiFormat::Gemini) => {
                     let key = api_key
                         .or_else(|| std::env::var("GEMINI_API_KEY").ok())
                         .unwrap_or_default();
@@ -145,7 +147,10 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     // configured key only.
                     let key = api_key;
                     let url = base_url.unwrap_or_else(|| "http://localhost:11434".to_owned());
-                    Arc::new(OpenAiProvider::ollama_with_ua(url, key, user_agent))
+                    Arc::new(
+                        OpenAiProvider::ollama_with_ua(url, key, user_agent)
+                            .with_provider_name(name.clone()),
+                    )
                 }
                 (_, &rsclaw_config::schema::ApiFormat::OpenAiResponses) => {
                     let key = openai_key_for_endpoint(
@@ -154,7 +159,10 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                         std::env::var("OPENAI_API_KEY").ok(),
                     );
                     let url = base_url.unwrap_or_else(|| crate::openai::OPENAI_API_BASE.to_owned());
-                    Arc::new(OpenAiProvider::responses_with_ua(url, key, user_agent))
+                    Arc::new(
+                        OpenAiProvider::responses_with_ua(url, key, user_agent)
+                            .with_provider_name(name.clone()),
+                    )
                 }
                 (_, &rsclaw_config::schema::ApiFormat::Rsclaw) => {
                     // rsclaw stateful session protocol (kvCacheMode=2).
@@ -196,15 +204,11 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                         base_url.is_none(),
                         std::env::var("OPENAI_API_KEY").ok(),
                     );
-                    if let Some(url) = base_url {
-                        Arc::new(OpenAiProvider::with_user_agent(url, key, user_agent))
-                    } else {
-                        Arc::new(OpenAiProvider::with_user_agent(
-                            crate::openai::OPENAI_API_BASE,
-                            key,
-                            user_agent,
-                        ))
-                    }
+                    let url = base_url.unwrap_or_else(|| crate::openai::OPENAI_API_BASE.to_owned());
+                    Arc::new(
+                        OpenAiProvider::with_user_agent(url, key, user_agent)
+                            .with_provider_name(name.clone()),
+                    )
                 }
             };
 
@@ -222,7 +226,10 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
     if !registry.names().contains(&"openai")
         && let Ok(key) = std::env::var("OPENAI_API_KEY")
     {
-        registry.register("openai", Arc::new(OpenAiProvider::new(key)));
+        registry.register(
+            "openai",
+            Arc::new(OpenAiProvider::new(key).with_provider_name("openai")),
+        );
     }
     if !registry.names().contains(&"gemini")
         && let Ok(key) = std::env::var("GEMINI_API_KEY")
@@ -318,7 +325,7 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         {
             registry.register(
                 name,
-                Arc::new(OpenAiProvider::with_base_url(base_url, Some(key))),
+                Arc::new(OpenAiProvider::with_base_url(base_url, Some(key)).with_provider_name(name)),
             );
         }
     }
@@ -328,10 +335,10 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         if let Ok(key) = std::env::var("ARK_API_KEY").or_else(|_| std::env::var("DOUBAO_API_KEY")) {
             registry.register(
                 "doubao",
-                Arc::new(OpenAiProvider::responses(
-                    "https://ark.cn-beijing.volces.com/api/v3",
-                    Some(key),
-                )),
+                Arc::new(
+                    OpenAiProvider::responses("https://ark.cn-beijing.volces.com/api/v3", Some(key))
+                        .with_provider_name("doubao"),
+                ),
             );
         }
     }
@@ -339,10 +346,10 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         if let Ok(key) = std::env::var("ARK_API_KEY").or_else(|_| std::env::var("DOUBAO_API_KEY")) {
             registry.register(
                 "bytedance",
-                Arc::new(OpenAiProvider::responses(
-                    "https://ark.cn-beijing.volces.com/api/v3",
-                    Some(key),
-                )),
+                Arc::new(
+                    OpenAiProvider::responses("https://ark.cn-beijing.volces.com/api/v3", Some(key))
+                        .with_provider_name("bytedance"),
+                ),
             );
         }
     }
@@ -351,10 +358,10 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
     if !registry.names().contains(&"ollama") {
         registry.register(
             "ollama",
-            Arc::new(OpenAiProvider::with_base_url(
-                "http://localhost:11434",
-                None,
-            )),
+            Arc::new(
+                OpenAiProvider::with_base_url("http://localhost:11434", None)
+                    .with_provider_name("ollama"),
+            ),
         );
     }
 
@@ -380,7 +387,7 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             .unwrap_or_else(|| "http://localhost:8090/v1".to_string());
         registry.register(
             "rsclaw_server",
-            Arc::new(OpenAiProvider::with_base_url(url, Some(key))),
+            Arc::new(OpenAiProvider::with_base_url(url, Some(key)).with_provider_name("rsclaw_server")),
         );
     }
 
