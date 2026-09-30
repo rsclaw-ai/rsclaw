@@ -3,35 +3,51 @@ use crate::ws::{
     types::ErrorShape,
 };
 
+/// `config.set` — set one dotted `key` to `value` in the config file.
+///
+/// Both params are required (a call without them used to rewrite the whole
+/// file as JSON for nothing). The edited document must still deserialize
+/// into the config schema, otherwise nothing is written.
 pub async fn config_set(ctx: MethodCtx) -> MethodResult {
     let params = ctx
         .req
         .params
         .as_ref()
         .ok_or_else(|| ErrorShape::bad_request("missing params"))?;
+    let key = params
+        .get("key")
+        .and_then(|v| v.as_str())
+        .filter(|k| !k.trim().is_empty())
+        .ok_or_else(|| ErrorShape::bad_request("missing required param: key"))?;
+    let value = params
+        .get("value")
+        .ok_or_else(|| ErrorShape::bad_request("missing required param: value"))?;
     let (path, mut val) = crate::cmd::config_json::load_config_json()
         .map_err(|e| ErrorShape::internal(e.to_string()))?;
-    if let Some(key) = params.get("key").and_then(|v| v.as_str())
-        && let Some(value) = params.get("value")
-    {
-        crate::cmd::config_json::set_nested_value(&mut val, key, value.clone())
-            .map_err(|e| ErrorShape::internal(e.to_string()))?;
+    crate::cmd::config_json::set_nested_value(&mut val, key, value.clone())
+        .map_err(|e| ErrorShape::bad_request(e.to_string()))?;
+    // Same schema gate as HTTP PUT /api/v1/config.
+    if let Err(e) = serde_json::from_value::<rsclaw_config::schema::Config>(val.clone()) {
+        return Err(ErrorShape::bad_request(format!(
+            "config schema validation failed for `{key}`: {e}"
+        )));
     }
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&val).unwrap_or_default(),
-    )
-    .map_err(|e| ErrorShape::internal(e.to_string()))?;
+    let json = serde_json::to_string_pretty(&val)
+        .map_err(|e| ErrorShape::internal(format!("serialize config: {e}")))?;
+    std::fs::write(&path, json).map_err(|e| ErrorShape::internal(e.to_string()))?;
     Ok(serde_json::json!({"ok": true}))
 }
+/// `config.patch` — alias of `config.set`.
 pub async fn config_patch(ctx: MethodCtx) -> MethodResult {
     config_set(ctx).await
 }
+/// `config.apply` — not implemented: it used to parse the config and report
+/// `applied: true` without applying anything. Use the HTTP reload endpoint
+/// (`POST /api/v1/reload`) or a gateway restart instead.
 pub async fn config_apply(_ctx: MethodCtx) -> MethodResult {
-    match rsclaw_config::load() {
-        Ok(_) => Ok(serde_json::json!({"applied": true, "restarted": false})),
-        Err(e) => Err(ErrorShape::internal(e.to_string())),
-    }
+    Err(ErrorShape::not_implemented(
+        "config.apply is not implemented; use POST /api/v1/reload or restart the gateway",
+    ))
 }
 
 /// config.schema — returns a schema descriptor for each config category.

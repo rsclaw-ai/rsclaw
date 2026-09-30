@@ -164,9 +164,13 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
     let schedule = params["schedule"]
         .as_str()
         .ok_or_else(|| ErrorShape::bad_request("missing schedule"))?;
-    // Validate the expression BEFORE saving so the LLM gets a clear error
-    // instead of silently writing a broken cron that never fires.
-    if let Err(msg) = crate::cron::validate_cron_expr(schedule) {
+    let tz = params["tz"]
+        .as_str()
+        .or_else(|| params["timezone"].as_str())
+        .filter(|t| !t.trim().is_empty());
+    // Validate the expression + timezone BEFORE saving so the LLM gets a
+    // clear error instead of silently writing a broken cron that never fires.
+    if let Err(msg) = crate::cron::validate_cron_expr_tz(schedule, tz) {
         return Err(ErrorShape::bad_request(msg));
     }
     let message = params["message"]
@@ -194,7 +198,13 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
         agent_id: agent_id.unwrap_or("default").to_string(),
         session_key: None,
         enabled: true,
-        schedule: crate::cron::CronSchedule::Flat(schedule.to_string()),
+        schedule: match tz {
+            Some(tz) => crate::cron::CronSchedule::Tagged(crate::cron::CronScheduleTagged::Nested {
+                expr: schedule.to_string(),
+                tz: Some(tz.to_string()),
+            }),
+            None => crate::cron::CronSchedule::Flat(schedule.to_string()),
+        },
         payload: None,
         message: Some(message.to_string()),
         delivery: None,
@@ -204,6 +214,7 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
         iter: None,
         created_at_ms: Some(chrono::Utc::now().timestamp_millis() as u64),
         updated_at_ms: None,
+        created_by: None,
     };
 
     jobs.push(job);
@@ -254,12 +265,25 @@ pub async fn cron_remove(ctx: MethodCtx) -> MethodResult {
     Ok(serde_json::json!({ "removed": id }))
 }
 
+/// Upper bound on lines returned by `logs.tail`.
+const MAX_LOG_TAIL_LINES: u64 = 2000;
+
+/// Secret-looking tokens redacted from log lines sent over WS.
+static LOG_SECRET_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)(?:bearer |api[_-]?key[=:]\s*|sk-|token[=:]\s*)[a-zA-Z0-9_-]{16,}",
+    )
+    .expect("log secret redaction regex")
+});
+
+/// `logs.tail` — last N (capped) lines of the gateway log, secrets redacted.
 pub async fn logs_tail(ctx: MethodCtx) -> MethodResult {
     let params = ctx.req.params.as_ref();
     let limit = params
         .and_then(|p| p.get("lines").or_else(|| p.get("limit")))
         .and_then(|v| v.as_u64())
-        .unwrap_or(50) as usize;
+        .unwrap_or(50)
+        .min(MAX_LOG_TAIL_LINES) as usize;
 
     // Candidate paths: configured file first, then well-known defaults.
     let configured = ctx
@@ -295,19 +319,17 @@ pub async fn logs_tail(ctx: MethodCtx) -> MethodResult {
             let tail: Vec<&str> = all[start..].to_vec();
             // Redact common secret patterns in log lines before sending
             // over WS, matching the HTTP /api/v1/logs endpoint behavior.
-            let redact_re = regex::Regex::new(
-                r"(?i)(?:bearer |api[_-]?key[=:]\s*|sk-|token[=:]\s*)[a-zA-Z0-9_-]{16,}",
-            )
-            .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
-            let entries: Vec<serde_json::Value> = tail
+            // Both `lines` and `entries` carry only redacted text.
+            let redacted: Vec<String> = tail
+                .iter()
+                .map(|line| LOG_SECRET_RE.replace_all(line, "[REDACTED]").into_owned())
+                .collect();
+            let entries: Vec<serde_json::Value> = redacted
                 .iter()
                 .enumerate()
-                .map(|(i, line)| {
-                    let redacted = redact_re.replace_all(line, "[REDACTED]");
-                    serde_json::json!({ "index": start + i, "line": redacted })
-                })
+                .map(|(i, line)| serde_json::json!({ "index": start + i, "line": line }))
                 .collect();
-            return Ok(serde_json::json!({ "lines": tail, "entries": entries, "source": path }));
+            return Ok(serde_json::json!({ "lines": redacted, "entries": entries, "source": path }));
         }
     }
 
@@ -566,10 +588,24 @@ pub async fn cron_update(ctx: MethodCtx) -> MethodResult {
 
     // Patch allowed fields.
     if let Some(schedule) = params.get("schedule").and_then(|v| v.as_str()) {
-        if let Err(msg) = crate::cron::validate_cron_expr(schedule) {
+        // Keep the job's existing timezone unless the patch supplies one.
+        let tz = params
+            .get("tz")
+            .or_else(|| params.get("timezone"))
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| job.schedule.tz().map(str::to_owned));
+        if let Err(msg) = crate::cron::validate_cron_expr_tz(schedule, tz.as_deref()) {
             return Err(ErrorShape::bad_request(msg));
         }
-        job.schedule = crate::cron::CronSchedule::Flat(schedule.to_string());
+        job.schedule = match tz {
+            Some(tz) => crate::cron::CronSchedule::Tagged(crate::cron::CronScheduleTagged::Nested {
+                expr: schedule.to_string(),
+                tz: Some(tz),
+            }),
+            None => crate::cron::CronSchedule::Flat(schedule.to_string()),
+        };
     }
     if let Some(message) = params.get("message").and_then(|v| v.as_str()) {
         job.message = Some(message.to_string());
@@ -682,6 +718,10 @@ pub async fn system_restart(ctx: MethodCtx) -> MethodResult {
     Ok(serde_json::json!({ "restarting": true }))
 }
 
+/// `cron.run` — run a cron job now. Loads the job from the authoritative
+/// redb store (jobs created via `cron.add` never appear in
+/// `config.ops.cron.jobs`) and dispatches it in-process, sharing the HTTP
+/// `POST /api/v1/cron/:id/trigger` path. Returns once the message is queued.
 pub async fn cron_run(ctx: MethodCtx) -> MethodResult {
     let params = ctx
         .req
@@ -692,39 +732,17 @@ pub async fn cron_run(ctx: MethodCtx) -> MethodResult {
         .as_str()
         .ok_or_else(|| ErrorShape::bad_request("missing id"))?;
 
-    let config = rsclaw_config::load().map_err(|e| ErrorShape::internal(e.to_string()))?;
-    let jobs = config
-        .ops
-        .cron
-        .as_ref()
-        .and_then(|c| c.jobs.as_deref())
-        .unwrap_or(&[]);
-    let job = jobs
-        .iter()
-        .find(|j| j.id == id)
-        .ok_or_else(|| ErrorShape::not_found(format!("cron job '{id}' not found")))?;
-
-    let port = config.gateway.port;
-    let url = format!("http://127.0.0.1:{port}/api/v1/message");
-    let body = serde_json::json!({
-        "text": job.message,
-        "agent_id": job.agent_id,
-        "session_key": format!("cron:{id}:manual"),
-    });
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| ErrorShape::internal(format!("gateway unreachable at {url}: {e}")))?;
-    if resp.status().is_success() {
-        Ok(serde_json::json!({ "triggered": id }))
-    } else {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        Err(ErrorShape::internal(format!(
-            "gateway error {status}: {text}"
-        )))
+    use crate::server::CronTriggerError;
+    match crate::server::trigger_cron_job(&ctx.state, id).await {
+        Ok(()) => Ok(serde_json::json!({ "triggered": id })),
+        Err(CronTriggerError::NotFound) => {
+            Err(ErrorShape::not_found(format!("cron job '{id}' not found")))
+        }
+        Err(CronTriggerError::Store(e)) => {
+            Err(ErrorShape::internal(format!("cron store unreadable: {e}")))
+        }
+        Err(CronTriggerError::Dispatch) => Err(ErrorShape::internal(format!(
+            "failed to dispatch cron job '{id}' to its agent"
+        ))),
     }
 }

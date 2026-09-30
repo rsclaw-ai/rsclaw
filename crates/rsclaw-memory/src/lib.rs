@@ -877,12 +877,41 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Vector search that records an access on every returned doc (updates
+    /// access stats and tier). Use [`Self::search_readonly`] for browsing.
     pub async fn search(
         &mut self,
         query: &str,
         scope: Option<&str>,
         top_k: usize,
     ) -> Result<Vec<MemoryDoc>> {
+        let result_indices = self.search_indices(query, scope, top_k)?;
+        // Touch each matched doc (updates access stats & tier).
+        let mut results = Vec::with_capacity(result_indices.len());
+        for idx in result_indices {
+            self.docs[idx].touch();
+            results.push(self.docs[idx].clone());
+        }
+        Ok(results)
+    }
+
+    /// Same as [`Self::search`] but never touches access statistics, so a
+    /// UI browse / admin query does not promote docs or skew decay.
+    pub async fn search_readonly(
+        &self,
+        query: &str,
+        scope: Option<&str>,
+        top_k: usize,
+    ) -> Result<Vec<MemoryDoc>> {
+        Ok(self
+            .search_indices(query, scope, top_k)?
+            .into_iter()
+            .map(|idx| self.docs[idx].clone())
+            .collect())
+    }
+
+    /// Indices (into `self.docs`) of the live docs nearest to `query`.
+    fn search_indices(&self, query: &str, scope: Option<&str>, top_k: usize) -> Result<Vec<usize>> {
         if self.docs.is_empty() {
             return Ok(vec![]);
         }
@@ -937,14 +966,7 @@ impl MemoryStore {
             k = (k * 4).min(total);
         };
 
-        // Touch each matched doc (updates access stats & tier).
-        let mut results = Vec::with_capacity(result_indices.len());
-        for idx in result_indices {
-            self.docs[idx].touch();
-            results.push(self.docs[idx].clone());
-        }
-
-        Ok(results)
+        Ok(result_indices)
     }
 
     /// Hybrid search: vector + BM25, fused via reciprocal rank fusion.

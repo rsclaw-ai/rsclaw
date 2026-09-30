@@ -74,14 +74,16 @@ const MAX_LOCAL_MEDIA_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_TRACKED_RATE_LIMIT_IPS: usize = 10_000;
 
 // H1: simple in-memory per-IP rate limiter with a sliding window.
-// Default: 100 req / 60s per IP. Bypassed when no limit is configured (rate_rps
-// = 0).
+// Fixed at 100 req / 60s per remote IP (not configurable). Loopback peers and
+// Bearer-authenticated requests are exempt (see `rate_limit_middleware`).
+// `max_req = 0` disables the limiter.
 #[derive(Clone)]
 pub struct RateLimiter {
     inner: Arc<RwLock<HashMap<IpAddr, Vec<Instant>>>>,
 }
 
 impl RateLimiter {
+    /// Create an empty limiter.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
@@ -105,7 +107,16 @@ impl RateLimiter {
             !entries.is_empty()
         });
         if !map.contains_key(&ip) && map.len() >= MAX_TRACKED_RATE_LIMIT_IPS {
-            return true;
+            // Table full: evict the peer whose most recent request is the
+            // oldest instead of rejecting every new IP (which let a botnet
+            // lock out all fresh clients).
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, entries)| entries.last().copied())
+                .map(|(k, _)| *k);
+            if let Some(k) = oldest {
+                map.remove(&k);
+            }
         }
         let entries = map.entry(ip).or_default();
         if entries.len() >= max_req as usize {
@@ -423,6 +434,172 @@ fn trusted_cors_origin(origin: &HeaderValue) -> bool {
         )
 }
 
+/// Custom request header that marks a request as coming from an rsclaw
+/// client (CLI, desktop, UI). Browsers cannot attach a custom header
+/// cross-origin without a CORS preflight, which `cors_layer` refuses for
+/// untrusted origins, so its presence defeats simple-request CSRF.
+pub const LOCAL_REQUEST_HEADER: &str = "x-rsclaw-request";
+
+/// Host part (`host[:port]`) of the request, from the `Host` header or the
+/// URI authority (HTTP/2).
+fn request_host(headers: &HeaderMap, uri: &axum::http::Uri) -> Option<String> {
+    headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| uri.authority().map(|a| a.as_str().to_owned()))
+}
+
+/// Whether a browser `Origin` may drive this gateway: the local/desktop
+/// origins accepted by CORS, or a same-origin request (page served from the
+/// same `host[:port]`, e.g. behind a reverse proxy).
+fn origin_allowed(origin: &HeaderValue, host: Option<&str>) -> bool {
+    if trusted_cors_origin(origin) {
+        return true;
+    }
+    let (Ok(origin), Some(host)) = (origin.to_str(), host) else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    let Some(origin_host) = url.host_str() else {
+        return false;
+    };
+    let origin_authority = match url.port() {
+        Some(p) => format!("{origin_host}:{p}"),
+        None => origin_host.to_owned(),
+    };
+    matches!(url.scheme(), "http" | "https") && origin_authority.eq_ignore_ascii_case(host)
+}
+
+/// True when the request carries a valid gateway Bearer token.
+fn bearer_matches(headers: &HeaderMap, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|t| constant_time_eq(t, expected))
+}
+
+/// CSRF gate for the loopback-only control endpoints (shutdown, restart,
+/// cron reload). The loopback peer check alone is not enough: any web page
+/// the user visits can fire a simple `no-cors` POST at 127.0.0.1.
+///
+/// Accepted when the request carries the gateway Bearer token, OR it is a
+/// non-browser request (no `Origin`, no cross-site `Sec-Fetch-Site`; local
+/// processes such as the CLI), OR it is a browser request from a trusted
+/// origin that also carries a preflight-forcing marker (`X-RsClaw-Request`
+/// header or a JSON content type).
+fn control_request_allowed(
+    headers: &HeaderMap,
+    auth_token: Option<&str>,
+) -> Result<(), &'static str> {
+    if bearer_matches(headers, auth_token) {
+        return Ok(());
+    }
+    let origin = headers.get(header::ORIGIN);
+    if let Some(origin) = origin
+        && !trusted_cors_origin(origin)
+    {
+        return Err("request origin is not allowed");
+    }
+    let sec_fetch_site = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok());
+    let from_browser = origin.is_some() || sec_fetch_site.is_some_and(|s| s != "none");
+    if !from_browser {
+        return Ok(());
+    }
+    let has_marker = headers.contains_key(LOCAL_REQUEST_HEADER)
+        || headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/json"));
+    if has_marker {
+        Ok(())
+    } else {
+        Err("browser requests must carry the X-RsClaw-Request header")
+    }
+}
+
+/// DNS-rebinding guard: whether `host` (a `Host` header value) names this
+/// machine's loopback interface. `allow_tailnet` also accepts MagicDNS
+/// `*.ts.net` names (tailscale serve proxies to the loopback listener).
+/// Extra names can be allowed via `RSCLAW_ALLOWED_HOSTS` (comma-separated).
+fn host_is_local(host: &str, allow_tailnet: bool) -> bool {
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // IPv6 literal: `[::1]:port`
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.rsplit_once(':')
+            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+            .map(|(h, _)| h)
+            .unwrap_or(host)
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if matches!(name.as_str(), "localhost" | "127.0.0.1" | "::1" | "tauri.localhost") {
+        return true;
+    }
+    if let Ok(ip) = name.parse::<IpAddr>()
+        && ip.is_loopback()
+    {
+        return true;
+    }
+    if allow_tailnet && name.ends_with(".ts.net") {
+        return true;
+    }
+    std::env::var("RSCLAW_ALLOWED_HOSTS").is_ok_and(|list| {
+        list.split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .any(|h| !h.is_empty() && h == name)
+    })
+}
+
+/// Configuration for [`host_guard_middleware`].
+#[derive(Clone, Copy)]
+struct HostGuard {
+    /// Only enforced when the listener is bound to a loopback address.
+    loopback_bound: bool,
+    allow_tailnet: bool,
+}
+
+/// Reject requests whose `Host` is not a local name while the gateway is
+/// bound to loopback. Defeats DNS rebinding (`evil.example` resolving to
+/// 127.0.0.1 makes the attacker's page same-origin with the gateway).
+/// Webhook and A2A paths are exempt: tunnels (ngrok, cloudflared) forward
+/// them with the public hostname and they carry their own authentication.
+async fn host_guard_middleware(
+    State(guard): State<HostGuard>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if guard.loopback_bound {
+        let path = request.uri().path();
+        let exempt = path.starts_with("/hooks/")
+            || path == "/health"
+            || path == "/api/v1/health"
+            || path == "/.well-known/agent.json"
+            || path == "/api/v1/a2a"
+            || path.starts_with("/api/v1/a2a/");
+        if !exempt
+            && let Some(host) = request_host(request.headers(), request.uri())
+            && !host_is_local(&host, guard.allow_tailnet)
+        {
+            warn!(%host, path = %path, "rejected request with non-local Host header (DNS rebinding guard)");
+            return (
+                StatusCode::MISDIRECTED_REQUEST,
+                Json(serde_json::json!({"error": "host not allowed"})),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
 fn cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin, _request_parts| {
@@ -592,7 +769,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(openai_chat_completions))
         .route("/v1/models", get(openai_list_models))
         // OpenAI Files API — file upload/management for doubao and other providers.
-        .route("/v1/files", post(upload_file).get(list_files))
+        // axum's default 2 MiB body limit would make MAX_UPLOAD_SIZE dead;
+        // allow the full upload plus multipart framing overhead.
+        .route(
+            "/v1/files",
+            post(upload_file)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_UPLOAD_SIZE + 1024 * 1024))
+                .get(list_files),
+        )
         .route(
             "/v1/files/{file_id}",
             get(get_file_meta).delete(delete_file),
@@ -607,7 +791,8 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             auth_middleware,
         ))
-        // H1: per-IP rate limiter (default 100 req/60s, configurable via gateway.rateLimitRps)
+        // H1: per-IP rate limiter (fixed 100 req/60s per remote IP; loopback
+        // and Bearer-authenticated requests are exempt)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit_middleware,
@@ -629,7 +814,18 @@ pub fn build_router(state: AppState) -> Router {
 /// replacement process, exiting).
 pub async fn serve(state: AppState, bind: std::net::SocketAddr) -> Result<()> {
     let shutdown = state.shutdown.clone();
-    let router = build_router(state);
+    let host_guard = HostGuard {
+        loopback_bound: bind.ip().is_loopback(),
+        allow_tailnet: state.config.gateway.allow_tailscale
+            || matches!(
+                state.config.gateway.bind,
+                rsclaw_config::schema::BindMode::Tailnet
+            ),
+    };
+    let router = build_router(state).layer(middleware::from_fn_with_state(
+        host_guard,
+        host_guard_middleware,
+    ));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("gateway listening on {bind}");
     // `into_make_service_with_connect_info` exposes the peer SocketAddr to
@@ -667,6 +863,48 @@ async fn auth_middleware(
     // same handler — see the top-level alias just below the `nest`
     // call in `build_router`.
     let path = request.uri().path();
+
+    // CSRF / cross-site WebSocket hijack guard: a browser request whose
+    // `Origin` is neither a trusted local/desktop origin nor same-origin is
+    // refused before it can cause side effects (CORS alone only hides the
+    // response). Absent `Origin` = non-browser client. Webhooks and A2A are
+    // server-to-server and authenticate themselves.
+    let cross_site_exempt = path.starts_with("/hooks/")
+        || path == "/api/v1/a2a"
+        || path.starts_with("/api/v1/a2a/")
+        || path == "/.well-known/agent.json";
+    if !cross_site_exempt && let Some(origin) = headers.get(header::ORIGIN) {
+        let host = request_host(&headers, request.uri());
+        if !origin_allowed(origin, host.as_deref()) {
+            warn!(path = %path, origin = ?origin, "rejected cross-origin request");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "origin not allowed"})),
+            )
+                .into_response();
+        }
+    }
+
+    // Loopback-only control endpoints (the handlers enforce the loopback
+    // peer). They stay reachable without the token for local processes, but
+    // browser-originated requests must prove they are not a CSRF.
+    if path == "/api/v1/cron/reload"
+        || path == "/api/v1/shutdown"
+        || path == "/api/v1/restart"
+        || path == "/api/v1/restart-dismiss"
+    {
+        let expected = state.live.gateway.read().await.auth_token.clone();
+        if let Err(reason) = control_request_allowed(&headers, expected.as_deref()) {
+            warn!(path = %path, reason, "control endpoint request rejected");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": reason})),
+            )
+                .into_response();
+        }
+        return next.run(request).await;
+    }
+
     if path == "/"
         || path == "/health"
         || path == "/api/v1/health"
@@ -674,10 +912,6 @@ async fn auth_middleware(
         || path == "/ws"
         || path == "/gateway-ws"
         || path.starts_with("/hooks/")
-        || path == "/api/v1/cron/reload"
-        || path == "/api/v1/shutdown"
-        || path == "/api/v1/restart"
-        || path == "/api/v1/restart-dismiss"
         // A2A v1.0: bypass gateway-level auth so the protocol's own
         // bearer/X-API-Key schemes (declared in Agent Card securitySchemes
         // and enforced by `a2a_auth_layer`) are the authoritative gate.
@@ -724,6 +958,16 @@ async fn rate_limit_middleware(
     let ip = addr.ip();
     const DEFAULT_MAX_REQ: u32 = 100;
     const WINDOW_SECS: u64 = 60;
+    // Local processes (desktop UI polling, CLI, agent tools calling back into
+    // the gateway) and token-authenticated clients are not throttled; the
+    // limiter exists to blunt unauthenticated remote floods.
+    if is_loopback(addr) {
+        return next.run(request).await;
+    }
+    let token = state.live.gateway.read().await.auth_token.clone();
+    if bearer_matches(request.headers(), token.as_deref()) {
+        return next.run(request).await;
+    }
     if state
         .rate_limiter
         .check(ip, DEFAULT_MAX_REQ, WINDOW_SECS)
@@ -792,6 +1036,7 @@ async fn send_message(
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
+        trust: rsclaw_agent::SenderTrust::Owner,
         session_key: session_key.clone(),
         text,
         channel: req.channel.unwrap_or_else(|| "api".to_string()),
@@ -1061,8 +1306,9 @@ mod tests {
                     .await
             );
         }
+        // A new peer is admitted by evicting the stalest bucket, not rejected.
         assert!(
-            limiter
+            !limiter
                 .check_at(
                     IpAddr::V4(std::net::Ipv4Addr::from(
                         (MAX_TRACKED_RATE_LIMIT_IPS + 1) as u32,
@@ -1074,6 +1320,97 @@ mod tests {
                 .await
         );
         assert_eq!(limiter.inner.read().await.len(), MAX_TRACKED_RATE_LIMIT_IPS);
+    }
+
+    #[test]
+    fn untrusted_origin_is_rejected_unless_same_origin() {
+        let hv = |s: &str| HeaderValue::from_str(s).expect("header");
+        assert!(origin_allowed(&hv("tauri://localhost"), None));
+        assert!(origin_allowed(&hv("http://localhost:3000"), Some("127.0.0.1:18888")));
+        assert!(!origin_allowed(&hv("https://evil.example"), Some("127.0.0.1:18888")));
+        // Same-origin reverse-proxy deployment.
+        assert!(origin_allowed(
+            &hv("https://claw.example.com"),
+            Some("claw.example.com")
+        ));
+        assert!(!origin_allowed(&hv("null"), Some("claw.example.com")));
+    }
+
+    #[test]
+    fn control_request_requires_marker_for_browser_callers() {
+        let mut h = HeaderMap::new();
+        // Plain local process (CLI / curl): no Origin, no Sec-Fetch.
+        assert!(control_request_allowed(&h, None).is_ok());
+        // Cross-site simple POST from a web page.
+        h.insert(header::ORIGIN, HeaderValue::from_static("https://evil.example"));
+        assert!(control_request_allowed(&h, None).is_err());
+        // Trusted origin but no preflight-forcing marker.
+        let mut h = HeaderMap::new();
+        h.insert(header::ORIGIN, HeaderValue::from_static("http://localhost:3000"));
+        assert!(control_request_allowed(&h, None).is_err());
+        h.insert(LOCAL_REQUEST_HEADER, HeaderValue::from_static("1"));
+        assert!(control_request_allowed(&h, None).is_ok());
+        // Bearer token wins.
+        let mut h = HeaderMap::new();
+        h.insert(header::ORIGIN, HeaderValue::from_static("http://localhost:3000"));
+        h.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer tok"));
+        assert!(control_request_allowed(&h, Some("tok")).is_ok());
+    }
+
+    #[test]
+    fn host_guard_allows_only_local_names() {
+        assert!(host_is_local("127.0.0.1:18888", false));
+        assert!(host_is_local("localhost:18888", false));
+        assert!(host_is_local("[::1]:18888", false));
+        assert!(host_is_local("localhost", false));
+        assert!(!host_is_local("evil.example:18888", false));
+        assert!(!host_is_local("mybox.tail1234.ts.net", false));
+        assert!(host_is_local("mybox.tail1234.ts.net", true));
+    }
+
+    #[test]
+    fn oai_content_flattens_text_parts() {
+        let v = serde_json::json!([
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "world"}
+        ]);
+        let (text, images) = oai_content_parts(&v);
+        assert_eq!(text, "hello\nworld");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(oai_content_parts(&serde_json::Value::Null).0, "");
+    }
+
+    #[test]
+    fn oai_session_key_is_stable_across_turns() {
+        let m = |role: &str, content: &str| OaiMessage {
+            role: role.to_owned(),
+            content: serde_json::json!(content),
+        };
+        use std::hash::Hasher;
+        let turn1 = vec![m("system", "s"), m("user", "hi-session-test")];
+        assert_eq!(oai_final_turn_start(&turn1), 1);
+        // Turn 1 produced reply "hello" in session K.
+        oai_index_register(oai_hasher(&turn1), "hello ", "oai:K");
+        let turn2 = vec![
+            m("system", "s"),
+            m("user", "hi-session-test"),
+            m("assistant", "hello"),
+            m("user", "next"),
+        ];
+        let start = oai_final_turn_start(&turn2);
+        assert_eq!(start, 3);
+        // The history of turn 2 is exactly turn 1 + reply, so it maps back.
+        assert_eq!(
+            oai_index_lookup(oai_hasher(&turn2[..start]).finish()).as_deref(),
+            Some("oai:K")
+        );
+        // Assistant tool-call turns carry `content: null` and must parse.
+        let parsed: OaiMessage =
+            serde_json::from_value(serde_json::json!({"role": "assistant", "content": null}))
+                .expect("null content");
+        assert_eq!(oai_text(&parsed), "");
     }
 
     #[tokio::test]
@@ -1231,10 +1568,34 @@ async fn get_session(State(state): State<AppState>, Path(id): Path<String>) -> i
     }
 }
 
+/// Queue a history reset for `session_key` on every agent, so the agent
+/// runtime's in-memory session cache is dropped as well. Deleting the redb
+/// rows alone left the runtime replaying the old history on the next turn.
+/// The reset is applied when that session next runs (or mid-loop if it is
+/// running now).
+///
+/// `kind` is `Clear` for a history reset (keeps a short summary) and `Delete`
+/// for a session delete (no summary is written back).
+pub(crate) fn reset_agent_session_cache(
+    state: &AppState,
+    session_key: &str,
+    kind: rsclaw_agent::registry::SessionResetKind,
+) {
+    for handle in state.agents.all() {
+        handle.request_session_reset(rsclaw_agent::registry::SessionResetRequest {
+            kind,
+            session_key: session_key.to_owned(),
+            channel: String::new(),
+            peer_id: String::new(),
+        });
+    }
+}
+
 async fn delete_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    reset_agent_session_cache(&state, &id, rsclaw_agent::registry::SessionResetKind::Delete);
     match state.store.db.delete_session(&id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
@@ -1279,7 +1640,8 @@ async fn list_acp_connections(State(state): State<AppState>) -> impl IntoRespons
 ///   - `target`  (required): channel-native target id (feishu open_id, wechat
 ///     openid, etc.)
 ///   - `channel` (required): channel brand (feishu / wechat / …)
-///   - `message` (required unless `media` is supplied): text body
+///   - `message` (required unless `media` is supplied): text body; `text` is
+///     accepted as an alias (the agent `message` tool sends `text`)
 ///   - `media`   (optional): single attachment, can be:
 ///       * a local file path  (`/abs/path.png` or `~/...` expanded)
 ///       * an http/https URL  (downstream channel downloads it)
@@ -1294,7 +1656,11 @@ async fn message_send(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let target = body["target"].as_str().unwrap_or("");
-    let text = body["message"].as_str().unwrap_or("");
+    // The agent `message` tool posts `text`; CLI / docs use `message`.
+    let text = body["message"]
+        .as_str()
+        .or_else(|| body["text"].as_str())
+        .unwrap_or("");
     let channel = body["channel"].as_str().unwrap_or("");
     let media = body["media"].as_str().unwrap_or("");
     let account = body["account"]
@@ -1496,7 +1862,10 @@ async fn message_broadcast(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let channel = body["channel"].as_str().unwrap_or("");
-    let text = body["message"].as_str().unwrap_or("");
+    let text = body["message"]
+        .as_str()
+        .or_else(|| body["text"].as_str())
+        .unwrap_or("");
     let targets = body["targets"]
         .as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
@@ -1564,6 +1933,15 @@ async fn create_agent(
     Json(req): Json<CreateAgentRequest>,
 ) -> impl IntoResponse {
     let id = req.id;
+    if !rsclaw_util::fs_guard::is_safe_slug(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid agent id (allowed: letters, digits, '_', '-', '.'; max 64 chars)"
+            })),
+        )
+            .into_response();
+    }
     let result: Result<(), anyhow::Error> = (|| {
         let (path, mut val) = load_config_json()?;
         if let Some(list) = val.pointer("/agents/list").and_then(|v| v.as_array())
@@ -1591,9 +1969,10 @@ async fn create_agent(
         }
         std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
 
-        // Seed workspace directory for the new agent.
-        let ws = resolve_workspace(Some(&id));
-        if !ws.exists() {
+        // Seed workspace directory for the new agent (id validated above).
+        if let Some(ws) = resolve_workspace(Some(&id))
+            && !ws.exists()
+        {
             if let Err(e) = rsclaw_agent::bootstrap::seed_workspace(&ws) {
                 warn!(agent = %id, error = %e, "failed to seed workspace for new agent");
             } else {
@@ -2203,6 +2582,7 @@ async fn http_reload(
     // into LiveConfig — same as the file watcher does. Without this, HTTP
     // reload reports success while live reads stay stale.
     {
+        crate::gateway::trust::refresh_from_config(&fresh_config);
         let restart_fields = state.live.apply(fresh_config.clone()).await;
         if !restart_fields.is_empty() {
             details.insert(
@@ -2413,22 +2793,33 @@ async fn http_reload(
         tracing::info!(provider_count, "hot-reload: providers rebuilt");
     }
 
-    // --- MCP: kill all existing servers and re-spawn from config ---
+    // --- MCP: spawn the configured set into a staging registry first, then
+    // swap. A server that fails to (re)spawn keeps its previous client instead
+    // of disappearing; servers removed from config are dropped.
     if reload_mcp {
         let registry = Arc::clone(&state.mcp);
+        let staging = Arc::new(rsclaw_mcp::McpRegistry::new());
+        let (spawned, configured) =
+            respawn_mcp_servers(&fresh_config, &codex_mcp_for_reload, Arc::clone(&staging)).await;
+        let fresh_clients = std::mem::take(&mut *staging.clients.lock().await);
+        let mut kept = Vec::new();
         {
             let mut clients = registry.clients.lock().await;
-            let old_count = clients.len();
-            clients.clear();
-            if old_count > 0 {
-                tracing::info!(count = old_count, "hot-reload: cleared old MCP clients");
+            let old = std::mem::take(&mut *clients);
+            let old_count = old.len();
+            for (name, client) in old {
+                if configured.contains(&name) && !fresh_clients.contains_key(&name) {
+                    tracing::warn!(name = %name, "hot-reload MCP: respawn failed; keeping previous server");
+                    kept.push(name.clone());
+                    clients.insert(name, client);
+                }
             }
+            clients.extend(fresh_clients);
+            tracing::info!(old_count, spawned, kept = kept.len(), "hot-reload: MCP servers swapped");
         }
-        let spawned =
-            respawn_mcp_servers(&fresh_config, &codex_mcp_for_reload, Arc::clone(&registry)).await;
         details.insert(
             "mcp".to_owned(),
-            serde_json::json!({"reloaded": true, "servers": spawned}),
+            serde_json::json!({"reloaded": true, "servers": spawned, "keptPrevious": kept}),
         );
     }
 
@@ -2542,6 +2933,12 @@ async fn http_reload(
                     senders.remove(running_name);
                 }
             }
+            // Every account of this channel was torn down: drop the bare
+            // `<channel>` fallback key too so it never points at a dead
+            // sender (register_outbound_sender rebinds it on restart).
+            if let Ok(mut senders) = state.channel_senders.write() {
+                senders.remove(name.as_str());
+            }
             tracing::info!(channel = %name, "hot-reload: channel config changed — restarting");
         }
 
@@ -2555,6 +2952,9 @@ async fn http_reload(
                 state.channel_manager.unregister(name);
                 if let Ok(mut senders) = state.channel_senders.write() {
                     senders.remove(name);
+                    // The whole channel is gone (all accounts): also drop
+                    // the bare `<channel>` fallback key.
+                    senders.remove(base);
                 }
                 // Also remove from custom_webhooks map so /hooks/{name} stops
                 // dispatching to a cancelled channel.
@@ -2791,13 +3191,14 @@ async fn http_reload(
                 if let Ok(mut senders) = state.channel_senders.write() {
                     senders.remove(name);
                 }
-                state
-                    .custom_webhooks
-                    .write()
-                    .map(|mut wh| {
+                match state.custom_webhooks.write() {
+                    Ok(mut wh) => {
                         wh.remove(name);
-                    })
-                    .ok();
+                    }
+                    Err(e) => {
+                        tracing::warn!(channel = %name, error = %e, "hot-reload: custom webhook registry lock poisoned; stale webhook may remain routable");
+                    }
+                }
                 removed.push(name.clone());
             }
 
@@ -2822,7 +3223,10 @@ async fn http_reload(
                 );
                 if let Some(ref custom_cfgs) = fresh_config.channel.channels.custom {
                     for ch_cfg in custom_cfgs {
-                        if ch_cfg.base.enabled.unwrap_or(true) {
+                        // Reserved local names are refused by start_custom_channels.
+                        if ch_cfg.base.enabled.unwrap_or(true)
+                            && !rsclaw_agent::trust::is_local_channel(&ch_cfg.name)
+                        {
                             added.push(ch_cfg.name.as_str());
                         }
                     }
@@ -2900,6 +3304,7 @@ async fn http_reload(
                 channels: None,
                 commands: None,
                 allowed_commands: None,
+                non_owner_tools: None,
                 opencode: defaults.opencode.clone(),
                 claudecode: defaults.claudecode.clone(),
                 codex: defaults.codex.clone(),
@@ -3042,12 +3447,13 @@ fn reload_failed_scopes(details: &serde_json::Map<String, serde_json::Value>) ->
 }
 
 /// Spawn MCP servers from config and codex plugins into the given registry.
-/// Returns count spawned.
+/// Returns the count spawned and the names of every configured server
+/// (attempted, whether or not it came up).
 async fn respawn_mcp_servers(
     config: &rsclaw_config::runtime::RuntimeConfig,
     codex_servers: &[rsclaw_config::schema::McpServerConfig],
     registry: Arc<rsclaw_mcp::McpRegistry>,
-) -> usize {
+) -> (usize, std::collections::HashSet<String>) {
     let config_servers = config
         .raw
         .mcp
@@ -3062,7 +3468,9 @@ async fn respawn_mcp_servers(
         .unwrap_or_default();
 
     let mut count = 0;
+    let mut configured = std::collections::HashSet::new();
     for server_cfg in config_servers.iter().chain(codex_servers.iter()) {
+        configured.insert(server_cfg.name.clone());
         match rsclaw_mcp::McpClient::spawn(server_cfg).await {
             Ok(mut client) => {
                 if let Err(e) = client.initialize().await {
@@ -3081,7 +3489,7 @@ async fn respawn_mcp_servers(
         }
     }
     tracing::info!(count, "hot-reload: MCP servers respawned");
-    count
+    (count, configured)
 }
 
 /// Reject the request if the caller isn't a loopback peer.
@@ -3107,7 +3515,9 @@ fn headers_are_trusted(auth_enabled: bool, peer: SocketAddr) -> bool {
 }
 
 /// POST /api/v1/shutdown — exit the gateway process cleanly.
-/// Loopback-only; no token required (same trust model as /api/v1/cron/reload).
+/// Loopback-only; no token required for local processes (same trust model as
+/// /api/v1/cron/reload). Browser-originated calls are CSRF-gated in
+/// `auth_middleware` (`control_request_allowed`).
 async fn http_shutdown(
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
@@ -3254,23 +3664,68 @@ fn cron_jobs_path() -> std::path::PathBuf {
     crate::cron::resolve_cron_store_path()
 }
 
-/// Helper: load jobs from cron.json5 (json5 parser for comment support).
-async fn cron_load_jobs() -> Vec<serde_json::Value> {
+/// Helper: load all cron jobs as raw JSON from the authoritative store —
+/// redb in a running gateway; `cron.json5` only when redb is not initialised
+/// (tests / standalone tools).
+///
+/// Any read or decode failure is an error. Callers must NOT treat it as an
+/// empty job set: the save path bulk-replaces redb, so a swallowed parse
+/// error used to wipe every job.
+async fn cron_load_jobs() -> Result<Vec<serde_json::Value>, String> {
+    if let Some(store) = crate::cron::cron_store() {
+        let entries = store
+            .cron_list()
+            .map_err(|e| format!("redb cron_list: {e}"))?;
+        return entries
+            .into_iter()
+            .map(|(id, json)| {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .map_err(|e| format!("cron job `{id}` is undecodable: {e}"))
+            })
+            .collect();
+    }
     let path = cron_jobs_path();
     let raw = match tokio::fs::read_to_string(&path).await {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    let parsed: serde_json::Value = json5::from_str(&raw)
-        .or_else(|_| serde_json::from_str(&raw))
-        .unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: serde_json::Value =
+        json5::from_str(&raw).map_err(|e| format!("cron.json5 parse error: {e}"))?;
     if let Some(jobs) = parsed.get("jobs").and_then(|v| v.as_array()) {
-        return jobs.clone();
+        return Ok(jobs.clone());
     }
     if let Some(arr) = parsed.as_array() {
-        return arr.clone();
+        return Ok(arr.clone());
     }
-    Vec::new()
+    Err("cron.json5 has no `jobs` array".to_owned())
+}
+
+/// 500 response for a cron store that could not be read; nothing is written.
+fn cron_load_failed(e: String) -> Response {
+    warn!(error = %e, "cron: job store unreadable; refusing to read-modify-write");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": format!("cron store unreadable: {e}")})),
+    )
+        .into_response()
+}
+
+/// Reject a job the cron runner could not decode (it would be dropped on
+/// load and poison every later read-modify-write of the store).
+fn validate_cron_job_value(job: &serde_json::Value) -> Result<(), Response> {
+    serde_json::from_value::<crate::cron::CronJob>(job.clone())
+        .map(|_| ())
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid cron job: {e}")})),
+            )
+                .into_response()
+        })
 }
 
 /// Helper: save jobs to file and notify CronRunner to reload.
@@ -3316,19 +3771,26 @@ async fn cron_save_and_reload(
     tokio::fs::rename(&tmp, &path)
         .await
         .map_err(|e| format!("rename jobs.json: {e}"))?;
-    let _ = reload_tx.send(());
+    if let Err(e) = reload_tx.send(()) {
+        warn!(err = %e, "cron: reload signal failed (no runner subscribed)");
+    }
     Ok(())
 }
 
 /// GET /api/v1/cron — list all cron jobs.
-async fn cron_list() -> impl IntoResponse {
-    let jobs = cron_load_jobs().await;
-    Json(serde_json::json!({"jobs": jobs}))
+async fn cron_list() -> Response {
+    match cron_load_jobs().await {
+        Ok(jobs) => Json(serde_json::json!({"jobs": jobs})).into_response(),
+        Err(e) => cron_load_failed(e),
+    }
 }
 
 /// GET /api/v1/cron/:id — get a single cron job.
 async fn cron_get(Path(id): Path<String>) -> Response {
-    let jobs = cron_load_jobs().await;
+    let jobs = match cron_load_jobs().await {
+        Ok(j) => j,
+        Err(e) => return cron_load_failed(e),
+    };
     match jobs.iter().find(|j| j["id"].as_str() == Some(&id)) {
         Some(job) => (StatusCode::OK, Json(job.clone())).into_response(),
         None => (
@@ -3361,18 +3823,19 @@ async fn cron_create(
         .and_then(|s| s.as_str())
         .map(|s| s.to_owned())
     {
-        // Validate before normalizing — reject bad expressions with a friendly error.
-        if let Err(msg) = crate::cron::validate_cron_expr(&sched) {
+        let tz = body
+            .get("timezone")
+            .and_then(|t| t.as_str())
+            .map(|t| t.to_owned());
+        // Validate before normalizing — reject bad expressions / timezones
+        // with a friendly error.
+        if let Err(msg) = crate::cron::validate_cron_expr_tz(&sched, tz.as_deref()) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": msg})),
             )
                 .into_response();
         }
-        let tz = body
-            .get("timezone")
-            .and_then(|t| t.as_str())
-            .map(|t| t.to_owned());
         if let Some(tz) = tz {
             body["schedule"] = serde_json::json!({"kind": "cron", "expr": sched, "tz": tz});
         } else {
@@ -3387,8 +3850,12 @@ async fn cron_create(
         .and_then(|s| s.get("expr"))
         .and_then(|e| e.as_str())
     {
-        // Nested schedule form — validate the expr here too.
-        if let Err(msg) = crate::cron::validate_cron_expr(expr) {
+        // Nested schedule form — validate the expr + tz here too.
+        let tz = body
+            .get("schedule")
+            .and_then(|s| s.get("tz"))
+            .and_then(|t| t.as_str());
+        if let Err(msg) = crate::cron::validate_cron_expr_tz(expr, tz) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": msg})),
@@ -3405,8 +3872,15 @@ async fn cron_create(
 
     // Serialize read-modify-write so parallel cron.add calls don't clobber each
     // other.
+    if let Err(resp) = validate_cron_job_value(&body) {
+        return resp;
+    }
+
     let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
-    let mut jobs = cron_load_jobs().await;
+    let mut jobs = match cron_load_jobs().await {
+        Ok(j) => j,
+        Err(e) => return cron_load_failed(e),
+    };
     // Prevent duplicate IDs
     if jobs.iter().any(|j| j["id"].as_str() == Some(&id)) {
         return (
@@ -3434,7 +3908,10 @@ async fn cron_update(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
-    let mut jobs = cron_load_jobs().await;
+    let mut jobs = match cron_load_jobs().await {
+        Ok(j) => j,
+        Err(e) => return cron_load_failed(e),
+    };
     let idx = match jobs.iter().position(|j| j["id"].as_str() == Some(&id)) {
         Some(i) => i,
         None => {
@@ -3453,17 +3930,17 @@ async fn cron_update(
                 // Normalize schedule string + timezone
                 if k == "schedule" {
                     if let Some(sched) = v.as_str() {
-                        if let Err(msg) = crate::cron::validate_cron_expr(sched) {
+                        let tz = patch
+                            .get("timezone")
+                            .and_then(|t| t.as_str())
+                            .or_else(|| existing.get("schedule").and_then(|s| s["tz"].as_str()));
+                        if let Err(msg) = crate::cron::validate_cron_expr_tz(sched, tz) {
                             return (
                                 StatusCode::BAD_REQUEST,
                                 Json(serde_json::json!({"error": msg})),
                             )
                                 .into_response();
                         }
-                        let tz = patch
-                            .get("timezone")
-                            .and_then(|t| t.as_str())
-                            .or_else(|| existing.get("schedule").and_then(|s| s["tz"].as_str()));
                         if let Some(tz) = tz {
                             existing.insert(
                                 k.clone(),
@@ -3489,6 +3966,9 @@ async fn cron_update(
     }
 
     let updated = jobs[idx].clone();
+    if let Err(resp) = validate_cron_job_value(&updated) {
+        return resp;
+    }
     match cron_save_and_reload(&jobs, &state.cron_reload).await {
         Ok(()) => (StatusCode::OK, Json(updated)).into_response(),
         Err(e) => (
@@ -3502,7 +3982,10 @@ async fn cron_update(
 /// DELETE /api/v1/cron/:id — delete a cron job.
 async fn cron_delete(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
-    let mut jobs = cron_load_jobs().await;
+    let mut jobs = match cron_load_jobs().await {
+        Ok(j) => j,
+        Err(e) => return cron_load_failed(e),
+    };
     let before = jobs.len();
     jobs.retain(|j| j["id"].as_str() != Some(&id));
     if jobs.len() == before {
@@ -3523,38 +4006,78 @@ async fn cron_delete(State(state): State<AppState>, Path(id): Path<String>) -> R
     }
 }
 
+/// Why a manual cron trigger could not be dispatched.
+pub(crate) enum CronTriggerError {
+    /// No job with that id in the store.
+    NotFound,
+    /// The cron store could not be read.
+    Store(String),
+    /// The target agent is missing or its inbox is closed.
+    Dispatch,
+}
+
 /// POST /api/v1/cron/:id/trigger — manually trigger a cron job.
 async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let jobs = cron_load_jobs().await;
-    let job = match jobs.iter().find(|j| j["id"].as_str() == Some(&id)) {
-        Some(j) => j,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "job not found"})),
-            )
-                .into_response();
-        }
+    match trigger_cron_job(&state, &id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"triggered": true, "job_id": id})),
+        )
+            .into_response(),
+        Err(CronTriggerError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job not found"})),
+        )
+            .into_response(),
+        Err(CronTriggerError::Store(e)) => cron_load_failed(e),
+        Err(CronTriggerError::Dispatch) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to send to agent"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Run a cron job now, in-process: load it from the authoritative store,
+/// dispatch its message to the job's agent, and deliver the reply through the
+/// job's delivery config in the background. Returns once the message is
+/// queued. Shared by `POST /api/v1/cron/:id/trigger` and WS `cron.run`.
+pub(crate) async fn trigger_cron_job(state: &AppState, id: &str) -> Result<(), CronTriggerError> {
+    let id = id.to_owned();
+    let jobs = cron_load_jobs().await.map_err(CronTriggerError::Store)?;
+    let Some(job) = jobs.iter().find(|j| j["id"].as_str() == Some(&id)) else {
+        return Err(CronTriggerError::NotFound);
     };
 
     let message = job["message"]
         .as_str()
         .or_else(|| job["payload"]["message"].as_str())
         .or_else(|| job["payload"]["text"].as_str())
+        .or_else(|| job["payload"].as_str())
         .unwrap_or("")
         .to_owned();
     let agent_id = job["agent_id"]
         .as_str()
         .or_else(|| job["agentId"].as_str())
+        .filter(|s| !s.is_empty())
         .unwrap_or("main");
 
-    // Send message to the agent via registry.
+    // Send message to the agent via registry. The placeholder ids "default"
+    // (WS `cron.add`) and "main" fall back to the default agent.
     // After the agent replies, deliver the result through the job's delivery
     // channel.
-    if let Ok(handle) = state.agents.get(agent_id) {
+    let handle = state.agents.get(agent_id).or_else(|e| {
+        if matches!(agent_id, "default" | "main") {
+            state.agents.default_agent()
+        } else {
+            Err(e)
+        }
+    });
+    if let Ok(handle) = handle {
         let session_key = format!("cron:{}", id);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = rsclaw_agent::AgentMessage {
+            trust: rsclaw_agent::SenderTrust::Owner,
             session_key,
             text: message,
             channel: "cron".to_string(),
@@ -3632,19 +4155,11 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
                     }
                 }
             });
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({"triggered": true, "job_id": id})),
-            )
-                .into_response();
+            return Ok(());
         }
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"error": "failed to send to agent"})),
-    )
-        .into_response()
+    Err(CronTriggerError::Dispatch)
 }
 
 // ---------------------------------------------------------------------------
@@ -4355,7 +4870,8 @@ async fn get_session_messages(
 use rsclaw_agent::compaction::is_compaction_message;
 
 async fn clear_session(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    // Delete and re-create the session with empty messages.
+    // Delete the stored history and drop the runtime's cached copy.
+    reset_agent_session_cache(&state, &id, rsclaw_agent::registry::SessionResetKind::Clear);
     match state.store.db.delete_session(&id) {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({"cleared": true}))).into_response(),
         Err(e) => (
@@ -4386,12 +4902,154 @@ struct OaiChatRequest {
     /// Tool definitions forwarded to the agent for external dispatch.
     #[serde(default)]
     tools: Option<serde_json::Value>,
+    /// Optional explicit conversation id (rsclaw extension). When set, it is
+    /// used as the session key instead of the history-derived lookup.
+    #[serde(default, alias = "session")]
+    session_id: Option<String>,
 }
 
+/// One OpenAI chat message. `content` is a string, `null` (assistant
+/// tool-call turns) or an array of typed parts (multimodal).
 #[derive(Debug, Deserialize, Serialize)]
 struct OaiMessage {
     role: String,
-    content: String,
+    #[serde(default)]
+    content: serde_json::Value,
+}
+
+/// Flatten an OpenAI `content` value into plain text (text parts joined by
+/// newlines) plus inline image attachments from `image_url` parts.
+fn oai_content_parts(
+    content: &serde_json::Value,
+) -> (String, Vec<rsclaw_types::ImageAttachment>) {
+    match content {
+        serde_json::Value::String(s) => (s.clone(), vec![]),
+        serde_json::Value::Array(parts) => {
+            let mut texts: Vec<&str> = Vec::new();
+            let mut images = Vec::new();
+            for part in parts {
+                match part.get("type").and_then(|v| v.as_str()) {
+                    Some("text" | "input_text") => {
+                        if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                            texts.push(t);
+                        }
+                    }
+                    Some("image_url" | "input_image") => {
+                        let url = part.get("image_url").and_then(|u| {
+                            u.get("url").and_then(|v| v.as_str()).or_else(|| u.as_str())
+                        });
+                        if let Some(url) = url {
+                            let mime = url
+                                .strip_prefix("data:")
+                                .and_then(|rest| rest.split(';').next())
+                                .filter(|m| m.starts_with("image/"))
+                                .unwrap_or("image/jpeg");
+                            images.push(rsclaw_types::ImageAttachment {
+                                data: url.to_owned(),
+                                mime_type: mime.to_owned(),
+                                source_path: None,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (texts.join("\n"), images)
+        }
+        _ => (String::new(), vec![]),
+    }
+}
+
+/// Plain-text view of a message's content (images dropped).
+fn oai_text(m: &OaiMessage) -> String {
+    oai_content_parts(&m.content).0
+}
+
+/// Index of the first message of the final turn: everything after the last
+/// assistant message (the new user input and/or tool results).
+fn oai_final_turn_start(messages: &[OaiMessage]) -> usize {
+    messages
+        .iter()
+        .rposition(|m| m.role == "assistant")
+        .map(|i| i + 1)
+        .unwrap_or_else(|| {
+            // No assistant yet: the final turn starts at the first user message
+            // (leading system/developer messages are the prefix).
+            messages
+                .iter()
+                .position(|m| m.role == "user")
+                .unwrap_or(messages.len())
+        })
+}
+
+/// Feed one message (role + trimmed text) into a conversation hasher.
+fn oai_hash_message(h: &mut std::collections::hash_map::DefaultHasher, role: &str, text: &str) {
+    use std::hash::Hash;
+    role.hash(h);
+    text.trim().hash(h);
+}
+
+/// Hasher state over a sequence of messages.
+fn oai_hasher(messages: &[OaiMessage]) -> std::collections::hash_map::DefaultHasher {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for m in messages {
+        oai_hash_message(&mut h, &m.role, &oai_text(m));
+    }
+    h
+}
+
+/// Maximum number of remembered conversation-prefix → session mappings.
+const MAX_OAI_SESSION_INDEX: usize = 10_000;
+
+/// Maps the hash of "request messages + assistant reply" to the session key
+/// that produced the reply, so the NEXT request (whose prefix is exactly that
+/// history) continues the same agent session instead of minting a new one.
+static OAI_SESSION_INDEX: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, (String, Instant)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn oai_index_lookup(prefix_hash: u64) -> Option<String> {
+    let guard = OAI_SESSION_INDEX.lock().ok()?;
+    guard.get(&prefix_hash).map(|(k, _)| k.clone())
+}
+
+/// Remember that the conversation `history_hasher` + assistant `reply` lives
+/// in `session_key`.
+fn oai_index_register(
+    mut history_hasher: std::collections::hash_map::DefaultHasher,
+    reply: &str,
+    session_key: &str,
+) {
+    use std::hash::Hasher;
+    oai_hash_message(&mut history_hasher, "assistant", reply);
+    let key = history_hasher.finish();
+    let Ok(mut guard) = OAI_SESSION_INDEX.lock() else {
+        warn!("oai session index lock poisoned; conversation continuity lost");
+        return;
+    };
+    if guard.len() >= MAX_OAI_SESSION_INDEX && !guard.contains_key(&key) {
+        let oldest = guard
+            .iter()
+            .min_by_key(|(_, (_, t))| *t)
+            .map(|(k, _)| *k);
+        if let Some(k) = oldest {
+            guard.remove(&k);
+        }
+    }
+    guard.insert(key, (session_key.to_owned(), Instant::now()));
+}
+
+/// Render prior conversation messages as a transcript so a freshly created
+/// session still sees the history the client sent.
+fn oai_history_transcript(messages: &[OaiMessage]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        let text = oai_text(m);
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&format!("[{}]: {}\n", m.role, text.trim()));
+    }
+    out
 }
 
 /// Parse OAI-format tool definitions into `ToolDef` values.
@@ -4436,16 +5094,27 @@ async fn openai_chat_completions(
         info!(%peer, "open gateway: ignoring identity headers from non-loopback peer");
     }
 
-    // Extract text from the last user message.
-    let text = req
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
+    // The final turn is everything after the last assistant message: the new
+    // user input and/or tool results. Earlier messages are the history.
+    let turn_start = oai_final_turn_start(&req.messages);
+    let (history, final_turn) = req.messages.split_at(turn_start);
+    let mut turn_images = Vec::new();
+    let mut turn_texts = Vec::new();
+    for m in final_turn {
+        let (t, imgs) = oai_content_parts(&m.content);
+        turn_images.extend(imgs);
+        if t.trim().is_empty() {
+            continue;
+        }
+        if m.role == "user" {
+            turn_texts.push(t);
+        } else {
+            turn_texts.push(format!("[{}]: {t}", m.role));
+        }
+    }
+    let text = turn_texts.join("\n");
 
-    if text.is_empty() {
+    if text.is_empty() && turn_images.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error":{"message":"no user message found","type":"invalid_request_error"}})),
@@ -4467,37 +5136,53 @@ async fn openai_chat_completions(
         }
     };
 
-    // Session key: prefer X-Session-Key header (desktop UI), else hash history.
-    let session_key = if trusted_headers {
-        headers
-            .get("x-session-key")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| {
-                use std::{
-                    collections::hash_map::DefaultHasher,
-                    hash::{Hash, Hasher},
-                };
-                let mut h = DefaultHasher::new();
-                for m in &req.messages {
-                    m.role.hash(&mut h);
-                    m.content.hash(&mut h);
-                }
-                format!("oai:{:x}", h.finish())
-            })
-    } else {
-        // Untrusted: always use hash-based session key
-        use std::{
-            collections::hash_map::DefaultHasher,
-            hash::{Hash, Hasher},
-        };
-        let mut h = DefaultHasher::new();
-        for m in &req.messages {
-            m.role.hash(&mut h);
-            m.content.hash(&mut h);
+    // Session key: X-Session-Key header (desktop UI, trusted peers only), then
+    // an explicit `session_id` body field, then the conversation-prefix index
+    // (history the client sent == history a previous reply produced). A miss
+    // mints a fresh session and replays the client-sent history into it.
+    let explicit_key = trusted_headers
+        .then(|| {
+            headers
+                .get("x-session-key")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_owned())
+        })
+        .flatten()
+        .or_else(|| {
+            req.session_id
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!("oai:{}", s.trim()))
+        });
+    let has_history = history.iter().any(|m| m.role == "assistant");
+    let (session_key, new_session) = match explicit_key {
+        Some(k) => (k, false),
+        None => {
+            use std::hash::Hasher;
+            let indexed = has_history
+                .then(|| oai_index_lookup(oai_hasher(history).finish()))
+                .flatten();
+            match indexed {
+                Some(k) => (k, false),
+                None => (format!("oai:{}", uuid::Uuid::new_v4().simple()), true),
+            }
         }
-        format!("oai:{:x}", h.finish())
     };
+    // Replay prior history only into a brand-new session; an existing
+    // session already holds it.
+    let text = if new_session {
+        let transcript = oai_history_transcript(history);
+        if transcript.is_empty() {
+            text
+        } else {
+            format!("Conversation so far:\n{transcript}\nLatest message:\n{text}")
+        }
+    } else {
+        text
+    };
+    // Hasher over the full request; the reply is fed in on completion to
+    // register the next turn's prefix.
+    let request_hasher = oai_hasher(&req.messages);
 
     let peer_id = if trusted_headers {
         headers
@@ -4510,11 +5195,13 @@ async fn openai_chat_completions(
     };
 
     // Extract [file:path] references from user text.
-    let (text, file_images, file_files) = rsclaw_agent::registry::extract_file_refs(&text);
+    let (text, mut file_images, file_files) = rsclaw_agent::registry::extract_file_refs(&text);
+    file_images.extend(turn_images);
 
     let extra_tools = parse_oai_tools(req.tools.as_ref());
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
+        trust: rsclaw_agent::SenderTrust::Owner,
         session_key: session_key.clone(),
         text,
         channel: if trusted_headers {
@@ -4575,17 +5262,33 @@ async fn openai_chat_completions(
         // is dropped (client disconnect, [DONE] sent, or scan terminator).
         let inflight_guard = state.shutdown.begin_work();
         let shutdown_for_stream = state.shutdown.clone();
+        // Accumulated reply text, registered in the session index on `done`
+        // so the client's next request continues this session.
+        let reply_acc = Arc::new(std::sync::Mutex::new(String::new()));
+        let index_key = session_key.clone();
 
+        // NOTE: the streaming path only relays text deltas. External
+        // `tool_calls` (from `tools` in the request) are delivered through
+        // the reply channel, which is only awaited on the non-streaming path;
+        // clients that need tool calls must use `stream: false`.
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
             .filter_map(move |msg| {
                 let _hold_inflight = &inflight_guard;
                 let sid = sid.clone();
                 let cid = cid.clone();
                 let model_str = model_str.clone();
+                let reply_acc = Arc::clone(&reply_acc);
+                let index_key = index_key.clone();
+                let request_hasher = request_hasher.clone();
                 async move {
+                    // Lagged receivers yield Err; skip and keep streaming.
                     let event = msg.ok()?;
                     if event.session_id != sid { return None; }
                     if event.done {
+                        match reply_acc.lock() {
+                            Ok(acc) => oai_index_register(request_hasher, &acc, &index_key),
+                            Err(_) => warn!("oai stream: reply accumulator poisoned"),
+                        }
                         let mut stop = serde_json::json!({
                             "id": cid, "object": "chat.completion.chunk",
                             "created": now, "model": model_str,
@@ -4603,6 +5306,9 @@ async fn openai_chat_completions(
                         return Some(format!("data: {stop}\n\ndata: [DONE]\n\n"));
                     }
                     if event.delta.is_empty() { return None; }
+                    if let Ok(mut acc) = reply_acc.lock() {
+                        acc.push_str(&event.delta);
+                    }
                     let chunk = serde_json::json!({
                         "id": cid, "object": "chat.completion.chunk",
                         "created": now, "model": model_str,
@@ -4676,11 +5382,13 @@ async fn openai_chat_completions(
     let prompt_tokens = req
         .messages
         .iter()
-        .map(|m| m.content.split_whitespace().count())
+        .map(|m| oai_text(m).split_whitespace().count())
         .sum::<usize>() as u32;
 
     // If the agent returned an external tool_calls payload, relay it to the caller.
     if let Some(tool_calls) = reply.tool_calls {
+        // The client echoes this turn back as `{role: assistant, content: null}`.
+        oai_index_register(request_hasher, "", &session_key);
         return Json(serde_json::json!({
             "id": completion_id,
             "object": "chat.completion",
@@ -4706,6 +5414,7 @@ async fn openai_chat_completions(
 
     let content = reply.text;
     let completion_tokens = content.split_whitespace().count() as u32;
+    oai_index_register(request_hasher, &content, &session_key);
 
     // Streaming is handled above (before reply_rx await).
 
@@ -4759,13 +5468,42 @@ async fn openai_list_models(State(state): State<AppState>) -> impl IntoResponse 
     }))
 }
 
-async fn feishu_webhook(State(state): State<AppState>, body: String) -> impl IntoResponse {
+/// Read a header as `&str` (None when absent or not visible ASCII).
+fn webhook_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// Inbound Feishu/Lark HTTP event webhook (POST /hooks/feishu). The slot is
+/// only filled when a verificationToken / encryptKey is configured, and every
+/// request is authenticated (signature, token) before dispatch.
+async fn feishu_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
     let Some(feishu) = state.feishu.get() else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "feishu not configured"})),
         )
             .into_response();
+    };
+
+    let body = match feishu.authenticate_webhook(
+        webhook_header(&headers, "x-lark-request-timestamp"),
+        webhook_header(&headers, "x-lark-request-nonce"),
+        webhook_header(&headers, "x-lark-signature"),
+        &body,
+    ) {
+        Ok(plain) => plain,
+        Err(e) => {
+            warn!("feishu webhook rejected: {e}");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "unauthorized"})),
+            )
+                .into_response();
+        }
     };
 
     match feishu.handle_webhook_event(&body).await {
@@ -4784,8 +5522,8 @@ async fn feishu_webhook(State(state): State<AppState>, body: String) -> impl Int
         Err(e) => {
             warn!("feishu webhook error: {e:#}");
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid event"})),
             )
                 .into_response()
         }
@@ -4855,7 +5593,15 @@ async fn whatsapp_verify(Query(params): Query<WhatsAppVerifyParams>) -> impl Int
 }
 
 /// Inbound WhatsApp Cloud API webhook (POST /hooks/whatsapp).
-async fn whatsapp_webhook(State(state): State<AppState>, body: String) -> impl IntoResponse {
+///
+/// Verifies `X-Hub-Signature-256` against the app secret, then acknowledges
+/// immediately and processes (media download / transcription) in the
+/// background so Meta does not time out and redeliver.
+async fn whatsapp_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
     let Some(wa) = state.whatsapp.get() else {
         return (
             StatusCode::NOT_FOUND,
@@ -4864,16 +5610,28 @@ async fn whatsapp_webhook(State(state): State<AppState>, body: String) -> impl I
             .into_response();
     };
 
-    match serde_json::from_str::<rsclaw_channel::whatsapp::WebhookPayload>(&body) {
+    if !wa.verify_signature(webhook_header(&headers, "x-hub-signature-256"), &body) {
+        warn!("whatsapp webhook rejected: bad or missing X-Hub-Signature-256");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+
+    match serde_json::from_slice::<rsclaw_channel::whatsapp::WebhookPayload>(&body) {
         Ok(payload) => {
-            wa.handle_webhook(&payload).await;
+            let wa = std::sync::Arc::clone(wa);
+            tokio::spawn(async move {
+                wa.handle_webhook(&payload).await;
+            });
             StatusCode::OK.into_response()
         }
         Err(e) => {
             warn!("whatsapp webhook parse error: {e:#}");
             (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
+                Json(serde_json::json!({"error": "invalid payload"})),
             )
                 .into_response()
         }
@@ -4885,7 +5643,14 @@ async fn whatsapp_webhook(State(state): State<AppState>, body: String) -> impl I
 // ---------------------------------------------------------------------------
 
 /// Inbound LINE webhook (POST /hooks/line).
-async fn line_webhook(State(state): State<AppState>, body: String) -> impl IntoResponse {
+///
+/// Verifies `X-Line-Signature` against the channel secret, then acknowledges
+/// immediately and processes events in the background.
+async fn line_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
     let Some(line) = state.line.get() else {
         return (
             StatusCode::NOT_FOUND,
@@ -4894,17 +5659,29 @@ async fn line_webhook(State(state): State<AppState>, body: String) -> impl IntoR
             .into_response();
     };
 
-    match line.handle_webhook(&body).await {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(e) => {
-            warn!("line webhook error: {e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response()
-        }
+    if !line.verify_signature(webhook_header(&headers, "x-line-signature"), &body) {
+        warn!("line webhook rejected: bad or missing X-Line-Signature");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
     }
+    let Ok(body) = String::from_utf8(body.to_vec()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid payload"})),
+        )
+            .into_response();
+    };
+
+    let line = std::sync::Arc::clone(line);
+    tokio::spawn(async move {
+        if let Err(e) = line.handle_webhook(&body).await {
+            warn!("line webhook error: {e:#}");
+        }
+    });
+    StatusCode::OK.into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -4912,7 +5689,14 @@ async fn line_webhook(State(state): State<AppState>, body: String) -> impl IntoR
 // ---------------------------------------------------------------------------
 
 /// Inbound Zalo OA webhook (POST /hooks/zalo).
-async fn zalo_webhook(State(state): State<AppState>, body: String) -> impl IntoResponse {
+///
+/// Verifies `X-ZEvent-Signature` when an OA secret is configured, then
+/// acknowledges immediately and processes the event in the background.
+async fn zalo_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
     let Some(zalo) = state.zalo.get() else {
         return (
             StatusCode::NOT_FOUND,
@@ -4921,17 +5705,29 @@ async fn zalo_webhook(State(state): State<AppState>, body: String) -> impl IntoR
             .into_response();
     };
 
-    match zalo.handle_webhook(&body).await {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(e) => {
-            warn!("zalo webhook error: {e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response()
-        }
+    if !zalo.verify_signature(webhook_header(&headers, "x-zevent-signature"), &body) {
+        warn!("zalo webhook rejected: bad or missing X-ZEvent-Signature");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
     }
+    let Ok(body) = String::from_utf8(body.to_vec()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid payload"})),
+        )
+            .into_response();
+    };
+
+    let zalo = std::sync::Arc::clone(zalo);
+    tokio::spawn(async move {
+        if let Err(e) = zalo.handle_webhook(&body).await {
+            warn!("zalo webhook error: {e:#}");
+        }
+    });
+    StatusCode::OK.into_response()
 }
 
 async fn stream_sse(
@@ -5073,7 +5869,8 @@ fn build_provider_models_request(
         default_auth
     };
 
-    // Build models URL — Gemini needs ?key= query param.
+    // Build models URL. Gemini's key goes in the `x-goog-api-key` header
+    // (never the query string, where reqwest error text would leak it).
     //
     // Critical: route by `effective_type` (the resolved api protocol),
     // not `req.provider`. doubao+anthropic must hit Anthropic's listing
@@ -5087,7 +5884,7 @@ fn build_provider_models_request(
         prov_defaults::models_url("ollama", &base_url)
     } else if is_gemini {
         let trimmed = base_url.trim_end_matches('/');
-        format!("{trimmed}/models?key={}", api_key)
+        format!("{trimmed}/models")
     } else {
         prov_defaults::models_url(effective_type, &base_url)
     };
@@ -5108,7 +5905,10 @@ fn build_provider_models_request(
                 .header("anthropic-version", "2023-06-01")
                 .header("Authorization", format!("Bearer {}", api_key));
         }
-        _ => {} // "none" or "gemini-key" (already in URL)
+        "gemini-key" => {
+            request = request.header("x-goog-api-key", &api_key);
+        }
+        _ => {} // "none"
     }
 
     Ok(request)
@@ -5249,7 +6049,7 @@ async fn probe_inference_for_request(
             return Ok(false);
         }
         "gemini" => {
-            // Gemini uses query-param auth, no inference probe needed.
+            // Gemini's /models listing is authoritative; no inference probe needed.
             return Ok(false);
         }
         _ => (
@@ -5330,7 +6130,7 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
             StatusCode::OK,
             Json(serde_json::json!({
                 "ok": false,
-                "error": e.to_string(),
+                "error": e.without_url().to_string(),
             })),
         )
             .into_response(),
@@ -5385,7 +6185,7 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
         }
         Err(e) => (
             StatusCode::OK,
-            Json(serde_json::json!({"models": [], "error": e.to_string()})),
+            Json(serde_json::json!({"models": [], "error": e.without_url().to_string()})),
         )
             .into_response(),
     }
@@ -5643,14 +6443,28 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Resolve workspace directory for an agent (or default workspace).
-fn resolve_workspace(agent_id: Option<&str>) -> std::path::PathBuf {
+/// Returns `None` when `agent_id` is not a safe slug (path traversal such as
+/// `../../etc` would otherwise escape the base dir via `workspace-{id}`).
+fn resolve_workspace(agent_id: Option<&str>) -> Option<std::path::PathBuf> {
     let base = rsclaw_config::loader::base_dir();
     match agent_id {
         Some(id) if !id.is_empty() && id != "default" && id != "main" => {
-            base.join(format!("workspace-{id}"))
+            if !rsclaw_util::fs_guard::is_safe_slug(id) {
+                warn!(agent = %id, "rejected unsafe agent id for workspace path");
+                return None;
+            }
+            Some(base.join(format!("workspace-{id}")))
         }
-        _ => base.join("workspace"),
+        _ => Some(base.join("workspace")),
     }
+}
+
+fn invalid_agent_id_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": "invalid agent id"})),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -5661,7 +6475,9 @@ struct WorkspaceQuery {
 /// GET /api/v1/workspace/files?agent=xxx
 /// List .md files in a workspace directory.
 async fn list_workspace_files(Query(q): Query<WorkspaceQuery>) -> Response {
-    let ws = resolve_workspace(q.agent.as_deref());
+    let Some(ws) = resolve_workspace(q.agent.as_deref()) else {
+        return invalid_agent_id_response();
+    };
     if !ws.exists() {
         return Json(serde_json::json!({ "files": [] })).into_response();
     }
@@ -5687,7 +6503,9 @@ async fn read_workspace_file(
     Path(file_path): Path<String>,
     Query(q): Query<WorkspaceQuery>,
 ) -> Response {
-    let ws = resolve_workspace(q.agent.as_deref());
+    let Some(ws) = resolve_workspace(q.agent.as_deref()) else {
+        return invalid_agent_id_response();
+    };
     // Security: only allow .md files, no path traversal.
     let file_name = std::path::Path::new(&file_path)
         .file_name()
@@ -5727,7 +6545,9 @@ async fn write_workspace_file(
     Query(q): Query<WorkspaceQuery>,
     Json(req): Json<WriteFileRequest>,
 ) -> Response {
-    let ws = resolve_workspace(q.agent.as_deref());
+    let Some(ws) = resolve_workspace(q.agent.as_deref()) else {
+        return invalid_agent_id_response();
+    };
     let file_name = std::path::Path::new(&file_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -6211,11 +7031,12 @@ async fn memory_list_docs(
         })
         .into_response();
     };
-    let mut store = mem.lock().await;
+    let store = mem.lock().await;
 
     let docs: Vec<rsclaw_agent::memory::MemoryDoc> =
         if let Some(q) = params.q.as_deref().filter(|s| !s.trim().is_empty()) {
-            match store.search(q, None, limit).await {
+            // Browsing must not count as an access (no tier promotion).
+            match store.search_readonly(q, None, limit).await {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(error = %e, query = %q, "memory_list: search failed");

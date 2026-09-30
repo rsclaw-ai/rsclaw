@@ -35,13 +35,30 @@ pub struct DeviceStore {
     path: std::path::PathBuf,
 }
 
+/// Fingerprint of the gateway auth token that device tokens are bound to.
+/// Only a truncated SHA-256 is stored, never the token itself.
+pub fn token_generation(gateway_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(gateway_token.as_bytes());
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl DeviceStore {
+    /// Load the device-token store from `path` (missing/corrupt file = empty).
     pub fn new(path: std::path::PathBuf) -> Self {
         let mut map = HashMap::new();
-        if let Ok(raw) = std::fs::read_to_string(&path)
-            && let Ok(loaded) = serde_json::from_str::<HashMap<String, DeviceRecord>>(&raw)
-        {
-            map = loaded;
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            match serde_json::from_str::<HashMap<String, DeviceRecord>>(&raw) {
+                Ok(loaded) => map = loaded,
+                Err(e) => warn!(error = %e, path = %path.display(), "device store unreadable; starting empty"),
+            }
         }
         Self {
             tokens: RwLock::new(map),
@@ -49,36 +66,42 @@ impl DeviceStore {
         }
     }
 
-    pub async fn is_valid_device_token(&self, token: &str) -> bool {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.tokens
-            .read()
-            .await
-            .values()
-            .any(|r| r.device_token == token && r.expires_at.is_none_or(|exp| now < exp))
+    /// True when `token` is an unexpired device token minted under the
+    /// current gateway token `generation` (see [`token_generation`]).
+    pub async fn is_valid_device_token(&self, token: &str, generation: &str) -> bool {
+        let now = now_secs();
+        self.tokens.read().await.values().any(|r| {
+            crate::server::constant_time_eq(&r.device_token, token)
+                && r.expires_at.is_none_or(|exp| now < exp)
+                && r.token_generation.as_deref() == Some(generation)
+        })
     }
 
     /// Device token lifetime: 30 days. Long enough for interactive sessions,
     /// short enough to limit exposure of leaked tokens.
     const DEVICE_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
-    pub async fn issue_token(&self, device_id: Option<String>) -> String {
+    /// Mint a device token for `device_id` bound to the gateway token
+    /// `generation`. Replaces the device's previous token and prunes expired
+    /// or stale-generation records before persisting.
+    pub async fn issue_token(&self, device_id: String, generation: &str) -> String {
         let token = uuid::Uuid::new_v4().to_string();
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = now_secs();
         let record = DeviceRecord {
             device_token: token.clone(),
-            device_id: device_id.clone(),
+            device_id: Some(device_id.clone()),
             created_at: now,
             expires_at: Some(now + Self::DEVICE_TOKEN_TTL_SECS),
+            token_generation: Some(generation.to_owned()),
         };
-        let key = device_id.unwrap_or_else(|| token.clone());
-        self.tokens.write().await.insert(key, record);
+        {
+            let mut guard = self.tokens.write().await;
+            guard.retain(|_, r| {
+                r.expires_at.is_some_and(|exp| now < exp)
+                    && r.token_generation.as_deref() == Some(generation)
+            });
+            guard.insert(device_id, record);
+        }
         self.persist().await;
         token
     }
@@ -103,21 +126,26 @@ impl DeviceStore {
 
     async fn persist(&self) {
         let guard = self.tokens.read().await;
-        if let Ok(json) = serde_json::to_string_pretty(&*guard) {
-            if let Err(e) = tokio::fs::write(&self.path, &json).await {
-                tracing::warn!(error = %e, "device store write failed");
-            }
-            // SECURITY: restrict file permissions to owner-only
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) =
-                    tokio::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
-                        .await
+        match serde_json::to_string_pretty(&*guard) {
+            Ok(json) => {
+                if let Err(e) = tokio::fs::write(&self.path, &json).await {
+                    tracing::warn!(error = %e, "device store write failed");
+                }
+                // SECURITY: restrict file permissions to owner-only
+                #[cfg(unix)]
                 {
-                    tracing::warn!(error = %e, "device store set_permissions failed");
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) = tokio::fs::set_permissions(
+                        &self.path,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "device store set_permissions failed");
+                    }
                 }
             }
+            Err(e) => tracing::warn!(error = %e, "device store serialize failed"),
         }
     }
 }
@@ -126,6 +154,12 @@ impl DeviceStore {
 // ws_handler — Axum upgrade entry point
 // ---------------------------------------------------------------------------
 
+/// WebSocket upgrade on `/ws` and `/gateway-ws`.
+///
+/// Browser `Origin` (cross-site WebSocket hijacking) and `Host` (DNS
+/// rebinding) are validated before this runs, by `auth_middleware` and the
+/// host guard layered in `server::serve`; token auth happens in the
+/// `connect` handshake below.
 pub async fn ws_handler(
     ws: axum::extract::ws::WebSocketUpgrade,
     axum::extract::State(state): axum::extract::State<AppState>,
@@ -289,7 +323,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer: std::net::Socke
 
     // 4. Validate auth.
     let expected_token = state.live.gateway.read().await.auth_token.clone();
-    if let Some(expected) = expected_token {
+    let mut reused_device_token: Option<String> = None;
+    if let Some(ref expected) = expected_token {
         let auth: &AuthCredentials = connect_params.auth.as_ref().unwrap_or(&AuthCredentials {
             token: None,
             device_token: None,
@@ -297,15 +332,19 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer: std::net::Socke
         });
 
         let mut authed = false;
+        let generation = token_generation(expected);
 
         // Check device token first.
-        if let Some(ref dt) = auth.device_token {
-            authed = state.devices.is_valid_device_token(dt).await;
+        if let Some(ref dt) = auth.device_token
+            && state.devices.is_valid_device_token(dt, &generation).await
+        {
+            authed = true;
+            reused_device_token = Some(dt.clone());
         }
 
         // Fall back to bearer token.
         if !authed && let Some(ref t) = auth.token {
-            authed = crate::server::constant_time_eq(t, &expected);
+            authed = crate::server::constant_time_eq(t, expected);
         }
 
         if !authed {
@@ -319,14 +358,24 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer: std::net::Socke
     }
 
     // 5. Issue device token and send hello-ok.
-    let device_token = state
-        .devices
-        .issue_token(connect_params.device_id.clone())
-        .await;
-    info!(
-        "ws: issued device token for device_id={:?}",
-        connect_params.device_id
-    );
+    //
+    // Device tokens are an auth shortcut, so they are only minted when the
+    // gateway has an auth token (open-mode tokens would otherwise stay valid
+    // after auth is enabled) and the client identifies a device. A client
+    // that authenticated with a still-valid device token keeps it instead of
+    // rewriting devices.json on every connection.
+    let device_token = match (&expected_token, &connect_params.device_id) {
+        _ if reused_device_token.is_some() => reused_device_token.take().unwrap_or_default(),
+        (Some(expected), Some(device_id)) if !device_id.trim().is_empty() => {
+            let t = state
+                .devices
+                .issue_token(device_id.clone(), &token_generation(expected))
+                .await;
+            info!(device_id = %device_id, "ws: issued device token");
+            t
+        }
+        _ => String::new(),
+    };
 
     let agent_count = state.agents.len();
     let hello = HelloOkPayload {
@@ -346,8 +395,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer: std::net::Socke
         },
         auth: HelloAuth { device_token },
         policy: PolicyInfo {
-            max_message_length: 100_000,
-            rate_limit_rpm: 120,
+            // Enforced by chat.send / sessions.send.
+            max_message_length: super::types::MAX_WS_MESSAGE_CHARS as u64,
+            // Matches the write-method limiter below (30 writes / minute).
+            rate_limit_rpm: u64::from(super::rate_limit::WRITE_LIMIT_PER_MINUTE),
             tick_interval_ms: 15_000,
         },
     };
@@ -584,10 +635,18 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer: std::net::Socke
                         debug!(method = %req.method, id = %req.id, "ws dispatch");
                         let id = req.id.clone();
 
-                        // Rate-limit write operations.
-                        if super::rate_limit::RateLimiter::is_write_method(&req.method)
-                            && !rate_limiter.check()
-                        {
+                        // Rate-limit write operations. Remote peers share one
+                        // bucket per IP (reconnecting must not reset it);
+                        // local clients keep a per-connection bucket so the
+                        // desktop UI and CLI do not starve each other.
+                        let write_allowed = !super::rate_limit::RateLimiter::is_write_method(
+                            &req.method,
+                        ) || if peer.ip().is_loopback() {
+                            rate_limiter.check()
+                        } else {
+                            super::rate_limit::check_peer(peer.ip())
+                        };
+                        if !write_allowed {
                             warn!(method = %req.method, "ws: rate limited");
                             let err = ResFrame::err(
                                 id,
@@ -608,6 +667,22 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer: std::net::Socke
                             state: state.clone(),
                             conn: Arc::clone(&conn),
                         };
+                        // Slow handlers (disk scans, subprocesses) run off the
+                        // read loop so they don't stall every other request
+                        // on this connection; responses are matched by id.
+                        if is_long_running_method(&ctx.req.method) {
+                            let tx = outbound_tx.clone();
+                            tokio::spawn(async move {
+                                let frame = match dispatch::dispatch(ctx).await {
+                                    Ok(p) => ResFrame::ok(id, p),
+                                    Err(e) => ResFrame::err(id, e),
+                                };
+                                if send_serialized(&tx, &frame).await.is_err() {
+                                    debug!("ws: connection closed before slow response");
+                                }
+                            });
+                            continue;
+                        }
                         let result = dispatch::dispatch(ctx).await;
                         let frame = match result {
                             Ok(p) => ResFrame::ok(id, p),
@@ -649,6 +724,23 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer: std::net::Socke
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Methods whose handlers can take seconds (filesystem scans, subprocesses,
+/// store-wide reads) and are therefore dispatched on their own task.
+fn is_long_running_method(method: &str) -> bool {
+    matches!(
+        method,
+        "cron.run"
+            | "cron.runs"
+            | "doctor.run"
+            | "doctor.memory.status"
+            | "logs.tail"
+            | "skills.status"
+            | "skills.list"
+            | "sessions.list"
+            | "memory.search"
+    )
+}
 
 async fn send_frame(
     tx: &mpsc::Sender<String>,

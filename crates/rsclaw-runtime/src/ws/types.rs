@@ -9,6 +9,20 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 3;
 
+/// Maximum message length (in characters) accepted by `chat.send` /
+/// `sessions.send`; advertised to clients in `hello-ok.policy`.
+pub const MAX_WS_MESSAGE_CHARS: usize = 100_000;
+
+/// Reject a chat message longer than [`MAX_WS_MESSAGE_CHARS`].
+pub fn check_message_length(text: &str) -> Result<(), ErrorShape> {
+    if text.chars().count() > MAX_WS_MESSAGE_CHARS {
+        return Err(ErrorShape::bad_request(format!(
+            "message too long (max {MAX_WS_MESSAGE_CHARS} characters)"
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Inbound (client -> server)
 // ---------------------------------------------------------------------------
@@ -139,6 +153,18 @@ impl ErrorShape {
         }
     }
 
+    /// Error for protocol methods rsclaw accepts but does not implement, so
+    /// clients do not mistake a no-op for success.
+    pub fn not_implemented(message: impl Into<String>) -> Self {
+        Self {
+            code: "not_implemented".to_owned(),
+            message: message.into(),
+            details: None,
+            retryable: false,
+            retry_after_ms: 0,
+        }
+    }
+
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             code: "unauthorized".to_owned(),
@@ -193,6 +219,12 @@ pub struct DeviceRecord {
     /// (only for legacy tokens loaded from disk before the expiry feature).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    /// Fingerprint of the gateway auth token this device token was minted
+    /// under. Rotating (or removing) the gateway token changes the
+    /// fingerprint and thereby invalidates every device token minted before.
+    /// `None` (legacy records) is never accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_generation: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
