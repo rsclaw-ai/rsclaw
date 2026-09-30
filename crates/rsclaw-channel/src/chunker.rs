@@ -83,44 +83,51 @@ pub fn chunk_text(text: &str, config: &ChunkConfig) -> Vec<String> {
 
 /// Take at most `max_chars` characters from `text`, respecting code fences.
 ///
-/// Returns `(chunk, remainder, open_fence_state)`.
+/// Returns `(chunk, remainder, open_fence_state)`. Always consumes at least
+/// one character of `text` when `text` is non-empty, so callers looping until
+/// the remainder is empty are guaranteed to terminate.
 fn take_chunk<'a>(
     text: &'a str,
     max_chars: usize,
     open_fence: &Option<String>,
 ) -> (String, &'a str, Option<String>) {
-    // Track the current fence state as we scan.
-    let _current_fence = open_fence.clone();
-    let mut fence_prefix = String::new();
-
-    // If we're inside an open fence, prepend a re-open marker.
-    if let Some(lang) = open_fence {
-        fence_prefix = format!("```{lang}\n");
-    }
-
-    let budget = max_chars.saturating_sub(fence_prefix.len() + 4); // 4 = "```\n"
-
-    // Scan char-by-char tracking fence toggles and finding the best split point.
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-
-    if chars.is_empty() {
+    if text.is_empty() {
         return (String::new(), "", None);
     }
 
-    // Find the last safe split byte offset within `budget` chars.
-    let hard_limit = chars.get(budget).map(|&(idx, _)| idx).unwrap_or(text.len());
+    // If we're inside an open fence, prepend a re-open marker.
+    let fence_prefix = match open_fence {
+        Some(lang) => format!("```{lang}\n"),
+        None => String::new(),
+    };
 
-    // Track fence crossings within the budget window.
-    let window = &text[..hard_limit];
-    let _end_fence = track_fences(window, open_fence);
+    // Reserve room for the re-open prefix and a possible closing "\n```".
+    // Never let the budget reach zero: that would stall the caller's loop.
+    let budget = max_chars
+        .saturating_sub(fence_prefix.chars().count() + 4)
+        .max(1);
 
-    // Find best break point in window.
-    let split_at = find_split(window, budget);
+    // Byte offset of the `budget`-th character (end of the candidate window).
+    let hard_limit = text
+        .char_indices()
+        .nth(budget)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+
+    let mut split_at = if hard_limit >= text.len() {
+        text.len()
+    } else {
+        find_split(&text[..hard_limit])
+    };
+    if split_at == 0 {
+        // Guarantee progress: consume at least one character.
+        split_at = text.chars().next().map(char::len_utf8).unwrap_or(text.len());
+    }
 
     let (body, rest) = text.split_at(split_at);
 
     // Build the final chunk.
-    let mut chunk = fence_prefix.clone();
+    let mut chunk = fence_prefix;
     chunk.push_str(body);
 
     // Close open fence if we cut mid-block.
@@ -131,6 +138,9 @@ fn take_chunk<'a>(
 
     (chunk, rest, trailing_fence)
 }
+
+/// Maximum length of a fence language tag we carry across chunks.
+const MAX_FENCE_TAG_CHARS: usize = 32;
 
 /// Return the open fence language tag at the end of `text`, or `None`.
 fn track_fences(text: &str, initial: &Option<String>) -> Option<String> {
@@ -143,11 +153,17 @@ fn track_fences(text: &str, initial: &Option<String>) -> Option<String> {
             let fence_start = i;
             // Advance past ```
             i += 3;
-            // Collect language tag (until newline or space).
+            // Language tag: only the leading `[A-Za-z0-9_+-]` run of the rest
+            // of the fence line, capped so a long line can never balloon the
+            // re-open prefix beyond the chunk budget.
             let tag_start = i;
-            while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b' ' {
+            while i < bytes.len()
+                && i - tag_start < MAX_FENCE_TAG_CHARS
+                && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'+' | b'-'))
+            {
                 i += 1;
             }
+            // Only ASCII bytes were accepted, so this is always valid UTF-8.
             let tag = std::str::from_utf8(&bytes[tag_start..i]).unwrap_or("");
 
             if current.is_some() {
@@ -169,28 +185,22 @@ fn track_fences(text: &str, initial: &Option<String>) -> Option<String> {
     current
 }
 
-/// Find the best byte offset to split `text` at, within `max_chars` characters.
-fn find_split(text: &str, max_chars: usize) -> usize {
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        return text.len();
-    }
+/// Find the best byte offset to split `window` at.
+///
+/// `window` is the largest prefix that fits the chunk budget; the search
+/// walks backwards through it for the softest break (paragraph > newline >
+/// sentence > whitespace), ignoring breaks in the first third so chunks do
+/// not degenerate into tiny fragments. Falls back to a hard split at the end
+/// of the window.
+fn find_split(window: &str) -> usize {
+    let min = window.len() / 3;
+    let accept = |pos: Option<usize>| pos.filter(|&p| p > min);
 
-    // Byte offset of max_chars-th character.
-    let hard = text
-        .char_indices()
-        .nth(max_chars)
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
-
-    let window = &text[..hard];
-
-    // Try progressively softer break preferences.
-    try_split_at(window, "\n\n")
-        .or_else(|| try_split_at(window, "\n"))
-        .or_else(|| try_split_at_sentence(window))
-        .or_else(|| try_split_at(window, " "))
-        .unwrap_or(hard)
+    accept(try_split_at(window, "\n\n"))
+        .or_else(|| accept(try_split_at(window, "\n")))
+        .or_else(|| accept(try_split_at_sentence(window)))
+        .or_else(|| accept(try_split_at(window, " ")))
+        .unwrap_or(window.len())
 }
 
 fn try_split_at(text: &str, pat: &str) -> Option<usize> {
@@ -198,13 +208,11 @@ fn try_split_at(text: &str, pat: &str) -> Option<usize> {
 }
 
 fn try_split_at_sentence(text: &str) -> Option<usize> {
-    // Look for `. `, `? `, `! ` from the right.
-    for pat in &[". ", "? ", "! "] {
-        if let Some(pos) = text.rfind(pat) {
-            return Some(pos + pat.len());
-        }
-    }
-    None
+    // Rightmost `. `, `? ` or `! `.
+    [". ", "? ", "! "]
+        .iter()
+        .filter_map(|pat| text.rfind(pat).map(|pos| pos + pat.len()))
+        .max()
 }
 
 // ---------------------------------------------------------------------------
@@ -333,5 +341,29 @@ mod tests {
                 chunk.chars().count()
             );
         }
+    }
+
+    #[test]
+    fn chunk_long_cjk_after_fence_terminates() {
+        // Regression: the fence tag used to swallow the whole window, making
+        // the re-open prefix exceed the budget and loop forever.
+        let text = format!("```{}", "中".repeat(10_000));
+        let chunks = chunk_text(&text, &cfg(100));
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 100, "chunk too long: {}", chunk.chars().count());
+        }
+        let long_tag = format!("```{}", "x".repeat(5_000));
+        let chunks = chunk_text(&long_tag, &cfg(20));
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn chunk_prefers_soft_newline_break() {
+        let text = format!("{}\n{}", "a".repeat(80), "b".repeat(80));
+        let chunks = chunk_text(&text, &cfg(100));
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], format!("{}\n", "a".repeat(80)));
+        assert_eq!(chunks[1], "b".repeat(80));
     }
 }

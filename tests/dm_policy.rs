@@ -352,8 +352,10 @@ async fn test_concurrent_pairing_requests() {
         }
     }
 
-    assert_eq!(codes, 3, "exactly 3 pairing codes should be issued");
-    assert_eq!(fulls, 7, "remaining 7 should get PairingQueueFull");
+    // The pending-pairing cap is 50 (per-peer one code), so 10 distinct
+    // concurrent peers all receive a code.
+    assert_eq!(codes, 10, "every distinct peer should receive a pairing code");
+    assert_eq!(fulls, 0, "queue must not be full below the 50-slot cap");
 }
 
 // ---------------------------------------------------------------------------

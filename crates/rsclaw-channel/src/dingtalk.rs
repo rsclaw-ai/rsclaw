@@ -165,14 +165,18 @@ impl DingTalkChannel {
             self.oapi_base, self.app_key, self.app_secret
         );
 
+        // The legacy gettoken endpoint carries appsecret in the query string;
+        // strip the URL from transport errors so it never reaches the logs.
         let resp: TokenResponse = self
             .client
             .get(&url)
             .send()
             .await
+            .map_err(|e| e.without_url())
             .context("DingTalk gettoken request")?
             .json()
             .await
+            .map_err(|e| e.without_url())
             .context("DingTalk gettoken parse")?;
 
         if resp.errcode != 0 {
@@ -380,9 +384,13 @@ impl DingTalkChannel {
             .download_url
             .context("DingTalk media download: no downloadUrl in response")?;
 
-        let media_bytes = self.client.get(&download_url).send().await?.bytes().await?;
+        let media_resp = self.client.get(&download_url).send().await?;
+        if !media_resp.status().is_success() {
+            bail!("DingTalk media download failed: {}", media_resp.status());
+        }
+        let media_bytes = crate::read_media_body(media_resp).await?;
         debug!(size = media_bytes.len(), "DingTalk media file downloaded");
-        Ok(media_bytes.to_vec())
+        Ok(media_bytes)
     }
 
     // -----------------------------------------------------------------------
@@ -461,6 +469,14 @@ impl DingTalkChannel {
             data.clone()
         };
 
+        // Stream redeliveries (missed ACK, reconnect) reuse msgId: dedup.
+        if let Some(mid) = payload.get("msgId").and_then(|v| v.as_str())
+            && crate::is_duplicate_inbound("dingtalk", mid)
+        {
+            debug!(msg_id = mid, "DingTalk: duplicate message dropped");
+            return;
+        }
+
         // Extract message fields.
         let sender_id = payload
             .get("senderStaffId")
@@ -499,9 +515,46 @@ impl DingTalkChannel {
                     .or_else(|| payload.get("msgContent").and_then(|v| v.as_str()));
 
                 match content {
-                    Some(t) if !t.trim().is_empty() => t.trim().to_owned(),
+                    Some(t) if !t.trim().is_empty() => crate::strip_inbound_sentinels(t.trim()),
                     _ => return,
                 }
+            }
+            "richText" => {
+                // Mixed text + inline pictures: content.richText is a list of
+                // `{text}` and `{downloadCode|pictureDownloadCode, type:"picture"}`.
+                let items = payload
+                    .pointer("/content/richText")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut parts: Vec<String> = Vec::new();
+                for item in &items {
+                    if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                        if !t.trim().is_empty() {
+                            parts.push(t.to_owned());
+                        }
+                        continue;
+                    }
+                    let code = item
+                        .get("downloadCode")
+                        .or_else(|| item.get("pictureDownloadCode"))
+                        .and_then(|v| v.as_str());
+                    if let Some(code) = code {
+                        match self.download_media_file(code).await {
+                            Ok(bytes) => {
+                                use base64::Engine;
+                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                images.push(rsclaw_types::ImageAttachment {
+                                    data: format!("data:image/png;base64,{b64}"),
+                                    mime_type: "image/png".to_owned(),
+                                    source_path: None,
+                                });
+                            }
+                            Err(e) => warn!("DingTalk richText image download failed: {e:#}"),
+                        }
+                    }
+                }
+                crate::strip_inbound_sentinels(parts.join("\n").trim())
             }
             "audio" | "voice" => {
                 let download_code = payload
@@ -526,7 +579,7 @@ impl DingTalkChannel {
                     }
                 }
             }
-            "picture" | "richText" => {
+            "picture" => {
                 let download_code = payload
                     .get("content")
                     .and_then(|c| c.get("downloadCode"))
@@ -782,10 +835,17 @@ impl DingTalkChannel {
                                             "message": "OK",
                                             "data": "",
                                         });
-                                        let _ = write.send(WsMessage::Text(ack.to_string().into())).await;
+                                        if let Err(e) = write.send(WsMessage::Text(ack.to_string().into())).await {
+                                            warn!("DingTalk: event ACK failed: {e}");
+                                        }
                                     }
 
-                                    self.handle_stream_event(&event).await;
+                                    // Downloads / transcription run off the
+                                    // stream loop so pings and ACKs keep flowing.
+                                    let this = Arc::clone(self);
+                                    tokio::spawn(async move {
+                                        this.handle_stream_event(&event).await;
+                                    });
                                 }
                                 Err(e) => {
                                     warn!("DingTalk: invalid JSON from stream: {e}");
@@ -793,7 +853,9 @@ impl DingTalkChannel {
                             }
                         }
                         Some(Ok(WsMessage::Ping(data))) => {
-                            let _ = write.send(WsMessage::Pong(data)).await;
+                            if let Err(e) = write.send(WsMessage::Pong(data)).await {
+                                warn!("DingTalk: pong failed: {e}");
+                            }
                         }
                         Some(Ok(WsMessage::Close(_))) => {
                             info!("DingTalk: WebSocket close frame received");

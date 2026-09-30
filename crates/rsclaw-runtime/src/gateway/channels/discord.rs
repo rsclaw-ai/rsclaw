@@ -76,27 +76,27 @@ pub(crate) fn start_discord_if_configured(
 
     let allow_bots = dc_cfg.allow_bots.unwrap_or(false);
 
+    let bare_acct = super::bare_account_name(dc_accounts.iter().map(|(n, _)| n));
     for (acct_name, token) in dc_accounts {
         let reg = Arc::clone(&registry);
         let cfg_arc = Arc::new(config.clone());
         let tq = Arc::clone(&task_queue);
         let acct_for_log = acct_name.clone();
         let w_acct_outer = acct_name.clone();
+        let enforcer_for_gate = Arc::clone(&enforcer);
         let enforcer = Arc::clone(&enforcer);
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register Discord channel sender for notification routing.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("discord/{}", acct_name), out_tx.clone());
-            senders
-                .entry("discord".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        super::register_outbound_sender(
+            &channel_senders,
+            "discord",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         // Find binding for this account.
         let bound_agent = config
@@ -426,6 +426,7 @@ pub(crate) fn start_discord_if_configured(
                                 "discord",
                                 &peer_id,
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("discord", &peer_id, is_guild),
                             )
                             .await
                             {
@@ -440,6 +441,7 @@ pub(crate) fn start_discord_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("discord", &peer_id, is_guild),
                                 session_key,
                                 text,
                                 channel: "discord".to_string(),
@@ -536,13 +538,20 @@ pub(crate) fn start_discord_if_configured(
             },
         );
 
-        let dc = Arc::new(DiscordChannel::new(
-            token,
-            allow_bots,
-            on_message,
-            dc_cfg.api_base.clone(),
-            dc_cfg.gateway_url.clone(),
-        ));
+        let dc = Arc::new(
+            DiscordChannel::new(
+                token,
+                allow_bots,
+                on_message,
+                dc_cfg.api_base.clone(),
+                dc_cfg.gateway_url.clone(),
+            )
+            .with_media_gate(super::build_media_gate(
+                Arc::clone(&enforcer_for_gate),
+                group_policy.clone(),
+                Arc::new(group_allow_from.clone()),
+            )),
+        );
         let dc_send = Arc::clone(&dc);
         let shutdown_for_out = shutdown.clone();
         let acct_key = format!("discord/{}", acct_name);

@@ -87,27 +87,27 @@ pub(crate) fn start_slack_if_configured(
         enforcers.insert("slack".to_owned(), Arc::clone(&enforcer));
     }
 
+    let bare_acct = super::bare_account_name(sl_accounts.iter().map(|(n, _, _, _)| n));
     for (acct_name, bot_token, app_token, api_base) in sl_accounts {
         let reg = Arc::clone(&registry);
         let cfg_arc = Arc::new(config.clone());
         let tq = Arc::clone(&task_queue);
         let acct_for_log = acct_name.clone();
         let w_acct_outer = acct_name.clone();
+        let enforcer_for_gate = Arc::clone(&enforcer);
         let enforcer = Arc::clone(&enforcer);
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register Slack channel sender for notification routing.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("slack/{}", acct_name), out_tx.clone());
-            senders
-                .entry("slack".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        super::register_outbound_sender(
+            &channel_senders,
+            "slack",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         // Find binding for this account.
         let bound_agent = config
@@ -435,6 +435,7 @@ pub(crate) fn start_slack_if_configured(
                                 "slack",
                                 &peer_id,
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("slack", &peer_id, is_channel),
                             )
                             .await
                             {
@@ -449,6 +450,7 @@ pub(crate) fn start_slack_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("slack", &peer_id, is_channel),
                                 session_key,
                                 text,
                                 channel: "slack".to_string(),
@@ -545,9 +547,15 @@ pub(crate) fn start_slack_if_configured(
             },
         );
 
-        let sl = Arc::new(SlackChannel::new(
-            bot_token, app_token, api_base, on_message,
-        ));
+        let sl = Arc::new(
+            SlackChannel::new(bot_token, app_token, api_base, on_message).with_media_gate(
+                super::build_media_gate(
+                    Arc::clone(&enforcer_for_gate),
+                    group_policy.clone(),
+                    Arc::new(group_allow_from.clone()),
+                ),
+            ),
+        );
         let sl_send = Arc::clone(&sl);
         let shutdown_for_out = shutdown.clone();
         let acct_key = format!("slack/{}", acct_name);

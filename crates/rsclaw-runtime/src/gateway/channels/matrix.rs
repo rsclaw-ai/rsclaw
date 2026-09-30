@@ -86,6 +86,7 @@ pub(crate) fn start_matrix_if_configured(
         return;
     }
 
+    let bare_acct = super::bare_account_name(mx_accounts.iter().map(|(n, _, _, _)| n));
     for (acct_name, homeserver, access_token, user_id) in mx_accounts {
         let acct_for_log = acct_name.clone();
         let w_acct_outer = acct_name.clone();
@@ -96,15 +97,13 @@ pub(crate) fn start_matrix_if_configured(
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register Matrix channel sender for notification routing.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("matrix/{}", acct_name), out_tx.clone());
-            senders
-                .entry("matrix".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        super::register_outbound_sender(
+            &channel_senders,
+            "matrix",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
@@ -386,6 +385,7 @@ pub(crate) fn start_matrix_if_configured(
                                 "matrix",
                                 &sender,
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("matrix", &sender, is_group),
                             )
                             .await
                             {
@@ -400,6 +400,7 @@ pub(crate) fn start_matrix_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("matrix", &sender, is_group),
                                 session_key,
                                 text,
                                 channel: "matrix".to_string(),

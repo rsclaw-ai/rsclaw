@@ -12,11 +12,12 @@ fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-type OnMessage =
-    Arc<dyn Fn(String, String, bool, Vec<rsclaw::agent::registry::ImageAttachment>) + Send + Sync>;
+type OnMessage = Arc<
+    dyn Fn(String, String, String, bool, Vec<rsclaw::agent::registry::ImageAttachment>) + Send + Sync,
+>;
 
 fn noop_on_message() -> OnMessage {
-    Arc::new(|_, _, _, _| {})
+    Arc::new(|_, _, _, _, _| {})
 }
 
 fn make_channel(base_url: &str) -> LineChannel {
@@ -95,7 +96,7 @@ async fn webhook_text_dispatches_to_callback() {
 
     let ch = LineChannel::new(
         "token",
-        Arc::new(move |from, text, is_group, _images| {
+        Arc::new(move |from, _chat_id, text, is_group, _images| {
             rx.lock().expect("lock").push((from, text, is_group));
         }),
     );
@@ -130,7 +131,7 @@ async fn webhook_group_message() {
 
     let ch = LineChannel::new(
         "token",
-        Arc::new(move |from, text, is_group, _images| {
+        Arc::new(move |from, _chat_id, text, is_group, _images| {
             rx.lock().expect("lock").push((from, text, is_group));
         }),
     );

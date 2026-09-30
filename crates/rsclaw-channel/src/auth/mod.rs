@@ -391,12 +391,91 @@ pub fn save_token(platform: &str, token_data: &serde_json::Value) -> Result<()> 
         .entry("enabled")
         .or_insert(serde_json::Value::Bool(true));
 
-    // Write back
+    // Write back atomically (tmp + rename) so a crash mid-write can never
+    // leave a truncated config behind.
+    // NOTE: the file is re-serialized from parsed JSON5, so comments in the
+    // user's config are not preserved by this path.
     let json = serde_json::to_string_pretty(&config)?;
-    std::fs::write(&config_path, &json)?;
+    write_atomic(&config_path, json.as_bytes())?;
 
     info!(platform, path = %config_path.display(), "auth token saved to config");
     Ok(())
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temp file, fsync it,
+/// then rename over the target.
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("rsclaw");
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err()
+        && let Err(e) = std::fs::remove_file(&tmp)
+    {
+        tracing::debug!(path = %tmp.display(), "cleanup of temp file failed: {e}");
+    }
+    result
+}
+
+/// Path of the small per-channel runtime state file
+/// (`<base_dir>/state/<platform>.json`).
+fn channel_state_path(platform: &str) -> std::path::PathBuf {
+    rsclaw_config::loader::base_dir()
+        .join("state")
+        .join(format!("{platform}.json"))
+}
+
+/// Load one key of a channel's persisted runtime state (e.g. the WeChat
+/// long-poll cursor). Kept out of the user config so frequent updates never
+/// rewrite `rsclaw.json5`.
+pub fn load_channel_state(platform: &str, key: &str) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(channel_state_path(platform)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get(key).cloned()
+}
+
+/// Persist one key of a channel's runtime state (atomic write).
+pub fn save_channel_state(platform: &str, key: &str, value: serde_json::Value) -> Result<()> {
+    let path = channel_state_path(platform);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut state = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = state.as_object_mut() {
+        obj.insert(key.to_owned(), value);
+    }
+    write_atomic(&path, serde_json::to_string(&state)?.as_bytes())
+}
+
+/// Print a user-facing notice for interactive CLI login flows. When stdout
+/// is not a terminal (desktop sidecar, daemon) the text goes to the log
+/// instead, so a closed stdout can never panic the process.
+pub fn cli_notice(text: &str) {
+    use std::io::{IsTerminal, Write};
+    let stdout = std::io::stdout();
+    if stdout.is_terminal() {
+        if let Err(e) = writeln!(stdout.lock(), "{text}") {
+            tracing::debug!("cli notice not printed: {e}");
+        }
+    } else {
+        info!("{text}");
+    }
 }
 
 /// Load a previously saved login token.

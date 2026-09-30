@@ -476,6 +476,15 @@ impl QQBotChannel {
         let event_type = val["t"].as_str().unwrap_or("");
         let data = &val["d"];
 
+        // Resume / reconnect can replay message events: dedup by message id.
+        if event_type.ends_with("MESSAGE_CREATE")
+            && let Some(mid) = data["id"].as_str()
+            && crate::is_duplicate_inbound("qq", mid)
+        {
+            debug!(event_type, msg_id = mid, "qq: duplicate message dropped");
+            return;
+        }
+
         match event_type {
             "GROUP_AT_MESSAGE_CREATE" => {
                 // Group @bot message
@@ -483,11 +492,8 @@ impl QQBotChannel {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
-                let mut text = data["content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_owned();
+                let mut text =
+                    crate::strip_inbound_sentinels(data["content"].as_str().unwrap_or_default().trim());
                 let group_openid = data["group_openid"].as_str().unwrap_or_default().to_owned();
                 let msg_id = data["id"].as_str().unwrap_or_default().to_owned();
 
@@ -504,11 +510,8 @@ impl QQBotChannel {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
-                let mut text = data["content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_owned();
+                let mut text =
+                    crate::strip_inbound_sentinels(data["content"].as_str().unwrap_or_default().trim());
                 let msg_id = data["id"].as_str().unwrap_or_default().to_owned();
 
                 let has_attachments = data.get("attachments").is_some();
@@ -528,11 +531,8 @@ impl QQBotChannel {
             "AT_MESSAGE_CREATE" => {
                 // Guild channel @bot message
                 let sender = data["author"]["id"].as_str().unwrap_or_default().to_owned();
-                let mut text = data["content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_owned();
+                let mut text =
+                    crate::strip_inbound_sentinels(data["content"].as_str().unwrap_or_default().trim());
                 let channel_id = data["channel_id"].as_str().unwrap_or_default().to_owned();
                 let msg_id = data["id"].as_str().unwrap_or_default().to_owned();
 
@@ -540,12 +540,15 @@ impl QQBotChannel {
 
                 if !text.is_empty() || !images.is_empty() || !files.is_empty() {
                     info!(sender = %sender, channel = %channel_id, "qq: guild message received");
-                    // Prefix channel_id with "guild:" to distinguish from group openid
+                    // Prefix channel_id with "guild:" to distinguish from group openid.
+                    // A guild channel is a multi-user space: is_group=true so
+                    // groupPolicy applies and pairing codes are never posted
+                    // publicly.
                     (self.on_message)(
                         sender,
                         text,
                         format!("guild:{channel_id}"),
-                        false,
+                        true,
                         msg_id,
                         images,
                         files,
@@ -555,11 +558,8 @@ impl QQBotChannel {
             "DIRECT_MESSAGE_CREATE" => {
                 // Guild DM
                 let sender = data["author"]["id"].as_str().unwrap_or_default().to_owned();
-                let mut text = data["content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_owned();
+                let mut text =
+                    crate::strip_inbound_sentinels(data["content"].as_str().unwrap_or_default().trim());
                 let guild_id = data["guild_id"].as_str().unwrap_or_default().to_owned();
                 let msg_id = data["id"].as_str().unwrap_or_default().to_owned();
 

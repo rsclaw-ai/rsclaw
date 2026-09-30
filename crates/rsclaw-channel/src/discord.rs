@@ -77,6 +77,8 @@ pub struct DiscordChannel {
     client: Client,
     retry: RetryConfig,
     allow_bots: bool,
+    /// Optional policy pre-check run before downloading attachments.
+    media_gate: Option<crate::MediaGate>,
     #[allow(clippy::type_complexity)]
     on_message: Arc<
         dyn Fn(
@@ -128,11 +130,19 @@ impl DiscordChannel {
                 .expect("reqwest client"),
             retry: RetryConfig::default(),
             allow_bots,
+            media_gate: None,
             on_message,
             api_base: api_base.unwrap_or_else(|| DISCORD_API_BASE.to_owned()),
             gateway_url,
             bot_user_id: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install a side-effect-free policy pre-check; attachments from senders
+    /// it rejects are never downloaded.
+    pub fn with_media_gate(mut self, gate: crate::MediaGate) -> Self {
+        self.media_gate = Some(gate);
+        self
     }
 
     fn auth_header(&self) -> String {
@@ -327,7 +337,7 @@ impl DiscordChannel {
     ///   OP 1  HEARTBEAT — send every heartbeat_interval ms
     ///   OP 11 HEARTBEAT_ACK — receive from server
     ///   OP 0  DISPATCH — receive events (READY, MESSAGE_CREATE)
-    async fn gateway_loop(&self) -> Result<()> {
+    async fn gateway_loop(self: &Arc<Self>) -> Result<()> {
         let url = if let Some(ref override_url) = self.gateway_url {
             override_url.clone()
         } else {
@@ -429,7 +439,9 @@ impl DiscordChannel {
                 // OP 1 HEARTBEAT request from server
                 1 => {
                     let hb = json!({"op": 1, "d": last_sequence});
-                    let _ = write.send(WsMessage::Text(hb.to_string().into())).await;
+                    if let Err(e) = write.send(WsMessage::Text(hb.to_string().into())).await {
+                        warn!("Discord: heartbeat reply failed: {e}");
+                    }
                 }
                 // OP 0 DISPATCH
                 0 => {
@@ -447,141 +459,31 @@ impl DiscordChannel {
                         }
                         "MESSAGE_CREATE" => {
                             let d = &payload["d"];
+                            let peer_id = d["author"]["id"].as_str().unwrap_or("").to_owned();
+                            // Never react to our own messages, even with
+                            // allowBots=true (would self-reply forever).
+                            let own_id = self.bot_user_id.read().ok().and_then(|g| g.clone());
+                            if own_id.as_deref().is_some_and(|bid| bid == peer_id) {
+                                continue;
+                            }
                             let is_bot = d["author"]["bot"].as_bool().unwrap_or(false);
                             if is_bot && !self.allow_bots {
                                 continue;
                             }
+                            // Gateway RESUME can replay events: dedup by id.
+                            if let Some(mid) = d["id"].as_str()
+                                && crate::is_duplicate_inbound("discord", mid)
+                            {
+                                debug!(id = mid, "Discord: duplicate MESSAGE_CREATE dropped");
+                                continue;
+                            }
                             let mut content = d["content"].as_str().unwrap_or("").to_owned();
                             let channel_id = d["channel_id"].as_str().unwrap_or("").to_owned();
-                            let peer_id = d["author"]["id"].as_str().unwrap_or("").to_owned();
                             let is_guild = d["guild_id"].is_string();
-
-                            // Process attachments (images, audio, video, files).
-                            // Images go into `images` so the runtime can hand
-                            // them to the vision model AND so `pending_files`
-                            // gets a chance to fire (analyze vs save prompt).
-                            // Other files go into `files` for the same reason.
-                            // Audio/video still get auto-transcribed inline.
-                            let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
-                            let mut files: Vec<rsclaw_types::FileAttachment> = Vec::new();
-                            if let Some(attachments) = d["attachments"].as_array() {
-                                for att in attachments {
-                                    let url = att["url"].as_str().unwrap_or("");
-                                    let filename = att["filename"].as_str().unwrap_or("file");
-                                    let content_type = att["content_type"].as_str().unwrap_or("");
-                                    if url.is_empty() {
-                                        continue;
-                                    }
-
-                                    let download = self.client.get(url).send().await;
-                                    let bytes = match download {
-                                        Ok(resp) if resp.status().is_success() => {
-                                            resp.bytes().await.ok().map(|b| b.to_vec())
-                                        }
-                                        _ => None,
-                                    };
-
-                                    if let Some(bytes) = bytes {
-                                        if content_type.starts_with("audio/")
-                                            || content_type.starts_with("video/")
-                                        {
-                                            match crate::transcription::transcribe_audio(
-                                                &self.client,
-                                                &bytes,
-                                                filename,
-                                                content_type,
-                                            )
-                                            .await
-                                            {
-                                                Ok(text) => {
-                                                    info!(
-                                                        "Discord: attachment transcribed ({} chars)",
-                                                        text.len()
-                                                    );
-                                                    if !content.is_empty() {
-                                                        content.push('\n');
-                                                    }
-                                                    content.push_str(&text);
-                                                }
-                                                Err(_) => {
-                                                    if !content.is_empty() {
-                                                        content.push('\n');
-                                                    }
-                                                    content.push_str(&format!(
-                                                        "[{content_type} attachment: {filename}]"
-                                                    ));
-                                                }
-                                            }
-                                        } else if content_type.starts_with("image/") {
-                                            use base64::Engine as _;
-                                            let orig_len = bytes.len();
-                                            let orig_mime = if content_type.is_empty() {
-                                                "image/png"
-                                            } else {
-                                                content_type
-                                            };
-                                            let (final_bytes, final_mime) =
-                                                rsclaw_util::downscale_image_for_vision(
-                                                    &bytes,
-                                                    orig_mime,
-                                                    1 * 1024 * 1024,
-                                                    1920,
-                                                    85,
-                                                )
-                                                .unwrap_or_else(|e| {
-                                                    warn!(error = %e, "Discord: downscale failed");
-                                                    (bytes, orig_mime.to_owned())
-                                                });
-                                            let b64 = base64::engine::general_purpose::STANDARD
-                                                .encode(&final_bytes);
-                                            images.push(rsclaw_types::ImageAttachment {
-                                                data: format!("data:{final_mime};base64,{b64}"),
-                                                mime_type: final_mime,
-                                                source_path: None,
-                                            });
-                                            info!(
-                                                from = orig_len,
-                                                to = final_bytes.len(),
-                                                %filename,
-                                                "Discord: image attachment forwarded for vision"
-                                            );
-                                        } else {
-                                            // Forward as a FileAttachment so
-                                            // the runtime's PendingFile flow
-                                            // can prompt analyze/save. Also
-                                            // keep the inline text extraction
-                                            // (PDF/Office/text) so plain Q&A
-                                            // works without two roundtrips.
-                                            let processed = discord_process_file(filename, &bytes);
-                                            files.push(rsclaw_types::FileAttachment {
-                                                filename: filename.to_owned(),
-                                                data: bytes.clone(),
-                                                mime_type: if content_type.is_empty() {
-                                                    "application/octet-stream".to_owned()
-                                                } else {
-                                                    content_type.to_owned()
-                                                },
-                                            });
-                                            if !content.is_empty() {
-                                                content.push('\n');
-                                            }
-                                            content.push_str(&processed);
-                                        }
-                                    } else {
-                                        if !content.is_empty() {
-                                            content.push('\n');
-                                        }
-                                        content.push_str(&format!(
-                                            "[attachment download failed: {filename}]"
-                                        ));
-                                    }
-                                }
-                            }
 
                             // Strip a leading bot mention so commands like
                             // `<@bot_id> /ss` reach is_fast_preparse intact.
-                            let bot_id = self.bot_user_id.read().ok().and_then(|g| g.clone());
-                            if let Some(bid) = bot_id.as_deref() {
+                            if let Some(bid) = own_id.as_deref() {
                                 content = strip_bot_mention(&content, bid);
                             }
                             // Allow `\xxx` as an alias for `/xxx` — Discord
@@ -598,14 +500,33 @@ impl DiscordChannel {
                                     content = format!("/{rest}");
                                 }
                             }
+                            let content = crate::strip_inbound_sentinels(&content);
 
-                            if content.is_empty() {
-                                continue;
+                            let attachments =
+                                d["attachments"].as_array().cloned().unwrap_or_default();
+                            if attachments.is_empty() {
+                                if content.is_empty() {
+                                    continue;
+                                }
+                                debug!(peer = %peer_id, channel = %channel_id, "Discord: MESSAGE_CREATE");
+                                (self.on_message)(
+                                    peer_id, content, channel_id, is_guild, vec![], vec![],
+                                );
+                            } else {
+                                // Downloads / transcription run off the
+                                // gateway loop so heartbeats keep flowing.
+                                let this = Arc::clone(self);
+                                tokio::spawn(async move {
+                                    this.process_attachments_and_dispatch(
+                                        peer_id,
+                                        content,
+                                        channel_id,
+                                        is_guild,
+                                        attachments,
+                                    )
+                                    .await;
+                                });
                             }
-                            debug!(peer = %peer_id, channel = %channel_id, "Discord: MESSAGE_CREATE");
-                            (self.on_message)(
-                                peer_id, content, channel_id, is_guild, images, files,
-                            );
                         }
                         _ => {
                             debug!("Discord: event {event_type}");
@@ -617,6 +538,156 @@ impl DiscordChannel {
                 }
             }
         }
+    }
+
+    /// Download / transcribe message attachments (bounded, gated by the
+    /// media policy pre-check), then dispatch the message.
+    async fn process_attachments_and_dispatch(
+        &self,
+        peer_id: String,
+        mut content: String,
+        channel_id: String,
+        is_guild: bool,
+        attachments: Vec<Value>,
+    ) {
+        if let Some(gate) = &self.media_gate
+            && !gate(peer_id.clone(), channel_id.clone(), is_guild).await
+        {
+            info!(peer = %peer_id, "Discord: sender not authorised, attachments not downloaded");
+            if content.is_empty() {
+                content = crate::GATED_MEDIA_PLACEHOLDER.to_owned();
+            }
+            (self.on_message)(peer_id, content, channel_id, is_guild, vec![], vec![]);
+            return;
+        }
+        let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
+        let mut files: Vec<rsclaw_types::FileAttachment> = Vec::new();
+        {
+            for att in &attachments {
+                let url = att["url"].as_str().unwrap_or("");
+                let filename = att["filename"].as_str().unwrap_or("file");
+                let content_type = att["content_type"].as_str().unwrap_or("");
+                if url.is_empty() {
+                    continue;
+                }
+
+                let download = self.client.get(url).send().await;
+                let bytes = match download {
+                    Ok(resp) if resp.status().is_success() => {
+                        match crate::read_media_body(resp).await {
+                            Ok(b) => Some(b),
+                            Err(e) => {
+                                warn!("Discord: attachment download failed: {e:#}");
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+
+                if let Some(bytes) = bytes {
+                    if content_type.starts_with("audio/")
+                        || content_type.starts_with("video/")
+                    {
+                        match crate::transcription::transcribe_audio(
+                            &self.client,
+                            &bytes,
+                            filename,
+                            content_type,
+                        )
+                        .await
+                        {
+                            Ok(text) => {
+                                info!(
+                                    "Discord: attachment transcribed ({} chars)",
+                                    text.len()
+                                );
+                                if !content.is_empty() {
+                                    content.push('\n');
+                                }
+                                content.push_str(&text);
+                            }
+                            Err(_) => {
+                                if !content.is_empty() {
+                                    content.push('\n');
+                                }
+                                content.push_str(&format!(
+                                    "[{content_type} attachment: {filename}]"
+                                ));
+                            }
+                        }
+                    } else if content_type.starts_with("image/") {
+                        use base64::Engine as _;
+                        let orig_len = bytes.len();
+                        let orig_mime = if content_type.is_empty() {
+                            "image/png"
+                        } else {
+                            content_type
+                        };
+                        let (final_bytes, final_mime) =
+                            rsclaw_util::downscale_image_for_vision(
+                                &bytes,
+                                orig_mime,
+                                1 * 1024 * 1024,
+                                1920,
+                                85,
+                            )
+                            .unwrap_or_else(|e| {
+                                warn!(error = %e, "Discord: downscale failed");
+                                (bytes, orig_mime.to_owned())
+                            });
+                        let b64 = base64::engine::general_purpose::STANDARD
+                            .encode(&final_bytes);
+                        images.push(rsclaw_types::ImageAttachment {
+                            data: format!("data:{final_mime};base64,{b64}"),
+                            mime_type: final_mime,
+                            source_path: None,
+                        });
+                        info!(
+                            from = orig_len,
+                            to = final_bytes.len(),
+                            %filename,
+                            "Discord: image attachment forwarded for vision"
+                        );
+                    } else {
+                        // Forward as a FileAttachment so
+                        // the runtime's PendingFile flow
+                        // can prompt analyze/save. Also
+                        // keep the inline text extraction
+                        // (PDF/Office/text) so plain Q&A
+                        // works without two roundtrips.
+                        let processed = discord_process_file(filename, &bytes);
+                        files.push(rsclaw_types::FileAttachment {
+                            filename: filename.to_owned(),
+                            data: bytes.clone(),
+                            mime_type: if content_type.is_empty() {
+                                "application/octet-stream".to_owned()
+                            } else {
+                                content_type.to_owned()
+                            },
+                        });
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&processed);
+                    }
+                } else {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str(&format!(
+                        "[attachment download failed: {filename}]"
+                    ));
+                }
+            }
+        }
+
+        // Image-only / file-only messages are valid input too.
+        if content.is_empty() && images.is_empty() && files.is_empty() {
+            return;
+        }
+        debug!(peer = %peer_id, channel = %channel_id, "Discord: MESSAGE_CREATE (attachments)");
+        (self.on_message)(peer_id, content, channel_id, is_guild, images, files);
     }
 }
 
@@ -829,7 +900,8 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
         } else {
             safe_name
         };
-        let tmp = std::env::temp_dir().join(format!("rsclaw_discord_{safe_name}"));
+        let tmp = std::env::temp_dir()
+            .join(format!("rsclaw_discord_{}_{safe_name}", uuid::Uuid::new_v4()));
         if std::fs::write(&tmp, bytes).is_ok() {
             let mut cmd = std::process::Command::new("pdftotext");
             cmd.args([tmp.to_str().unwrap_or(""), "-"]);
@@ -882,10 +954,25 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
             rsclaw_util::truncate_str(&text, 20000)
         )
     } else {
+        // Never join the remote filename: it is attacker-controlled and may
+        // contain `../`. Store under a generated canonical name instead.
         let ws = rsclaw_config::loader::base_dir().join("workspace/uploads");
-        let _ = std::fs::create_dir_all(&ws);
-        let dest = ws.join(filename);
-        let _ = std::fs::write(&dest, bytes);
+        if let Err(e) = std::fs::create_dir_all(&ws) {
+            warn!("Discord: create uploads dir failed: {e}");
+        }
+        let safe = rsclaw_util::fs_guard::sanitize_filename(filename, "file");
+        let stored = crate::upload_filename("application/octet-stream", &safe);
+        let dest = match rsclaw_util::fs_guard::resolve_within(&ws, &stored) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Discord: refusing to store upload {filename}: {e:#}");
+                return format!("[file: {filename}]");
+            }
+        };
+        if let Err(e) = std::fs::write(&dest, bytes) {
+            warn!("Discord: save upload failed: {e}");
+            return format!("[file: {filename}]");
+        }
         format!(
             "[File saved: {filename} ({} bytes) at {}]",
             bytes.len(),

@@ -7,7 +7,14 @@
 //! `signal-cli` and communicates via newline-delimited JSON on stdio.
 //! No message size limit; chunker is a passthrough for Signal.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use futures::future::BoxFuture;
@@ -16,9 +23,9 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{Mutex, oneshot},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::{Channel, OutboundMessage};
 
@@ -29,6 +36,12 @@ use super::{Channel, OutboundMessage};
 #[derive(Debug, Deserialize)]
 struct SignalEnvelope {
     envelope: SignalMessage,
+}
+
+/// JSON-RPC notification form (`{"method":"receive","params":{"envelope":..}}`).
+#[derive(Debug, Deserialize)]
+struct SignalNotification {
+    params: SignalEnvelope,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,13 +62,27 @@ struct SignalDataMessage {
 // SignalChannel
 // ---------------------------------------------------------------------------
 
+/// Inbound Signal message callback: `(sender_number, chat_id, text, is_group)`.
+///
+/// `chat_id` is the base64 group id for group messages and the sender number
+/// for direct messages; replies must go to `chat_id`.
+pub type SignalOnMessage = Arc<dyn Fn(String, String, String, bool) + Send + Sync>;
+
+/// How long to wait for signal-cli to answer an RPC that references a temp
+/// attachment before the file is removed anyway.
+const SIGNAL_RPC_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub struct SignalChannel {
     phone_number: String,
     stdin: Arc<Mutex<ChildStdin>>,
     stdout: Arc<Mutex<BufReader<ChildStdout>>>,
     _child: Arc<Mutex<Child>>,
-    on_message: Arc<dyn Fn(String, String, bool) + Send + Sync>,
-    // (sender_number, text, is_group)
+    on_message: SignalOnMessage,
+    /// Monotonic JSON-RPC request id.
+    next_id: AtomicU64,
+    /// RPC calls awaiting a response, keyed by request id. Resolved by the
+    /// receive loop in `run()`.
+    pending: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
 }
 
 impl SignalChannel {
@@ -63,19 +90,20 @@ impl SignalChannel {
     pub async fn spawn(
         phone_number: impl Into<String>,
         cli_path: Option<String>,
-        on_message: Arc<dyn Fn(String, String, bool) + Send + Sync>,
+        on_message: SignalOnMessage,
     ) -> Result<Self> {
         let phone = phone_number.into();
         let bin = cli_path.unwrap_or_else(|| "signal-cli".to_owned());
 
-        let mut child = Command::new(&bin)
-            .args(["-u", &phone, "jsonRpc"])
+        let mut cmd = Command::new(&bin);
+        cmd.args(["-u", &phone, "jsonRpc"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .context("spawn signal-cli (is it installed?)")?;
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let mut child = cmd.spawn().context("spawn signal-cli (is it installed?)")?;
 
         let stdin = child.stdin.take().context("signal-cli stdin")?;
         let stdout = child.stdout.take().context("signal-cli stdout")?;
@@ -88,15 +116,55 @@ impl SignalChannel {
             stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
             _child: Arc::new(Mutex::new(child)),
             on_message,
+            next_id: AtomicU64::new(1),
+            pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
+    /// Fire-and-forget JSON-RPC request.
     async fn send_rpc(&self, method: &str, params: Value) -> Result<()> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.write_rpc(id, method, params).await
+    }
+
+    /// JSON-RPC request that waits (bounded) for signal-cli's response. Used
+    /// when the request references a temp file that must outlive the call.
+    async fn call_rpc(&self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending_map().insert(id, tx);
+        if let Err(e) = self.write_rpc(id, method, params).await {
+            self.pending_map().remove(&id);
+            return Err(e);
+        }
+        match tokio::time::timeout(SIGNAL_RPC_TIMEOUT, rx).await {
+            Ok(Ok(resp)) => {
+                if let Some(err) = resp.get("error") {
+                    anyhow::bail!("signal-cli {method} error: {err}");
+                }
+                Ok(resp)
+            }
+            Ok(Err(_)) => anyhow::bail!("signal-cli {method}: response channel closed"),
+            Err(_) => {
+                self.pending_map().remove(&id);
+                anyhow::bail!("signal-cli {method}: no response within {SIGNAL_RPC_TIMEOUT:?}")
+            }
+        }
+    }
+
+    fn pending_map(&self) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<Value>>> {
+        match self.pending.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    async fn write_rpc(&self, id: u64, method: &str, params: Value) -> Result<()> {
         let req = json!({
             "jsonrpc": "2.0",
             "method":  method,
             "params":  params,
-            "id":      1,
+            "id":      id,
         });
         let line = serde_json::to_string(&req)? + "\n";
         let mut stdin = self.stdin.lock().await;
@@ -126,23 +194,23 @@ impl Channel for SignalChannel {
 
     fn send(&self, msg: OutboundMessage) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            let params = if msg.is_group {
-                json!({
-                    "groupId":  msg.target_id,
-                    "message":  msg.text,
-                })
-            } else {
-                json!({
-                    "recipient": msg.target_id,
-                    "message":   msg.text,
-                })
-            };
-            let method = if msg.is_group {
-                "sendGroupMessage"
-            } else {
-                "send"
-            };
-            self.send_rpc(method, params).await?;
+            // signal-cli JSON-RPC uses `send` for both DMs (`recipient`) and
+            // groups (`groupId`); there is no `sendGroupMessage` method.
+            let method = "send";
+            if !msg.text.trim().is_empty() {
+                let params = if msg.is_group {
+                    json!({
+                        "groupId":  msg.target_id,
+                        "message":  msg.text,
+                    })
+                } else {
+                    json!({
+                        "recipient": msg.target_id,
+                        "message":   msg.text,
+                    })
+                };
+                self.send_rpc(method, params).await?;
+            }
 
             if !msg.images.is_empty() {
                 info!(count = msg.images.len(), "signal: sending images");
@@ -159,8 +227,9 @@ impl Channel for SignalChannel {
                             continue;
                         }
                     };
-                    let tmp_path =
-                        std::env::temp_dir().join(format!("rsclaw_signal_img_{idx}.png"));
+                    // Unique name: concurrent sends must never share a file.
+                    let tmp_path = std::env::temp_dir()
+                        .join(format!("rsclaw_signal_img_{}.png", uuid::Uuid::new_v4()));
                     if let Err(e) = std::fs::write(&tmp_path, &bytes) {
                         tracing::warn!(idx, "signal: write temp image failed: {e}");
                         continue;
@@ -179,10 +248,14 @@ impl Channel for SignalChannel {
                             "attachments": [attachment],
                         })
                     };
-                    if let Err(e) = self.send_rpc(method, img_params).await {
-                        tracing::warn!(idx, "signal: image send RPC failed: {e}");
+                    // Wait for signal-cli to answer before deleting the file
+                    // it reads the attachment from.
+                    if let Err(e) = self.call_rpc(method, img_params).await {
+                        tracing::warn!(idx, "signal: image send RPC failed: {e:#}");
                     }
-                    let _ = std::fs::remove_file(&tmp_path);
+                    if let Err(e) = std::fs::remove_file(&tmp_path) {
+                        tracing::warn!(idx, "signal: remove temp image failed: {e}");
+                    }
                 }
             }
 
@@ -207,18 +280,51 @@ impl Channel for SignalChannel {
                     }
                 };
 
-                let envelope: SignalEnvelope = match serde_json::from_str(&line) {
-                    Ok(e) => e,
+                let value: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
                     Err(_) => continue,
+                };
+
+                // RPC response: resolve the waiting caller, if any.
+                if value.get("method").is_none()
+                    && let Some(id) = value.get("id").and_then(|v| v.as_u64())
+                {
+                    if let Some(tx) = self.pending_map().remove(&id)
+                        && tx.send(value).is_err()
+                    {
+                        debug!(id, "signal: RPC caller gone before response");
+                    }
+                    continue;
+                }
+
+                // Notification (`params.envelope`) or legacy bare envelope.
+                let envelope = match serde_json::from_value::<SignalNotification>(value.clone()) {
+                    Ok(n) => n.params,
+                    Err(_) => match serde_json::from_value::<SignalEnvelope>(value) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    },
                 };
 
                 let msg = &envelope.envelope;
                 if let (Some(sender), Some(dm)) = (&msg.source, &msg.data_message)
                     && let Some(text) = &dm.message
                 {
+                    let group_id = dm
+                        .group_info
+                        .as_ref()
+                        .and_then(|g| g.get("groupId"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
                     let is_group = dm.group_info.is_some();
+                    if is_group && group_id.is_none() {
+                        warn!(sender, "signal: group message without groupId skipped");
+                        continue;
+                    }
+                    let chat_id = group_id.unwrap_or_else(|| sender.clone());
+                    let text = crate::strip_inbound_sentinels(text);
                     debug!(sender, is_group, "Signal message received");
-                    (self.on_message)(sender.clone(), text.clone(), is_group);
+                    (self.on_message)(sender.clone(), chat_id, text, is_group);
                 }
             }
 

@@ -76,7 +76,18 @@ pub(crate) fn start_wecom_if_configured(
     if let Ok(mut enforcers) = dm_enforcers.write() {
         enforcers.insert("wecom".to_owned(), Arc::clone(&enforcer));
     }
+    // Group policy (groupPolicy / groupAllowFrom by chat id).
+    let group_policy = Arc::new(
+        wc_cfg
+            .base
+            .group_policy
+            .clone()
+            .unwrap_or(rsclaw_config::schema::GroupPolicy::Allowlist),
+    );
+    let group_allow: Arc<Vec<String>> =
+        Arc::new(wc_cfg.base.group_allow_from.clone().unwrap_or_default());
 
+    let bare_acct = super::bare_account_name(wc_accounts.iter().map(|(n, _, _, _)| n));
     for (acct_name, bot_id, secret, ws_url) in wc_accounts {
         let acct_for_log = acct_name.clone();
         let w_acct_outer = acct_name.clone();
@@ -87,15 +98,13 @@ pub(crate) fn start_wecom_if_configured(
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register WeCom channel sender for notification routing.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("wecom/{}", acct_name), out_tx.clone());
-            senders
-                .entry("wecom".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        super::register_outbound_sender(
+            &channel_senders,
+            "wecom",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         // Per-user inbound queue for WeCom.
         type WcItem = (
@@ -111,6 +120,8 @@ pub(crate) fn start_wecom_if_configured(
         > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
         let wc_enforcer = Arc::clone(&enforcer);
+        let group_policy = Arc::clone(&group_policy);
+        let group_allow = Arc::clone(&group_allow);
         let on_message = Arc::new(
             move |from: String,
                   text: String,
@@ -124,8 +135,15 @@ pub(crate) fn start_wecom_if_configured(
                 let tq = Arc::clone(&tq);
                 let queues = Arc::clone(&wc_user_queues);
                 let enforcer = Arc::clone(&wc_enforcer);
+                let group_policy = Arc::clone(&group_policy);
+                let group_allow = Arc::clone(&group_allow);
                 let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
+                    if is_group
+                        && !super::group_message_allowed("wecom", &group_policy, &group_allow, &chat_id)
+                    {
+                        return;
+                    }
                     // DM policy check (pairing).
                     if !is_group {
                         match enforcer.check(&from).await {
@@ -344,6 +362,7 @@ pub(crate) fn start_wecom_if_configured(
                                 "wecom",
                                 &from,
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("wecom", &from, is_group),
                             )
                             .await
                             {
@@ -362,6 +381,7 @@ pub(crate) fn start_wecom_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("wecom", &from, is_group),
                                 session_key,
                                 text,
                                 channel: "wecom".to_string(),

@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     super::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally_with_account},
-    default_dm_scope,
+    bare_account_name, default_dm_scope, register_outbound_sender,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
 
@@ -139,6 +139,27 @@ pub(crate) fn start_feishu_if_configured(
         .and_then(|u| u.download_timeout_secs)
         .unwrap_or(600);
 
+    // Webhook auth (only relevant for the HTTP `/hooks/feishu` mode; the
+    // default WS mode is authenticated by the app credentials).
+    let top_verification_token = fs_cfg
+        .and_then(|c| c.verification_token.as_ref())
+        .and_then(|s| s.resolve_full(config.ops.secrets.as_ref()))
+        .filter(|s| !s.is_empty());
+    let top_encrypt_key = fs_cfg
+        .and_then(|c| c.encrypt_key.as_ref())
+        .and_then(|s| s.resolve_full(config.ops.secrets.as_ref()))
+        .filter(|s| !s.is_empty());
+    let acct_str = |acct: &str, key: &str| -> Option<String> {
+        fs_cfg
+            .and_then(|c| c.accounts.as_ref())
+            .and_then(|a| a.get(acct))
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(rsclaw_config::loader::expand_env_vars)
+    };
+    let bare_acct = bare_account_name(fs_accounts.iter().map(|(n, _, _, _)| n));
+
     for (acct_name, app_id, app_secret, brand) in fs_accounts {
         let reg = Arc::clone(&registry);
         let cfg = config.clone();
@@ -159,29 +180,13 @@ pub(crate) fn start_feishu_if_configured(
         //   for messages received via every other account → Feishu 230002 "Bot/User can
         //   NOT be out of the chat" because that bot wasn't actually in the originating
         //   chat.
-        {
-            let mut senders = _channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("feishu/{}", acct_name), out_tx.clone());
-            // Bare "feishu" fallback (used when an outbound message carries no
-            // account). Must be DETERMINISTIC: bind it to the account named
-            // "default", regardless of HashMap iteration order. The old
-            // `.or_insert` bound it to whichever account iterated first out of
-            // an unordered HashMap, so on multi-account setups the bare key
-            // pointed at an arbitrary app's token → Feishu 99992361 "open_id
-            // cross app" when that token didn't own the target open_id.
-            if acct_name == "default" {
-                senders.insert("feishu".to_string(), out_tx.clone());
-            } else {
-                // Configs without a "default"-named account still need *some*
-                // bare fallback; first-wins is fine there since "default"
-                // (above) overrides it whenever it exists.
-                senders
-                    .entry("feishu".to_string())
-                    .or_insert_with(|| out_tx.clone());
-            }
-        }
+        register_outbound_sender(
+            &_channel_senders,
+            "feishu",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         // Find binding for this account to determine which agent handles it.
         let bound_agent = config
@@ -327,6 +332,7 @@ pub(crate) fn start_feishu_if_configured(
                             &sender_id,
                             Some(&w_acct_outer),
                             crate::gateway::preparse::PreparseOrigin::User,
+                            rsclaw_agent::trust::channel_trust("feishu", &sender_id, is_group),
                         )
                         .await
                         {
@@ -563,6 +569,7 @@ pub(crate) fn start_feishu_if_configured(
                                 &sender_id,
                                 Some(&w_acct_for_preparse),
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("feishu", &sender_id, is_group),
                             )
                             .await
                             {
@@ -577,6 +584,7 @@ pub(crate) fn start_feishu_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("feishu", &sender_id, is_group),
                                 session_key,
                                 text,
                                 channel: "feishu".to_string(),
@@ -681,11 +689,21 @@ pub(crate) fn start_feishu_if_configured(
         fs_channel.max_file_size = max_file_size;
         fs_channel.download_timeout_secs = download_timeout_secs;
         fs_channel.ws_reconnect_delay_secs = feishu_reconnect_delay;
+        fs_channel.verification_token =
+            acct_str(&acct_for_log, "verificationToken").or_else(|| top_verification_token.clone());
+        fs_channel.encrypt_key =
+            acct_str(&acct_for_log, "encryptKey").or_else(|| top_encrypt_key.clone());
         let fs = Arc::new(fs_channel);
 
-        // First account fills the webhook slot for backward compatibility.
-        if feishu_slot.set(Arc::clone(&fs)).is_err() {
-            tracing::debug!("slot already set, skipping");
+        // The HTTP webhook slot is only filled when webhook verification is
+        // configured (verificationToken / encryptKey). Plain WS-mode setups
+        // never expose an unauthenticated `/hooks/feishu` entry point.
+        if fs.webhook_auth_configured() {
+            if feishu_slot.set(Arc::clone(&fs)).is_err() {
+                tracing::debug!("slot already set, skipping");
+            }
+        } else {
+            debug!(account = %acct_for_log, "feishu: no verificationToken/encryptKey, /hooks/feishu disabled (WS mode)");
         }
         // Register under both `feishu/<acct>` (account-keyed; lets /watch
         // route deliveries back through the SAME app that received the

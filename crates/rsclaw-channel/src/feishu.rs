@@ -143,9 +143,15 @@ pub struct FeishuChannel {
     chat_ids: Vec<String>,
     client: Client,
     token_cache: RwLock<Option<TokenCache>>,
-    /// Event dedup: recently processed event IDs (prevents duplicate processing
-    /// on retry).
-    seen_events: RwLock<std::collections::HashSet<String>>,
+    /// Event dedup: recently processed event / message IDs (prevents
+    /// duplicate processing on retry). TTL-bounded, never bulk-cleared.
+    seen_events: crate::InboundDedup,
+    /// Webhook verification token (`verificationToken`); when set, inbound
+    /// webhook payloads must carry the same token.
+    pub verification_token: Option<String>,
+    /// Webhook encrypt key (`encryptKey`); when set, `X-Lark-Signature` is
+    /// verified and encrypted payloads are decrypted.
+    pub encrypt_key: Option<String>,
     /// REST API base URL override (for testing).
     pub api_base_override: Option<String>,
     /// WS endpoint request domain override (for testing).
@@ -381,7 +387,9 @@ impl FeishuChannel {
                 .build()
                 .expect("reqwest client"),
             token_cache: RwLock::new(None),
-            seen_events: RwLock::new(std::collections::HashSet::new()),
+            seen_events: crate::InboundDedup::new(Duration::from_secs(15 * 60), 5_000),
+            verification_token: None,
+            encrypt_key: None,
             api_base_override: None,
             ws_url_override: None,
             max_file_size: 128_000_000, // default 128MB, overridden by startup
@@ -698,7 +706,7 @@ impl FeishuChannel {
     // -----------------------------------------------------------------------
 
     /// Obtain WS endpoint URL, connect, and process events until disconnect.
-    async fn ws_connect_loop(&self) -> Result<()> {
+    async fn ws_connect_loop(self: &Arc<Self>) -> Result<()> {
         // 1. Get WS endpoint URL via Feishu callback API
         let resp = self
             .client
@@ -746,6 +754,10 @@ impl FeishuChannel {
         // 3. Read events with idle timeout (detect half-open connections).
         // Feishu sends pings every ~30s; if we hear nothing for 90s, reconnect.
         const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+        // Fragmented DATA frames (headers sum>1) keyed by message_id:
+        // (first-seen, parts indexed by seq).
+        let mut fragments: std::collections::HashMap<String, (Instant, Vec<Option<Vec<u8>>>)> =
+            std::collections::HashMap::new();
         loop {
             let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, read.next()).await {
                 Ok(Some(msg)) => msg,
@@ -770,26 +782,83 @@ impl FeishuChannel {
                         "feishu: WS frame received: {}",
                         rsclaw_util::truncate_str(&text, 300)
                     );
-                    self.handle_ws_event(&text).await;
+                    self.spawn_ws_event(text.to_string());
                 }
                 Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => {
                     // Decode protobuf frame (pbbp2 format)
                     use prost::Message as ProstMessage;
                     match lark_websocket_protobuf::pbbp2::Frame::decode(&data[..]) {
-                        Ok(frame) => {
-                            // method=0 is CONTROL (ping), method=1 is DATA
-                            if frame.method == 1
-                                && let Some(payload) = frame.payload
-                                && let Ok(text) = String::from_utf8(payload.clone())
+                        Ok(mut frame) => {
+                            // method=0 is CONTROL (ping/pong), method=1 is DATA
+                            if frame.method != 1 {
+                                continue;
+                            }
+                            let header = |k: &str| -> Option<String> {
+                                frame
+                                    .headers
+                                    .iter()
+                                    .find(|h| h.key == k)
+                                    .map(|h| h.value.clone())
+                            };
+                            let sum: usize = header("sum")
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(1)
+                                .clamp(1, 64);
+                            let seq: usize =
+                                header("seq").and_then(|v| v.parse().ok()).unwrap_or(0);
+                            let msg_id = header("message_id").unwrap_or_default();
+                            let Some(part) = frame.payload.take() else {
+                                continue;
+                            };
+                            // Reassemble fragmented payloads (sum/seq headers).
+                            let payload = if sum > 1 {
+                                fragments.retain(|_, (t, _)| t.elapsed() < Duration::from_secs(30));
+                                let entry = fragments
+                                    .entry(msg_id.clone())
+                                    .or_insert_with(|| (Instant::now(), vec![None; sum]));
+                                if entry.1.len() != sum || seq >= sum {
+                                    debug!(sum, seq, "feishu: inconsistent WS fragment, dropped");
+                                    fragments.remove(&msg_id);
+                                    continue;
+                                }
+                                entry.1[seq] = Some(part);
+                                if entry.1.iter().any(Option::is_none) {
+                                    continue;
+                                }
+                                let parts = fragments.remove(&msg_id).map(|(_, p)| p).unwrap_or_default();
+                                parts.into_iter().flatten().flatten().collect::<Vec<u8>>()
+                            } else {
+                                part
+                            };
+                            // ACK the DATA frame so the server does not
+                            // redeliver it: echo the frame with a 200
+                            // response payload and a biz_rt header.
+                            frame.headers.push(lark_websocket_protobuf::pbbp2::Header {
+                                key: "biz_rt".to_owned(),
+                                value: "0".to_owned(),
+                            });
+                            frame.payload =
+                                Some(br#"{"code":200,"headers":null,"data":null}"#.to_vec());
+                            if let Err(e) = write
+                                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                                    frame.encode_to_vec().into(),
+                                ))
+                                .await
                             {
-                                info!(len = text.len(), "feishu: WS event received");
-                                self.handle_ws_event(&text).await;
+                                warn!("feishu: WS ack send failed: {e:#}");
+                            }
+                            match String::from_utf8(payload) {
+                                Ok(text) => {
+                                    info!(len = text.len(), "feishu: WS event received");
+                                    self.spawn_ws_event(text);
+                                }
+                                Err(_) => debug!("feishu: WS payload is not UTF-8"),
                             }
                         }
                         Err(e) => {
                             // Fallback: try as UTF-8 text
                             if let Ok(text) = String::from_utf8(data.to_vec()) {
-                                self.handle_ws_event(&text).await;
+                                self.spawn_ws_event(text);
                             } else {
                                 debug!(len = data.len(), error = %e, "feishu: WS binary decode failed");
                             }
@@ -797,11 +866,13 @@ impl FeishuChannel {
                     }
                 }
                 Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
-                    info!("feishu: WS ping received");
-
-                    let _ = write
+                    debug!("feishu: WS ping received");
+                    if let Err(e) = write
                         .send(tokio_tungstenite::tungstenite::Message::Pong(data))
-                        .await;
+                        .await
+                    {
+                        warn!("feishu: WS pong send failed: {e:#}");
+                    }
                 }
                 Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
                     info!("feishu: WS closed by server");
@@ -821,6 +892,15 @@ impl FeishuChannel {
         }
 
         Ok(())
+    }
+
+    /// Process a WS event off the receive loop so media downloads and
+    /// transcription never stall pings / ACKs of later frames.
+    fn spawn_ws_event(self: &Arc<Self>, text: String) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            this.handle_ws_event(&text).await;
+        });
     }
 
     /// Parse and dispatch a single WebSocket frame from Feishu.
@@ -882,6 +962,81 @@ impl FeishuChannel {
     // Webhook handler (for event subscription -- supports private chat)
     // -----------------------------------------------------------------------
 
+    /// Whether HTTP webhook verification is configured (verification token
+    /// and/or encrypt key). The gateway only exposes `/hooks/feishu` then.
+    pub fn webhook_auth_configured(&self) -> bool {
+        self.verification_token.is_some() || self.encrypt_key.is_some()
+    }
+
+    /// Authenticate and decode a raw HTTP webhook POST.
+    ///
+    /// - With an encrypt key: `X-Lark-Signature` must equal
+    ///   `sha256_hex(timestamp + nonce + encrypt_key + raw_body)` (the only
+    ///   exemption is the unsigned `url_verification` handshake, which must
+    ///   still decrypt with the key), and `{"encrypt": ...}` bodies are
+    ///   decrypted.
+    /// - With a verification token: the payload token (`header.token` or
+    ///   top-level `token`) must match.
+    ///
+    /// Returns the plaintext event JSON on success.
+    pub fn authenticate_webhook(
+        &self,
+        timestamp: Option<&str>,
+        nonce: Option<&str>,
+        signature: Option<&str>,
+        body: &[u8],
+    ) -> std::result::Result<String, FeishuWebhookAuthError> {
+        let raw = std::str::from_utf8(body)
+            .map_err(|_| FeishuWebhookAuthError("body is not UTF-8"))?;
+        let outer: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|_| FeishuWebhookAuthError("body is not JSON"))?;
+
+        let mut signature_ok = false;
+        if let (Some(key), Some(sig)) = (self.encrypt_key.as_deref(), signature) {
+            let expected = crate::sha256_hex(&[
+                timestamp.unwrap_or("").as_bytes(),
+                nonce.unwrap_or("").as_bytes(),
+                key.as_bytes(),
+                body,
+            ]);
+            if !crate::constant_time_eq(expected.as_bytes(), sig.trim().to_ascii_lowercase().as_bytes())
+            {
+                return Err(FeishuWebhookAuthError("X-Lark-Signature mismatch"));
+            }
+            signature_ok = true;
+        }
+
+        let plain = match outer.get("encrypt").and_then(|v| v.as_str()) {
+            Some(enc) => {
+                let key = self
+                    .encrypt_key
+                    .as_deref()
+                    .ok_or(FeishuWebhookAuthError("encrypted payload but no encryptKey configured"))?;
+                feishu_decrypt(key, enc).map_err(|_| FeishuWebhookAuthError("payload decryption failed"))?
+            }
+            None => raw.to_owned(),
+        };
+        let val: serde_json::Value = serde_json::from_str(&plain)
+            .map_err(|_| FeishuWebhookAuthError("decrypted payload is not JSON"))?;
+        let is_handshake = val.get("type").and_then(|v| v.as_str()) == Some("url_verification")
+            || (val.get("challenge").is_some() && val.get("header").is_none());
+
+        if self.encrypt_key.is_some() && !signature_ok && !is_handshake {
+            return Err(FeishuWebhookAuthError("missing X-Lark-Signature"));
+        }
+        if let Some(expected) = self.verification_token.as_deref() {
+            let got = val
+                .pointer("/header/token")
+                .or_else(|| val.get("token"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !crate::constant_time_eq(expected.as_bytes(), got.as_bytes()) {
+                return Err(FeishuWebhookAuthError("verification token mismatch"));
+            }
+        }
+        Ok(plain)
+    }
+
     /// Handle an incoming webhook event from Feishu.
     /// Returns the response body to send back (for challenge verification).
     pub async fn handle_webhook_event(&self, body: &str) -> Result<Option<String>> {
@@ -901,17 +1056,11 @@ impl FeishuChannel {
         }
 
         // 2. Event dedup — Feishu retries unacknowledged events.
-        if let Some(event_id) = val.pointer("/header/event_id").and_then(|v| v.as_str()) {
-            let mut seen = self.seen_events.write().await;
-            if seen.contains(event_id) {
-                debug!(event_id, "feishu: duplicate event, skipping");
-                return Ok(None);
-            }
-            seen.insert(event_id.to_owned());
-            // Cap the set size to prevent unbounded growth
-            if seen.len() > 1000 {
-                seen.clear();
-            }
+        if let Some(event_id) = val.pointer("/header/event_id").and_then(|v| v.as_str())
+            && !self.seen_events.first_seen(&format!("evt:{event_id}"))
+        {
+            debug!(event_id, "feishu: duplicate event, skipping");
+            return Ok(None);
         }
 
         // 3. Event callback
@@ -932,16 +1081,11 @@ impl FeishuChannel {
             .context("feishu: missing message field")?;
 
         // Dedup by message_id (second line of defense after event_id dedup)
-        if let Some(msg_id) = message.get("message_id").and_then(|v| v.as_str()) {
-            let mut seen = self.seen_events.write().await;
-            if seen.contains(msg_id) {
-                debug!(msg_id, "feishu: duplicate message_id, skipping");
-                return Ok(None);
-            }
-            seen.insert(msg_id.to_owned());
-            if seen.len() > 2000 {
-                seen.clear();
-            }
+        if let Some(msg_id) = message.get("message_id").and_then(|v| v.as_str())
+            && !self.seen_events.first_seen(&format!("msg:{msg_id}"))
+        {
+            debug!(msg_id, "feishu: duplicate message_id, skipping");
+            return Ok(None);
         }
 
         // Skip stale messages (older than 5 minutes) to prevent replay storms.
@@ -1004,11 +1148,56 @@ impl FeishuChannel {
                     .unwrap_or("{}");
                 let content: serde_json::Value =
                     serde_json::from_str(content_str).unwrap_or_default();
-                content
-                    .get("text")
+                let raw = content.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                strip_feishu_mentions(&crate::strip_inbound_sentinels(raw))
+            }
+            "post" => {
+                // Rich text: flatten title + paragraphs to plain text and
+                // pull inline images through the vision path.
+                let message_id = message
+                    .get("message_id")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned()
+                    .unwrap_or("");
+                let content_str = message
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}");
+                let content: serde_json::Value =
+                    serde_json::from_str(content_str).unwrap_or_default();
+                let (post_text, image_keys) = parse_feishu_post(&content);
+                if !message_id.is_empty() {
+                    for key in image_keys.iter().take(8) {
+                        match self.download_image(message_id, key).await {
+                            Ok(bytes) => {
+                                use base64::Engine;
+                                let (final_bytes, final_mime) =
+                                    rsclaw_util::downscale_image_for_vision(
+                                        &bytes,
+                                        "image/png",
+                                        1 * 1024 * 1024,
+                                        1920,
+                                        85,
+                                    )
+                                    .unwrap_or_else(|e| {
+                                        warn!(error = %e, "feishu: downscale failed, sending original");
+                                        (bytes.clone(), "image/png".to_string())
+                                    });
+                                if final_bytes.is_empty() {
+                                    continue;
+                                }
+                                let b64 =
+                                    base64::engine::general_purpose::STANDARD.encode(&final_bytes);
+                                images.push(rsclaw_types::ImageAttachment {
+                                    data: format!("data:{final_mime};base64,{b64}"),
+                                    mime_type: final_mime,
+                                    source_path: None,
+                                });
+                            }
+                            Err(e) => warn!("feishu: post image download failed: {e:#}"),
+                        }
+                    }
+                }
+                strip_feishu_mentions(&crate::strip_inbound_sentinels(&post_text))
             }
             "audio" => {
                 let message_id = message
@@ -1376,12 +1565,14 @@ impl FeishuChannel {
             anyhow::bail!("feishu: download_image failed {status}: {body}");
         }
 
-        let bytes = resp.bytes().await.context("feishu: read image bytes")?;
+        let bytes = crate::read_media_body(resp)
+            .await
+            .context("feishu: read image bytes")?;
         debug!(
             size = bytes.len(),
             message_id, file_key, "feishu: image downloaded"
         );
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Download and transcribe a voice message.
@@ -1454,6 +1645,113 @@ impl FeishuChannel {
             .is_some_and(|t| t == "app")
     }
 }
+
+/// Remove Feishu mention placeholders (`@_user_1`, `@_all`) from inbound text
+/// so slash commands in group chats (`@bot /new`) are recognised.
+fn strip_feishu_mentions(text: &str) -> String {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"@_(?:user_\d+|all)\s*").expect("valid mention regex")
+    });
+    RE.replace_all(text, "").trim().to_owned()
+}
+
+/// Flatten a Feishu `post` (rich text) content object into plain text and
+/// the list of inline image keys. Accepts both the bare `{title, content}`
+/// shape and the locale-wrapped `{"zh_cn": {title, content}}` shape.
+fn parse_feishu_post(content: &serde_json::Value) -> (String, Vec<String>) {
+    let body = if content.get("content").is_some() {
+        content
+    } else {
+        content
+            .as_object()
+            .and_then(|m| m.values().find(|v| v.get("content").is_some()))
+            .unwrap_or(content)
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut image_keys = Vec::new();
+    if let Some(title) = body.get("title").and_then(|v| v.as_str())
+        && !title.trim().is_empty()
+    {
+        lines.push(title.to_owned());
+    }
+    for para in body
+        .get("content")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let mut line = String::new();
+        for el in para.as_array().into_iter().flatten() {
+            match el.get("tag").and_then(|v| v.as_str()).unwrap_or("") {
+                "text" | "a" | "md" | "code_block" => {
+                    if let Some(t) = el.get("text").and_then(|v| v.as_str()) {
+                        line.push_str(t);
+                    }
+                }
+                "img" => {
+                    if let Some(k) = el.get("image_key").and_then(|v| v.as_str()) {
+                        image_keys.push(k.to_owned());
+                    }
+                }
+                // "at" mentions and "emotion" carry no user text.
+                _ => {}
+            }
+        }
+        if !line.trim().is_empty() {
+            lines.push(line);
+        }
+    }
+    (lines.join("\n"), image_keys)
+}
+
+/// AES-256-CBC decrypt a Feishu encrypted event (`{"encrypt": "..."}`):
+/// key = SHA-256(encrypt_key), first 16 bytes of the payload are the IV,
+/// PKCS#7 padding.
+fn feishu_decrypt(encrypt_key: &str, encrypted_b64: &str) -> Result<String> {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    use base64::Engine;
+    use sha2::Digest;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(encrypted_b64.trim())
+        .context("feishu: encrypted payload is not base64")?;
+    if raw.len() < 32 || raw.len() % 16 != 0 {
+        anyhow::bail!("feishu: encrypted payload has invalid length {}", raw.len());
+    }
+    let key = sha2::Sha256::digest(encrypt_key.as_bytes());
+    let cipher = aes::Aes256::new_from_slice(&key).context("feishu: AES key init")?;
+    let (iv, data) = raw.split_at(16);
+    let mut prev = [0u8; 16];
+    prev.copy_from_slice(iv);
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks(16) {
+        let mut block = aes::Block::clone_from_slice(chunk);
+        cipher.decrypt_block(&mut block);
+        for (b, p) in block.iter_mut().zip(prev.iter()) {
+            *b ^= p;
+        }
+        prev.copy_from_slice(chunk);
+        out.extend_from_slice(&block);
+    }
+    let pad = out.last().copied().unwrap_or(0) as usize;
+    if pad == 0 || pad > 16 || pad > out.len() || !out[out.len() - pad..].iter().all(|&b| b as usize == pad) {
+        anyhow::bail!("feishu: bad PKCS#7 padding in decrypted payload");
+    }
+    out.truncate(out.len() - pad);
+    String::from_utf8(out).context("feishu: decrypted payload is not UTF-8")
+}
+
+/// Error returned by [`FeishuChannel::authenticate_webhook`] when an inbound
+/// webhook fails verification.
+#[derive(Debug)]
+pub struct FeishuWebhookAuthError(pub &'static str);
+
+impl std::fmt::Display for FeishuWebhookAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for FeishuWebhookAuthError {}
 
 /// Try to base64-decode a string and parse it as JSON.
 fn base64_decode_json(s: &str) -> Option<serde_json::Value> {
@@ -2437,5 +2735,38 @@ mod tests {
     #[test]
     fn base64_decode_invalid() {
         assert!(base64_decode_json("not-valid-base64!!!").is_none());
+    }
+
+    #[test]
+    fn post_rich_text_flattened() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"title":"T","content":[[{"tag":"at","user_id":"@_user_1"},{"tag":"text","text":" /new hi"}],[{"tag":"img","image_key":"img_1"}]]}"#,
+        )
+        .unwrap();
+        let (text, keys) = parse_feishu_post(&v);
+        assert_eq!(text, "T\n /new hi");
+        assert_eq!(keys, vec!["img_1".to_owned()]);
+    }
+
+    #[test]
+    fn mentions_stripped() {
+        assert_eq!(strip_feishu_mentions("@_user_1 /new"), "/new");
+        assert_eq!(strip_feishu_mentions("hi @_all there"), "hi there");
+    }
+
+    #[test]
+    fn webhook_signature_and_token() {
+        init_crypto();
+        let mut ch = FeishuChannel::new("id", "secret", vec![], Arc::new(|_, _, _, _, _, _| {}));
+        ch.verification_token = Some("vt".to_owned());
+        ch.encrypt_key = Some("ek".to_owned());
+        let body = br#"{"header":{"token":"vt","event_type":"x"}}"#;
+        let sig = crate::sha256_hex(&[b"1", b"n", b"ek", body]);
+        assert!(ch.authenticate_webhook(Some("1"), Some("n"), Some(&sig), body).is_ok());
+        assert!(ch.authenticate_webhook(Some("2"), Some("n"), Some(&sig), body).is_err());
+        assert!(ch.authenticate_webhook(None, None, None, body).is_err());
+        let bad_token = br#"{"header":{"token":"nope"}}"#;
+        let sig2 = crate::sha256_hex(&[b"1", b"n", b"ek", bad_token]);
+        assert!(ch.authenticate_webhook(Some("1"), Some("n"), Some(&sig2), bad_token).is_err());
     }
 }

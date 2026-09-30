@@ -372,7 +372,7 @@ impl WeChatPersonalChannel {
             ILINK_BASE_URL, qrcode
         );
 
-        println!("Waiting for WeChat scan...");
+        crate::auth::cli_notice(&rsclaw_i18n::t("wechat_waiting_scan", rsclaw_i18n::default_lang()));
 
         for attempt in 0..60 {
             let resp: QrStatusResponse = client
@@ -407,7 +407,10 @@ impl WeChatPersonalChannel {
                 }
                 Some("scaned") => {
                     if attempt == 0 {
-                        println!("Scanned! Please confirm on your phone...");
+                        crate::auth::cli_notice(&rsclaw_i18n::t(
+                            "wechat_scanned_confirm",
+                            rsclaw_i18n::default_lang(),
+                        ));
                     }
                 }
                 Some("expired") => {
@@ -540,14 +543,253 @@ impl WeChatPersonalChannel {
     // Long-polling
     // -----------------------------------------------------------------------
 
+    /// Process one inbound message (text / voice / image / file / video) and
+    /// dispatch it to the gateway callback.
+    async fn handle_inbound_message(&self, msg: WeixinMessage) {
+        let from = msg.from_user_id.unwrap_or_default();
+        // message_type: 1 = user, 2 = bot (skip bot messages to avoid echo)
+        if msg.message_type == Some(2) {
+            return;
+        }
+
+        // Process items: text, voice, image, file, video
+        let items = msg.item_list.as_deref().unwrap_or(&[]);
+
+        // 1. Text (type 1)
+        if let Some(t) = items
+            .iter()
+            .find_map(|i| i.text_item.as_ref().and_then(|t| t.text.clone()))
+        {
+            let t = crate::strip_inbound_sentinels(&t);
+            if !from.is_empty() && !t.is_empty() {
+                info!(from = %from, text_len = t.len(), "wechat: text message");
+                (self.on_message)(from.clone(), t, vec![], vec![]);
+            }
+            return;
+        }
+
+        // 2. Voice (type 3) -- prefer WeChat STT, else
+        //    download+decode+transcribe
+        if let Some(v) = items.iter().find_map(|i| i.voice_item.as_ref()) {
+            // WeChat's own speech-to-text
+            if let Some(stt) = &v.text {
+                if !stt.is_empty() {
+                    info!(
+                        chars = stt.len(),
+                        "wechat: using WeChat voice-to-text"
+                    );
+                    if !from.is_empty() {
+                        // Tag the text so the agent enables
+                        // voice-reply mode for this turn —
+                        // channel-side STT bypasses the
+                        // agent's media_files audio detection.
+                        let tagged = format!("[__VOICE_INPUT__]\n{stt}");
+                        (self.on_message)(from.clone(), tagged, vec![], vec![]);
+                    }
+                    return;
+                }
+            }
+            // Download and transcribe
+            let src = resolve_media_source_voice(v);
+            if let Some(src) = src {
+                let audio = self.download_media_source(&src).await;
+                match audio {
+                    Ok(bytes) => {
+                        match crate::transcription::transcribe_audio(
+                            &self.client,
+                            &bytes,
+                            "voice.silk",
+                            "audio/silk",
+                        )
+                        .await
+                        {
+                            Ok(t) if !t.is_empty() => {
+                                info!(
+                                    chars = t.len(),
+                                    "wechat: voice transcribed"
+                                );
+                                if !from.is_empty() {
+                                    let tagged =
+                                        format!("[__VOICE_INPUT__]\n{t}");
+                                    (self.on_message)(
+                                        from.clone(),
+                                        tagged,
+                                        vec![],
+                                        vec![],
+                                    );
+                                }
+                            }
+                            Ok(_) => warn!(
+                                "wechat: voice transcription returned empty"
+                            ),
+                            Err(e) => warn!(
+                                "wechat: voice transcription failed: {e:#}"
+                            ),
+                        }
+                    }
+                    Err(e) => warn!("wechat: voice download failed: {e:#}"),
+                }
+            }
+            return;
+        }
+
+        // 3. Image (type 2)
+        if let Some(img) = items.iter().find_map(|i| i.image_item.as_ref()) {
+            let src = resolve_media_source_image(img);
+            debug!(
+                has_image_url = img.image_url.is_some(),
+                has_media = img.media.is_some(),
+                has_aeskey = img.aeskey.is_some(),
+                has_src = src.is_some(),
+                "wechat: image item"
+            );
+            if let Some(src) = src {
+                match self.download_media_source(&src).await {
+                    Ok(bytes) => {
+                        let orig_len = bytes.len();
+                        let (final_bytes, final_mime) =
+                            rsclaw_util::downscale_image_for_vision(
+                                &bytes,
+                                "image/jpeg",
+                                1 * 1024 * 1024,
+                                1920,
+                                85,
+                            )
+                            .unwrap_or_else(|e| {
+                                warn!(error = %e, "wechat: downscale failed");
+                                (bytes, "image/jpeg".to_owned())
+                            });
+                        let b64 = base64::engine::general_purpose::STANDARD
+                            .encode(&final_bytes);
+                        let data_url =
+                            format!("data:{final_mime};base64,{b64}");
+                        let images = vec![rsclaw_types::ImageAttachment {
+                            data: data_url,
+                            mime_type: final_mime,
+                            source_path: None,
+                        }];
+                        info!(
+                            from = orig_len,
+                            to = final_bytes.len(),
+                            "wechat: image received"
+                        );
+                        if !from.is_empty() {
+                            (self.on_message)(
+                                from.clone(),
+                                rsclaw_i18n::t(
+                                    "describe_image",
+                                    rsclaw_i18n::default_lang(),
+                                ),
+                                images,
+                                vec![],
+                            );
+                        }
+                    }
+                    Err(e) => warn!("wechat: image download failed: {e:#}"),
+                }
+            }
+            return;
+        }
+
+        // 4. File (type 4) -- pass raw bytes as FileAttachment
+        if let Some(f) = items.iter().find_map(|i| i.file_item.as_ref()) {
+            let src = resolve_media_source_file(f);
+            if let Some(src) = src {
+                match self.download_media_source(&src).await {
+                    Ok(bytes) => {
+                        let fname =
+                            f.file_name.as_deref().unwrap_or("file.bin");
+                        info!(
+                            size = bytes.len(),
+                            fname, "wechat: file received, routing to agent"
+                        );
+                        let fa = rsclaw_types::FileAttachment {
+                            filename: fname.to_owned(),
+                            data: bytes,
+                            mime_type: "application/octet-stream".to_owned(),
+                        };
+                        if !from.is_empty() {
+                            (self.on_message)(
+                                from.clone(),
+                                String::new(),
+                                vec![],
+                                vec![fa],
+                            );
+                        }
+                    }
+                    Err(e) => warn!("wechat: file download failed: {e:#}"),
+                }
+            }
+            return;
+        }
+
+        // 5. Video (type 5) -- download, decrypt, save as file
+        if let Some(vid) = items.iter().find_map(|i| i.video_item.as_ref()) {
+            if let Some(m) = &vid.media {
+                if let Some(param) = &m.encrypt_query_param {
+                    let aes_key = m.aes_key.clone().unwrap_or_default();
+                    let src = MediaSource::Cdn {
+                        encrypt_query_param: param.clone(),
+                        aes_key,
+                    };
+                    match self.download_media_source(&src).await {
+                        Ok(bytes) => {
+                            info!(
+                                size = bytes.len(),
+                                "wechat: video downloaded"
+                            );
+                            // Send as both ImageAttachment (for vision models
+                            // that support video) and FileAttachment (for
+                            // audio transcription fallback on other models).
+                            use base64::Engine;
+                            let b64 = base64::engine::general_purpose::STANDARD
+                                .encode(&bytes);
+                            let data_uri =
+                                format!("data:video/mp4;base64,{b64}");
+                            let img = rsclaw_types::ImageAttachment {
+                                data: data_uri,
+                                mime_type: "video/mp4".to_owned(),
+                                source_path: None,
+                            };
+                            let fa = rsclaw_types::FileAttachment {
+                                filename: "video.mp4".to_owned(),
+                                data: bytes,
+                                mime_type: "video/mp4".to_owned(),
+                            };
+                            if !from.is_empty() {
+                                (self.on_message)(
+                                    from.clone(),
+                                    rsclaw_i18n::t(
+                                        "describe_video",
+                                        rsclaw_i18n::default_lang(),
+                                    ),
+                                    vec![img],
+                                    vec![fa],
+                                );
+                            }
+                        }
+                        Err(e) => warn!("wechat: video download failed: {e:#}"),
+                    }
+                }
+            }
+            return;
+        }
+
+        debug!(
+            "wechat: unhandled message item types: {:?}",
+            items.iter().map(|i| i.item_type).collect::<Vec<_>>()
+        );
+    }
+
     async fn poll_loop(self: Arc<Self>) -> Result<()> {
         let mut updates_buf = String::new();
 
-        // Try to load saved state
-        if let Some(saved) = crate::auth::load_token("wechat")
-            && let Some(buf) = saved.get("get_updates_buf").and_then(|v| v.as_str())
+        // Try to load the persisted long-poll cursor so a restart resumes
+        // where it left off instead of re-fetching / skipping messages.
+        if let Some(buf) = crate::auth::load_channel_state("wechat", "get_updates_buf")
+            .and_then(|v| v.as_str().map(str::to_owned))
         {
-            updates_buf = buf.to_owned();
+            updates_buf = buf;
             debug!(
                 buf_len = updates_buf.len(),
                 "restored updates_buf from saved state"
@@ -573,8 +815,17 @@ impl WeChatPersonalChannel {
                         );
                     }
                     consecutive_errs = 0;
-                    if let Some(new_buf) = resp.get_updates_buf {
+                    if let Some(new_buf) = resp.get_updates_buf
+                        && new_buf != updates_buf
+                    {
                         updates_buf = new_buf;
+                        if let Err(e) = crate::auth::save_channel_state(
+                            "wechat",
+                            "get_updates_buf",
+                            serde_json::Value::String(updates_buf.clone()),
+                        ) {
+                            warn!("wechat: failed to persist updates_buf: {e:#}");
+                        }
                     }
 
                     if let Some(msgs) = resp.msgs {
@@ -595,238 +846,23 @@ impl WeChatPersonalChannel {
                             }
                         }
                         for msg in msgs {
-                            let from = msg.from_user_id.unwrap_or_default();
-                            // message_type: 1 = user, 2 = bot (skip bot messages to avoid echo)
                             if msg.message_type == Some(2) {
                                 continue;
                             }
-
-                            // Process items: text, voice, image, file, video
-                            let items = msg.item_list.as_deref().unwrap_or(&[]);
-
-                            // 1. Text (type 1)
-                            if let Some(t) = items
-                                .iter()
-                                .find_map(|i| i.text_item.as_ref().and_then(|t| t.text.clone()))
-                            {
-                                if !from.is_empty() && !t.is_empty() {
-                                    info!(from = %from, text_len = t.len(), "wechat: text message");
-                                    (self.on_message)(from.clone(), t, vec![], vec![]);
-                                }
-                                continue;
-                            }
-
-                            // 2. Voice (type 3) -- prefer WeChat STT, else
-                            //    download+decode+transcribe
-                            if let Some(v) = items.iter().find_map(|i| i.voice_item.as_ref()) {
-                                // WeChat's own speech-to-text
-                                if let Some(stt) = &v.text {
-                                    if !stt.is_empty() {
-                                        info!(
-                                            chars = stt.len(),
-                                            "wechat: using WeChat voice-to-text"
-                                        );
-                                        if !from.is_empty() {
-                                            // Tag the text so the agent enables
-                                            // voice-reply mode for this turn —
-                                            // channel-side STT bypasses the
-                                            // agent's media_files audio detection.
-                                            let tagged = format!("[__VOICE_INPUT__]\n{stt}");
-                                            (self.on_message)(from.clone(), tagged, vec![], vec![]);
-                                        }
-                                        continue;
-                                    }
-                                }
-                                // Download and transcribe
-                                let src = resolve_media_source_voice(v);
-                                if let Some(src) = src {
-                                    let audio = self.download_media_source(&src).await;
-                                    match audio {
-                                        Ok(bytes) => {
-                                            match crate::transcription::transcribe_audio(
-                                                &self.client,
-                                                &bytes,
-                                                "voice.silk",
-                                                "audio/silk",
-                                            )
-                                            .await
-                                            {
-                                                Ok(t) if !t.is_empty() => {
-                                                    info!(
-                                                        chars = t.len(),
-                                                        "wechat: voice transcribed"
-                                                    );
-                                                    if !from.is_empty() {
-                                                        let tagged =
-                                                            format!("[__VOICE_INPUT__]\n{t}");
-                                                        (self.on_message)(
-                                                            from.clone(),
-                                                            tagged,
-                                                            vec![],
-                                                            vec![],
-                                                        );
-                                                    }
-                                                }
-                                                Ok(_) => warn!(
-                                                    "wechat: voice transcription returned empty"
-                                                ),
-                                                Err(e) => warn!(
-                                                    "wechat: voice transcription failed: {e:#}"
-                                                ),
-                                            }
-                                        }
-                                        Err(e) => warn!("wechat: voice download failed: {e:#}"),
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // 3. Image (type 2)
-                            if let Some(img) = items.iter().find_map(|i| i.image_item.as_ref()) {
-                                let src = resolve_media_source_image(img);
-                                debug!(
-                                    has_image_url = img.image_url.is_some(),
-                                    has_media = img.media.is_some(),
-                                    has_aeskey = img.aeskey.is_some(),
-                                    has_src = src.is_some(),
-                                    "wechat: image item"
-                                );
-                                if let Some(src) = src {
-                                    match self.download_media_source(&src).await {
-                                        Ok(bytes) => {
-                                            let orig_len = bytes.len();
-                                            let (final_bytes, final_mime) =
-                                                rsclaw_util::downscale_image_for_vision(
-                                                    &bytes,
-                                                    "image/jpeg",
-                                                    1 * 1024 * 1024,
-                                                    1920,
-                                                    85,
-                                                )
-                                                .unwrap_or_else(|e| {
-                                                    warn!(error = %e, "wechat: downscale failed");
-                                                    (bytes, "image/jpeg".to_owned())
-                                                });
-                                            let b64 = base64::engine::general_purpose::STANDARD
-                                                .encode(&final_bytes);
-                                            let data_url =
-                                                format!("data:{final_mime};base64,{b64}");
-                                            let images = vec![rsclaw_types::ImageAttachment {
-                                                data: data_url,
-                                                mime_type: final_mime,
-                                                source_path: None,
-                                            }];
-                                            info!(
-                                                from = orig_len,
-                                                to = final_bytes.len(),
-                                                "wechat: image received"
-                                            );
-                                            if !from.is_empty() {
-                                                (self.on_message)(
-                                                    from.clone(),
-                                                    rsclaw_i18n::t(
-                                                        "describe_image",
-                                                        rsclaw_i18n::default_lang(),
-                                                    ),
-                                                    images,
-                                                    vec![],
-                                                );
-                                            }
-                                        }
-                                        Err(e) => warn!("wechat: image download failed: {e:#}"),
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // 4. File (type 4) -- pass raw bytes as FileAttachment
-                            if let Some(f) = items.iter().find_map(|i| i.file_item.as_ref()) {
-                                let src = resolve_media_source_file(f);
-                                if let Some(src) = src {
-                                    match self.download_media_source(&src).await {
-                                        Ok(bytes) => {
-                                            let fname =
-                                                f.file_name.as_deref().unwrap_or("file.bin");
-                                            info!(
-                                                size = bytes.len(),
-                                                fname, "wechat: file received, routing to agent"
-                                            );
-                                            let fa = rsclaw_types::FileAttachment {
-                                                filename: fname.to_owned(),
-                                                data: bytes,
-                                                mime_type: "application/octet-stream".to_owned(),
-                                            };
-                                            if !from.is_empty() {
-                                                (self.on_message)(
-                                                    from.clone(),
-                                                    String::new(),
-                                                    vec![],
-                                                    vec![fa],
-                                                );
-                                            }
-                                        }
-                                        Err(e) => warn!("wechat: file download failed: {e:#}"),
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // 5. Video (type 5) -- download, decrypt, save as file
-                            if let Some(vid) = items.iter().find_map(|i| i.video_item.as_ref()) {
-                                if let Some(m) = &vid.media {
-                                    if let Some(param) = &m.encrypt_query_param {
-                                        let aes_key = m.aes_key.clone().unwrap_or_default();
-                                        let src = MediaSource::Cdn {
-                                            encrypt_query_param: param.clone(),
-                                            aes_key,
-                                        };
-                                        match self.download_media_source(&src).await {
-                                            Ok(bytes) => {
-                                                info!(
-                                                    size = bytes.len(),
-                                                    "wechat: video downloaded"
-                                                );
-                                                // Send as both ImageAttachment (for vision models
-                                                // that support video) and FileAttachment (for
-                                                // audio transcription fallback on other models).
-                                                use base64::Engine;
-                                                let b64 = base64::engine::general_purpose::STANDARD
-                                                    .encode(&bytes);
-                                                let data_uri =
-                                                    format!("data:video/mp4;base64,{b64}");
-                                                let img = rsclaw_types::ImageAttachment {
-                                                    data: data_uri,
-                                                    mime_type: "video/mp4".to_owned(),
-                                                    source_path: None,
-                                                };
-                                                let fa = rsclaw_types::FileAttachment {
-                                                    filename: "video.mp4".to_owned(),
-                                                    data: bytes,
-                                                    mime_type: "video/mp4".to_owned(),
-                                                };
-                                                if !from.is_empty() {
-                                                    (self.on_message)(
-                                                        from.clone(),
-                                                        rsclaw_i18n::t(
-                                                            "describe_video",
-                                                            rsclaw_i18n::default_lang(),
-                                                        ),
-                                                        vec![img],
-                                                        vec![fa],
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => warn!("wechat: video download failed: {e:#}"),
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-
-                            debug!(
-                                "wechat: unhandled message item types: {:?}",
-                                items.iter().map(|i| i.item_type).collect::<Vec<_>>()
+                            let text_only = msg.item_list.as_deref().unwrap_or(&[]).iter().any(
+                                |i| i.text_item.as_ref().is_some_and(|t| t.text.is_some()),
                             );
+                            if text_only {
+                                // Plain text: handle inline to keep order.
+                                self.handle_inbound_message(msg).await;
+                            } else {
+                                // Media download / transcription off the
+                                // long-poll loop.
+                                let this = Arc::clone(&self);
+                                tokio::spawn(async move {
+                                    this.handle_inbound_message(msg).await;
+                                });
+                            }
                         }
                     }
                 }
@@ -941,7 +977,7 @@ impl WeChatPersonalChannel {
             );
         }
 
-        let encrypted = resp.bytes().await?;
+        let encrypted = crate::read_media_body(resp).await?;
         info!(size = encrypted.len(), "wechat: CDN download ok");
 
         if aes_key_b64.is_empty() {

@@ -39,6 +39,8 @@ pub struct SlackChannel {
     api_base: String,
     client: Client,
     retry: RetryConfig,
+    /// Optional policy pre-check run before downloading attachments.
+    media_gate: Option<crate::MediaGate>,
     #[allow(clippy::type_complexity)]
     on_message: Arc<
         dyn Fn(
@@ -81,8 +83,16 @@ impl SlackChannel {
                 .build()
                 .expect("reqwest client"),
             retry: RetryConfig::default(),
+            media_gate: None,
             on_message,
         }
+    }
+
+    /// Install a side-effect-free policy pre-check; attachments from senders
+    /// it rejects are never downloaded.
+    pub fn with_media_gate(mut self, gate: crate::MediaGate) -> Self {
+        self.media_gate = Some(gate);
+        self
     }
 
     async fn post_message(&self, channel_id: &str, text: &str) -> Result<()> {
@@ -261,7 +271,7 @@ impl SlackChannel {
     ///   - Receive `hello` event
     ///   - Receive `events_api` / `slash_commands` / `interactive` envelopes
     ///   - Each envelope must be ACKed with `{"envelope_id": "<id>"}`
-    async fn socket_loop(&self) -> Result<()> {
+    async fn socket_loop(self: &Arc<Self>) -> Result<()> {
         let url = self.open_socket_url().await?;
         info!("Slack: connecting to Socket Mode {url}");
 
@@ -313,7 +323,9 @@ impl SlackChannel {
                     // ACK immediately to avoid replay.
                     if !envelope_id.is_empty() {
                         let ack = json!({"envelope_id": envelope_id});
-                        let _ = write.send(WsMessage::Text(ack.to_string().into())).await;
+                        if let Err(e) = write.send(WsMessage::Text(ack.to_string().into())).await {
+                            warn!("Slack: envelope ACK failed: {e}");
+                        }
                     }
                     let event = &payload["payload"]["event"];
                     let etype = event["type"].as_str().unwrap_or("");
@@ -357,154 +369,47 @@ impl SlackChannel {
                                 text = format!("/{rest}");
                             }
                         }
+                        let text = crate::strip_inbound_sentinels(&text);
                         let channel = event["channel"].as_str().unwrap_or("").to_owned();
                         let is_channel = event["channel_type"]
                             .as_str()
                             .map(|t| t == "channel" || t == "group")
                             .unwrap_or(false);
 
-                        // Process file attachments. Images go into `images`
-                        // so the runtime hands them to the vision model AND
-                        // pending_files (analyze vs save) can fire. Other
-                        // files go into `file_attachments` for the same
-                        // reason. Audio/video still get inline-transcribed.
-                        let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
-                        let mut file_attachments: Vec<rsclaw_types::FileAttachment> = Vec::new();
-                        if let Some(files) = event["files"].as_array() {
-                            for file in files {
-                                let url = file["url_private_download"].as_str().unwrap_or("");
-                                let filename = file["name"].as_str().unwrap_or("file");
-                                let mimetype = file["mimetype"].as_str().unwrap_or("");
-                                if url.is_empty() {
-                                    continue;
-                                }
-
-                                let download = self
-                                    .client
-                                    .get(url)
-                                    .bearer_auth(&self.bot_token)
-                                    .send()
-                                    .await;
-                                let bytes = match download {
-                                    Ok(resp) if resp.status().is_success() => {
-                                        resp.bytes().await.ok().map(|b| b.to_vec())
-                                    }
-                                    _ => None,
-                                };
-
-                                if let Some(bytes) = bytes {
-                                    if mimetype.starts_with("audio/")
-                                        || mimetype.starts_with("video/")
-                                    {
-                                        match crate::transcription::transcribe_audio(
-                                            &self.client,
-                                            &bytes,
-                                            filename,
-                                            mimetype,
-                                        )
-                                        .await
-                                        {
-                                            Ok(t) => {
-                                                info!(
-                                                    "Slack: file transcribed ({} chars)",
-                                                    t.len()
-                                                );
-                                                if !text.is_empty() {
-                                                    text.push('\n');
-                                                }
-                                                text.push_str(&t);
-                                            }
-                                            Err(_) => {
-                                                if !text.is_empty() {
-                                                    text.push('\n');
-                                                }
-                                                text.push_str(&format!(
-                                                    "[{mimetype} file: {filename}]"
-                                                ));
-                                            }
-                                        }
-                                    } else if mimetype.starts_with("image/") {
-                                        use base64::Engine as _;
-                                        let orig_len = bytes.len();
-                                        let orig_mime = if mimetype.is_empty() {
-                                            "image/png"
-                                        } else {
-                                            mimetype
-                                        };
-                                        let (final_bytes, final_mime) =
-                                            rsclaw_util::downscale_image_for_vision(
-                                                &bytes,
-                                                orig_mime,
-                                                1 * 1024 * 1024,
-                                                1920,
-                                                85,
-                                            )
-                                            .unwrap_or_else(|e| {
-                                                warn!(error = %e, "Slack: downscale failed");
-                                                (bytes, orig_mime.to_owned())
-                                            });
-                                        let b64 = base64::engine::general_purpose::STANDARD
-                                            .encode(&final_bytes);
-                                        images.push(rsclaw_types::ImageAttachment {
-                                            data: format!("data:{final_mime};base64,{b64}"),
-                                            mime_type: final_mime,
-                                            source_path: None,
-                                        });
-                                        info!(from = orig_len, to = final_bytes.len(), %filename, "Slack: image forwarded for vision");
-                                    } else {
-                                        let processed = slack_process_file(filename, &bytes);
-                                        file_attachments.push(rsclaw_types::FileAttachment {
-                                            filename: filename.to_owned(),
-                                            data: bytes.clone(),
-                                            mime_type: if mimetype.is_empty() {
-                                                "application/octet-stream".to_owned()
-                                            } else {
-                                                mimetype.to_owned()
-                                            },
-                                        });
-                                        if !text.is_empty() {
-                                            text.push('\n');
-                                        }
-                                        text.push_str(&processed);
-                                    }
-                                } else {
-                                    if !text.is_empty() {
-                                        text.push('\n');
-                                    }
-                                    text.push_str(&format!("[file download failed: {filename}]"));
-                                }
-                            }
+                        // A channel @-mention arrives both as `message` and
+                        // `app_mention` with the same ts; Slack also retries
+                        // envelopes. Dedup on (channel, ts) so each user
+                        // message is handled exactly once.
+                        let ts = event["ts"].as_str().unwrap_or("");
+                        if !ts.is_empty()
+                            && crate::is_duplicate_inbound("slack", &format!("{channel}:{ts}"))
+                        {
+                            info!(etype = %etype, "Slack: duplicate event for ts {ts}, skipping");
+                            continue;
                         }
 
-                        if !user.is_empty()
-                            && (!text.is_empty()
-                                || !images.is_empty()
-                                || !file_attachments.is_empty())
-                        {
-                            info!(
-                                user = %user,
-                                channel = %channel,
-                                etype = %etype,
-                                len = text.len(),
-                                imgs = images.len(),
-                                files = file_attachments.len(),
-                                "Slack: dispatching message"
-                            );
-                            (self.on_message)(
+                        let files = event["files"].as_array().cloned().unwrap_or_default();
+                        if files.is_empty() {
+                            self.dispatch_event(
                                 user,
                                 text,
                                 channel,
                                 is_channel,
-                                images,
-                                file_attachments,
+                                etype.to_owned(),
+                                vec![],
+                                vec![],
                             );
                         } else {
-                            warn!(
-                                user_empty = user.is_empty(),
-                                text_empty = text.is_empty(),
-                                etype = %etype,
-                                "Slack: event ignored — empty user or text"
-                            );
+                            // Downloads / transcription run off the socket
+                            // loop so pings and envelope ACKs keep flowing.
+                            let this = Arc::clone(self);
+                            let etype = etype.to_owned();
+                            tokio::spawn(async move {
+                                this.process_files_and_dispatch(
+                                    user, text, channel, is_channel, etype, files,
+                                )
+                                .await;
+                            });
                         }
                     }
                 }
@@ -521,6 +426,178 @@ impl SlackChannel {
             }
         }
         bail!("Slack: socket stream ended")
+    }
+
+    /// Download / transcribe the files of an inbound event (bounded, gated by
+    /// the media policy pre-check), then dispatch it.
+    async fn process_files_and_dispatch(
+        &self,
+        user: String,
+        mut text: String,
+        channel: String,
+        is_channel: bool,
+        etype: String,
+        files: Vec<Value>,
+    ) {
+        if let Some(gate) = &self.media_gate
+            && !gate(user.clone(), channel.clone(), is_channel).await
+        {
+            info!(user = %user, "Slack: sender not authorised, attachments not downloaded");
+            if text.is_empty() {
+                text = crate::GATED_MEDIA_PLACEHOLDER.to_owned();
+            }
+            self.dispatch_event(user, text, channel, is_channel, etype, vec![], vec![]);
+            return;
+        }
+        let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
+        let mut file_attachments: Vec<rsclaw_types::FileAttachment> = Vec::new();
+        {
+            for file in &files {
+                let url = file["url_private_download"].as_str().unwrap_or("");
+                let filename = file["name"].as_str().unwrap_or("file");
+                let mimetype = file["mimetype"].as_str().unwrap_or("");
+                if url.is_empty() {
+                    continue;
+                }
+
+                let download = self
+                    .client
+                    .get(url)
+                    .bearer_auth(&self.bot_token)
+                    .send()
+                    .await;
+                let bytes = match download {
+                    Ok(resp) if resp.status().is_success() => {
+                        match crate::read_media_body(resp).await {
+                            Ok(b) => Some(b),
+                            Err(e) => {
+                                warn!("Slack: file download failed: {e:#}");
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+
+                if let Some(bytes) = bytes {
+                    if mimetype.starts_with("audio/")
+                        || mimetype.starts_with("video/")
+                    {
+                        match crate::transcription::transcribe_audio(
+                            &self.client,
+                            &bytes,
+                            filename,
+                            mimetype,
+                        )
+                        .await
+                        {
+                            Ok(t) => {
+                                info!(
+                                    "Slack: file transcribed ({} chars)",
+                                    t.len()
+                                );
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(&t);
+                            }
+                            Err(_) => {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(&format!(
+                                    "[{mimetype} file: {filename}]"
+                                ));
+                            }
+                        }
+                    } else if mimetype.starts_with("image/") {
+                        use base64::Engine as _;
+                        let orig_len = bytes.len();
+                        let orig_mime = if mimetype.is_empty() {
+                            "image/png"
+                        } else {
+                            mimetype
+                        };
+                        let (final_bytes, final_mime) =
+                            rsclaw_util::downscale_image_for_vision(
+                                &bytes,
+                                orig_mime,
+                                1 * 1024 * 1024,
+                                1920,
+                                85,
+                            )
+                            .unwrap_or_else(|e| {
+                                warn!(error = %e, "Slack: downscale failed");
+                                (bytes, orig_mime.to_owned())
+                            });
+                        let b64 = base64::engine::general_purpose::STANDARD
+                            .encode(&final_bytes);
+                        images.push(rsclaw_types::ImageAttachment {
+                            data: format!("data:{final_mime};base64,{b64}"),
+                            mime_type: final_mime,
+                            source_path: None,
+                        });
+                        info!(from = orig_len, to = final_bytes.len(), %filename, "Slack: image forwarded for vision");
+                    } else {
+                        let processed = slack_process_file(filename, &bytes);
+                        file_attachments.push(rsclaw_types::FileAttachment {
+                            filename: filename.to_owned(),
+                            data: bytes.clone(),
+                            mime_type: if mimetype.is_empty() {
+                                "application/octet-stream".to_owned()
+                            } else {
+                                mimetype.to_owned()
+                            },
+                        });
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&processed);
+                    }
+                } else {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&format!("[file download failed: {filename}]"));
+                }
+            }
+        }
+
+        self.dispatch_event(user, text, channel, is_channel, etype, images, file_attachments);
+    }
+
+    /// Hand a fully-assembled inbound event to the gateway callback.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_event(
+        &self,
+        user: String,
+        text: String,
+        channel: String,
+        is_channel: bool,
+        etype: String,
+        images: Vec<rsclaw_types::ImageAttachment>,
+        file_attachments: Vec<rsclaw_types::FileAttachment>,
+    ) {
+        if !user.is_empty() && (!text.is_empty() || !images.is_empty() || !file_attachments.is_empty())
+        {
+            info!(
+                user = %user,
+                channel = %channel,
+                etype = %etype,
+                len = text.len(),
+                imgs = images.len(),
+                files = file_attachments.len(),
+                "Slack: dispatching message"
+            );
+            (self.on_message)(user, text, channel, is_channel, images, file_attachments);
+        } else {
+            warn!(
+                user_empty = user.is_empty(),
+                text_empty = text.is_empty(),
+                etype = %etype,
+                "Slack: event ignored — empty user or text"
+            );
+        }
     }
 }
 
@@ -755,10 +832,25 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
             rsclaw_util::truncate_str(&text, 20000)
         )
     } else {
+        // Never join the remote filename: it is attacker-controlled and may
+        // contain `../`. Store under a generated canonical name instead.
         let ws = rsclaw_config::loader::base_dir().join("workspace/uploads");
-        let _ = std::fs::create_dir_all(&ws);
-        let dest = ws.join(filename);
-        let _ = std::fs::write(&dest, bytes);
+        if let Err(e) = std::fs::create_dir_all(&ws) {
+            warn!("Slack: create uploads dir failed: {e}");
+        }
+        let safe = rsclaw_util::fs_guard::sanitize_filename(filename, "file");
+        let stored = crate::upload_filename("application/octet-stream", &safe);
+        let dest = match rsclaw_util::fs_guard::resolve_within(&ws, &stored) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Slack: refusing to store upload {filename}: {e:#}");
+                return format!("[file: {filename}]");
+            }
+        };
+        if let Err(e) = std::fs::write(&dest, bytes) {
+            warn!("Slack: save upload failed: {e}");
+            return format!("[file: {filename}]");
+        }
         format!(
             "[File saved: {filename} ({} bytes) at {}]",
             bytes.len(),

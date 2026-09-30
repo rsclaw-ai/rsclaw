@@ -69,7 +69,7 @@ impl Channel for CliChannel {
                     Ok(bytes) => {
                         let file = tempfile::Builder::new()
                             .prefix(&format!("image_{i}_"))
-                            .suffix(super::attachments::mime_to_ext(&mime))
+                            .suffix(&format!(".{}", super::attachments::mime_to_ext(&mime)))
                             .tempfile_in(image_dir.as_ref().expect("image directory exists"))?;
                         let mut file = file;
                         file.write_all(&bytes)?;

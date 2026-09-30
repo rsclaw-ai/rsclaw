@@ -32,6 +32,8 @@ pub struct LineWebhookBody {
 pub struct LineEvent {
     #[serde(rename = "type")]
     pub event_type: String,
+    /// Unique per-event id; stable across LINE's redelivery attempts.
+    pub webhook_event_id: Option<String>,
     pub reply_token: Option<String>,
     pub source: Option<LineSource>,
     pub message: Option<LineMessage>,
@@ -44,6 +46,7 @@ pub struct LineSource {
     pub source_type: String,
     pub user_id: Option<String>,
     pub group_id: Option<String>,
+    pub room_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,31 +63,35 @@ pub struct LineMessage {
 // LineChannel
 // ---------------------------------------------------------------------------
 
+/// Inbound LINE message callback:
+/// `(sender_user_id, chat_id, text, is_group, images)`.
+///
+/// `chat_id` is the group / room id for group chats and the sender's user id
+/// for 1:1 chats; replies must go to `chat_id`.
+pub type LineOnMessage =
+    Arc<dyn Fn(String, String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>;
+
 pub struct LineChannel {
     channel_access_token: String,
+    /// Channel secret used to verify `X-Line-Signature` on inbound webhooks.
+    channel_secret: Option<String>,
     api_base: String,
     api_data_base: String,
     client: Client,
-    #[allow(clippy::type_complexity)]
-    on_message: Arc<dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
+    on_message: LineOnMessage,
 }
 
 impl LineChannel {
-    pub fn new(
-        channel_access_token: impl Into<String>,
-        on_message: Arc<
-            dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
-        >,
-    ) -> Self {
+    /// Create a LINE channel against the default API base.
+    pub fn new(channel_access_token: impl Into<String>, on_message: LineOnMessage) -> Self {
         Self::with_api_base(channel_access_token, None, on_message)
     }
 
+    /// Create a LINE channel with an optional API base override.
     pub fn with_api_base(
         channel_access_token: impl Into<String>,
         api_base: Option<String>,
-        on_message: Arc<
-            dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
-        >,
+        on_message: LineOnMessage,
     ) -> Self {
         let base = api_base.unwrap_or_else(|| LINE_API_BASE.to_owned());
         // Derive data API base by replacing the messaging host.
@@ -98,6 +105,7 @@ impl LineChannel {
         };
         Self {
             channel_access_token: channel_access_token.into(),
+            channel_secret: None,
             api_base: base,
             api_data_base: data_base,
             client: rsclaw_config::build_proxy_client()
@@ -106,6 +114,32 @@ impl LineChannel {
                 .expect("reqwest client"),
             on_message,
         }
+    }
+
+    /// Set the channel secret used to verify inbound webhook signatures.
+    pub fn with_channel_secret(mut self, secret: Option<String>) -> Self {
+        self.channel_secret = secret.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// Whether a channel secret is configured (webhook verification possible).
+    pub fn has_channel_secret(&self) -> bool {
+        self.channel_secret.is_some()
+    }
+
+    /// Verify the `X-Line-Signature` header:
+    /// `base64(HMAC-SHA256(channel_secret, raw_body))`. Returns `false` when
+    /// no secret is configured or the header is missing / wrong.
+    pub fn verify_signature(&self, signature: Option<&str>, body: &[u8]) -> bool {
+        use base64::Engine;
+        let (Some(secret), Some(sig)) = (self.channel_secret.as_deref(), signature) else {
+            return false;
+        };
+        let Ok(provided) = base64::engine::general_purpose::STANDARD.decode(sig.trim()) else {
+            return false;
+        };
+        let expected = crate::hmac_sha256(secret.as_bytes(), body);
+        crate::constant_time_eq(&expected, &provided)
     }
 
     /// Handle incoming webhook from LINE.
@@ -126,15 +160,31 @@ impl LineChannel {
                 None => continue,
             };
 
+            // LINE redelivers webhooks on timeouts; drop repeats.
+            let dedup_id = event.webhook_event_id.as_deref().unwrap_or(msg.id.as_str());
+            if crate::is_duplicate_inbound("line", dedup_id) {
+                debug!(id = dedup_id, "LINE: duplicate event dropped");
+                continue;
+            }
+
             let user_id = source.user_id.as_deref().unwrap_or("").to_owned();
-            let is_group = source.source_type == "group";
+            // Multi-person "room" chats behave like groups.
+            let (is_group, chat_id) = match source.source_type.as_str() {
+                "group" => (true, source.group_id.clone().unwrap_or_default()),
+                "room" => (true, source.room_id.clone().unwrap_or_default()),
+                _ => (false, user_id.clone()),
+            };
+            if user_id.is_empty() || chat_id.is_empty() {
+                debug!("LINE: event without sender/chat id skipped");
+                continue;
+            }
 
             let mut text = String::new();
             let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
 
             match msg.message_type.as_str() {
                 "text" => {
-                    text = msg.text.as_deref().unwrap_or("").to_owned();
+                    text = crate::strip_inbound_sentinels(msg.text.as_deref().unwrap_or(""));
                     if text.is_empty() {
                         continue;
                     }
@@ -253,8 +303,8 @@ impl LineChannel {
                 continue;
             }
 
-            info!(from = %user_id, text_len = text.len(), "LINE: message received");
-            (self.on_message)(user_id, text, is_group, images);
+            info!(from = %user_id, chat = %chat_id, text_len = text.len(), "LINE: message received");
+            (self.on_message)(user_id, chat_id, text, is_group, images);
         }
         Ok(())
     }
@@ -276,7 +326,7 @@ impl LineChannel {
             anyhow::bail!("LINE: content download failed {status}: {err}");
         }
 
-        Ok(resp.bytes().await?.to_vec())
+        crate::read_media_body(resp).await
     }
 
     async fn send_push(&self, to: &str, text: &str) -> Result<()> {
@@ -310,15 +360,18 @@ impl LineChannel {
                 "previewImageUrl": image_url
             }]
         });
-        if let Err(e) = self
+        let resp = self
             .client
             .post(&url)
             .bearer_auth(&self.channel_access_token)
             .json(&body)
             .send()
             .await
-        {
-            tracing::warn!(target_id = %to, err = %e, "line: send_image failed");
+            .context("LINE: image push request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("LINE: image push failed {status}: {err}");
         }
         Ok(())
     }
@@ -405,8 +458,10 @@ impl Channel for LineChannel {
                         if let Ok(body) = r.json::<serde_json::Value>().await {
                             if let Some(blob_url) = body.get("url").and_then(|v| v.as_str()) {
                                 let blob_owned = blob_url.to_owned();
-                                let _ = self.send_image(&msg.target_id, &blob_owned).await;
-                                debug!("LINE: image sent via blob upload");
+                                match self.send_image(&msg.target_id, &blob_owned).await {
+                                    Ok(()) => debug!("LINE: image sent via blob upload"),
+                                    Err(e) => warn!("LINE: image send failed: {e:#}"),
+                                }
                                 continue;
                             }
                         }
@@ -504,7 +559,7 @@ mod tests {
     #[test]
     fn channel_name() {
         init_crypto();
-        let ch = LineChannel::new("token", Arc::new(|_, _, _, _| {}));
+        let ch = LineChannel::new("token", Arc::new(|_, _, _, _, _| {}));
         assert_eq!(ch.name(), "line");
     }
 
@@ -517,7 +572,7 @@ mod tests {
 
         let ch = LineChannel::new(
             "token",
-            Arc::new(move |from, text, is_group, _images| {
+            Arc::new(move |from, _chat, text, is_group, _images| {
                 rx.lock().expect("lock").push((from, text, is_group));
             }),
         );
@@ -542,5 +597,19 @@ mod tests {
         assert_eq!(msgs[0].0, "U12345");
         assert_eq!(msgs[0].1, "hello");
         assert!(!msgs[0].2);
+    }
+
+    #[test]
+    fn verify_signature_hmac() {
+        init_crypto();
+        use base64::Engine;
+        let ch = LineChannel::new("token", Arc::new(|_, _, _, _, _| {}))
+            .with_channel_secret(Some("secret".to_owned()));
+        let body = br#"{"events":[]}"#;
+        let sig = base64::engine::general_purpose::STANDARD
+            .encode(crate::hmac_sha256(b"secret", body));
+        assert!(ch.verify_signature(Some(&sig), body));
+        assert!(!ch.verify_signature(Some(&sig), b"tampered"));
+        assert!(!ch.verify_signature(None, body));
     }
 }

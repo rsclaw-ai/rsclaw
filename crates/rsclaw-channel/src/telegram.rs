@@ -118,6 +118,17 @@ pub struct TgChat {
     pub kind: String, // "private" | "group" | "supergroup" | "channel"
 }
 
+/// Strip the request URL from reqwest errors. Telegram Bot API URLs embed
+/// the bot token in the path (`/bot<token>/...`), so a raw reqwest error
+/// printed with `{e:#}` would leak the token into logs.
+fn scrub_url(e: impl Into<anyhow::Error>) -> anyhow::Error {
+    let e: anyhow::Error = e.into();
+    match e.downcast::<reqwest::Error>() {
+        Ok(re) => anyhow::Error::new(re.without_url()),
+        Err(e) => e,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Retry config
 // ---------------------------------------------------------------------------
@@ -159,6 +170,8 @@ pub struct TelegramChannel {
     api_base: String,
     client: Client,
     retry: RetryConfig,
+    /// Optional policy pre-check run before downloading media.
+    media_gate: Option<crate::MediaGate>,
     /// Callback: called with (peer_id, text, chat_id, is_group, thread_id,
     /// images, files).
     #[allow(clippy::type_complexity)]
@@ -202,8 +215,16 @@ impl TelegramChannel {
                 .build()
                 .expect("reqwest client"),
             retry: RetryConfig::default(),
+            media_gate: None,
             on_message,
         }
+    }
+
+    /// Install a side-effect-free policy pre-check; media from senders it
+    /// rejects is never downloaded or transcribed.
+    pub fn with_media_gate(mut self, gate: crate::MediaGate) -> Self {
+        self.media_gate = Some(gate);
+        self
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -239,6 +260,7 @@ impl TelegramChannel {
                 .json(&body)
                 .send()
                 .await
+                .map_err(scrub_url)
             {
                 Ok(r) => r,
                 Err(e) => {
@@ -273,6 +295,7 @@ impl TelegramChannel {
                         .json(&plain_body)
                         .send()
                         .await
+                        .map_err(scrub_url)
                     {
                         Ok(r) if r.status().is_success() => return Ok(()),
                         Ok(r) => {
@@ -327,6 +350,7 @@ impl TelegramChannel {
                 .json(&body)
                 .send()
                 .await
+                .map_err(scrub_url)
                 .context("sendMessage (preview)")?;
 
             let status = resp.status();
@@ -346,7 +370,7 @@ impl TelegramChannel {
             }
 
             let tg: TgResponse<TgSentMessage> =
-                resp.json().await.context("parse sendMessage result")?;
+                resp.json().await.map_err(scrub_url).context("parse sendMessage result")?;
             if !tg.ok {
                 return Err(anyhow::anyhow!(
                     "sendMessage not ok: {}",
@@ -385,6 +409,7 @@ impl TelegramChannel {
                 .json(&body)
                 .send()
                 .await
+                .map_err(scrub_url)
                 .context("editMessageText")?;
 
             let status = resp.status();
@@ -458,8 +483,9 @@ impl TelegramChannel {
             .post(&url)
             .json(&json!({ "file_id": file_id }))
             .send()
-            .await?;
-        let raw_text = raw_resp.text().await?;
+            .await
+            .map_err(scrub_url)?;
+        let raw_text = raw_resp.text().await.map_err(scrub_url)?;
         let resp: TgResponse<TgFile> = match serde_json::from_str(&raw_text) {
             Ok(r) => r,
             Err(e) => {
@@ -503,10 +529,14 @@ impl TelegramChannel {
 
         // 2. Download the file.
         let download_url = format!("{}/file/bot{}/{}", self.api_base, self.token, file_path);
-        let bytes = self.client.get(&download_url).send().await?.bytes().await?;
+        let resp = self.client.get(&download_url).send().await.map_err(scrub_url)?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Telegram file download failed: {}", resp.status());
+        }
+        let bytes = crate::read_media_body(resp).await.map_err(scrub_url)?;
 
         debug!(size = bytes.len(), path = %file_path, "downloaded file from Telegram");
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Download a voice/audio file from Telegram and transcribe it.
@@ -523,27 +553,24 @@ impl TelegramChannel {
 
     /// Register bot commands with Telegram so they appear in the command menu.
     async fn register_commands(&self) {
-        let commands = serde_json::json!({
-            "commands": [
-                {"command": "help", "description": "Show available commands"},
-                {"command": "run", "description": "Execute a shell command"},
-                {"command": "search", "description": "Search the web"},
-                {"command": "fetch", "description": "Fetch a web page"},
-                {"command": "find", "description": "Find files"},
-                {"command": "grep", "description": "Search file contents"},
-                {"command": "read", "description": "Read a file"},
-                {"command": "status", "description": "Gateway status"},
-                {"command": "version", "description": "Show version"},
-                {"command": "models", "description": "List models"},
-                {"command": "clear", "description": "Clear session"},
-                {"command": "remember", "description": "Save to memory"},
-                {"command": "recall", "description": "Search memory"},
-            ]
-        });
+        let lang = rsclaw_i18n::default_lang();
+        let commands: Vec<serde_json::Value> = [
+            "help", "run", "search", "fetch", "find", "grep", "read", "status", "version",
+            "models", "clear", "remember", "recall",
+        ]
+        .iter()
+        .map(|cmd| {
+            serde_json::json!({
+                "command": cmd,
+                "description": rsclaw_i18n::t(&format!("tg_cmd_{cmd}"), lang),
+            })
+        })
+        .collect();
+        let commands = serde_json::json!({ "commands": commands });
 
         let url = self.api_url("setMyCommands");
 
-        match self.client.post(&url).json(&commands).send().await {
+        match self.client.post(&url).json(&commands).send().await.map_err(scrub_url) {
             Ok(resp) if resp.status().is_success() => {
                 tracing::info!("telegram: bot commands registered");
             }
@@ -570,9 +597,10 @@ impl TelegramChannel {
             .json(&body)
             .send()
             .await
+            .map_err(scrub_url)
             .context("getUpdates")?;
 
-        let tg: TgResponse<Vec<Update>> = resp.json().await.context("parse getUpdates")?;
+        let tg: TgResponse<Vec<Update>> = resp.json().await.map_err(scrub_url).context("parse getUpdates")?;
 
         if !tg.ok {
             return Err(anyhow::anyhow!(
@@ -582,6 +610,202 @@ impl TelegramChannel {
         }
 
         Ok(tg.result.unwrap_or_default())
+    }
+
+    /// Handle an inbound message carrying media (voice / audio / video /
+    /// document / photo): policy pre-check, bounded downloads, then dispatch.
+    async fn process_media_message(&self, msg: TgMessage) {
+        if let Some(gate) = &self.media_gate {
+            let peer = msg.from.as_ref().map(|u| u.id).unwrap_or(0).to_string();
+            let is_group = msg.chat.kind != "private";
+            if !gate(peer, msg.chat.id.to_string(), is_group).await {
+                info!(chat_id = msg.chat.id, "Telegram: sender not authorised, media not downloaded");
+                let text = msg
+                    .caption
+                    .clone()
+                    .or_else(|| msg.text.clone())
+                    .filter(|s| !s.is_empty())
+                    .map(|t| crate::strip_inbound_sentinels(&t))
+                    .unwrap_or_else(|| crate::GATED_MEDIA_PLACEHOLDER.to_owned());
+                (self.on_message)(
+                    msg.from.as_ref().map(|u| u.id).unwrap_or(0),
+                    text,
+                    msg.chat.id,
+                    is_group,
+                    msg.message_thread_id,
+                    vec![],
+                    vec![],
+                );
+                return;
+            }
+        }
+        let mut tg_file_attachments: Vec<rsclaw_types::FileAttachment> =
+            Vec::new();
+        // Try text first, then voice/audio transcription, then caption.
+        let text = if let Some(t) =
+            msg.text.clone().filter(|s| !s.is_empty())
+        {
+            crate::strip_inbound_sentinels(&t)
+        } else if let Some(ref voice) = msg.voice {
+            match self.transcribe_voice(&voice.file_id).await {
+                Ok(t) => {
+                    info!("voice transcribed ({} chars)", t.len());
+                    t
+                }
+                Err(e) => {
+                    warn!("voice transcription failed: {e:#}");
+                    return;
+                }
+            }
+        } else if let Some(ref audio) = msg.audio {
+            match self.transcribe_voice(&audio.file_id).await {
+                Ok(t) => {
+                    info!("audio transcribed ({} chars)", t.len());
+                    t
+                }
+                Err(e) => {
+                    warn!("audio transcription failed: {e:#}");
+                    return;
+                }
+            }
+        } else if let Some(ref video) = msg.video {
+            // Send video as FileAttachment — runtime decides
+            // whether to use vision (doubao) or transcription.
+            match self.download_file(&video.file_id).await {
+                Ok(bytes) => {
+                    info!(size = bytes.len(), "telegram: video downloaded");
+                    tg_file_attachments.push(
+                        rsclaw_types::FileAttachment {
+                            filename: "video.mp4".to_owned(),
+                            data: bytes,
+                            mime_type: "video/mp4".to_owned(),
+                        },
+                    );
+                    String::new()
+                }
+                Err(e) => {
+                    // Only reached for senders that passed the
+                    // media policy gate, so replying is safe.
+                    let err_msg = format!("{e:#}");
+                    let lang = rsclaw_i18n::default_lang();
+                    let reply = if err_msg.contains("too big")
+                        || err_msg.contains("no file_path")
+                    {
+                        warn!(
+                            "video too large for Telegram Bot API (>20MB)"
+                        );
+                        rsclaw_i18n::t("tg_video_too_large", lang)
+                    } else {
+                        warn!("video download failed: {err_msg}");
+                        rsclaw_i18n::t("tg_video_download_failed", lang)
+                    };
+                    if let Err(e) = self
+                        .client
+                        .post(self.api_url("sendMessage"))
+                        .json(&json!({
+                            "chat_id": msg.chat.id,
+                            "text": reply,
+                        }))
+                        .send()
+                        .await
+                        .map_err(scrub_url)
+                    {
+                        warn!("telegram: video failure notice not sent: {e:#}");
+                    }
+                    return;
+                }
+            }
+        } else if let Some(ref doc) = msg.document {
+            let filename = doc.file_name.as_deref().unwrap_or("file");
+            match self.download_file(&doc.file_id).await {
+                Ok(bytes) => {
+                    tg_file_attachments.push(
+                        rsclaw_types::FileAttachment {
+                            filename: filename.to_owned(),
+                            data: bytes,
+                            mime_type: "application/octet-stream"
+                                .to_owned(),
+                        },
+                    );
+                    String::new()
+                }
+                Err(e) => {
+                    format!("[file download failed: {e}]")
+                }
+            }
+        } else if let Some(t) =
+            msg.caption.clone().filter(|s| !s.is_empty())
+        {
+            crate::strip_inbound_sentinels(&t)
+        } else if msg.photo.is_some() {
+            // Photo with no caption — use placeholder text.
+            String::new()
+        } else {
+            return;
+        };
+
+        // Download photo attachments for vision support.
+        let mut images = Vec::new();
+        if let Some(ref photos) = msg.photo {
+            // Telegram sends multiple sizes; last is largest.
+            if let Some(largest) = photos.last() {
+                match self.download_file(&largest.file_id).await {
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        let orig_len = bytes.len();
+                        let (final_bytes, final_mime) =
+                            rsclaw_util::downscale_image_for_vision(
+                                &bytes,
+                                "image/jpeg",
+                                1 * 1024 * 1024,
+                                1920,
+                                85,
+                            )
+                            .unwrap_or_else(|e| {
+                                warn!(error = %e, "Telegram: downscale failed, sending original");
+                                (bytes.clone(), "image/jpeg".to_string())
+                            });
+                        if !final_bytes.is_empty() {
+                            let b64 =
+                                base64::engine::general_purpose::STANDARD
+                                    .encode(&final_bytes);
+                            let data_url =
+                                format!("data:{final_mime};base64,{b64}");
+                            images.push(rsclaw_types::ImageAttachment {
+                                data: data_url,
+                                mime_type: final_mime,
+                                source_path: None,
+                            });
+                            info!(
+                                from = orig_len,
+                                to = final_bytes.len(),
+                                "Telegram photo downloaded for vision"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Telegram photo download failed: {e:#}");
+                    }
+                }
+            }
+        }
+
+        let peer_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
+        let chat_id = msg.chat.id;
+        let is_group = msg.chat.kind != "private";
+        let thread = msg.message_thread_id;
+
+        debug!(peer_id, chat_id, is_group, "Telegram message received");
+
+        (self.on_message)(
+            peer_id,
+            text,
+            chat_id,
+            is_group,
+            thread,
+            images,
+            tg_file_attachments,
+        );
     }
 }
 
@@ -644,7 +868,7 @@ impl Channel for TelegramChannel {
                     .part("photo", part);
 
                 let url = self.api_url("sendPhoto");
-                match self.client.post(&url).multipart(form).send().await {
+                match self.client.post(&url).multipart(form).send().await.map_err(scrub_url) {
                     Ok(resp) if !resp.status().is_success() => {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
@@ -659,8 +883,8 @@ impl Channel for TelegramChannel {
             for (idx, (filename, mime, path_or_url)) in msg.files.iter().enumerate() {
                 let bytes =
                     if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
-                        match self.client.get(path_or_url.as_str()).send().await {
-                            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                        match self.client.get(path_or_url.as_str()).send().await.map_err(scrub_url) {
+                            Ok(resp) if resp.status().is_success() => match resp.bytes().await.map_err(scrub_url) {
                                 Ok(b) if !b.is_empty() => b.to_vec(),
                                 _ => {
                                     warn!(idx, "telegram: empty file download");
@@ -735,7 +959,7 @@ impl Channel for TelegramChannel {
                     .part(field_name, part);
 
                 let url = self.api_url(api_method);
-                match self.client.post(&url).multipart(form).send().await {
+                match self.client.post(&url).multipart(form).send().await.map_err(scrub_url) {
                     Ok(resp) if !resp.status().is_success() => {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
@@ -759,169 +983,42 @@ impl Channel for TelegramChannel {
             loop {
                 match self.get_updates(offset).await {
                     Ok(updates) => {
-                        for update in &updates {
+                        for update in updates {
                             offset = update.update_id + 1;
 
-                            if let Some(msg) = &update.message {
-                                let mut tg_file_attachments: Vec<rsclaw_types::FileAttachment> =
-                                    Vec::new();
-                                // Try text first, then voice/audio transcription, then caption.
-                                let text = if let Some(t) =
-                                    msg.text.clone().filter(|s| !s.is_empty())
-                                {
-                                    t
-                                } else if let Some(ref voice) = msg.voice {
-                                    match self.transcribe_voice(&voice.file_id).await {
-                                        Ok(t) => {
-                                            info!("voice transcribed ({} chars)", t.len());
-                                            t
-                                        }
-                                        Err(e) => {
-                                            warn!("voice transcription failed: {e:#}");
-                                            continue;
-                                        }
-                                    }
-                                } else if let Some(ref audio) = msg.audio {
-                                    match self.transcribe_voice(&audio.file_id).await {
-                                        Ok(t) => {
-                                            info!("audio transcribed ({} chars)", t.len());
-                                            t
-                                        }
-                                        Err(e) => {
-                                            warn!("audio transcription failed: {e:#}");
-                                            continue;
-                                        }
-                                    }
-                                } else if let Some(ref video) = msg.video {
-                                    // Send video as FileAttachment — runtime decides
-                                    // whether to use vision (doubao) or transcription.
-                                    match self.download_file(&video.file_id).await {
-                                        Ok(bytes) => {
-                                            info!(size = bytes.len(), "telegram: video downloaded");
-                                            tg_file_attachments.push(
-                                                rsclaw_types::FileAttachment {
-                                                    filename: "video.mp4".to_owned(),
-                                                    data: bytes,
-                                                    mime_type: "video/mp4".to_owned(),
-                                                },
-                                            );
-                                            String::new()
-                                        }
-                                        Err(e) => {
-                                            let err_msg = format!("{e:#}");
-                                            let reply = if err_msg.contains("too big") {
-                                                warn!(
-                                                    "video too large for Telegram Bot API (>20MB)"
-                                                );
-                                                "Video exceeds Telegram 20MB bot limit. Send a smaller file or share via link."
-                                            } else {
-                                                warn!("video download failed: {err_msg}");
-                                                "Video download failed."
-                                            };
-                                            let _ = self
-                                                .client
-                                                .post(self.api_url("sendMessage"))
-                                                .json(&json!({
-                                                    "chat_id": msg.chat.id,
-                                                    "text": reply,
-                                                }))
-                                                .send()
-                                                .await;
-                                            continue;
-                                        }
-                                    }
-                                } else if let Some(ref doc) = msg.document {
-                                    let filename = doc.file_name.as_deref().unwrap_or("file");
-                                    match self.download_file(&doc.file_id).await {
-                                        Ok(bytes) => {
-                                            tg_file_attachments.push(
-                                                rsclaw_types::FileAttachment {
-                                                    filename: filename.to_owned(),
-                                                    data: bytes,
-                                                    mime_type: "application/octet-stream"
-                                                        .to_owned(),
-                                                },
-                                            );
-                                            String::new()
-                                        }
-                                        Err(e) => {
-                                            format!("[file download failed: {e}]")
-                                        }
-                                    }
-                                } else if let Some(t) =
-                                    msg.caption.clone().filter(|s| !s.is_empty())
-                                {
-                                    t
-                                } else if msg.photo.is_some() {
-                                    // Photo with no caption — use placeholder text.
-                                    String::new()
-                                } else {
+                            let Some(msg) = update.message else {
+                                continue;
+                            };
+                            let has_media = msg.voice.is_some()
+                                || msg.audio.is_some()
+                                || msg.video.is_some()
+                                || msg.document.is_some()
+                                || msg.photo.is_some();
+                            if !has_media {
+                                // Plain text: dispatch inline to keep order.
+                                let Some(text) = msg.text.clone().filter(|s| !s.is_empty())
+                                else {
                                     continue;
                                 };
-
-                                // Download photo attachments for vision support.
-                                let mut images = Vec::new();
-                                if let Some(ref photos) = msg.photo {
-                                    // Telegram sends multiple sizes; last is largest.
-                                    if let Some(largest) = photos.last() {
-                                        match self.download_file(&largest.file_id).await {
-                                            Ok(bytes) => {
-                                                use base64::Engine;
-                                                let orig_len = bytes.len();
-                                                let (final_bytes, final_mime) =
-                                                    rsclaw_util::downscale_image_for_vision(
-                                                        &bytes,
-                                                        "image/jpeg",
-                                                        1 * 1024 * 1024,
-                                                        1920,
-                                                        85,
-                                                    )
-                                                    .unwrap_or_else(|e| {
-                                                        warn!(error = %e, "Telegram: downscale failed, sending original");
-                                                        (bytes.clone(), "image/jpeg".to_string())
-                                                    });
-                                                if !final_bytes.is_empty() {
-                                                    let b64 =
-                                                        base64::engine::general_purpose::STANDARD
-                                                            .encode(&final_bytes);
-                                                    let data_url =
-                                                        format!("data:{final_mime};base64,{b64}");
-                                                    images.push(rsclaw_types::ImageAttachment {
-                                                        data: data_url,
-                                                        mime_type: final_mime,
-                                                        source_path: None,
-                                                    });
-                                                    info!(
-                                                        from = orig_len,
-                                                        to = final_bytes.len(),
-                                                        "Telegram photo downloaded for vision"
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!("Telegram photo download failed: {e:#}");
-                                            }
-                                        }
-                                    }
-                                }
-
                                 let peer_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
-                                let chat_id = msg.chat.id;
                                 let is_group = msg.chat.kind != "private";
-                                let thread = msg.message_thread_id;
-
-                                debug!(peer_id, chat_id, is_group, "Telegram message received");
-
+                                debug!(peer_id, chat_id = msg.chat.id, is_group, "Telegram message received");
                                 (self.on_message)(
                                     peer_id,
-                                    text,
-                                    chat_id,
+                                    crate::strip_inbound_sentinels(&text),
+                                    msg.chat.id,
                                     is_group,
-                                    thread,
-                                    images,
-                                    tg_file_attachments,
+                                    msg.message_thread_id,
+                                    vec![],
+                                    vec![],
                                 );
+                                continue;
                             }
+                            // Media: download / transcribe off the poll loop.
+                            let this = Arc::clone(&self);
+                            tokio::spawn(async move {
+                                this.process_media_message(msg).await;
+                            });
                         }
                     }
                     Err(e) => {

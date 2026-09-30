@@ -43,6 +43,96 @@ use super::{
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
 
+/// Pick the account that owns the bare `<channel>` outbound key: the account
+/// named "default" when present, otherwise the lexicographically smallest
+/// name. Deterministic regardless of `HashMap` iteration order.
+pub(crate) fn bare_account_name<'a>(names: impl IntoIterator<Item = &'a String>) -> Option<String> {
+    let mut best: Option<&String> = None;
+    for n in names {
+        if n == "default" {
+            return Some(n.clone());
+        }
+        if best.is_none_or(|b| n < b) {
+            best = Some(n);
+        }
+    }
+    best.cloned()
+}
+
+/// Register the outbound sender for `<channel>/<account>` and, when
+/// `account == bare_account`, (re)bind the bare `<channel>` fallback key.
+/// Overwriting (instead of `or_insert`) makes the binding deterministic and
+/// replaces a stale sender left behind by a hot-reload teardown.
+pub(crate) fn register_outbound_sender(
+    senders: &std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    channel: &str,
+    account: &str,
+    bare_account: Option<&str>,
+    tx: &mpsc::Sender<OutboundMessage>,
+) {
+    let mut senders = senders.write().expect("channel_senders lock poisoned");
+    senders.insert(format!("{channel}/{account}"), tx.clone());
+    let owns_bare = bare_account == Some(account);
+    let bare_stale = senders.get(channel).is_none_or(|s| s.is_closed());
+    if owns_bare || bare_stale {
+        senders.insert(channel.to_owned(), tx.clone());
+    }
+}
+
+/// Shared groupPolicy gate: `true` when a group message addressed to
+/// `group_id` may be processed. `groupAllowFrom` lists GROUP ids.
+pub(crate) fn group_message_allowed(
+    channel: &str,
+    policy: &rsclaw_config::schema::GroupPolicy,
+    group_allow: &[String],
+    group_id: &str,
+) -> bool {
+    match policy {
+        rsclaw_config::schema::GroupPolicy::Disabled => {
+            warn!(channel, group_id, "group message rejected: groupPolicy=disabled");
+            false
+        }
+        rsclaw_config::schema::GroupPolicy::Allowlist => {
+            if group_allow.iter().any(|g| g == group_id || g == "*") {
+                true
+            } else {
+                warn!(channel, group_id, "group message rejected: not in groupAllowFrom");
+                false
+            }
+        }
+        rsclaw_config::schema::GroupPolicy::Open => true,
+    }
+}
+
+/// Build the side-effect-free media pre-check handed to channels so they can
+/// skip downloading / transcribing attachments from senders the policy would
+/// reject anyway. Groups are checked against groupPolicy by `chat_id`, DMs
+/// against the DM enforcer (allowlist / approved pairing) by sender.
+pub(crate) fn build_media_gate(
+    enforcer: Arc<rsclaw_channel::DmPolicyEnforcer>,
+    group_policy: rsclaw_config::schema::GroupPolicy,
+    group_allow: Arc<Vec<String>>,
+) -> rsclaw_channel::MediaGate {
+    Arc::new(move |sender: String, chat_id: String, is_group: bool| {
+        let enforcer = Arc::clone(&enforcer);
+        let group_policy = group_policy.clone();
+        let group_allow = Arc::clone(&group_allow);
+        Box::pin(async move {
+            if is_group {
+                match group_policy {
+                    rsclaw_config::schema::GroupPolicy::Disabled => false,
+                    rsclaw_config::schema::GroupPolicy::Open => true,
+                    rsclaw_config::schema::GroupPolicy::Allowlist => group_allow
+                        .iter()
+                        .any(|g| *g == chat_id || g == "*"),
+                }
+            } else {
+                enforcer.is_allowed(&sender).await
+            }
+        })
+    })
+}
+
 pub(crate) fn default_dm_scope(config: &RuntimeConfig) -> DmScope {
     config
         .channel
@@ -107,6 +197,7 @@ pub(crate) fn start_channels(
                 });
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let msg = AgentMessage {
+                    trust: rsclaw_agent::SenderTrust::Owner,
                     session_key,
                     text,
                     channel: "cli".to_string(),

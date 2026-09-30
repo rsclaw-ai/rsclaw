@@ -82,6 +82,7 @@ pub(crate) fn start_qq_if_configured(
     let qq_api_base = qq_cfg.api_base.clone();
     let qq_token_url = qq_cfg.token_url.clone();
 
+    let bare_acct = super::bare_account_name(qq_accounts.iter().map(|(n, _, _)| n));
     for (acct_name, app_id, app_secret) in qq_accounts {
         let acct_for_log = acct_name.clone();
         let w_acct_outer = acct_name.clone();
@@ -92,15 +93,13 @@ pub(crate) fn start_qq_if_configured(
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register QQ channel sender for notification routing.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("qq/{}", acct_name), out_tx.clone());
-            senders
-                .entry("qq".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        super::register_outbound_sender(
+            &channel_senders,
+            "qq",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
@@ -367,6 +366,7 @@ pub(crate) fn start_qq_if_configured(
                                 "qq",
                                 &sender_id,
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("qq", &sender_id, is_group),
                             )
                             .await
                             {
@@ -381,6 +381,7 @@ pub(crate) fn start_qq_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("qq", &sender_id, is_group),
                                 session_key,
                                 text,
                                 channel: "qq".to_string(),

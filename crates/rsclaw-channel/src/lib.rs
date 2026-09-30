@@ -47,7 +47,6 @@ pub mod signal;
 pub mod slack;
 pub mod telegram;
 pub mod transcription;
-pub mod tts;
 pub mod wechat;
 pub mod wecom;
 pub mod whatsapp;
@@ -120,8 +119,11 @@ pub trait Channel: Send + Sync {
 // DmPolicy enforcer
 // ---------------------------------------------------------------------------
 
-/// Maximum number of pending pairing requests per channel.
-const MAX_PENDING_PAIRINGS: usize = 3;
+/// Maximum number of pending pairing requests per channel. Each peer holds at
+/// most one pending code (repeat requests reuse it) and codes expire after
+/// [`PAIRING_TTL`], so a handful of strangers can no longer lock everyone else
+/// out of pairing.
+const MAX_PENDING_PAIRINGS: usize = 50;
 /// How long a pairing code is valid.
 const PAIRING_TTL: Duration = Duration::from_secs(3600);
 
@@ -324,6 +326,20 @@ impl DmPolicyEnforcer {
         }
     }
 
+    /// Side-effect-free variant of [`Self::check`]: `true` only when the peer
+    /// would be `Allow`ed right now. Never creates pairing codes. Used by
+    /// channels to skip expensive media downloads for unauthorised senders.
+    pub async fn is_allowed(&self, peer_id: &str) -> bool {
+        match &self.policy {
+            DmPolicy::Disabled => false,
+            DmPolicy::Open => true,
+            DmPolicy::Allowlist => {
+                self.allow_from.contains(peer_id) || self.allow_from.contains("*")
+            }
+            DmPolicy::Pairing => self.pairing.lock().await.is_approved(peer_id),
+        }
+    }
+
     /// Approve a pairing code, returning the peer_id if the code was valid.
     pub async fn approve_pairing(&self, code: &str) -> Option<String> {
         let peer = self.pairing.lock().await.approve(code);
@@ -362,6 +378,153 @@ impl DmPolicyEnforcer {
     pub fn channel_name(&self) -> &str {
         &self.channel_name
     }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound hardening helpers — shared by all channels
+// ---------------------------------------------------------------------------
+
+/// Cheap policy pre-check a channel runs BEFORE downloading / transcribing
+/// inbound media: `(sender_id, chat_id, is_group) -> allowed`. Must be free
+/// of side effects (no pairing codes); the authoritative check still runs in
+/// the gateway on the dispatched message.
+pub type MediaGate =
+    Arc<dyn Fn(String, String, bool) -> BoxFuture<'static, bool> + Send + Sync>;
+
+/// Placeholder text dispatched instead of media from a sender the
+/// [`MediaGate`] rejected, so the gateway still runs its policy flow (e.g.
+/// replies with a pairing code) without the media ever being fetched.
+pub const GATED_MEDIA_PLACEHOLDER: &str = "[attachment]";
+
+/// Upper bound for any inbound media / attachment download (bytes).
+pub const MAX_INBOUND_MEDIA_BYTES: usize = 50 * 1024 * 1024;
+
+/// Read an inbound media response body, failing once it exceeds
+/// [`MAX_INBOUND_MEDIA_BYTES`].
+pub async fn read_media_body(resp: reqwest::Response) -> Result<Vec<u8>> {
+    rsclaw_util::net::read_body_limited(resp, MAX_INBOUND_MEDIA_BYTES).await
+}
+
+/// How long an inbound platform message id is remembered for dedup.
+const INBOUND_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
+/// Maximum number of remembered inbound message ids (all channels combined).
+const INBOUND_DEDUP_CAP: usize = 20_000;
+
+/// Time- and size-bounded dedup set for inbound platform message ids.
+///
+/// Unlike a `HashSet` that is `clear()`ed when full, entries age out one by
+/// one (oldest first), so a redelivery that arrives right after a purge is
+/// still recognised.
+#[derive(Debug)]
+pub struct InboundDedup {
+    ttl: Duration,
+    cap: usize,
+    inner: std::sync::Mutex<DedupInner>,
+}
+
+#[derive(Debug, Default)]
+struct DedupInner {
+    seen: HashMap<String, Instant>,
+    order: std::collections::VecDeque<(String, Instant)>,
+}
+
+impl InboundDedup {
+    /// Create a dedup set remembering ids for `ttl`, holding at most `cap`.
+    pub fn new(ttl: Duration, cap: usize) -> Self {
+        Self {
+            ttl,
+            cap: cap.max(1),
+            inner: std::sync::Mutex::new(DedupInner::default()),
+        }
+    }
+
+    /// Record `id`; returns `true` when it was NOT seen within the TTL (i.e.
+    /// the message should be processed) and `false` for a duplicate.
+    /// Empty ids are never treated as duplicates.
+    pub fn first_seen(&self, id: &str) -> bool {
+        if id.is_empty() {
+            return true;
+        }
+        let now = Instant::now();
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Evict expired / overflow entries from the front (oldest first).
+        while let Some((front_id, ts)) = inner.order.front().cloned() {
+            if now.duration_since(ts) < self.ttl && inner.order.len() < self.cap {
+                break;
+            }
+            inner.order.pop_front();
+            if inner.seen.get(&front_id) == Some(&ts) {
+                inner.seen.remove(&front_id);
+            }
+        }
+        if let Some(ts) = inner.seen.get(id)
+            && now.duration_since(*ts) < self.ttl
+        {
+            return false;
+        }
+        inner.seen.insert(id.to_owned(), now);
+        inner.order.push_back((id.to_owned(), now));
+        true
+    }
+}
+
+static INBOUND_DEDUP: std::sync::LazyLock<InboundDedup> =
+    std::sync::LazyLock::new(|| InboundDedup::new(INBOUND_DEDUP_TTL, INBOUND_DEDUP_CAP));
+
+/// Process-wide inbound dedup keyed by `(channel, platform message id)`.
+/// Returns `true` when the message is a redelivery that must be dropped.
+pub fn is_duplicate_inbound(channel: &str, message_id: &str) -> bool {
+    if message_id.is_empty() {
+        return false;
+    }
+    !INBOUND_DEDUP.first_seen(&format!("{channel}:{message_id}"))
+}
+
+/// In-band control markers the gateway/agent interpret specially. They are
+/// produced by channel code only; user-typed copies must be removed so a
+/// sender cannot forge them.
+const INBOUND_SENTINELS: &[&str] = &["__DIRECT_REPLY__", "[__VOICE_INPUT__]"];
+
+/// Strip in-band control sentinels from user-supplied inbound text.
+pub fn strip_inbound_sentinels(text: &str) -> String {
+    let mut out = text.to_owned();
+    for s in INBOUND_SENTINELS {
+        if out.contains(s) {
+            out = out.replace(s, "");
+        }
+    }
+    out
+}
+
+/// Constant-time byte comparison for webhook signature checks.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Compute `HMAC-SHA256(key, data)`.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    // HMAC accepts keys of any length, so construction cannot fail.
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Lower-case hex SHA-256 digest of the concatenation of `parts`.
+pub fn sha256_hex(parts: &[&[u8]]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    for p in parts {
+        hasher.update(p);
+    }
+    hex::encode(hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +1119,26 @@ mod tests {
             enforcer.check("overflow_user").await,
             PolicyResult::PairingQueueFull
         );
+    }
+
+    #[test]
+    fn inbound_dedup_detects_redelivery() {
+        let d = InboundDedup::new(Duration::from_secs(60), 2);
+        assert!(d.first_seen("a"));
+        assert!(!d.first_seen("a"));
+        assert!(d.first_seen("b"));
+        // Capacity 2: inserting "c" evicts "a" (oldest), never clears "b".
+        assert!(d.first_seen("c"));
+        assert!(!d.first_seen("c"));
+        assert!(d.first_seen(""));
+        assert!(d.first_seen(""));
+    }
+
+    #[test]
+    fn strip_sentinels_removes_forged_markers() {
+        assert_eq!(strip_inbound_sentinels("__DIRECT_REPLY__hi"), "hi");
+        assert_eq!(strip_inbound_sentinels("[__VOICE_INPUT__]\nx"), "\nx");
+        assert_eq!(strip_inbound_sentinels("plain"), "plain");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     super::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},
-    default_dm_scope,
+    bare_account_name, default_dm_scope, group_message_allowed, register_outbound_sender,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
 
@@ -58,17 +58,29 @@ pub(crate) fn start_line_if_configured(
         enforcers.insert("line".to_owned(), Arc::clone(&enforcer));
     }
 
-    // Collect (account_name, access_token) pairs from
-    // accounts.<name>.channelAccessToken.
-    let mut line_accounts: Vec<(String, String)> = Vec::new();
+    // Top-level channelSecret (per-account `channelSecret` overrides it).
+    let top_secret = line_cfg
+        .channel_secret
+        .as_ref()
+        .and_then(|s| s.resolve_full(config.ops.secrets.as_ref()));
+
+    // Collect (account_name, access_token, channel_secret) from
+    // accounts.<name>.{channelAccessToken, channelSecret}.
+    let mut line_accounts: Vec<(String, String, Option<String>)> = Vec::new();
     if let Some(accts) = &line_cfg.accounts {
         for (name, acct) in accts {
             let t = acct
                 .get("channelAccessToken")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let secret = acct
+                .get("channelSecret")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(rsclaw_config::loader::expand_env_vars)
+                .or_else(|| top_secret.clone());
             if !t.is_empty() {
-                line_accounts.push((name.clone(), t.to_owned()));
+                line_accounts.push((name.clone(), t.to_owned(), secret));
             }
         }
     }
@@ -77,8 +89,9 @@ pub(crate) fn start_line_if_configured(
         warn!("line.channelAccessToken not set in accounts, channel disabled");
         return;
     }
+    let bare_acct = bare_account_name(line_accounts.iter().map(|(n, _, _)| n));
 
-    for (acct_name, channel_access_token) in line_accounts {
+    for (acct_name, channel_access_token, channel_secret) in line_accounts {
         let acct_for_log = acct_name.clone();
         let w_acct_outer = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
@@ -87,22 +100,21 @@ pub(crate) fn start_line_if_configured(
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register LINE channel sender for notification routing.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("line/{}", acct_name), out_tx.clone());
-            senders
-                .entry("line".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        register_outbound_sender(
+            &channel_senders,
+            "line",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
         let tq = Arc::clone(&task_queue);
 
-        // Per-user inbound queue for LINE.
+        // Per-user inbound queue for LINE: (text, sender, chat_id, is_group, images).
         type LineItem = (
+            String,
             String,
             String,
             bool,
@@ -114,6 +126,7 @@ pub(crate) fn start_line_if_configured(
 
         let on_message = Arc::new(
             move |user_id: String,
+                  chat_id: String,
                   text: String,
                   is_group: bool,
                   images: Vec<rsclaw_agent::registry::ImageAttachment>| {
@@ -127,21 +140,11 @@ pub(crate) fn start_line_if_configured(
                 let tq = Arc::clone(&tq);
                 let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
-                    // Group policy check.
-                    if is_group {
-                        match group_policy.as_ref() {
-                            rsclaw_config::schema::GroupPolicy::Disabled => {
-                                warn!("line group message rejected: groupPolicy=disabled");
-                                return;
-                            }
-                            rsclaw_config::schema::GroupPolicy::Allowlist => {
-                                if !group_allow.iter().any(|g| *g == user_id) {
-                                    warn!("line group message rejected: not in groupAllowFrom");
-                                    return;
-                                }
-                            }
-                            rsclaw_config::schema::GroupPolicy::Open => {}
-                        }
+                    // Group policy check (groupAllowFrom lists group/room ids).
+                    if is_group
+                        && !group_message_allowed("line", &group_policy, &group_allow, &chat_id)
+                    {
+                        return;
                     }
                     // DM policy check.
                     if !is_group {
@@ -220,7 +223,8 @@ pub(crate) fn start_line_if_configured(
                             let w_tq = Arc::clone(&tq);
                             let w_acct = w_acct_outer.clone();
                             tokio::spawn(async move {
-                                while let Some((text, user_id, is_group, images)) = urx.recv().await
+                                while let Some((text, user_id, chat_id, is_group, images)) =
+                                    urx.recv().await
                                 {
                                     // No debounce — task queue merge_into_pending
                                     // handles rapid consecutive messages automatically.
@@ -239,7 +243,7 @@ pub(crate) fn start_line_if_configured(
                                         agent_id: handle.id.clone(),
                                         kind: if is_group {
                                             MessageKind::GroupMessage {
-                                                group_id: user_id.clone(),
+                                                group_id: chat_id.clone(),
                                                 thread_id: None,
                                             }
                                         } else {
@@ -255,7 +259,7 @@ pub(crate) fn start_line_if_configured(
                                         text,
                                         sender: user_id.clone(),
                                         channel: "line".to_string(),
-                                        chat_id: String::new(),
+                                        chat_id: chat_id.clone(),
                                         is_group,
                                         reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
@@ -284,7 +288,7 @@ pub(crate) fn start_line_if_configured(
                         let tx = tx.clone();
                         let cfg = Arc::clone(&cfg);
                         let question = text[5..].to_owned();
-                        let user_id = user_id.clone();
+                        let reply_target = chat_id.clone();
                         let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
                             let handle = match reg
@@ -304,8 +308,8 @@ pub(crate) fn start_line_if_configured(
                             {
                                 if let Err(e) = tx
                                     .send(OutboundMessage {
-                                        target_id: user_id,
-                                        is_group: false,
+                                        target_id: reply_target,
+                                        is_group,
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
@@ -328,6 +332,7 @@ pub(crate) fn start_line_if_configured(
                         let tx = tx.clone();
                         let cfg = Arc::clone(&cfg);
                         let user_id = user_id.clone();
+                        let chat_id = chat_id.clone();
                         let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
                             let handle = match reg
@@ -342,7 +347,7 @@ pub(crate) fn start_line_if_configured(
                                 agent_id: handle.id.clone(),
                                 kind: if is_group {
                                     MessageKind::GroupMessage {
-                                        group_id: user_id.clone(),
+                                        group_id: chat_id.clone(),
                                         thread_id: None,
                                     }
                                 } else {
@@ -360,10 +365,11 @@ pub(crate) fn start_line_if_configured(
                                 "line",
                                 &user_id,
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("line", &user_id, is_group),
                             )
                             .await
                             {
-                                reply.target_id = user_id.clone();
+                                reply.target_id = chat_id.clone();
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
                                     if let Err(e) = tx.send(reply).await {
@@ -374,11 +380,12 @@ pub(crate) fn start_line_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("line", &user_id, is_group),
                                 session_key,
                                 text,
                                 channel: "line".to_string(),
                                 peer_id: user_id.clone(),
-                                chat_id: String::new(),
+                                chat_id: chat_id.clone(),
                                 reply_tx,
                                 task_id: None,
                                 context_id: None,
@@ -400,7 +407,7 @@ pub(crate) fn start_line_if_configured(
                                     if !r.is_empty {
                                         if let Err(e) = tx
                                             .send(OutboundMessage {
-                                                target_id: user_id,
+                                                target_id: chat_id.clone(),
                                                 is_group,
                                                 text: r.text,
                                                 reply_to: None,
@@ -419,7 +426,7 @@ pub(crate) fn start_line_if_configured(
                                     warn!("line: chat-mode agent reply error");
                                     let _ = tx
                                         .send(OutboundMessage {
-                                            target_id: user_id.clone(),
+                                            target_id: chat_id.clone(),
                                             is_group,
                                             text: rsclaw_i18n::t(
                                                 "chat_reply_error",
@@ -437,7 +444,7 @@ pub(crate) fn start_line_if_configured(
                                     warn!("line: chat-mode agent reply timed out");
                                     let _ = tx
                                         .send(OutboundMessage {
-                                            target_id: user_id.clone(),
+                                            target_id: chat_id.clone(),
                                             is_group,
                                             text: rsclaw_i18n::t(
                                                 "chat_reply_timeout",
@@ -455,19 +462,27 @@ pub(crate) fn start_line_if_configured(
                         });
                         return;
                     }
-                    if let Err(e) = user_tx.try_send((text, user_id.clone(), is_group, images)) {
+                    if let Err(e) =
+                        user_tx.try_send((text, user_id.clone(), chat_id, is_group, images))
+                    {
                         warn!(user = %user_id, error = %e, "line: user queue full, dropping message");
                     }
                 });
             },
         );
 
-        let line = Arc::new(LineChannel::with_api_base(
-            channel_access_token,
-            line_cfg.api_base.clone(),
-            on_message,
-        ));
-        if line_slot.set(Arc::clone(&line)).is_err() {
+        let line = Arc::new(
+            LineChannel::with_api_base(channel_access_token, line_cfg.api_base.clone(), on_message)
+                .with_channel_secret(channel_secret),
+        );
+        // The inbound webhook is only exposed when LINE signatures can be
+        // verified; without a channelSecret anyone could forge events.
+        if !line.has_channel_secret() {
+            error!(
+                account = %acct_for_log,
+                "line: channelSecret not configured — inbound webhook /hooks/line DISABLED (outbound only)"
+            );
+        } else if line_slot.set(Arc::clone(&line)).is_err() {
             tracing::debug!("slot already set, skipping");
         }
         let line_send = Arc::clone(&line);

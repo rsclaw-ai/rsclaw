@@ -73,6 +73,7 @@ pub(crate) fn start_telegram_if_configured(
         enforcers.insert("telegram".to_owned(), Arc::clone(&enforcer));
     }
 
+    let bare_acct = super::bare_account_name(tg_accounts.iter().map(|(n, _)| n));
     for (acct_name, token) in tg_accounts {
         // Skip if this account is already running (idempotent for hot-reload).
         if manager.contains(&format!("telegram/{}", acct_name)) {
@@ -95,6 +96,7 @@ pub(crate) fn start_telegram_if_configured(
         let acct_for_log = acct_name.clone();
         let w_acct_outer = acct_name.clone();
         let bound = bound_agent.clone();
+        let enforcer_for_gate = Arc::clone(&enforcer);
         let enforcer = Arc::clone(&enforcer);
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
@@ -102,15 +104,13 @@ pub(crate) fn start_telegram_if_configured(
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register Telegram channel sender for notification routing.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("telegram/{}", acct_name), out_tx.clone());
-            senders
-                .entry("telegram".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        super::register_outbound_sender(
+            &channel_senders,
+            "telegram",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         // Per-user inbound queue: serializes messages so each user's messages
         // are processed one at a time, preventing reply channel drops.
@@ -453,6 +453,7 @@ pub(crate) fn start_telegram_if_configured(
                                 "telegram",
                                 &peer_id_s,
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("telegram", &peer_id_s, is_group),
                             )
                             .await
                             {
@@ -467,6 +468,7 @@ pub(crate) fn start_telegram_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("telegram", &peer_id_s, is_group),
                                 session_key,
                                 text,
                                 channel: "telegram".to_string(),
@@ -564,7 +566,13 @@ pub(crate) fn start_telegram_if_configured(
         );
 
         let api_base = tg_cfg.api_base.clone();
-        let tg = Arc::new(TelegramChannel::new(token, api_base, on_message));
+        let tg = Arc::new(TelegramChannel::new(token, api_base, on_message).with_media_gate(
+            super::build_media_gate(
+                Arc::clone(&enforcer_for_gate),
+                group_policy.clone(),
+                Arc::new(group_allow_from.clone()),
+            ),
+        ));
         let tg_send = Arc::clone(&tg);
         let shutdown_for_out = shutdown.clone();
         let chan_name = format!("telegram/{}", acct_for_log);

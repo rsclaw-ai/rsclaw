@@ -82,6 +82,7 @@ pub(crate) fn start_dingtalk_if_configured(
         enforcers.insert("dingtalk".to_owned(), Arc::clone(&enforcer));
     }
 
+    let bare_acct = super::bare_account_name(dt_accounts.iter().map(|(n, _, _, _)| n));
     for (acct_name, app_key, app_secret, robot_code) in dt_accounts {
         let reg = Arc::clone(&registry);
         let cfg = config.clone();
@@ -94,15 +95,13 @@ pub(crate) fn start_dingtalk_if_configured(
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register DingTalk channel sender for notification routing.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("dingtalk/{}", acct_name), out_tx.clone());
-            senders
-                .entry("dingtalk".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        super::register_outbound_sender(
+            &channel_senders,
+            "dingtalk",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         // Find binding for this account to determine which agent handles it.
         let bound_agent = config
@@ -415,6 +414,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                 "dingtalk",
                                 &sender_id,
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("dingtalk", &sender_id, is_group),
                             )
                             .await
                             {
@@ -433,6 +433,7 @@ pub(crate) fn start_dingtalk_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("dingtalk", &sender_id, is_group),
                                 session_key,
                                 text,
                                 channel: "dingtalk".to_string(),

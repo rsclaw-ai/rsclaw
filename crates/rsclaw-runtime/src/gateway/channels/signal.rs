@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     super::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},
-    default_dm_scope,
+    bare_account_name, default_dm_scope, group_message_allowed, register_outbound_sender,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
 
@@ -132,6 +132,7 @@ pub(crate) fn start_signal_if_configured(
         return;
     }
     let sig_cli_path = sig_cfg.cli_path.clone();
+    let bare_acct = bare_account_name(sig_accounts.iter().map(|(n, _)| n));
 
     for (acct_name, phone) in sig_accounts {
         let acct_for_log = acct_name.clone();
@@ -147,27 +148,25 @@ pub(crate) fn start_signal_if_configured(
         // - bare "signal" registered only by the first account so legacy callers still
         //   find a sender. Without first-wins guarding, each account would overwrite
         //   the bare key and replies route via the wrong principal.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("signal/{}", acct_name), out_tx.clone());
-            senders
-                .entry("signal".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        register_outbound_sender(
+            &channel_senders,
+            "signal",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
         let tq = Arc::clone(&task_queue);
 
-        // Per-user inbound queue for Signal.
-        type SigItem = (String, String, bool);
+        // Per-user inbound queue for Signal: (text, sender, chat_id, is_group).
+        type SigItem = (String, String, String, bool);
         let sig_user_queues: Arc<
             tokio::sync::Mutex<std::collections::HashMap<String, mpsc::Sender<SigItem>>>,
         > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-        let on_message = Arc::new(move |sender: String, text: String, is_group: bool| {
+        let on_message = Arc::new(move |sender: String, chat_id: String, text: String, is_group: bool| {
             let reg = Arc::clone(&reg);
             let cfg = Arc::clone(&cfg_arc);
             let tx = out_tx.clone();
@@ -178,21 +177,11 @@ pub(crate) fn start_signal_if_configured(
             let tq = Arc::clone(&tq);
             let sig_acct = sig_acct_outer.clone();
             tokio::spawn(async move {
-                // Group policy check.
-                if is_group {
-                    match group_policy.as_ref() {
-                        rsclaw_config::schema::GroupPolicy::Disabled => {
-                            warn!("signal group message rejected: groupPolicy=disabled");
-                            return;
-                        }
-                        rsclaw_config::schema::GroupPolicy::Allowlist => {
-                            if !group_allow.iter().any(|g| *g == sender) {
-                                warn!("signal group message rejected: not in groupAllowFrom");
-                                return;
-                            }
-                        }
-                        rsclaw_config::schema::GroupPolicy::Open => {}
-                    }
+                // Group policy check (groupAllowFrom lists group ids).
+                if is_group
+                    && !group_message_allowed("signal", &group_policy, &group_allow, &chat_id)
+                {
+                    return;
                 }
                 // DM policy check.
                 if !is_group {
@@ -271,7 +260,7 @@ pub(crate) fn start_signal_if_configured(
                         let w_tq = Arc::clone(&tq);
                         let w_acct = sig_acct.clone();
                         tokio::spawn(async move {
-                            while let Some((text, sender, is_group)) = urx.recv().await {
+                            while let Some((text, sender, chat_id, is_group)) = urx.recv().await {
                                 // No debounce — task queue merge_into_pending
                                 // handles rapid consecutive messages automatically.
                                 let handle = match w_reg
@@ -290,7 +279,7 @@ pub(crate) fn start_signal_if_configured(
                                     agent_id: handle.id.clone(),
                                     kind: if is_group {
                                         MessageKind::GroupMessage {
-                                            group_id: sender.clone(),
+                                            group_id: chat_id.clone(),
                                             thread_id: None,
                                         }
                                     } else {
@@ -306,7 +295,7 @@ pub(crate) fn start_signal_if_configured(
                                     text,
                                     sender: sender.clone(),
                                     channel: "signal".to_string(),
-                                    chat_id: String::new(),
+                                    chat_id: chat_id.clone(),
                                     is_group,
                                     reply_to: None,
                                     timestamp: chrono::Utc::now().timestamp(),
@@ -335,7 +324,7 @@ pub(crate) fn start_signal_if_configured(
                     let tx = tx.clone();
                     let cfg = Arc::clone(&cfg);
                     let question = text[5..].to_owned();
-                    let sender = sender.clone();
+                    let reply_target = chat_id.clone();
                     let sig_acct = sig_acct.clone();
                     tokio::spawn(async move {
                         let handle = match reg
@@ -352,8 +341,8 @@ pub(crate) fn start_signal_if_configured(
                         {
                             if let Err(e) = tx
                                 .send(OutboundMessage {
-                                    target_id: sender,
-                                    is_group: false,
+                                    target_id: reply_target,
+                                    is_group,
                                     text: format!("[/btw] {}", reply_text),
                                     reply_to: None,
                                     images: vec![],
@@ -376,6 +365,7 @@ pub(crate) fn start_signal_if_configured(
                     let tx = tx.clone();
                     let cfg = Arc::clone(&cfg);
                     let sender = sender.clone();
+                    let chat_id = chat_id.clone();
                     let sig_acct = sig_acct.clone();
                     tokio::spawn(async move {
                         let handle = match reg
@@ -391,7 +381,7 @@ pub(crate) fn start_signal_if_configured(
                             agent_id: handle.id.clone(),
                             kind: if is_group {
                                 MessageKind::GroupMessage {
-                                    group_id: sender.clone(),
+                                    group_id: chat_id.clone(),
                                     thread_id: None,
                                 }
                             } else {
@@ -409,10 +399,11 @@ pub(crate) fn start_signal_if_configured(
                             "signal",
                             &sender,
                             crate::gateway::preparse::PreparseOrigin::User,
+                            rsclaw_agent::trust::channel_trust("signal", &sender, is_group),
                         )
                         .await
                         {
-                            reply.target_id = sender.clone();
+                            reply.target_id = chat_id.clone();
                             reply.is_group = is_group;
                             if !reply.text.is_empty() || !reply.images.is_empty() {
                                 if let Err(e) = tx.send(reply).await {
@@ -423,11 +414,12 @@ pub(crate) fn start_signal_if_configured(
                         }
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                         let msg = AgentMessage {
+                            trust: rsclaw_agent::trust::channel_trust("signal", &sender, is_group),
                             session_key,
                             text,
                             channel: "signal".to_string(),
                             peer_id: sender.clone(),
-                            chat_id: String::new(),
+                            chat_id: chat_id.clone(),
                             reply_tx,
                             task_id: None,
                             context_id: None,
@@ -449,7 +441,7 @@ pub(crate) fn start_signal_if_configured(
                                 if !r.is_empty {
                                     if let Err(e) = tx
                                         .send(OutboundMessage {
-                                            target_id: sender,
+                                            target_id: chat_id.clone(),
                                             is_group,
                                             text: r.text,
                                             reply_to: None,
@@ -468,7 +460,7 @@ pub(crate) fn start_signal_if_configured(
                                 warn!("signal: chat-mode agent reply error");
                                 let _ = tx
                                     .send(OutboundMessage {
-                                        target_id: sender.clone(),
+                                        target_id: chat_id.clone(),
                                         is_group,
                                         text: rsclaw_i18n::t(
                                             "chat_reply_error",
@@ -486,7 +478,7 @@ pub(crate) fn start_signal_if_configured(
                                 warn!("signal: chat-mode agent reply timed out");
                                 let _ = tx
                                     .send(OutboundMessage {
-                                        target_id: sender.clone(),
+                                        target_id: chat_id.clone(),
                                         is_group,
                                         text: rsclaw_i18n::t(
                                             "chat_reply_timeout",
@@ -504,7 +496,7 @@ pub(crate) fn start_signal_if_configured(
                     });
                     return;
                 }
-                if let Err(e) = user_tx.try_send((text, sender.clone(), is_group)) {
+                if let Err(e) = user_tx.try_send((text, sender.clone(), chat_id, is_group)) {
                     warn!(user = %sender, error = %e, "signal: user queue full, dropping message");
                 }
             });

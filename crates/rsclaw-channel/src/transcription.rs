@@ -104,12 +104,20 @@ pub async fn transcribe_audio(
 }
 
 /// Download a file from a URL and return the bytes.
-pub async fn download_file(client: &Client, url: &str) -> Result<Vec<u8>> {
-    let resp = client.get(url).send().await?;
+///
+/// The URL usually comes from an inbound platform payload, so the fetch is
+/// SSRF-safe (public addresses only, DNS pinned, redirects re-validated per
+/// hop) and the body is capped at [`crate::MAX_INBOUND_MEDIA_BYTES`]. The
+/// `client` argument is kept for call-site compatibility; the request runs on
+/// a pinned per-hop client built from the proxy-aware base builder.
+pub async fn download_file(_client: &Client, url: &str) -> Result<Vec<u8>> {
+    let mut req = rsclaw_util::net::SafeRequest::get(url);
+    req.timeout = std::time::Duration::from_secs(120);
+    let resp = rsclaw_util::net::safe_send(rsclaw_config::build_proxy_client, req).await?;
     if !resp.status().is_success() {
         anyhow::bail!("download failed: {}", resp.status());
     }
-    Ok(resp.bytes().await?.to_vec())
+    crate::read_media_body(resp).await
 }
 
 /// Resolve OpenAI API key from environment variable.

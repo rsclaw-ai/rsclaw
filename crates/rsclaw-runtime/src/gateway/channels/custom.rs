@@ -42,6 +42,16 @@ pub(crate) fn start_custom_channels(
         }
 
         let ch_name = ch_cfg.name.clone();
+        // A custom channel named like a local entry point ("ws", "cli", ...)
+        // would inherit owner trust. Startup filters these already; this
+        // also covers the hot-reload path.
+        if rsclaw_agent::trust::is_local_channel(&ch_name) {
+            warn!(
+                channel = %ch_name,
+                "custom channel uses a reserved local channel name; refusing to start it"
+            );
+            continue;
+        }
 
         match ch_cfg.channel_type.as_str() {
             "webhook" => {
@@ -108,6 +118,17 @@ fn start_custom_webhook(
     let enforcer = Arc::new(
         DmPolicyEnforcer::new(dm_policy, allow_from).with_persistence(&ch_name, redb_store),
     );
+    // Group policy: `is_group` comes from the inbound payload, so group
+    // messages must pass groupPolicy / groupAllowFrom (by chat id) too.
+    let group_policy = Arc::new(
+        ch_cfg
+            .base
+            .group_policy
+            .clone()
+            .unwrap_or(rsclaw_config::schema::GroupPolicy::Allowlist),
+    );
+    let group_allow: Arc<Vec<String>> =
+        Arc::new(ch_cfg.base.group_allow_from.clone().unwrap_or_default());
 
     let reg = Arc::clone(&registry);
     let cfg_arc = Arc::new(config.clone());
@@ -134,6 +155,8 @@ fn start_custom_webhook(
             let tx = out_tx.clone();
             let ch_name = ch_name_cb.clone();
             let enforcer = Arc::clone(&enforcer);
+            let group_policy = Arc::clone(&group_policy);
+            let group_allow = Arc::clone(&group_allow);
             // Where agent replies go: groups → group chat, DMs → speaker.
             let reply_target = if is_group {
                 chat_id.clone()
@@ -141,8 +164,12 @@ fn start_custom_webhook(
                 sender.clone()
             };
             tokio::spawn(async move {
-                // DM policy check (skip for groups — group_allow_from would
-                // belong here once the schema exposes it for custom channels).
+                if is_group
+                    && !super::group_message_allowed(&ch_name, &group_policy, &group_allow, &chat_id)
+                {
+                    return;
+                }
+                // DM policy check.
                 if !is_group {
                     match enforcer.check(&sender).await {
                         PolicyResult::Allow => {}
@@ -268,6 +295,7 @@ fn start_custom_webhook(
                             &ch_name,
                             &sender,
                             crate::gateway::preparse::PreparseOrigin::User,
+                            rsclaw_agent::trust::channel_trust(&ch_name, &sender, is_group),
                         )
                         .await
                         {
@@ -282,6 +310,7 @@ fn start_custom_webhook(
                         }
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                         let msg = AgentMessage {
+                            trust: rsclaw_agent::trust::channel_trust(&ch_name, &sender, is_group),
                             session_key,
                             text,
                             channel: ch_name.clone(),
@@ -389,6 +418,7 @@ fn start_custom_webhook(
                 });
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let msg = AgentMessage {
+                    trust: rsclaw_agent::trust::channel_trust(&ch_name, &sender, is_group),
                     session_key,
                     text,
                     channel: ch_name.clone(),
@@ -561,6 +591,17 @@ fn start_custom_websocket(
     let enforcer = Arc::new(
         DmPolicyEnforcer::new(dm_policy, allow_from).with_persistence(&ch_name, redb_store),
     );
+    // Group policy: `is_group` comes from the inbound payload, so group
+    // messages must pass groupPolicy / groupAllowFrom (by chat id) too.
+    let group_policy = Arc::new(
+        ch_cfg
+            .base
+            .group_policy
+            .clone()
+            .unwrap_or(rsclaw_config::schema::GroupPolicy::Allowlist),
+    );
+    let group_allow: Arc<Vec<String>> =
+        Arc::new(ch_cfg.base.group_allow_from.clone().unwrap_or_default());
 
     let reg = Arc::clone(&registry);
     let cfg_arc = Arc::new(config.clone());
@@ -587,12 +628,19 @@ fn start_custom_websocket(
             let tx = out_tx.clone();
             let ch_name = ch_name_cb.clone();
             let enforcer = Arc::clone(&enforcer);
+            let group_policy = Arc::clone(&group_policy);
+            let group_allow = Arc::clone(&group_allow);
             let reply_target = if is_group {
                 chat_id.clone()
             } else {
                 sender.clone()
             };
             tokio::spawn(async move {
+                if is_group
+                    && !super::group_message_allowed(&ch_name, &group_policy, &group_allow, &chat_id)
+                {
+                    return;
+                }
                 if !is_group {
                     match enforcer.check(&sender).await {
                         PolicyResult::Allow => {}
@@ -718,6 +766,7 @@ fn start_custom_websocket(
                             &ch_name,
                             &sender,
                             crate::gateway::preparse::PreparseOrigin::User,
+                            rsclaw_agent::trust::channel_trust(&ch_name, &sender, is_group),
                         )
                         .await
                         {
@@ -732,6 +781,7 @@ fn start_custom_websocket(
                         }
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                         let msg = AgentMessage {
+                            trust: rsclaw_agent::trust::channel_trust(&ch_name, &sender, is_group),
                             session_key,
                             text,
                             channel: ch_name.clone(),
@@ -839,6 +889,7 @@ fn start_custom_websocket(
                 });
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let msg = AgentMessage {
+                    trust: rsclaw_agent::trust::channel_trust(&ch_name, &sender, is_group),
                     session_key,
                     text,
                     channel: ch_name.clone(),
