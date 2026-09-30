@@ -16,8 +16,24 @@ import { useDebouncedCallback } from "use-debounce";
 import { showImageModal, FullScreen } from "./ui-lib";
 // Artifacts removed - stub types
 type HTMLPreviewHandler = { reload: () => void };
+// SECURITY: model output is untrusted. `sandbox="allow-scripts"` WITHOUT
+// `allow-same-origin` gives the frame an opaque origin, so scripts inside it
+// cannot reach `parent.__TAURI__` / `__TAURI_INTERNALS__` (Tauri IPC) or the
+// app's storage. Never add allow-same-origin / allow-top-navigation here.
 const HTMLPreview = React.forwardRef<HTMLPreviewHandler, any>((props, ref) => {
-  return <iframe srcDoc={props.code} style={{ width: "100%", height: props.height || 600, border: "none" }} />;
+  const [nonce, setNonce] = useState(0);
+  React.useImperativeHandle(ref, () => ({
+    reload: () => setNonce((n) => n + 1),
+  }));
+  return (
+    <iframe
+      key={nonce}
+      srcDoc={props.code}
+      sandbox="allow-scripts"
+      referrerPolicy="no-referrer"
+      style={{ width: "100%", height: props.height || 600, border: "none" }}
+    />
+  );
 });
 HTMLPreview.displayName = "HTMLPreview";
 const ArtifactsShareButton = (_props: any) => null;
@@ -78,6 +94,8 @@ export function PreCode(props: { children: any }) {
   const previewRef = useRef<HTMLPreviewHandler>(null);
   const [mermaidCode, setMermaidCode] = useState("");
   const [htmlCode, setHtmlCode] = useState("");
+  // HTML preview is opt-in per block: never auto-execute model-authored HTML.
+  const [htmlPreviewOpen, setHtmlPreviewOpen] = useState(false);
   const { height } = useWindowSize();
   const chatStore = useChatStore();
   const session = chatStore.currentSession();
@@ -150,7 +168,14 @@ export function PreCode(props: { children: any }) {
       {mermaidCode.length > 0 && (
         <Mermaid code={mermaidCode} key={mermaidCode} />
       )}
-      {htmlCode.length > 0 && enableArtifacts && (
+      {htmlCode.length > 0 && enableArtifacts && !htmlPreviewOpen && (
+        <IconButton
+          bordered
+          text={`${Locale.Export.Steps.Preview} HTML`}
+          onClick={() => setHtmlPreviewOpen(true)}
+        />
+      )}
+      {htmlCode.length > 0 && enableArtifacts && htmlPreviewOpen && (
         <FullScreen className="no-dark html" right={70}>
           <ArtifactsShareButton
             style={{ position: "absolute", right: 20, top: 10 }}

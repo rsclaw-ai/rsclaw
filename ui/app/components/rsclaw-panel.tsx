@@ -1561,583 +1561,10 @@ const PROVIDERS = [
   { id: "ollama", logo: "Lm", name: "Ollama", desc: "Local model" },
 ];
 
-function getChannelOptions() {
-  const zh = getLang() === "cn";
-  return [
-    { id: "wechat", icon: "W", name: zh ? "微信" : "WeChat", color: "#07c160" },
-    { id: "feishu", icon: "F", name: zh ? "飞书" : "Feishu", color: "#1677ff" },
-    { id: "telegram", icon: "Tg", name: "Telegram", color: "#2ca5e0" },
-    { id: "dingtalk", icon: "DT", name: zh ? "钉钉" : "DingTalk", color: "#3080f0" },
-    { id: "discord", icon: "Dc", name: "Discord", color: "#5865f2" },
-    { id: "slack", icon: "Sl", name: "Slack", color: "#4a154b" },
-    { id: "wecom", icon: "WC", name: zh ? "企业微信" : "WeCom", color: "#07c160" },
-    { id: "matrix", icon: "Mx", name: "Matrix", color: "#000" },
-  ];
-}
-const CHANNEL_OPTIONS = getChannelOptions();
-
 const LANGUAGES = [
   "Chinese", "English", "Japanese", "Korean", "French",
   "German", "Spanish", "Russian", "Arabic", "Portuguese",
 ];
-
-function SetupWizardPage() {
-  const navigate = useNavigate();
-  const [step, setStep] = useState(0); // 0=detect, 1=lang, 2=provider, 3=channels, 4=launch
-  const [selectedLang, setSelectedLang] = useState("Chinese");
-  const [selectedProviders, setSelectedProviders] = useState<string[]>([
-    "anthropic",
-  ]);
-  const [apiKeys, setApiKeys] = useState<Record<string, string>>({});
-  const [selectedChannels, setSelectedChannels] = useState<string[]>([]);
-  const [launching, setLaunching] = useState(false);
-  const [launchChecks, setLaunchChecks] = useState<
-    { label: string; status: string }[]
-  >([]);
-  const [launchDone, setLaunchDone] = useState(false);
-
-  // Step 0: OpenClaw detection
-  const [detecting, setDetecting] = useState(true);
-  const [openclawPath, setOpenclawPath] = useState<string | null>(null);
-  const [migrating, setMigrating] = useState(false);
-  const [migrateDone, setMigrateDone] = useState(false);
-  const [migrateError, setMigrateError] = useState("");
-
-  // Channel credentials
-  const [wechatQrUrl, setWechatQrUrl] = useState("");
-  const [wechatQrToken, setWechatQrToken] = useState("");
-  const [wechatStatus, setWechatStatus] = useState<"idle" | "scanning" | "connected" | "expired">("idle");
-  const [feishuAppId, setFeishuAppId] = useState("");
-  const [feishuAppSecret, setFeishuAppSecret] = useState("");
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-        if (tauriInvoke) {
-          const path = await tauriInvoke("detect_openclaw");
-          setOpenclawPath(path || null);
-        }
-      } catch {}
-      setDetecting(false);
-    })();
-  }, []);
-
-  const handleMigrate = async () => {
-    if (!openclawPath) return;
-    setMigrating(true);
-    setMigrateError("");
-    try {
-      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-      if (tauriInvoke) {
-        await tauriInvoke("migrate_openclaw", { sourcePath: openclawPath });
-      }
-      setMigrateDone(true);
-      toast.success(Locale.RsClawPanel.Wizard.MigrateDone);
-    } catch (e) {
-      setMigrateError((e as Error).message);
-      toast.error(Locale.RsClawPanel.Wizard.MigrateFailed);
-    } finally {
-      setMigrating(false);
-    }
-  };
-
-  const toggleProvider = (id: string) => {
-    setSelectedProviders((prev) =>
-      prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id],
-    );
-  };
-
-  const toggleChannel = (id: string) => {
-    setSelectedChannels((prev) =>
-      prev.includes(id) ? prev.filter((c) => c !== id) : [...prev, id],
-    );
-  };
-
-  // Generate rsclaw.json5 config from wizard selections.
-  const generateConfig = () => {
-    const providers: Record<string, any> = {};
-    for (const p of selectedProviders) {
-      if (p === "ollama") {
-        providers[p] = { api: "ollama", baseUrl: "http://localhost:11434/v1" };
-      } else {
-        providers[p] = apiKeys[p] ? { apiKey: apiKeys[p] } : {};
-      }
-    }
-    const channels: Record<string, any> = {};
-    for (const ch of selectedChannels) {
-      if (ch === "feishu" && feishuAppId) {
-        channels[ch] = { appId: feishuAppId, appSecret: feishuAppSecret };
-      } else {
-        channels[ch] = {};
-      }
-    }
-    const config: any = {
-      gateway: { port: 18888, language: selectedLang },
-      models: { providers },
-      channels,
-      agents: { list: [{ id: "main", default: true }] },
-    };
-    // Pretty-print as JSON (json5 superset of JSON)
-    return JSON.stringify(config, null, 2);
-  };
-
-  const runLaunch = async () => {
-    setLaunching(true);
-    const checks = [
-      { label: Locale.RsClawPanel.Wizard.CheckGateway, status: "loading" },
-      { label: Locale.RsClawPanel.Wizard.CheckHealth, status: "wait" },
-      { label: Locale.RsClawPanel.Wizard.CheckChannel, status: "wait" },
-      { label: Locale.RsClawPanel.Wizard.CheckModel, status: "wait" },
-    ];
-    setLaunchChecks([...checks]);
-
-    try {
-      // Step 1: Write config (merge with existing to preserve auth token)
-      const newConfig = JSON.parse(generateConfig());
-      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-      if (tauriInvoke) {
-        try { await tauriInvoke("run_setup"); } catch {}
-        let existing: any = {};
-        try {
-          const raw: string = await tauriInvoke("read_config_file");
-          existing = JSON5.parse(raw || "{}");
-        } catch {}
-        const merged = { ...newConfig };
-        merged.gateway = { ...(existing.gateway || {}), ...(newConfig.gateway || {}) };
-        if (existing.gateway?.auth) {
-          merged.gateway.auth = existing.gateway.auth;
-        }
-        const allChannels = { ...(newConfig.channels || {}), ...(existing.channels || {}) };
-        for (const [ch, val] of Object.entries(newConfig.channels || {})) {
-          if (allChannels[ch] && Object.keys(val as any).length > 0) {
-            allChannels[ch] = { ...allChannels[ch], ...(val as any) };
-          }
-        }
-        merged.channels = allChannels;
-        await tauriInvoke("write_config", { content: JSON.stringify(merged, null, 2) });
-      } else {
-        await saveConfig({ raw: JSON.stringify(newConfig, null, 2) });
-      }
-      checks[0].status = "ok";
-      checks[1].status = "loading";
-      setLaunchChecks([...checks]);
-
-      // Step 2: Start gateway
-      if (tauriInvoke) {
-        await tauriInvoke("start_gateway");
-      }
-      await new Promise((r) => setTimeout(r, 2000));
-      checks[1].status = "ok";
-      checks[2].status = "loading";
-      setLaunchChecks([...checks]);
-
-      // Step 3: Check health
-      try {
-        await getHealth();
-        checks[2].status = "ok";
-      } catch {
-        checks[2].status = "warn";
-      }
-      checks[3].status = "loading";
-      setLaunchChecks([...checks]);
-
-      // Step 4: Verify model
-      await new Promise((r) => setTimeout(r, 500));
-      checks[3].status = "ok";
-      setLaunchChecks([...checks]);
-      setLaunchDone(true);
-    } catch (e) {
-      // Mark current step as failed
-      const current = checks.findIndex((c) => c.status === "loading");
-      if (current >= 0) checks[current].status = "error";
-      setLaunchChecks([...checks]);
-      toast.fromError("Setup failed", e);
-    } finally {
-      setLaunching(false);
-    }
-  };
-
-  const stepState = (n: number) => {
-    if (n < step) return "done";
-    if (n === step) return "active";
-    return "";
-  };
-
-  return (
-    <div>
-      <div className={styles["page-title"]} style={{ marginBottom: "4px" }}>
-        {Locale.RsClawPanel.Wizard.PageTitle}
-      </div>
-      <div className={styles["page-sub"]} style={{ marginBottom: "20px" }}>
-        {Locale.RsClawPanel.Wizard.PageSub}
-      </div>
-
-      {/* Step indicators */}
-      <div className={styles["wiz-steps"]}>
-        {[0, 1, 2, 3, 4].map((n) => (
-          <div
-            key={n}
-            className={styles["wiz-step"]}
-            style={n === 4 ? { flex: 0 } : undefined}
-          >
-            <div className={`${styles["step-c"]} ${styles[stepState(n)] || ""}`}>
-              {n < step ? "\u2713" : n + 1}
-            </div>
-            {n < 4 && (
-              <div
-                className={`${styles["step-line"]} ${n < step ? styles["done"] : ""}`}
-              />
-            )}
-          </div>
-        ))}
-      </div>
-
-      {/* Step 0: Detect OpenClaw */}
-      {step === 0 && (
-        <div className={styles["wiz-card"]}>
-          <div className={styles["wiz-title"]}>{Locale.RsClawPanel.Wizard.DetectTitle}</div>
-          <div className={styles["wiz-sub"]}>{Locale.RsClawPanel.Wizard.DetectSub}</div>
-
-          {detecting ? (
-            <div className={styles["lcheck"]} style={{ marginBottom: "12px" }}>
-              <div className={styles["lcheck-ico"]}>{"\u23F3"}</div>
-              <div className={styles["lcheck-lbl"]}>{Locale.RsClawPanel.Wizard.DetectChecking}</div>
-            </div>
-          ) : openclawPath ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginBottom: "12px" }}>
-              <div className={styles["det-row"]}>
-                <div className={styles["det-ico"]}>{"\uD83D\uDD04"}</div>
-                <div>
-                  <div className={styles["det-lbl"]}>{Locale.RsClawPanel.Wizard.DetectFound}</div>
-                  <div className={styles["det-sub"]}>{openclawPath}</div>
-                </div>
-              </div>
-              {migrateDone ? (
-                <div className={styles["success-box"]}>
-                  <div className={styles["success-box-title"]}>{Locale.RsClawPanel.Wizard.MigrateDone}</div>
-                </div>
-              ) : migrateError ? (
-                <div className={styles["note"] + " " + styles["warn"]}>
-                  {Locale.RsClawPanel.Wizard.MigrateFailed}: {migrateError}
-                </div>
-              ) : null}
-            </div>
-          ) : (
-            <div className={styles["note"] + " " + styles["info"]} style={{ marginBottom: "12px" }}>
-              <span>i</span>
-              <span>{Locale.RsClawPanel.Wizard.DetectNotFound}</span>
-            </div>
-          )}
-
-          <div className={styles["wiz-nav"]}>
-            <span />
-            <div style={{ display: "flex", gap: "8px" }}>
-              {openclawPath && !migrateDone && (
-                <button
-                  className={`${styles["btn"]} ${styles["primary"]}`}
-                  onClick={handleMigrate}
-                  disabled={migrating}
-                >
-                  {migrating ? Locale.RsClawPanel.Wizard.Migrating : Locale.RsClawPanel.Wizard.MigrateBtn}
-                </button>
-              )}
-              <button
-                className={openclawPath && !migrateDone ? styles["btn"] : `${styles["btn"]} ${styles["primary"]}`}
-                onClick={() => setStep(1)}
-              >
-                {openclawPath && !migrateDone
-                  ? Locale.RsClawPanel.Wizard.MigrateSkip
-                  : `${Locale.RsClawPanel.Wizard.Next} \u2192`}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Step 1: Language */}
-      {step === 1 && (
-        <div className={styles["wiz-card"]}>
-          <div className={styles["wiz-title"]}>{Locale.RsClawPanel.Wizard.Step1Title}</div>
-          <div className={styles["wiz-sub"]}>
-            {Locale.RsClawPanel.Wizard.Step1Sub}
-          </div>
-          <div className={styles["provider-grid"]}>
-            {LANGUAGES.map((lang) => (
-              <div
-                key={lang}
-                className={`${styles["prov-card"]} ${
-                  selectedLang === lang ? styles["sel"] : ""
-                }`}
-                onClick={() => setSelectedLang(lang)}
-              >
-                <div className={styles["prov-n"]}>{lang}</div>
-              </div>
-            ))}
-          </div>
-          <div className={styles["wiz-nav"]}>
-            <button className={styles["btn"]} onClick={() => setStep(0)}>
-              &larr; {Locale.RsClawPanel.Wizard.Back}
-            </button>
-            <button
-              className={`${styles["btn"]} ${styles["primary"]}`}
-              onClick={() => setStep(2)}
-            >
-              {Locale.RsClawPanel.Wizard.Next} &rarr;
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Step 2: Provider */}
-      {step === 2 && (
-        <div className={styles["wiz-card"]}>
-          <div className={styles["wiz-title"]}>{Locale.RsClawPanel.Wizard.Step2Title}</div>
-          <div className={styles["wiz-sub"]}>
-            {Locale.RsClawPanel.Wizard.Step2Sub}
-          </div>
-          <div className={styles["provider-grid"]}>
-            {PROVIDERS.map((p) => (
-              <div
-                key={p.id}
-                className={`${styles["prov-card"]} ${
-                  selectedProviders.includes(p.id) ? styles["sel"] : ""
-                }`}
-                onClick={() => toggleProvider(p.id)}
-              >
-                <div className={styles["prov-logo"]}>{p.logo}</div>
-                <div>
-                  <div className={styles["prov-n"]}>{p.name}</div>
-                  <div className={styles["prov-s"]}>{p.desc}</div>
-                </div>
-              </div>
-            ))}
-          </div>
-          {selectedProviders.filter((p) => p !== "ollama").map((p) => (
-            <div
-              key={p}
-              className={styles["cfg-f"]}
-              style={{
-                background: "#27272c",
-                borderRadius: "9px",
-                padding: "12px 13px",
-                border: "1px solid rgba(255,255,255,0.06)",
-                marginBottom: "8px",
-              }}
-            >
-              <div className={styles["cfg-lbl"]}>
-                {p.toUpperCase()} API Key
-              </div>
-              <input
-                type="password"
-                className={styles["cfg-input"]}
-                value={apiKeys[p] || ""}
-                onChange={(e) => setApiKeys({ ...apiKeys, [p]: e.target.value })}
-                placeholder="sk-..."
-              />
-            </div>
-          ))}
-          <div className={styles["wiz-nav"]}>
-            <button className={styles["btn"]} onClick={() => setStep(1)}>
-              &larr; {Locale.RsClawPanel.Wizard.Back}
-            </button>
-            <button
-              className={`${styles["btn"]} ${styles["primary"]}`}
-              onClick={() => setStep(3)}
-            >
-              {Locale.RsClawPanel.Wizard.Next} &rarr;
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Step 3: Channels */}
-      {step === 3 && (
-        <div className={styles["wiz-card"]}>
-          <div className={styles["wiz-title"]}>{Locale.RsClawPanel.Wizard.Step3Title}</div>
-          <div className={styles["wiz-sub"]}>
-            {Locale.RsClawPanel.Wizard.Step3Sub}
-          </div>
-          <div className={styles["ch-grid"]}>
-            {CHANNEL_OPTIONS.map((ch) => (
-              <div
-                key={ch.id}
-                className={`${styles["ch-pick"]} ${
-                  selectedChannels.includes(ch.id) ? styles["sel"] : ""
-                }`}
-                onClick={() => toggleChannel(ch.id)}
-              >
-                <div
-                  className={styles["ch-pick-ico"]}
-                  style={{ color: ch.color }}
-                >
-                  {ch.icon}
-                </div>
-                <div className={styles["ch-pick-n"]}>{ch.name}</div>
-              </div>
-            ))}
-          </div>
-
-          {/* WeChat QR scan */}
-          {selectedChannels.includes("wechat") && (
-            <div className={styles["cfg-f"]} style={{ background: "#27272c", borderRadius: "9px", padding: "12px 13px", border: "1px solid rgba(255,255,255,0.06)", marginBottom: "8px" }}>
-              <div className={styles["cfg-lbl"]}>{getLang() === "cn" ? "微信" : "WeChat"}</div>
-              {wechatStatus === "connected" ? (
-                <div style={{ color: "#3ecf8e", fontSize: "12px" }}>{Locale.RsClawPanel.Wizard.WechatConnected}</div>
-              ) : wechatStatus === "expired" ? (
-                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                  <span style={{ color: "#f06565", fontSize: "12px" }}>{Locale.RsClawPanel.Wizard.WechatExpired}</span>
-                  <button className={styles["btn"]} style={{ fontSize: "11px", padding: "3px 10px" }} onClick={async () => {
-                    try {
-                      const data = await wechatQrStart();
-                      setWechatQrUrl(data.qrcode_url);
-                      setWechatQrToken(data.qrcode_token);
-                      setWechatStatus("scanning");
-                    } catch {}
-                  }}>{Locale.RsClawPanel.Wizard.WechatScanQR}</button>
-                </div>
-              ) : wechatStatus === "scanning" ? (
-                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                  <img src={wechatQrUrl} alt="QR" style={{ width: "180px", height: "180px", borderRadius: "8px", background: "#fff" }} />
-                  <span style={{ color: "#f5a623", fontSize: "11px" }}>{Locale.RsClawPanel.Wizard.WechatScanning}</span>
-                </div>
-              ) : (
-                <button className={styles["btn"]} style={{ marginTop: "6px", width: "100%" }} onClick={async () => {
-                  try {
-                    const data = await wechatQrStart();
-                    setWechatQrUrl(data.qrcode_url);
-                    setWechatQrToken(data.qrcode_token);
-                    setWechatStatus("scanning");
-                    // Start polling
-                    const poll = setInterval(async () => {
-                      try {
-                        const result = await wechatQrStatus(data.qrcode_token);
-                        if (result.status === "ok") {
-                          setWechatStatus("connected");
-                          clearInterval(poll);
-                        }
-                      } catch {
-                        setWechatStatus("expired");
-                        clearInterval(poll);
-                      }
-                    }, 3000);
-                    // Auto-stop after 2 min
-                    setTimeout(() => clearInterval(poll), 120000);
-                  } catch {
-                    toast.error("QR code", "Failed to get QR code");
-                  }
-                }}>{Locale.RsClawPanel.Wizard.WechatScanQR}</button>
-              )}
-            </div>
-          )}
-
-          {/* Feishu credentials */}
-          {selectedChannels.includes("feishu") && (
-            <div className={styles["cfg-f"]} style={{ background: "#27272c", borderRadius: "9px", padding: "12px 13px", border: "1px solid rgba(255,255,255,0.06)", marginBottom: "8px" }}>
-              <div className={styles["cfg-lbl"]}>{Locale.RsClawPanel.Wizard.FeishuAppId}</div>
-              <input className={styles["cfg-input"]} value={feishuAppId} onChange={(e) => setFeishuAppId(e.target.value)} placeholder="cli_xxx" style={{ marginBottom: "8px" }} />
-              <div className={styles["cfg-lbl"]}>{Locale.RsClawPanel.Wizard.FeishuAppSecret}</div>
-              <input className={styles["cfg-input"]} type="password" value={feishuAppSecret} onChange={(e) => setFeishuAppSecret(e.target.value)} placeholder="***" />
-            </div>
-          )}
-
-          <div className={styles["wiz-nav"]}>
-            <button className={styles["btn"]} onClick={() => setStep(2)}>
-              &larr; {Locale.RsClawPanel.Wizard.Back}
-            </button>
-            <button
-              className={`${styles["btn"]} ${styles["primary"]}`}
-              onClick={() => setStep(4)}
-            >
-              {Locale.RsClawPanel.Wizard.Next} &rarr;
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Step 4: Launch */}
-      {step === 4 && (
-        <div className={styles["wiz-card"]}>
-          <div className={styles["wiz-title"]}>{Locale.RsClawPanel.Wizard.Step4Title}</div>
-          <div className={styles["wiz-sub"]}>
-            {Locale.RsClawPanel.Wizard.Step4Sub}
-          </div>
-
-          {/* Summary */}
-          <div className={styles["note"] + " " + styles["info"]}>
-            <span>i</span>
-            <span>
-              {Locale.RsClawPanel.Wizard.Summary(
-                selectedLang,
-                selectedProviders.join(", "),
-                selectedChannels.join(", "),
-              )}
-            </span>
-          </div>
-
-          {launchChecks.length > 0 && (
-            <div className={styles["launch-row"]}>
-              {launchChecks.map((check, i) => (
-                <div key={i} className={styles["lcheck"]}>
-                  <div className={styles["lcheck-ico"]}>
-                    {check.status === "ok"
-                      ? "\u2705"
-                      : check.status === "loading"
-                        ? "\u23F3"
-                        : "\u2B55"}
-                  </div>
-                  <div className={styles["lcheck-lbl"]}>{check.label}</div>
-                  <div
-                    className={`${styles["lcheck-res"]} ${styles[check.status] || ""}`}
-                  >
-                    {check.status === "ok"
-                      ? Locale.RsClawPanel.Wizard.StatusPass
-                      : check.status === "loading"
-                        ? Locale.RsClawPanel.Wizard.StatusChecking
-                        : Locale.RsClawPanel.Wizard.StatusWaiting}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {launchDone && (
-            <div className={styles["success-box"]}>
-              <div className={styles["success-box-title"]}>
-                {Locale.RsClawPanel.Wizard.ReadyTitle}
-              </div>
-              <div className={styles["success-box-body"]}>
-                {Locale.RsClawPanel.Wizard.ReadySub}
-              </div>
-            </div>
-          )}
-
-          <div className={styles["wiz-nav"]}>
-            <button className={styles["btn"]} onClick={() => setStep(3)}>
-              &larr; {Locale.RsClawPanel.Wizard.Back}
-            </button>
-            {launchDone ? (
-              <button
-                className={`${styles["btn"]} ${styles["primary"]}`}
-                onClick={() => navigate(Path.Home)}
-              >
-                {Locale.RsClawPanel.Wizard.StartChatting}
-              </button>
-            ) : (
-              <button
-                className={`${styles["btn"]} ${styles["primary"]}`}
-                onClick={runLaunch}
-                disabled={launching}
-              >
-                {launching ? Locale.RsClawPanel.Wizard.Launching : Locale.RsClawPanel.Wizard.LaunchGateway}
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ══════════════════════════════════════════════════════════
 // ── Workspace Editor Page ────────────────────────────────
@@ -2358,8 +1785,7 @@ function DoctorPage() {
       return;
     }
     try {
-      const args = fix ? ["doctor", "--fix", "--yes"] : ["doctor"];
-      const output: string = await invoke("run_rsclaw_cli", { args });
+      const output: string = await invoke("run_doctor", { fix });
       setChecks(parseOutput(output));
       setHasRun(true);
     } catch (e: any) {
@@ -3096,6 +2522,13 @@ function TauriConfigPageInner() {
 
   // All hooks must be before any early return (React rules of hooks)
   const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Stop QR polling when the panel unmounts.
+  useEffect(() => {
+    return () => {
+      if (qrPollRef.current) clearInterval(qrPollRef.current);
+      qrPollRef.current = null;
+    };
+  }, []);
 
   if (loading) return <div style={{ padding: 40, textAlign: "center", color: V.t1 }}>...</div>;
 
@@ -3330,6 +2763,11 @@ function TauriConfigPageInner() {
                 setConfig(updated);
                 setRaw(JSON.stringify(updated, null, 2));
               } catch {}
+              return;
+            }
+            if (status === "error") {
+              if (qrPollRef.current) clearInterval(qrPollRef.current);
+              setQrStatus((prev) => ({ ...prev, [key]: zh ? "\u767B\u5F55\u5931\u8D25" : "Login failed" }));
               return;
             }
             // Check for QR image
@@ -5044,8 +4482,11 @@ function CronTaskPage() {
       } else {
         const res = await gatewayFetch("/api/v1/cron");
         if (res.ok) { const data = await res.json(); setJobs(data.jobs || []); }
+        else throw new Error(`HTTP ${res.status}`);
       }
-    } catch {}
+    } catch (e) {
+      toast.fromError("Cron", e);
+    }
     setLoading(false);
   }, []);
 
@@ -5106,7 +4547,9 @@ function CronTaskPage() {
         }
       }
       setShowForm(false); setEditJob(null); fetchJobs();
-    } catch {}
+    } catch (e) {
+      toast.fromError("Cron", e);
+    }
   };
 
   const deleteJob = async (id: string) => {
@@ -5120,7 +4563,9 @@ function CronTaskPage() {
         await gatewayFetch(`/api/v1/cron/${id}`, { method: "DELETE" });
       }
       fetchJobs();
-    } catch {}
+    } catch (e) {
+      toast.fromError("Cron", e);
+    }
   };
   const triggerJob = async (id: string) => {
     try {
@@ -5141,7 +4586,9 @@ function CronTaskPage() {
         }
       }
       fetchJobs();
-    } catch {}
+    } catch (e) {
+      toast.fromError("Cron", e);
+    }
   };
 
   const openEdit = (job: CronJob) => {

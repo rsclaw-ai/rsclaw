@@ -111,6 +111,7 @@ import {
 } from "../constant";
 import { Avatar } from "./emoji";
 import { UserMdBanner } from "./user-md-banner";
+import { useWsConnectionState } from "../hooks/useWsConnectionState";
 import { ChatCommandPrefix, useChatCommand, useCommand } from "../command";
 import { prettyObject } from "../utils/format";
 // ExportMessageModal removed
@@ -427,12 +428,19 @@ function extractRsFiles(content: string): {
   rsFiles: [string, string, string][];
   rsImages: string[];
 } {
-  const match = content.match(/<rsfiles>([\s\S]*?)<\/rsfiles>/);
-  if (!match) return { cleanContent: content, rsFiles: [], rsImages: [] };
+  // Only the trailing block appended by the client on `done` counts (it may
+  // be followed by the `<rstools>` block). An `<rsfiles>` earlier in the
+  // text is model output and must not become a clickable file card.
+  const match = content.match(
+    /<rsfiles>((?:(?!<\/?rsfiles>)[\s\S])*)<\/rsfiles>(\s*<rstools>(?:(?!<\/?rstools>)[\s\S])*<\/rstools>)?\s*$/,
+  );
+  if (!match || match.index === undefined) {
+    return { cleanContent: content, rsFiles: [], rsImages: [] };
+  }
   try {
     const data = JSON.parse(match[1]);
     return {
-      cleanContent: content.replace(/<rsfiles>[\s\S]*?<\/rsfiles>/, "").trimEnd(),
+      cleanContent: (content.slice(0, match.index) + (match[2] || "")).trimEnd(),
       rsFiles: data.f || [],
       rsImages: data.i || [],
     };
@@ -1431,6 +1439,23 @@ function _Chat() {
   // so .finally() would clear isLoading immediately and let queued items
   // spawn parallel streams.
   const isStreaming = session.messages.some((m) => m.streaming);
+  // Gateway WebSocket state — send is disabled until the handshake is done.
+  const wsState = useWsConnectionState();
+  const wsStateLabel = (() => {
+    const cn = getLang() === "cn";
+    switch (wsState) {
+      case "connected":
+        return "";
+      case "connecting":
+        return cn ? "正在连接网关…" : "Connecting to gateway…";
+      case "reconnecting":
+        return cn ? "网关连接断开，正在重连…" : "Gateway disconnected, reconnecting…";
+      case "error":
+        return cn ? "网关连接失败（认证错误？），正在重试…" : "Gateway connection failed (auth?), retrying…";
+      default:
+        return cn ? "未连接网关" : "Not connected to gateway";
+    }
+  })();
   const { submitKey, shouldSubmit } = useSubmitHandler();
   // Virtuoso owns the scroll container. We capture its scroller into
   // `scrollRef` for legacy consumers (markdown components passing
@@ -1632,6 +1657,11 @@ function _Chat() {
       setUserInput("");
       setPromptHints([]);
       matchCommand.invoke();
+      return;
+    }
+    // Keep the draft instead of sending into a dead socket.
+    if (wsState !== "connected") {
+      showToast(wsStateLabel);
       return;
     }
     // Slash commands skip the pending queue.
@@ -3064,11 +3094,29 @@ function _Chat() {
                     }}
                   />
                 )}
+                {wsState !== "connected" && (
+                  <span
+                    role="status"
+                    title={wsStateLabel}
+                    style={{
+                      position: "absolute",
+                      right: 30,
+                      bottom: 10,
+                      fontSize: 11,
+                      opacity: 0.7,
+                      pointerEvents: "none",
+                    }}
+                  >
+                    {wsStateLabel}
+                  </span>
+                )}
                 <IconButton
                   icon={<SendWhiteIcon />}
                   text={Locale.Chat.Send}
                   className={styles["chat-input-send"]}
                   type="primary"
+                  disabled={wsState !== "connected"}
+                  title={wsStateLabel || undefined}
                   onClick={() => doSubmit(userInput)}
                 />
               </label>

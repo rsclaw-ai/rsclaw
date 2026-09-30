@@ -60,6 +60,77 @@ fn rsclaw_base_dir() -> std::path::PathBuf {
     dirs::home_dir().unwrap_or_default().join(".rsclaw")
 }
 
+/// Truncate `s` to at most `max_chars` characters without ever splitting a
+/// UTF-8 code point (byte slicing like `&s[..n]` panics on CJK boundaries and
+/// `panic = "abort"` would take the whole desktop app down).
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+/// Expand a leading `~/` (or bare `~`) to the user's home directory, matching
+/// the gateway config loader.
+fn expand_home(p: &str) -> std::path::PathBuf {
+    if p == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    std::path::PathBuf::from(p)
+}
+
+/// Parse `~/.rsclaw/rsclaw.json5` (or `$RSCLAW_BASE_DIR`). `None` when the
+/// file is missing or unparseable.
+fn read_config_value() -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(rsclaw_base_dir().join("rsclaw.json5")).ok()?;
+    json5::from_str::<serde_json::Value>(&raw).ok()
+}
+
+/// Gateway auth token, resolved like the gateway does:
+/// `gateway.auth.token` (with `${VAR}` expansion) > `RSCLAW_AUTH_TOKEN` env.
+fn gateway_auth_token() -> String {
+    read_config_value()
+        .and_then(|val| {
+            val.pointer("/gateway/auth/token")
+                .and_then(|v| v.as_str())
+                .map(|s| expand_env_vars(s))
+        })
+        .filter(|t| !t.is_empty() && !t.contains("${"))
+        .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
+        .unwrap_or_default()
+}
+
+/// `Authorization` header line (with trailing CRLF) for hand-written HTTP
+/// requests to the local gateway, or "" when no token is configured.
+fn gateway_auth_header_line() -> String {
+    let token = gateway_auth_token();
+    if token.is_empty() {
+        String::new()
+    } else {
+        format!("Authorization: Bearer {token}\r\n")
+    }
+}
+
+/// Run blocking work (sidecar `.output()`, sync socket IO, …) off the main
+/// thread. Sync `#[tauri::command] fn`s execute on the main thread and freeze
+/// the window while they run.
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("background task failed: {e}"))?
+}
+
 /// Resolve the tray menu language. Order:
 ///   1. `gateway.language` field in `~/.rsclaw/rsclaw.json5` (the value the
 ///      user picked during onboarding — keeps the tray consistent with the
@@ -180,10 +251,26 @@ fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
 
 // -- Tauri commands for frontend --
 
-/// Run rsclaw with arbitrary arguments and return combined stdout+stderr.
+/// Run `rsclaw doctor [--fix --yes]` and return combined stdout+stderr.
+///
+/// Deliberately narrow: the webview must not be able to run arbitrary CLI
+/// subcommands (a previous `run_rsclaw_cli(args)` accepted anything).
 #[tauri::command]
-fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
-    let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+async fn run_doctor(fix: bool) -> Result<String, String> {
+    run_blocking(move || {
+        let args: &[&str] = if fix {
+            &["doctor", "--fix", "--yes"]
+        } else {
+            &["doctor"]
+        };
+        run_rsclaw_capture(args)
+    })
+    .await
+}
+
+/// Run rsclaw with fixed arguments and return combined stdout+stderr, even on
+/// non-zero exit (doctor reports issues via exit status).
+fn run_rsclaw_capture(str_args: &[&str]) -> Result<String, String> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
@@ -195,7 +282,7 @@ fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
             "rsclaw"
         });
         if sidecar.exists() {
-            hide_window(std::process::Command::new(&sidecar).args(&str_args))
+            hide_window(std::process::Command::new(&sidecar).args(str_args))
                 .output()
                 .ok()
         } else {
@@ -209,7 +296,7 @@ fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
         ),
         None => {
             let o = hide_window(&mut std::process::Command::new("rsclaw"))
-                .args(&str_args)
+                .args(str_args)
                 .output()
                 .map_err(|e| format!("Failed to execute rsclaw: {}", e))?;
             (
@@ -221,14 +308,10 @@ fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
     };
 
     // Return combined output (doctor writes to both stdout and stderr)
-    let combined = format!("{}{}", stdout, stderr);
-    if success {
-        Ok(combined)
-    } else {
-        // Still return output even on failure (doctor may report issues as non-zero
-        // exit)
-        Ok(combined)
-    }
+    // Still return output even on failure (doctor may report issues as
+    // non-zero exit).
+    let _ = success;
+    Ok(format!("{}{}", stdout, stderr))
 }
 
 #[tauri::command]
@@ -269,13 +352,13 @@ fn start_gateway() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn stop_gateway() -> Result<String, String> {
-    run_rsclaw_command(&["gateway", "stop"])
+async fn stop_gateway() -> Result<String, String> {
+    run_blocking(|| run_rsclaw_command(&["gateway", "stop"])).await
 }
 
 #[tauri::command]
-fn gateway_status() -> Result<String, String> {
-    run_rsclaw_command(&["gateway", "status"])
+async fn gateway_status() -> Result<String, String> {
+    run_blocking(|| run_rsclaw_command(&["gateway", "status"])).await
 }
 
 #[tauri::command]
@@ -360,8 +443,8 @@ fn clear_webview_cache_dirs() -> Result<String, String> {
 
 /// Run initial setup: create directories + seed workspace.
 #[tauri::command]
-fn run_setup() -> Result<String, String> {
-    run_rsclaw_command(&["setup", "--non-interactive"])
+async fn run_setup() -> Result<String, String> {
+    run_blocking(|| run_rsclaw_command(&["setup", "--non-interactive"])).await
 }
 
 /// First-launch convenience: make the bundled `rsclaw` sidecar reachable as a
@@ -590,7 +673,8 @@ fn resolve_workspace_dir(agent_id: &str) -> std::path::PathBuf {
                     let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     if id == agent_id {
                         if let Some(ws) = entry.get("workspace").and_then(|v| v.as_str()) {
-                            return std::path::PathBuf::from(ws);
+                            // Match the gateway loader: `${VAR}` + `~/` expansion.
+                            return expand_home(&expand_env_vars(ws));
                         }
                         break;
                     }
@@ -691,16 +775,16 @@ fn get_gateway_port() -> Result<serde_json::Value, String> {
         ip if ip.contains('.') || ip.contains(':') => ip,
         _ => "localhost",
     };
-    // Read auth token: gateway.auth.token > env var
-    // If missing, auto-generate one and write it to config.
-    // Read-only: use token from config or env, never auto-generate.
-    // If user wants auth they configure gateway.auth.token themselves.
-    let token = val
-        .pointer("/gateway/auth/token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned())
-        .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
-        .unwrap_or_default();
+    // IPv6 literals must be bracketed inside a URL authority.
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    // Read auth token: gateway.auth.token (with `${VAR}` expansion, same as
+    // the gateway loader) > RSCLAW_AUTH_TOKEN env. Read-only: never
+    // auto-generate — if the user wants auth they configure it themselves.
+    let token = gateway_auth_token();
 
     Ok(serde_json::json!({
         "url": format!("http://{}:{}", host, port),
@@ -893,8 +977,8 @@ fn check_setup() -> Result<bool, String> {
 
 /// Get rsclaw version from the sidecar/PATH binary.
 #[tauri::command]
-fn get_version() -> Result<String, String> {
-    run_rsclaw_command(&["--version"])
+async fn get_version() -> Result<String, String> {
+    run_blocking(|| run_rsclaw_command(&["--version"])).await
 }
 
 /// HTML payload for the full-screen glow overlay. Inline so we don't
@@ -1432,96 +1516,127 @@ fn detect_openclaw() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// In-flight `rsclaw channels login` process + its private temp dir.
+///
+/// Single-flight: starting a new login kills the previous one so two logins
+/// never race on the same QR file. Each login gets a unique temp dir under
+/// the rsclaw data dir (passed to the sidecar via TMPDIR/TMP/TEMP, which is
+/// where the CLI writes `rsclaw_qr.png`) instead of the shared, world-readable
+/// `/tmp/rsclaw_qr.png`.
+struct LoginState {
+    child: Option<std::process::Child>,
+    tmp_dir: Option<std::path::PathBuf>,
+}
+
+static LOGIN_STATE: std::sync::Mutex<LoginState> = std::sync::Mutex::new(LoginState {
+    child: None,
+    tmp_dir: None,
+});
+
+fn login_state() -> std::sync::MutexGuard<'static, LoginState> {
+    LOGIN_STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn login_qr_path(state: &LoginState) -> Option<std::path::PathBuf> {
+    state.tmp_dir.as_ref().map(|d| d.join("rsclaw_qr.png"))
+}
+
+fn reset_login_state(state: &mut LoginState) {
+    if let Some(mut child) = state.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if let Some(dir) = state.tmp_dir.take() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Start channel login (wechat/feishu) as a background process.
 /// Returns the temp QR image path to monitor.
 #[tauri::command]
 fn channel_login_start(channel: String) -> Result<String, String> {
-    let qr_path = std::env::temp_dir().join("rsclaw_qr.png");
-    // Remove stale QR file so we can detect when a new one appears
-    let _ = std::fs::remove_file(&qr_path);
+    let mut state = login_state();
+    reset_login_state(&mut state);
 
-    // Record config mtime for login completion detection
-    let config_path = rsclaw_base_dir().join("rsclaw.json5");
-    let mtime = std::fs::metadata(&config_path)
-        .ok()
-        .and_then(|m| m.modified().ok());
-    *LOGIN_START_MTIME.lock().unwrap() = mtime.or(Some(std::time::SystemTime::now()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_dir = rsclaw_base_dir()
+        .join("var")
+        .join("login-qr")
+        .join(format!("{nanos:x}"));
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create login temp dir: {e}"))?;
 
-    // Try sidecar binary next to executable
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let program: std::ffi::OsString = exe_dir
+        .map(|dir| {
+            dir.join(if cfg!(target_os = "windows") {
+                "rsclaw.exe"
+            } else {
+                "rsclaw"
+            })
+        })
+        .filter(|p| p.exists())
+        .map(|p| p.into_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("rsclaw"));
 
-    let spawned = exe_dir.as_ref().and_then(|dir| {
-        let sidecar = dir.join(if cfg!(target_os = "windows") {
-            "rsclaw.exe"
-        } else {
-            "rsclaw"
-        });
-        if sidecar.exists() {
-            // hide_window prevents a flashing cmd console on Windows.
-            hide_window(
-                std::process::Command::new(&sidecar)
-                    .args(["channels", "login", "--quiet", &channel])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null()),
-            )
-            .spawn()
-            .ok()
-        } else {
-            None
+    // hide_window prevents a flashing cmd console on Windows.
+    let child = hide_window(
+        std::process::Command::new(&program)
+            .args(["channels", "login", "--quiet", &channel])
+            .env("TMPDIR", &tmp_dir)
+            .env("TMP", &tmp_dir)
+            .env("TEMP", &tmp_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .spawn();
+    let child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(format!("Failed to start login: {e}"));
         }
-    });
+    };
 
-    if spawned.is_none() {
-        // Fallback: spawn via PATH
-        hide_window(
-            std::process::Command::new("rsclaw")
-                .args(["channels", "login", "--quiet", &channel])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()),
-        )
-        .spawn()
-        .map_err(|e| format!("Failed to start login: {e}"))?;
-    }
-
+    let qr_path = tmp_dir.join("rsclaw_qr.png");
+    state.child = Some(child);
+    state.tmp_dir = Some(tmp_dir);
     Ok(qr_path.to_string_lossy().to_string())
 }
 
-/// Track config mtime at login start
-static LOGIN_START_MTIME: std::sync::Mutex<Option<std::time::SystemTime>> =
-    std::sync::Mutex::new(None);
-
-/// Check if channel login completed by comparing config mtime.
+/// Report the in-flight login's progress: `done` (the login process exited
+/// successfully — it writes credentials to config and exits), `error`
+/// (exited non-zero), `waiting` (QR is on screen) or `idle`.
 #[tauri::command]
 fn channel_login_status() -> Result<String, String> {
-    let qr_path = std::env::temp_dir().join("rsclaw_qr.png");
-    let config_path = rsclaw_base_dir().join("rsclaw.json5");
-
-    let start_mtime = LOGIN_START_MTIME.lock().unwrap().clone();
-    if let Some(start) = start_mtime {
-        // Config was modified after login started = login succeeded
-        if let Ok(meta) = std::fs::metadata(&config_path) {
-            if let Ok(modified) = meta.modified() {
-                if modified > start {
-                    *LOGIN_START_MTIME.lock().unwrap() = None;
-                    let _ = std::fs::remove_file(&qr_path);
-                    return Ok("done".to_string());
-                }
-            }
+    let mut state = login_state();
+    let exited = match state.child.as_mut() {
+        Some(child) => child.try_wait().map_err(|e| e.to_string())?,
+        None => return Ok("idle".to_string()),
+    };
+    if let Some(status) = exited {
+        state.child = None;
+        if let Some(dir) = state.tmp_dir.take() {
+            let _ = std::fs::remove_dir_all(&dir);
         }
+        return Ok(if status.success() { "done" } else { "error" }.to_string());
     }
-    if qr_path.exists() {
-        Ok("waiting".to_string())
-    } else {
-        Ok("idle".to_string())
+    match login_qr_path(&state) {
+        Some(p) if p.exists() => Ok("waiting".to_string()),
+        _ => Ok("idle".to_string()),
     }
 }
 
 /// Read the temp QR PNG as base64 data URI.
 #[tauri::command]
 fn channel_login_qr() -> Result<Option<String>, String> {
-    let qr_path = std::env::temp_dir().join("rsclaw_qr.png");
+    let Some(qr_path) = login_qr_path(&login_state()) else {
+        return Ok(None);
+    };
     if !qr_path.exists() {
         return Ok(None);
     }
@@ -1564,13 +1679,19 @@ fn channel_login_qr() -> Result<Option<String>, String> {
 /// still write the file so the UI works in "cold edit" mode; the
 /// next gateway boot reconciles the file → redb anyway.
 #[tauri::command]
-fn save_cron_jobs(content: String) -> Result<(), String> {
+async fn save_cron_jobs(content: String) -> Result<(), String> {
+    run_blocking(move || save_cron_jobs_blocking(content)).await
+}
+
+fn save_cron_jobs_blocking(content: String) -> Result<(), String> {
     let port = get_gateway_port_number();
     let body = content.clone();
     let body_len = body.len();
+    let auth = gateway_auth_header_line();
     let request = format!(
         "PUT /api/v1/cron/bulk_replace HTTP/1.1\r\n\
          Host: 127.0.0.1\r\n\
+         {auth}\
          Content-Type: application/json\r\n\
          Content-Length: {body_len}\r\n\
          Connection: close\r\n\r\n{body}"
@@ -1590,16 +1711,18 @@ fn save_cron_jobs(content: String) -> Result<(), String> {
             let _ = stream.read_to_end(&mut resp);
             // Parse the HTTP status line to surface backend errors.
             let resp_str = String::from_utf8_lossy(&resp);
-            if let Some(first_line) = resp_str.lines().next() {
-                if !first_line.contains(" 200 ") {
+            match resp_str.lines().next() {
+                Some(first_line) if first_line.contains(" 200 ") => Ok(()),
+                Some(first_line) => {
                     // 4xx/5xx: extract the JSON body for a friendlier
                     // toast in the UI. Body is after the empty line.
                     let body_start = resp_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-                    let body = &resp_str[body_start..];
-                    return Err(format!("gateway rejected: {}", body.trim()));
+                    let body = resp_str[body_start..].trim();
+                    let detail = if body.is_empty() { first_line.trim() } else { body };
+                    Err(format!("gateway rejected: {}", truncate_chars(detail, 300)))
                 }
+                None => Err("gateway closed the connection without a response".to_string()),
             }
-            Ok(())
         }
         Err(_) => {
             // Gateway is offline — write the file directly so the user
@@ -1653,11 +1776,17 @@ fn http_shutdown_gateway() -> Result<(), String> {
 /// redb source). Falls back to reading `cron.json5` when the gateway
 /// is offline so the UI still shows something in cold-edit mode.
 #[tauri::command]
-fn get_cron_jobs() -> Result<serde_json::Value, String> {
+async fn get_cron_jobs() -> Result<serde_json::Value, String> {
+    run_blocking(get_cron_jobs_blocking).await
+}
+
+fn get_cron_jobs_blocking() -> Result<serde_json::Value, String> {
     let port = get_gateway_port_number();
+    let auth = gateway_auth_header_line();
     let request = format!(
         "GET /api/v1/cron HTTP/1.1\r\n\
          Host: 127.0.0.1\r\n\
+         {auth}\
          Connection: close\r\n\r\n"
     );
 
@@ -1671,17 +1800,22 @@ fn get_cron_jobs() -> Result<serde_json::Value, String> {
                 let mut resp = Vec::with_capacity(8192);
                 let _ = stream.read_to_end(&mut resp);
                 let resp_str = String::from_utf8_lossy(&resp);
-                if resp_str
-                    .lines()
-                    .next()
-                    .map_or(false, |l| l.contains(" 200 "))
-                {
+                let status_line = resp_str.lines().next().unwrap_or("").trim().to_string();
+                if status_line.contains(" 200 ") {
                     if let Some(body_start) = resp_str.find("\r\n\r\n") {
                         let body = &resp_str[body_start + 4..];
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
                             return Ok(val);
                         }
                     }
+                } else if !status_line.is_empty() {
+                    // Gateway is up but refused (e.g. 401 when
+                    // gateway.auth.token is set): surface it instead of
+                    // silently showing the stale cold-edit file.
+                    return Err(format!(
+                        "gateway rejected: {}",
+                        truncate_chars(&status_line, 200)
+                    ));
                 }
             }
         }
@@ -1767,8 +1901,8 @@ fn get_skills() -> Result<serde_json::Value, String> {
 
 /// Install a skill via sidecar
 #[tauri::command]
-fn install_skill(name: String) -> Result<String, String> {
-    run_rsclaw_command(&["skills", "install", &name])
+async fn install_skill(name: String) -> Result<String, String> {
+    run_blocking(move || run_rsclaw_command(&["skills", "install", &name])).await
 }
 
 /// Search skills online via sidecar, parse the human-readable table.
@@ -1782,8 +1916,12 @@ fn install_skill(name: String) -> Result<String, String> {
 /// from the header row and stop at the first blank line after results so
 /// the footer doesn't get scraped into a fake skill entry.
 #[tauri::command]
-fn search_skills(query: String) -> Result<serde_json::Value, String> {
-    let raw = run_rsclaw_command(&["skills", "search", &query])?;
+async fn search_skills(query: String) -> Result<serde_json::Value, String> {
+    run_blocking(move || search_skills_blocking(&query)).await
+}
+
+fn search_skills_blocking(query: &str) -> Result<serde_json::Value, String> {
+    let raw = run_rsclaw_command(&["skills", "search", query])?;
     let mut results = Vec::new();
     let mut has_stats: Option<bool> = None;
     let mut seen_any_result = false;
@@ -1887,8 +2025,8 @@ fn strip_ansi(s: &str) -> String {
 
 /// Uninstall a skill via sidecar
 #[tauri::command]
-fn uninstall_skill(name: String) -> Result<String, String> {
-    run_rsclaw_command(&["skills", "uninstall", &name])
+async fn uninstall_skill(name: String) -> Result<String, String> {
+    run_blocking(move || run_rsclaw_command(&["skills", "uninstall", &name])).await
 }
 
 /// List installed plugins by reading
@@ -1984,14 +2122,14 @@ fn get_plugins() -> Result<serde_json::Value, String> {
 /// Install a plugin via sidecar. `spec` can be a URL, local .wasm/.zip path, or
 /// directory.
 #[tauri::command]
-fn install_plugin(spec: String) -> Result<String, String> {
-    run_rsclaw_command(&["plugins", "install", &spec])
+async fn install_plugin(spec: String) -> Result<String, String> {
+    run_blocking(move || run_rsclaw_command(&["plugins", "install", &spec])).await
 }
 
 /// Uninstall a plugin by name via sidecar.
 #[tauri::command]
-fn uninstall_plugin(name: String) -> Result<String, String> {
-    run_rsclaw_command(&["plugins", "uninstall", &name])
+async fn uninstall_plugin(name: String) -> Result<String, String> {
+    run_blocking(move || run_rsclaw_command(&["plugins", "uninstall", &name])).await
 }
 
 /// Install an external tool binary (chrome/ffmpeg/node/python/opencode/
@@ -2259,32 +2397,54 @@ fn local_tool_binary_path(name: &str) -> Option<std::path::PathBuf> {
 /// gateway so the test path matches actual runtime substitution.
 /// Unknown vars are kept as the literal `${VAR}` token.
 fn expand_env_vars(s: &str) -> String {
+    expand_env_vars_filtered(s, |_| true)
+}
+
+/// Like [`expand_env_vars`] but only expands names accepted by `allow`;
+/// rejected names stay literal. Operates on `&str` slices at ASCII
+/// delimiters, so non-ASCII text passes through intact.
+fn expand_env_vars_filtered(s: &str, allow: impl Fn(&str) -> bool) -> String {
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            if let Some(end_off) = s[i + 2..].find('}') {
-                let var_name = &s[i + 2..i + 2 + end_off];
-                if !var_name.is_empty()
-                    && var_name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                {
-                    if let Ok(val) = std::env::var(var_name) {
-                        out.push_str(&val);
-                    } else {
-                        out.push_str(&s[i..i + 2 + end_off + 1]);
-                    }
-                    i += 2 + end_off + 1;
-                    continue;
-                }
-            }
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let name = &after[..end];
+        let valid = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !valid {
+            // Not a placeholder — emit "${" literally and keep scanning.
+            out.push_str("${");
+            rest = after;
+            continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        match std::env::var(name).ok().filter(|_| allow(name)) {
+            Some(val) => out.push_str(&val),
+            None => out.push_str(&rest[start..start + 2 + end + 1]),
+        }
+        rest = &after[end + 1..];
     }
+    out.push_str(rest);
     out
+}
+
+/// Look up a provider's catalog `env_var` (e.g. `ANTHROPIC_API_KEY`).
+fn provider_env_var_from_defaults(provider: &str) -> Option<String> {
+    let user_path = rsclaw_base_dir().join("defaults.toml");
+    let toml_src =
+        std::fs::read_to_string(&user_path).unwrap_or_else(|_| EMBEDDED_DEFAULTS_TOML.to_owned());
+    let catalog: DefaultsCatalog = toml::from_str(&toml_src).ok()?;
+    catalog
+        .providers
+        .into_iter()
+        .find(|p| p.name == provider && !p.env_var.is_empty())
+        .map(|p| p.env_var)
 }
 
 /// Look up a provider's default base URL from `defaults.toml` (user file with
@@ -2314,9 +2474,30 @@ async fn test_provider(
     // Expand `${VAR}` env placeholders so a config like `apiKey:
     // "${ANTHROPIC_API_KEY}"` tests the actual key, matching the gateway's
     // runtime expansion.
+    //
+    // Only key-shaped variables are expanded (the provider's own catalog
+    // env var, or `*_API_KEY`). The webview picks both the key string and
+    // the destination base_url, so expanding arbitrary `${ANY_SECRET}` would
+    // let it ship any process env var to any host. base_url only expands
+    // URL/host-shaped names for the same reason.
     let raw_key = api_key.clone();
-    let api_key = expand_env_vars(&api_key);
-    let base_url = base_url.map(|u| expand_env_vars(&u));
+    let own_env = provider_env_var_from_defaults(&provider);
+    let api_key = expand_env_vars_filtered(&api_key, |name| {
+        name.ends_with("_API_KEY") || own_env.as_deref() == Some(name)
+    });
+    let base_url = base_url.map(|u| {
+        expand_env_vars_filtered(&u, |name| {
+            name.ends_with("_BASE_URL") || name.ends_with("_URL") || name.ends_with("_HOST")
+        })
+    });
+    if api_key.contains("${") {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": "API key references an env var that is unset or not allowed here \
+                      (only the provider's own key variable or *_API_KEY names are expanded). \
+                      Set it before launching RsClaw, or paste the literal key into rsclaw.json5."
+        }));
+    }
     // Diagnose the silent failure mode: user has `apiKey: "${FOO}"` in
     // config but `FOO` is unset / empty in the gateway's process env, so
     // expansion produces "" and the test sends an empty header — provider
@@ -2385,7 +2566,7 @@ async fn test_provider(
     // Determine auth style based on provider or api_type
     let auth_style = match effective_api_type {
         "anthropic" => "x-api-key",
-        "gemini" => "gemini-key", // query param auth
+        "gemini" => "gemini-key", // x-goog-api-key header
         "ollama" => "none",
         _ => {
             if api_key.is_empty() {
@@ -2441,7 +2622,9 @@ async fn test_provider(
     let url = if is_ollama {
         format!("{effective_base}/api/tags")
     } else if is_gemini {
-        format!("{effective_base}/models?key={api_key}")
+        // Key goes in the `x-goog-api-key` header (below), never the URL —
+        // a key in the query string leaks into reqwest error messages.
+        format!("{effective_base}/models")
     } else {
         format!("{effective_base}/models")
     };
@@ -2462,7 +2645,12 @@ async fn test_provider(
                 .header("anthropic-version", "2023-06-01")
                 .header("Authorization", format!("Bearer {api_key}"));
         }
-        _ => {} // gemini uses query param, ollama needs no auth
+        _ => {
+            // ollama needs no auth; gemini takes the key as a header.
+            if is_gemini && !api_key.is_empty() {
+                req = req.header("x-goog-api-key", &api_key);
+            }
+        }
     }
 
     match req.send().await {
@@ -2526,11 +2714,13 @@ async fn test_provider(
             let msg = if status == 401 || status == 403 {
                 "Invalid API key".to_owned()
             } else {
-                body[..body.len().min(200)].to_owned()
+                truncate_chars(&body, 200).to_owned()
             };
             Ok(serde_json::json!({"ok": false, "error": msg}))
         }
-        Err(e) => Ok(serde_json::json!({"ok": false, "error": e.to_string()})),
+        // Strip the URL from transport errors so nothing sensitive that may
+        // sit in it is echoed back to the UI.
+        Err(e) => Ok(serde_json::json!({"ok": false, "error": e.without_url().to_string()})),
     }
 }
 
@@ -2595,8 +2785,8 @@ async fn probe_inference_endpoint(
 
 /// Run OpenClaw migration.
 #[tauri::command]
-fn migrate_openclaw(source_path: String) -> Result<String, String> {
-    run_rsclaw_command(&["migrate", "--openclaw-dir", &source_path])
+async fn migrate_openclaw(source_path: String) -> Result<String, String> {
+    run_blocking(move || run_rsclaw_command(&["migrate", "--openclaw-dir", &source_path])).await
 }
 
 #[tauri::command]
@@ -2656,13 +2846,128 @@ fn get_auto_start() -> Result<bool, String> {
         .map_err(|e| format!("Failed to check auto-start status: {}", e))
 }
 
-/// Open a file or directory with the system default application.
-#[tauri::command]
-fn open_path(path: String) -> Result<(), String> {
+/// Extensions that execute (or install / mount / launch something) when
+/// handed to the OS "open" handler. Such paths are revealed in the file
+/// manager instead of opened.
+const OPEN_DENY_EXTS: &[&str] = &[
+    // macOS bundles / scripts / installers
+    "app", "command", "tool", "scpt", "scptd", "applescript", "workflow", "action",
+    "terminal", "pkg", "mpkg", "prefpane", "kext", "plugin", "bundle", "dmg",
+    "webloc", "inetloc", "fileloc",
+    // Windows
+    "exe", "bat", "cmd", "com", "ps1", "psm1", "psd1", "msi", "msp", "msix", "appx",
+    "appxbundle", "lnk", "url", "scr", "pif", "vbs", "vbe", "js", "jse", "wsf", "wsh",
+    "hta", "cpl", "msc", "reg", "inf", "application", "appref-ms", "gadget",
+    "settingcontent-ms", "dll", "sys", "iso", "img", "vhd", "vhdx",
+    // Unix / cross-platform
+    "sh", "bash", "zsh", "fish", "csh", "ksh", "run", "bin", "appimage", "desktop",
+    "jar", "py", "pyw", "pl", "rb", "php", "so", "dylib", "deb", "rpm",
+];
+
+/// Strip the Windows verbatim prefix (`\\?\`) that `canonicalize` adds —
+/// Explorer does not understand it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn display_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().to_string();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    s
+}
+
+/// True when opening `p` would run code rather than show a document.
+fn is_executable_like(p: &std::path::Path) -> bool {
+    // Anything inside or named like a bundle/executable type.
+    let ext_hit = p.components().any(|c| {
+        std::path::Path::new(c.as_os_str())
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| OPEN_DENY_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+            .unwrap_or(false)
+    });
+    if ext_hit {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(p) {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Directories whose files the UI may open / read: the rsclaw data dir,
+/// `<Downloads>/rsclaw` (attachments, generated media) and every configured
+/// agent workspace. Canonicalized; missing roots are skipped.
+fn allowed_file_roots(include_workspaces: bool) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![rsclaw_base_dir()];
+    let downloads = dirs::download_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Downloads"));
+    roots.push(downloads.join("rsclaw"));
+    if include_workspaces {
+        roots.push(resolve_workspace_dir("main"));
+        if let Some(val) = read_config_value() {
+            if let Some(list) = val.pointer("/agents/list").and_then(|v| v.as_array()) {
+                for entry in list {
+                    if let Some(ws) = entry.get("workspace").and_then(|v| v.as_str()) {
+                        roots.push(expand_home(&expand_env_vars(ws)));
+                    }
+                }
+            }
+        }
+    }
+    roots
+        .into_iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect()
+}
+
+fn is_under_roots(p: &std::path::Path, roots: &[std::path::PathBuf]) -> bool {
+    roots.iter().any(|r| p.starts_with(r))
+}
+
+/// Show `p` selected in the platform file manager without opening it.
+fn reveal_in_file_manager(p: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
-            .arg(&path)
+            .arg("-R")
+            .arg(p)
+            .spawn()
+            .map_err(|e| format!("reveal failed: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // Intentionally visible — opens File Explorer with the file selected.
+        std::process::Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", display_path(p)))
+            .spawn()
+            .map_err(|e| format!("reveal failed: {e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let dir = p.parent().unwrap_or(p);
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| format!("reveal failed: {e}"))?;
+    }
+    Ok(())
+}
+
+fn open_with_default_app(p: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(p)
             .spawn()
             .map_err(|e| format!("open failed: {e}"))?;
     }
@@ -2670,18 +2975,45 @@ fn open_path(path: String) -> Result<(), String> {
     {
         // Intentionally visible — opens File Explorer for the user to browse files.
         std::process::Command::new("explorer")
-            .arg(&path)
+            .arg(display_path(p))
             .spawn()
             .map_err(|e| format!("open failed: {e}"))?;
     }
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
-            .arg(&path)
+            .arg(p)
             .spawn()
             .map_err(|e| format!("open failed: {e}"))?;
     }
     Ok(())
+}
+
+/// Open a file or directory with the system default application.
+///
+/// The path comes from chat content (model output / file cards), so it is
+/// treated as untrusted:
+///   - executables, app bundles, scripts, installers → revealed in the file
+///     manager, never opened (opening = running code);
+///   - regular files under the rsclaw data / downloads / workspace dirs →
+///     opened;
+///   - regular files elsewhere → revealed only;
+///   - plain directories → opened (shows them in the file manager).
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    let canon = std::fs::canonicalize(expand_home(&path))
+        .map_err(|e| format!("cannot open {path}: {e}"))?;
+    if is_executable_like(&canon) {
+        return reveal_in_file_manager(&canon);
+    }
+    if canon.is_dir() {
+        return open_with_default_app(&canon);
+    }
+    if is_under_roots(&canon, &allowed_file_roots(true)) {
+        open_with_default_app(&canon)
+    } else {
+        reveal_in_file_manager(&canon)
+    }
 }
 
 /// Called by frontend when user manually stops/starts gateway.
@@ -2736,10 +3068,18 @@ fn save_attach_image(bytes: Vec<u8>, extension: String) -> Result<String, String
 /// Read a local image file and return it as a `data:image/...;base64,...`
 /// URL. Used at LLM-send time to rehydrate disk-backed attachments into
 /// the format upstream APIs expect.
+///
+/// Restricted to image files under the same roots as the asset protocol
+/// scope (`~/.rsclaw`, `<Downloads>/rsclaw`) and capped in size, so the
+/// webview can't use it to read arbitrary files.
 #[tauri::command]
 fn read_file_as_data_url(path: String) -> Result<String, String> {
-    let p = std::path::Path::new(&path);
-    let data = std::fs::read(p).map_err(|e| format!("read: {e}"))?;
+    const MAX_BYTES: u64 = 32 * 1024 * 1024;
+    let canon = std::fs::canonicalize(&path).map_err(|e| format!("read: {e}"))?;
+    if !is_under_roots(&canon, &allowed_file_roots(false)) {
+        return Err("read: path is outside the RsClaw data/download directories".to_string());
+    }
+    let p = canon.as_path();
     let mime = match p
         .extension()
         .and_then(|e| e.to_str())
@@ -2753,8 +3093,20 @@ fn read_file_as_data_url(path: String) -> Result<String, String> {
         Some("svg") => "image/svg+xml",
         Some("heic") => "image/heic",
         Some("heif") => "image/heif",
-        _ => "image/jpeg",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        _ => return Err("read: not an image file".to_string()),
     };
+    let meta = std::fs::metadata(p).map_err(|e| format!("read: {e}"))?;
+    if !meta.is_file() {
+        return Err("read: not a file".to_string());
+    }
+    if meta.len() > MAX_BYTES {
+        return Err(format!(
+            "read: file too large ({} bytes, max {MAX_BYTES})",
+            meta.len()
+        ));
+    }
+    let data = std::fs::read(p).map_err(|e| format!("read: {e}"))?;
     const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut b64 = String::with_capacity(data.len() * 4 / 3 + 4);
     for chunk in data.chunks(3) {
@@ -2888,7 +3240,7 @@ fn main() {
             test_provider,
             write_workspace_file,
             read_workspace_file,
-            run_rsclaw_cli,
+            run_doctor,
             migrate_openclaw,
             set_auto_start,
             get_auto_start,
@@ -3068,8 +3420,12 @@ fn main() {
                         continue;
                     }
                     // Simple TCP connect check — if gateway is listening, it's alive.
+                    // Port is re-read each tick so a non-default / edited
+                    // gateway.port doesn't trigger a spawn loop.
+                    let port = u16::try_from(get_gateway_port_number()).unwrap_or(18888);
+                    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
                     let healthy = std::net::TcpStream::connect_timeout(
-                        &"127.0.0.1:18888".parse().expect("valid addr"),
+                        &addr,
                         std::time::Duration::from_secs(2),
                     ).is_ok();
                     if healthy {

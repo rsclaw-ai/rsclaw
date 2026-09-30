@@ -205,9 +205,7 @@ export class ChatGPTApi implements LLMApi {
       const controller = new AbortController();
       options.onController?.(controller);
 
-      rsclawWs.connect();
-
-      // Send via WS and get runId back
+      // send() connects if needed and waits for the handshake.
       const result = await rsclawWs.send("chat.send", {
         message: text,
         sessionKey,
@@ -215,24 +213,40 @@ export class ChatGPTApi implements LLMApi {
       });
       const runId: string = result?.runId || "";
 
-      // Stream deltas back via WS events
+      // Model text must not be able to forge the `<rsfiles>` / `<rstools>`
+      // blocks we append on `done` (file cards open local paths). Escape any
+      // such tags coming from the model; markdown still renders them as
+      // literal text.
+      const neutralize = (t: string) =>
+        t.replace(/<(\/?)(rsfiles|rstools)>/gi, "&lt;$1$2&gt;");
+
+      // Stream deltas back via WS events. Frames that arrived before this
+      // registration are buffered by rsclawWs and replayed here.
       let fullText = "";
       await new Promise<void>((resolve, reject) => {
-        controller.signal.addEventListener("abort", () => {
+        const onAbort = () => {
+          rsclawWs.offChatEvent(runId);
           rsclawWs.send("chat.abort", { sessionKey }).catch(() => {});
           reject(new Error("aborted"));
-        });
+        };
+        if (controller.signal.aborted) {
+          onAbort();
+          return;
+        }
+        controller.signal.addEventListener("abort", onAbort, { once: true });
 
         rsclawWs.onChatEvent(runId, {
           onDelta: (_full: string, delta: string) => {
             fullText += delta;
-            options.onUpdate?.(fullText, delta);
+            options.onUpdate?.(neutralize(fullText), delta);
           },
           onDone: (
             files: [string, string, string][],
             images: string[],
             toolLog: [string, string, string][],
           ) => {
+            controller.signal.removeEventListener("abort", onAbort);
+            fullText = neutralize(fullText);
             if (files.length > 0 || images.length > 0) {
               fullText += `\n\n<rsfiles>${JSON.stringify({ f: files, i: images })}</rsfiles>`;
             }
@@ -241,7 +255,10 @@ export class ChatGPTApi implements LLMApi {
             }
             resolve();
           },
-          onError: reject,
+          onError: (err: Error) => {
+            controller.signal.removeEventListener("abort", onAbort);
+            reject(err);
+          },
         });
       });
 

@@ -198,12 +198,19 @@ export async function applyInstalledKey(
         /* tolerate — config may already be there */
       }
 
+      // Missing config reads back as "" → start from empty. A config that
+      // exists but can't be read/parsed must abort: merging into `{}` and
+      // writing would wipe the user's whole rsclaw.json5.
+      const raw = (await invoke("read_config_file")) as string;
       let existing: any = {};
-      try {
-        const raw = (await invoke("read_config_file")) as string;
-        existing = JSON5.parse(raw || "{}");
-      } catch {
-        /* missing config → start from empty */
+      if (raw && raw.trim()) {
+        try {
+          existing = JSON5.parse(raw);
+        } catch (e) {
+          throw new Error(
+            `rsclaw.json5 is not valid JSON5, refusing to overwrite it: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
       }
       const merged = deepMerge(existing, patch);
       // RsClaw's baseUrl is hardcoded in the gateway
@@ -240,12 +247,18 @@ export async function applyInstalledKey(
     }
 
     // Browser dev mode: write via the HTTP gateway config endpoint.
+    // Abort (don't fall back to `{}`) when the current config can't be
+    // fetched or parsed — saving the merge would wipe it.
+    const cfg = await getConfig();
     let existing: any = {};
-    try {
-      const cfg = await getConfig();
-      existing = JSON5.parse(cfg.raw || "{}");
-    } catch {
-      /* empty config */
+    if (cfg?.raw && cfg.raw.trim()) {
+      try {
+        existing = JSON5.parse(cfg.raw);
+      } catch (e) {
+        throw new Error(
+          `rsclaw.json5 is not valid JSON5, refusing to overwrite it: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
     }
     const merged = deepMerge(existing, patch);
     if (merged?.models?.providers?.rsclaw) {
