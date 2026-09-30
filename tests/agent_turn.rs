@@ -71,6 +71,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
                 name: None,
                 commands: None,
                 allowed_commands: None,
+                non_owner_tools: None,
                 opencode: None,
                 claudecode: None,
                 codex: None,

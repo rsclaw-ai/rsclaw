@@ -1184,6 +1184,20 @@ impl RedbStore {
         session_key: &str,
         message: &rsclaw_types::QueuedMessage,
     ) -> Result<bool> {
+        self.merge_into_pending_with_budget(session_key, message, 0, 0)
+    }
+
+    /// Like [`Self::merge_into_pending`], but when `max_turns > 0` (a
+    /// task-mode message such as `/task -n 10 ...` or a follow-up task) the
+    /// pending task's `max_turns` / `ttl_secs` are raised so the merged
+    /// message keeps its requested budget instead of inheriting a smaller one.
+    pub fn merge_into_pending_with_budget(
+        &self,
+        session_key: &str,
+        message: &rsclaw_types::QueuedMessage,
+        max_turns: u32,
+        ttl_secs: u64,
+    ) -> Result<bool> {
         use rsclaw_types::TaskStatus;
 
         let write = self.db.begin_write()?;
@@ -1207,6 +1221,15 @@ impl RedbStore {
                 let mut task: rsclaw_types::QueuedTask = serde_json::from_str(guard.value())?;
                 drop(guard);
                 task.messages.push(message.clone());
+                if max_turns > 0 {
+                    task.max_turns = task.max_turns.max(max_turns);
+                    // ttl 0 means "no expiry": keep the more permissive one.
+                    task.ttl_secs = if task.ttl_secs == 0 || ttl_secs == 0 {
+                        0
+                    } else {
+                        task.ttl_secs.max(ttl_secs)
+                    };
+                }
                 task.updated_at = chrono::Utc::now().timestamp();
                 let json = serde_json::to_string(&task)?;
                 table.insert(id.as_str(), json.as_str())?;

@@ -37,6 +37,7 @@ pub use rsclaw_cron::{
     export_cron_jobs_to_file, extract_saved_files_content, init_cron_store, install_reload_sender,
     load_cron_jobs, load_cron_jobs_from_file, reconcile_file_to_redb_on_boot,
     resolve_cron_store_path, save_cron_jobs, trigger_reload, validate_cron_expr,
+    validate_cron_expr_tz,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -67,6 +68,12 @@ const STUCK_RUN_MS: u64 = 2 * 60 * 60 * 1000; // 2 hours
 /// Used to distinguish reload-driven cancellation from actual failures so
 /// `consecutive_errors` is not bumped and the new job version starts clean.
 const CANCEL_BY_RELOAD: &str = "cron: cancelled by reload";
+
+/// A run whose scheduled time passed while the gateway was down fires once on
+/// startup when it is at most this late. Older one-shot runs are reported as
+/// missed and removed; older recurring runs skip to their next slot. The same
+/// window bounds how long an unfired one-shot may sit past due in the loop.
+const MISSED_RUN_GRACE_MS: u64 = 10 * 60 * 1000;
 
 /// Wake-mode prefix for a plugin-owned, read-only cron preflight.
 const PLUGIN_PREFLIGHT_WAKE_MODE_PREFIX: &str = "plugin-preflight:";
@@ -222,6 +229,11 @@ impl CronRunner {
 
         // Fast path: redb available (production).
         if let Some(store) = cron_store() {
+            // Same lock as every other cron writer (HTTP / WS / agent tool):
+            // the merge below is a read-modify-write against redb, and the
+            // cron.json5 export must not land after (and overwrite) a newer
+            // write made by another writer.
+            let _guard = CRON_FILE_LOCK.lock().await;
             for mem_job in jobs {
                 let merged = match store.cron_get(&mem_job.id) {
                     Ok(Some(json)) => match serde_json::from_str::<CronJob>(&json) {
@@ -282,9 +294,15 @@ impl CronRunner {
                     .into_iter()
                     .filter_map(|(_, j)| serde_json::from_str(&j).ok())
                     .collect();
-                tokio::task::spawn_blocking(move || {
+                // Awaited (not detached) so the export completes while the
+                // lock is still held.
+                if let Err(e) = tokio::task::spawn_blocking(move || {
                     export_cron_jobs_to_file(&exported);
-                });
+                })
+                .await
+                {
+                    warn!(err = %e, "cron: export task failed");
+                }
             }
             return Ok(());
         }
@@ -313,6 +331,8 @@ impl CronRunner {
         let mut jobs = self.jobs.clone();
         let now_ms = current_timestamp_ms();
 
+        let mut missed_once: Vec<CronJob> = Vec::new();
+
         // Initialize state for each job
         for job in &mut jobs {
             if job.state.is_none() {
@@ -332,13 +352,55 @@ impl CronRunner {
                 }
             }
 
-            // Compute next_run_at_ms if not set OR if the stored value is in the past
-            // (may have been computed with the old buggy algorithm that ignored timezone)
-            if state.next_run_at_ms.is_none() || state.next_run_at_ms.is_some_and(|t| t <= now_ms) {
-                let old_ts = state.next_run_at_ms;
-                state.next_run_at_ms = job.schedule.compute_next_run(now_ms);
-                info!(job_id = %job.id, old = ?old_ts, new = ?state.next_run_at_ms, "cron: recomputed next_run_at_ms");
+            // Runs that came due while the gateway was down: fire once now if
+            // only slightly late; otherwise one-shots are reported as missed
+            // and removed, recurring jobs skip to their next slot.
+            match state.next_run_at_ms {
+                Some(t) if t <= now_ms && job.enabled && now_ms - t <= MISSED_RUN_GRACE_MS => {
+                    info!(
+                        job_id = %job.id,
+                        late_secs = (now_ms - t) / 1000,
+                        "cron: run came due during downtime, firing once now"
+                    );
+                }
+                Some(t) if t <= now_ms && job.enabled && job.schedule.is_once() => {
+                    warn!(
+                        job_id = %job.id,
+                        due_at_ms = t,
+                        "cron: one-shot job missed while the gateway was down; removing"
+                    );
+                    state.next_run_at_ms = None;
+                    job.enabled = false;
+                    missed_once.push(job.clone());
+                }
+                Some(t) if t > now_ms => {}
+                old_ts => {
+                    // Not set, or in the past (possibly computed by the old
+                    // algorithm that ignored timezone): recompute.
+                    state.next_run_at_ms = job.schedule.compute_next_run(now_ms);
+                    info!(job_id = %job.id, old = ?old_ts, new = ?state.next_run_at_ms, "cron: recomputed next_run_at_ms");
+                }
             }
+        }
+
+        // Tell the owners of missed one-shot jobs (best effort, detached).
+        for job in missed_once {
+            let channels = Arc::clone(&self.channels);
+            let agents = Arc::clone(&self.agents);
+            let default_delivery = self.default_delivery.clone();
+            tokio::spawn(async move {
+                let name = job.name.clone().unwrap_or_else(|| job.id.clone());
+                let text = rsclaw_i18n::t_fmt(
+                    "cron_oneshot_missed",
+                    rsclaw_i18n::default_lang(),
+                    &[("name", &name)],
+                );
+                if let Err(e) =
+                    send_delivery(&channels, &agents, &job, &default_delivery, &text).await
+                {
+                    warn!(job_id = %job.id, %e, "cron: missed-run notice delivery failed");
+                }
+            });
         }
 
         // Sweep zombie one-shot jobs left disabled by previous runs that
@@ -488,9 +550,11 @@ impl CronRunner {
 
             let next_wake = next_wake_job.map(|(t, _, _)| t);
 
-            // Auto-remove expired once jobs (past due by > 5 minutes).
-            // This prevents stale once jobs from spamming "next_wake in the past" warnings.
-            let expired_threshold_ms = 5 * 60 * 1000;
+            // Auto-remove expired once jobs (past due by > MISSED_RUN_GRACE_MS).
+            // This prevents stale once jobs from spamming "next_wake in the past"
+            // warnings. Must not be shorter than the startup catch-up window,
+            // or a caught-up one-shot would be removed before it fires.
+            let expired_threshold_ms = MISSED_RUN_GRACE_MS;
             let before_len = jobs.len();
             jobs.retain(|j| {
                 if !j.schedule.is_once() || !j.enabled { return true; }
@@ -964,6 +1028,7 @@ impl CronRunner {
                             job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false),
                             &job,
                             &agents,
+                            Some(Arc::clone(&cancelled)),
                         )
                         .await
                     } else {
@@ -1018,12 +1083,25 @@ impl CronRunner {
                             let backoff = error_backoff_ms(consecutive);
                             let will_disable = consecutive >= MAX_CONSECUTIVE_ERRORS;
 
+                            let lang = rsclaw_i18n::default_lang();
                             let backoff_text = if backoff < 60_000 {
-                                format!("{}秒", backoff / 1000)
+                                rsclaw_i18n::t_fmt(
+                                    "cron_backoff_seconds",
+                                    lang,
+                                    &[("n", &(backoff / 1000).to_string())],
+                                )
                             } else if backoff < 3_600_000 {
-                                format!("{}分钟", backoff / 60_000)
+                                rsclaw_i18n::t_fmt(
+                                    "cron_backoff_minutes",
+                                    lang,
+                                    &[("n", &(backoff / 60_000).to_string())],
+                                )
                             } else {
-                                format!("{}小时", backoff / 3_600_000)
+                                rsclaw_i18n::t_fmt(
+                                    "cron_backoff_hours",
+                                    lang,
+                                    &[("n", &(backoff / 3_600_000).to_string())],
+                                )
                             };
 
                             let consecutive_str = consecutive.to_string();
@@ -1103,16 +1181,28 @@ impl CronRunner {
                 let result_tx = result_tx.clone();
                 tokio::spawn(async move {
                     let result = handle.await;
-                    match result {
+                    let r = match result {
                         Ok(r) => {
                             tracing::info!(job_id = %job_id_for_log, success = r.1, duration_ms = r.2, "cron: result sender got result, sending to channel");
-                            if let Err(e) = result_tx.send(r).await {
-                                tracing::warn!(job_id = %job_id_for_log, "cron: failed to send result to channel: {}", e);
-                            }
+                            r
                         }
                         Err(e) => {
-                            tracing::warn!(job_id = %job_id_for_log, "cron: handle.await failed (spawn error): {}", e);
+                            // The job task died (panic / runtime cancel). Report
+                            // a failure so running_at_ms is cleared instead of
+                            // leaving the job "running" forever.
+                            tracing::warn!(job_id = %job_id_for_log, "cron: job task failed to complete: {}", e);
+                            let duration_ms = current_timestamp_ms().saturating_sub(started_at);
+                            (
+                                job_id_for_log.clone(),
+                                false,
+                                duration_ms,
+                                started_at,
+                                Some(format!("cron job task aborted: {e}")),
+                            )
                         }
+                    };
+                    if let Err(e) = result_tx.send(r).await {
+                        tracing::warn!(job_id = %job_id_for_log, "cron: failed to send result to channel: {}", e);
                     }
                 });
             }
@@ -1176,6 +1266,7 @@ impl CronRunner {
                 job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false),
                 job,
                 &self.agents,
+                None,
             )
             .await
         } else {
@@ -1505,11 +1596,24 @@ async fn run_cron_job(
             preparse_channel,
             preparse_peer,
             crate::gateway::preparse::PreparseOrigin::Cron,
+            rsclaw_agent::SenderTrust::Owner,
         )
         .await
         {
-            // Clear the abort flag (we never dispatched to the agent).
+            // We never dispatched to the agent, so the runtime's own cleanup
+            // won't run: drop the entry we created (per-run session keys
+            // would otherwise leak one entry per fire).
+            // A configured (shared) session key may have a live turn using
+            // the same entry, so only per-run keys are removed.
             abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            if job.session_key.is_none() {
+                match handle.abort_flags.write() {
+                    Ok(mut flags) => {
+                        flags.remove(&session_key);
+                    }
+                    Err(e) => warn!(job_id = %job.id, "cron: abort flag cleanup failed: {e}"),
+                }
+            }
             // Empty reply text = preparse handled silently (e.g. /watch dedup-hit
             // triggered by /loop replay). Skip delivery — don't send blank chat
             // messages or fall through to the agent.
@@ -1528,6 +1632,7 @@ async fn run_cron_job(
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
+        trust: rsclaw_agent::SenderTrust::Owner,
         session_key: session_key.clone(),
         text: job_text.to_owned(),
         channel: "cron".to_string(),
@@ -1908,12 +2013,17 @@ async fn send_delivery(
 /// Used for execCommand payload type to bypass session history pollution.
 /// Uses background execution pattern to avoid blocking the spawned task.
 /// If summarize=true, sends output to agent for summarization.
+///
+/// `cancelled`, when given, is the scheduler's per-run cancel flag: once set
+/// (job deleted / disabled / edited via reload) the child process is killed
+/// and the run ends with [`CANCEL_BY_RELOAD`].
 async fn run_exec_command(
     command: &str,
     timeout_secs: Option<u64>,
     summarize: bool,
     job: &CronJob,
     agents: &AgentRegistry,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String> {
     let exec_timeout = Duration::from_secs(timeout_secs.unwrap_or(120));
     let task_id = format!("cron:{}:{}", job.id, chrono::Utc::now().timestamp_millis());
@@ -1948,7 +2058,30 @@ async fn run_exec_command(
     let cmd_timeout = exec_timeout;
     tokio::spawn(async move {
         let started_at = std::time::Instant::now();
-        let result = tokio::time::timeout(cmd_timeout, cmd.output()).await;
+        // Dropping the `output()` future drops the child, and `kill_on_drop`
+        // then kills it — that is how a reload cancel stops the command.
+        let cancel_watch = async {
+            match cancelled {
+                Some(flag) => loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                },
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let result = tokio::select! {
+            r = tokio::time::timeout(cmd_timeout, cmd.output()) => Some(r),
+            _ = cancel_watch => None,
+        };
+        let Some(result) = result else {
+            tracing::info!(task_id = %tid, "cron exec: cancelled by reload, child killed");
+            if result_tx.send(None).is_err() {
+                tracing::debug!(task_id = %tid, "cron exec: result receiver gone");
+            }
+            return;
+        };
 
         let (exit_code, stdout, stderr) = match result {
             Ok(Ok(output)) => {
@@ -1982,14 +2115,17 @@ async fn run_exec_command(
         );
 
         // Send result back via oneshot channel
-        let _ = result_tx.send((exit_code, stdout, stderr));
+        if result_tx.send(Some((exit_code, stdout, stderr))).is_err() {
+            tracing::debug!(task_id = %tid, "cron exec: result receiver gone");
+        }
     });
 
     // Wait for background task result (non-blocking for spawned task, but waits
     // here)
     let (exit_code, stdout, stderr) = result_rx
         .await
-        .map_err(|_| anyhow!("background exec channel closed"))?;
+        .map_err(|_| anyhow!("background exec channel closed"))?
+        .ok_or_else(|| anyhow!(CANCEL_BY_RELOAD))?;
 
     let exit_code = exit_code.unwrap_or(-1);
 
@@ -2076,6 +2212,7 @@ async fn run_exec_command(
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = AgentMessage {
+            trust: rsclaw_agent::SenderTrust::Owner,
             // `summarize:` prefix is detected by the agent runtime and disables
             // ALL tools for the turn — forces the LLM to return a text summary
             // instead of calling memory.put / write_file / etc. Without this,

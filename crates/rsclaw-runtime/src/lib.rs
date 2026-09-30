@@ -427,8 +427,7 @@ fn resolve_gateway_token(explicit: Option<String>) -> String {
                 .as_ref()
                 .and_then(|g| g.auth.as_ref())
                 .and_then(|a| a.token.as_ref())
-                .and_then(|s| s.as_plain())
-                .map(str::to_owned)
+                .and_then(|s| s.resolve_full(cfg.secrets.as_ref()))
             {
                 return t;
             }

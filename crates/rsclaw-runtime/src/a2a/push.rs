@@ -24,22 +24,20 @@ pub fn sign_payload(token: &str, body: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
+/// Per-attempt timeout for a push webhook POST.
+const PUSH_TIMEOUT_SECS: u64 = 10;
+
+/// Push webhook bodies are ignored; cap how much of them we drain.
+const PUSH_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+
 pub struct PushDispatcher {
     store: Arc<TaskStore>,
     bus: TaskEventBus,
-    client: reqwest::Client,
 }
 
 impl PushDispatcher {
     pub fn new(store: Arc<TaskStore>, bus: TaskEventBus) -> Self {
-        Self {
-            store,
-            bus,
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("reqwest"),
-        }
+        Self { store, bus }
     }
 
     /// Watch a task's event stream. Spawn-and-forget; the spawn exits when
@@ -80,18 +78,43 @@ impl PushDispatcher {
         let body = serde_json::to_vec(&ev.to_wire_event())?;
         for cfg in configs {
             let sig = sign_payload(&cfg.token, &body);
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+            match (
+                reqwest::header::HeaderValue::from_str(&sig),
+                reqwest::header::HeaderValue::from_str(task_id),
+            ) {
+                (Ok(sig_v), Ok(task_v)) => {
+                    headers.insert("X-A2A-Signature", sig_v);
+                    headers.insert("X-A2A-Task-Id", task_v);
+                }
+                _ => {
+                    warn!(task_id, "push skipped: task id is not a valid header value");
+                    continue;
+                }
+            }
             for attempt in 1..=3u32 {
-                let resp = self
-                    .client
-                    .post(&cfg.url)
-                    .header("Content-Type", "application/json")
-                    .header("X-A2A-Signature", &sig)
-                    .header("X-A2A-Task-Id", task_id)
-                    .body(body.clone())
-                    .send()
-                    .await;
+                // The webhook URL is caller-supplied: SSRF-safe send (public
+                // addresses only, every redirect hop re-validated).
+                let req = rsclaw_util::net::SafeRequest {
+                    method: reqwest::Method::POST,
+                    url: cfg.url.clone(),
+                    headers: headers.clone(),
+                    body: Some(body.clone()),
+                    timeout: std::time::Duration::from_secs(PUSH_TIMEOUT_SECS),
+                    max_redirects: 3,
+                };
+                let resp = rsclaw_util::net::safe_send(reqwest::Client::builder, req).await;
                 match resp {
                     Ok(r) if r.status().is_success() => {
+                        if let Err(e) =
+                            rsclaw_util::net::read_body_truncated(r, PUSH_RESPONSE_MAX_BYTES).await
+                        {
+                            warn!(task_id, err = %e, "push response body read failed");
+                        }
                         info!(task_id, url = %cfg.url, "push delivered");
                         break;
                     }

@@ -43,6 +43,7 @@ fn make_job(id: &str, schedule: &str, agent_id: &str, enabled: bool) -> CronJob 
         iter: None,
         created_at_ms: None,
         updated_at_ms: None,
+        created_by: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
                 agent_dir: None,
                 system: None,
                 allowed_commands: None,
+                non_owner_tools: None,
                 commands: None,
                 opencode: None,
                 claudecode: None,

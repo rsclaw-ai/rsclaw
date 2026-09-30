@@ -1561,7 +1561,24 @@ pub async fn relay_ws_handler(
     if relay.mode != A2aRelayModeRuntime::Hub {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     }
-    let Some(mut node) = resolve_node(relay, &query.node_id) else {
+    // Revocations are read from the live (hot-reloaded) config so revoking a
+    // node takes effect without a restart; the startup snapshot's list is
+    // still honoured by `resolve_node`.
+    let revoked_live = state
+        .live
+        .gateway
+        .read()
+        .await
+        .a2a_relay
+        .revoked_nodes
+        .iter()
+        .any(|n| n == &query.node_id);
+    let resolved = if revoked_live {
+        None
+    } else {
+        resolve_node(relay, &query.node_id)
+    };
+    let Some(mut node) = resolved else {
         state
             .relay_hub
             .metrics

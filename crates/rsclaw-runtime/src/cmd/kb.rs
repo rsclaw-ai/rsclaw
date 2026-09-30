@@ -456,8 +456,24 @@ fn open_kb(kb_root: &PathBuf) -> Result<Handles> {
     // fresh install before `rsclaw models download`.
     let embedder = rsclaw_kb::embedder::resolve_embedder(kb_root);
     let dim = embedder.dimension();
-    let index =
-        Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim).context("open index")?);
+    // Pin the dense layer to the active embedder so chunks embedded by a
+    // different model of the same dimension (or failed zero vectors) are
+    // never admitted; the gateway's KB service re-embeds those docs.
+    let (index, scan) = KbIndex::open_and_rebuild_for(
+        &paths,
+        &store,
+        dim,
+        Some(embedder.embedder_id().to_string()),
+    )
+    .context("open index")?;
+    if !scan.stale_docs.is_empty() {
+        tracing::warn!(
+            docs = scan.stale_docs.len(),
+            embedder = embedder.embedder_id(),
+            "kb: some docs have chunks from another embedder or invalid vectors; they are excluded from semantic search until re-embedded"
+        );
+    }
+    let index = Arc::new(index);
     Ok(Handles {
         store,
         paths,
@@ -645,12 +661,13 @@ fn rm(kb_root: PathBuf, doc_id: Option<String>, tag: Option<String>, yes: bool) 
 }
 
 fn rm_by_id(h: &Handles, doc_id: String) -> Result<()> {
-    let rtx = h.store.begin_read()?;
-    let mut d =
-        docs::get(&rtx, &doc_id)?.ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
-    drop(rtx);
-    d.status = KbStatus::Tombstoned;
+    // Read + write in one transaction so a concurrent writer's newer copy is
+    // never overwritten with a stale one.
     let wtx = h.store.begin_write()?;
+    let mut d = docs::get_in_wtx(&wtx, &doc_id)?
+        .ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
+    d.status = KbStatus::Tombstoned;
+    d.updated_at = chrono::Utc::now().timestamp_millis();
     docs::put(&wtx, &d)?;
     wtx.commit()?;
     println!("tombstoned {doc_id}");
@@ -660,10 +677,11 @@ fn rm_by_id(h: &Handles, doc_id: String) -> Result<()> {
 fn rm_by_tag(h: &Handles, tag: &str) -> Result<()> {
     use redb::ReadableTable;
     use rsclaw_kb::store::codec::decode;
-    let rtx = h.store.begin_read()?;
+    // Scan + tombstone in one write transaction (no stale write-back).
+    let wtx = h.store.begin_write()?;
     let mut to_tombstone: Vec<rsclaw_kb::model::KbDoc> = Vec::new();
     {
-        let tbl = rtx.open_table(rsclaw_kb::store::schema::KB_DOCS)?;
+        let tbl = wtx.open_table(rsclaw_kb::store::schema::KB_DOCS)?;
         for entry in tbl.iter()? {
             let (_, v) = entry?;
             let d: rsclaw_kb::model::KbDoc = decode(v.value())?;
@@ -672,14 +690,14 @@ fn rm_by_tag(h: &Handles, tag: &str) -> Result<()> {
             }
         }
     }
-    drop(rtx);
     if to_tombstone.is_empty() {
         println!("no Active docs with tag={tag}");
         return Ok(());
     }
-    let wtx = h.store.begin_write()?;
+    let now = chrono::Utc::now().timestamp_millis();
     for mut d in to_tombstone.iter().cloned() {
         d.status = KbStatus::Tombstoned;
+        d.updated_at = now;
         docs::put(&wtx, &d)?;
     }
     wtx.commit()?;
@@ -829,12 +847,10 @@ fn set_visibility(kb_root: PathBuf, doc_id: String, visibility: String) -> Resul
     let h = open_kb(&kb_root)?;
     let new_vis = parse_visibility(&visibility)
         .ok_or_else(|| anyhow::anyhow!("invalid visibility: {visibility}"))?;
-    let rtx = h.store.begin_read()?;
-    let mut d =
-        docs::get(&rtx, &doc_id)?.ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
-    drop(rtx);
-    d.visibility = new_vis;
     let wtx = h.store.begin_write()?;
+    let mut d = docs::get_in_wtx(&wtx, &doc_id)?
+        .ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
+    d.visibility = new_vis;
     docs::put(&wtx, &d)?;
     wtx.commit()?;
     println!("updated {doc_id} visibility → {visibility}");
@@ -865,6 +881,11 @@ fn compact(kb_root: PathBuf) -> Result<()> {
     let h = open_kb(&kb_root)?;
     let now = chrono::Utc::now().timestamp_millis();
     let stats = run_compactor_tick(&h.store, &h.paths, now)?;
+    // Drop purged chunks from tantivy and rebuild HNSW BEFORE snapshotting,
+    // so the snapshot manifest matches redb and is reusable on next start.
+    h.index
+        .apply_purge(&h.store, &stats.purged_chunk_ids)
+        .context("apply purge to kb index")?;
     // Spec §6 pairs the compactor tick with an HNSW snapshot dump.
     // Errors here are non-fatal — snapshot is a performance
     // optimisation; the next startup just rebuilds from redb.

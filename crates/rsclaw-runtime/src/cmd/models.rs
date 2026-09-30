@@ -238,7 +238,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                     option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
                 ));
                 let url = format!("{}/api/v1/models/health", gateway_base());
-                let mut rb = reqwest::Client::new()
+                let mut rb = crate::cmd::gateway_http::local_client()
                     .get(&url)
                     .timeout(std::time::Duration::from_secs(5));
                 if let Some(t) = gateway_token() {
@@ -299,7 +299,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
             }
             HealthCommand::Reset { model } => {
                 let url = format!("{}/api/v1/models/health/reset", gateway_base());
-                let mut rb = reqwest::Client::new()
+                let mut rb = crate::cmd::gateway_http::local_client()
                     .post(&url)
                     .json(&serde_json::json!({ "model": &model }))
                     .timeout(std::time::Duration::from_secs(5));

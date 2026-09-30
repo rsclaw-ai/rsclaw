@@ -63,7 +63,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 "agent_id": job.agent_id,
                 "session_key": format!("cron:{id}:manual"),
             });
-            let client = reqwest::Client::new();
+            let client = crate::cmd::gateway_http::local_client();
             let resp = with_gateway_auth(client.post(&url), config.gateway.auth_token.as_deref())
                 .json(&body)
                 .send()
@@ -111,7 +111,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
 
             let cfg = gateway_config()?;
             let url = gateway_url(&cfg, "/api/v1/cron");
-            let client = reqwest::Client::new();
+            let client = crate::cmd::gateway_http::local_client();
             let body = serde_json::json!({
                 "agent_id": args.agent.as_deref().unwrap_or("main"),
                 "enabled": true,
@@ -164,7 +164,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 if args.disable {
                     body.insert("enabled".to_owned(), serde_json::json!(false));
                 }
-                let client = reqwest::Client::new();
+                let client = crate::cmd::gateway_http::local_client();
                 let resp = with_gateway_auth(client.put(&url), cfg.gateway.auth_token.as_deref())
                     .json(&body)
                     .send()
@@ -205,7 +205,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
         CronCommand::Enable { id } => {
             let cfg = gateway_config()?;
             let url = gateway_url(&cfg, &format!("/api/v1/cron/{id}"));
-            let client = reqwest::Client::new();
+            let client = crate::cmd::gateway_http::local_client();
             let resp = with_gateway_auth(client.put(&url), cfg.gateway.auth_token.as_deref())
                 .json(&serde_json::json!({"enabled": true}))
                 .send()
@@ -222,7 +222,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
         CronCommand::Disable { id } => {
             let cfg = gateway_config()?;
             let url = gateway_url(&cfg, &format!("/api/v1/cron/{id}"));
-            let client = reqwest::Client::new();
+            let client = crate::cmd::gateway_http::local_client();
             let resp = with_gateway_auth(client.put(&url), cfg.gateway.auth_token.as_deref())
                 .json(&serde_json::json!({"enabled": false}))
                 .send()
@@ -239,7 +239,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
         CronCommand::Rm { id } => {
             let cfg = gateway_config()?;
             let url = gateway_url(&cfg, &format!("/api/v1/cron/{id}"));
-            let client = reqwest::Client::new();
+            let client = crate::cmd::gateway_http::local_client();
             let resp = with_gateway_auth(client.delete(&url), cfg.gateway.auth_token.as_deref())
                 .send()
                 .await
@@ -365,7 +365,7 @@ async fn notify_gateway_cron_reload() {
         return;
     };
     let url = format!("http://127.0.0.1:{}/api/v1/cron/reload", cfg.gateway.port);
-    let client = reqwest::Client::builder()
+    let client = crate::cmd::gateway_http::local_client_builder()
         .timeout(std::time::Duration::from_secs(3))
         .build();
     let Ok(client) = client else {
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn gateway_auth_helper_adds_bearer_token() {
         let request = with_gateway_auth(
-            reqwest::Client::new().post("http://127.0.0.1:18888/api/v1/message"),
+            crate::cmd::gateway_http::local_client().post("http://127.0.0.1:18888/api/v1/message"),
             Some("secret-token"),
         )
         .build()
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn gateway_auth_helper_omits_empty_token() {
         let request = with_gateway_auth(
-            reqwest::Client::new().post("http://127.0.0.1:18888/api/v1/message"),
+            crate::cmd::gateway_http::local_client().post("http://127.0.0.1:18888/api/v1/message"),
             Some(""),
         )
         .build()

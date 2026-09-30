@@ -248,7 +248,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 .map(|s| s.join(","))
                 .unwrap_or_else(|| "all".to_owned());
             let url = format!("http://127.0.0.1:{port}/api/v1/reload?scope={scope_param}");
-            let client = reqwest::Client::new();
+            let client = crate::cmd::gateway_http::local_client();
             let mut req = client.post(&url);
             if !auth_token.is_empty() {
                 req = req.bearer_auth(&auth_token);
@@ -280,7 +280,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             let config = config::load_quiet().ok();
             let port = config.map(|c| c.gateway.port).unwrap_or(18888);
             let url = format!("http://127.0.0.1:{port}/api/v1/health");
-            match reqwest::Client::new().get(&url).send().await {
+            match crate::cmd::gateway_http::local_client().get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     println!("  [ok] Healthy -- {url}");
                 }
@@ -299,7 +299,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             let config = std::sync::Arc::new(config::load_quiet()?);
             let port = config.gateway.port;
             let url = format!("http://127.0.0.1:{port}/api/v1/health");
-            let resp = reqwest::Client::new()
+            let resp = crate::cmd::gateway_http::local_client()
                 .get(&url)
                 .send()
                 .await
@@ -320,7 +320,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 .and_then(|c| c.gateway.auth_token)
                 .unwrap_or_default();
             let url = format!("http://127.0.0.1:{port}/api/v1/usage");
-            let mut req = reqwest::Client::new().get(&url);
+            let mut req = crate::cmd::gateway_http::local_client().get(&url);
             if !auth_token.is_empty() {
                 req = req.bearer_auth(&auth_token);
             }
@@ -349,7 +349,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 serde_json::from_str(&args.join(" "))
                     .unwrap_or(serde_json::Value::String(args.join(" ")))
             };
-            let mut req = reqwest::Client::new().post(&url).json(&body);
+            let mut req = crate::cmd::gateway_http::local_client().post(&url).json(&body);
             if !auth_token.is_empty() {
                 req = req.bearer_auth(&auth_token);
             }
@@ -381,8 +381,12 @@ fn gateway_read_pid() -> Option<u32> {
         .ok()
 }
 
+/// True when `pid` is a live rsclaw process. A bare liveness check is not
+/// enough here: a stale PID file (or a port listener) may point at an
+/// unrelated process that reused the number, and we must never report it as
+/// the gateway or signal it.
 fn process_alive(pid: u32) -> bool {
-    rsclaw_platform::process_alive(pid)
+    rsclaw_platform::process_is_rsclaw(pid)
 }
 
 /// Scan for the process listening on this instance's configured gateway port.
@@ -514,7 +518,12 @@ fn detect_port_from_sources(instance_port: Option<u16>, configured_port: Option<
 }
 
 fn gateway_target_pid() -> Option<u32> {
-    select_gateway_pid(gateway_read_pid(), find_gateway_pid())
+    // Ignore a PID-file entry that no longer names a live rsclaw process so a
+    // stale file cannot shadow the real port listener.
+    select_gateway_pid(
+        gateway_read_pid().filter(|&pid| process_alive(pid)),
+        find_gateway_pid(),
+    )
 }
 
 fn select_gateway_pid(pid_file_pid: Option<u32>, port_listener_pid: Option<u32>) -> Option<u32> {
@@ -733,7 +742,7 @@ fn gateway_auth_token() -> String {
 }
 
 async fn gateway_health_reachable(url: &str) -> bool {
-    reqwest::Client::new()
+    crate::cmd::gateway_http::local_client()
         .get(url)
         .send()
         .await
@@ -743,7 +752,7 @@ async fn gateway_health_reachable(url: &str) -> bool {
 
 async fn request_graceful_restart(url: &str) -> Result<()> {
     let token = gateway_auth_token();
-    let mut req = reqwest::Client::new().post(url);
+    let mut req = crate::cmd::gateway_http::local_client().post(url);
     if !token.is_empty() {
         req = req.bearer_auth(token);
     }
@@ -763,7 +772,7 @@ pub fn should_remove_pid_after_stop(outcome: &StopWaitOutcome) -> bool {
 }
 
 async fn wait_for_gateway_health(url: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = crate::cmd::gateway_http::local_client();
     let deadline = std::time::Instant::now() + START_HEALTH_TIMEOUT;
     let mut samples = Vec::new();
 
@@ -841,9 +850,16 @@ pub fn gateway_signal_stop() -> Result<()> {
 
     // Fallback: direct PID kill (for manual `gateway start` without service).
     // Try this instance's PID file first, then its configured port listener.
-    let pid = gateway_target_pid().ok_or_else(|| {
-        anyhow::anyhow!("gateway is not running (no PID file and no matching process)")
-    })?;
+    let Some(pid) = gateway_target_pid() else {
+        // A PID file whose process is gone (or was reused by a non-rsclaw
+        // process) is stale; clear it so later commands don't trust it.
+        if gateway_read_pid().is_some()
+            && let Err(e) = std::fs::remove_file(gateway_pid_file())
+        {
+            tracing::warn!("failed to remove stale gateway pid file: {e}");
+        }
+        anyhow::bail!("gateway is not running (no PID file and no matching process)");
+    };
     if !process_alive(pid) {
         let _ = std::fs::remove_file(gateway_pid_file());
         anyhow::bail!("gateway process {pid} is not running");
@@ -1064,7 +1080,7 @@ pub async fn gateway_print_status() -> Result<()> {
                 .ok()
                 .and_then(|c| c.gateway.auth_token.clone())
                 .unwrap_or_default();
-            let mut req = reqwest::Client::new().get(&url);
+            let mut req = crate::cmd::gateway_http::local_client().get(&url);
             if !auth_token.is_empty() {
                 req = req.bearer_auth(&auth_token);
             }

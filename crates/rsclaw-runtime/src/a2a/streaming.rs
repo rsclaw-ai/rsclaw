@@ -321,28 +321,23 @@ pub(crate) fn subscribe_to_task(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_default();
-    let receiver = state.task_event_bus.subscribe(&task_id);
     // A non-owner gets the same result as an unknown task so existence is not
-    // leaked.
+    // leaked. The rejection goes to a fresh ephemeral bus: publishing Failed
+    // on (or closing) the requested task's bus would let a non-owner forge a
+    // terminal event for someone else's task.
     if task_id.is_empty()
         || state.task_store.get(&task_id).ok().flatten().is_none()
         || !crate::a2a::server::caller_owns(&state.task_store, caller, &task_id)
     {
-        state.task_event_bus.publish(AgentEvent::Status {
-            task_id: task_id.clone(),
-            context_id: String::new(),
-            state: TaskState::Failed,
-            message: Some(rsclaw_a2a_types::event::text_message(
-                if task_id.is_empty() {
-                    "SubscribeToTask: missing task id"
-                } else {
-                    "SubscribeToTask: task not found"
-                },
-            )),
-            final_: true,
-        });
-        state.task_event_bus.close(&task_id);
+        let message = if task_id.is_empty() {
+            "SubscribeToTask: missing task id"
+        } else {
+            "SubscribeToTask: task not found"
+        };
+        let (rejection_id, receiver, _) = rejected_stream(state, "", message.to_owned());
+        return (rejection_id, receiver);
     }
+    let receiver = state.task_event_bus.subscribe(&task_id);
     (task_id, receiver)
 }
 
@@ -455,11 +450,16 @@ pub(crate) async fn spawn_streaming_task(
     // Submitted/Working frames. broadcast channels don't replay history.
     let early_rx = state.task_event_bus.subscribe(&task_id);
 
-    let session_key = params
-        .message
-        .context_id
-        .clone()
-        .unwrap_or_else(|| format!("a2a:{}", Uuid::new_v4()));
+    let session_key = match crate::a2a::server::a2a_session_key(
+        &caller,
+        params.message.context_id.as_deref(),
+    ) {
+        Ok(k) => k,
+        Err(reason) => {
+            drop(early_rx);
+            return rejected_stream(&state, "", reason);
+        }
+    };
 
     let agent_id = params
         .metadata
@@ -481,21 +481,15 @@ pub(crate) async fn spawn_streaming_task(
     };
     let Ok(handle) = handle else {
         warn!("SendStreamingMessage: no agent available");
-        // Publish Failed AND close the bus so the SSE stream actually
-        // terminates — without the close the subscriber sees Failed but
-        // BroadcastStream stays subscribed forever waiting for the next
-        // event that will never come.
-        state.task_event_bus.publish(AgentEvent::Status {
-            task_id: task_id.clone(),
-            context_id: session_key.clone(),
-            state: TaskState::Failed,
-            message: Some(rsclaw_a2a_types::event::text_message(
-                "no agent available for this task",
-            )),
-            final_: true,
-        });
-        state.task_event_bus.close(&task_id);
-        return (task_id, early_rx, None);
+        // The task id is caller-supplied and not yet reserved, so it may
+        // belong to another caller: report on a fresh ephemeral bus instead
+        // of publishing / closing the requested task's bus.
+        drop(early_rx);
+        return rejected_stream(
+            &state,
+            &session_key,
+            "no agent available for this task".to_owned(),
+        );
     };
 
     // Reply oneshot — we await this in a spawned task so we can publish
@@ -716,6 +710,7 @@ pub(crate) async fn spawn_streaming_task(
     );
 
     let msg = AgentMessage {
+        trust: rsclaw_agent::SenderTrust::User,
         session_key: session_key.clone(),
         text,
         channel: "a2a".to_owned(),

@@ -8,7 +8,11 @@
 //! `dispatch_poll`, add the corresponding `submit_*` for the tool side,
 //! and add the URL → Done outcome mapping.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use rsclaw_channel::OutboundMessage;
@@ -41,6 +45,12 @@ const MAX_CONCURRENT_OPS: usize = 8;
 /// back-off.
 const DELIVERY_RETRY_DELAY_SECS: u64 = 30;
 
+/// Lease stamped into `next_poll_at` when a job is claimed for a cycle, so
+/// later ticks don't re-select it while a long poll / download is running.
+/// Every successful cycle overwrites `next_poll_at` with the real schedule;
+/// the lease only matters if the process dies mid-cycle.
+const CLAIM_LEASE_SECS: i64 = 600;
+
 pub struct ExternalJobsWorker {
     store: Arc<RedbStore>,
     notification_tx: broadcast::Sender<OutboundMessage>,
@@ -49,6 +59,22 @@ pub struct ExternalJobsWorker {
     client: reqwest::Client,
     /// Cap on concurrent per-job operations — see MAX_CONCURRENT_OPS.
     op_semaphore: Arc<Semaphore>,
+    /// Job ids currently being processed by a spawned task. Guards against
+    /// re-spawning the same job on the next tick.
+    in_flight: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Removes a job id from the in-flight set when the processing task ends.
+struct InFlightGuard {
+    set: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut set = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.id);
+    }
 }
 
 impl ExternalJobsWorker {
@@ -69,6 +95,7 @@ impl ExternalJobsWorker {
             config,
             client,
             op_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OPS)),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -86,21 +113,43 @@ impl ExternalJobsWorker {
             match self.store.due_external_jobs(now) {
                 Ok(jobs) if !jobs.is_empty() => {
                     debug!(count = jobs.len(), "external jobs: due tick");
-                    for job in jobs {
+                    for mut job in jobs {
+                        // Skip jobs a previous tick already spawned.
+                        {
+                            let set = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                            if set.contains(&job.id) {
+                                continue;
+                            }
+                        }
+                        // Don't queue waiters behind a saturated semaphore;
+                        // remaining due jobs get picked up on a later tick.
+                        let permit = match Arc::clone(&self.op_semaphore).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                debug!("external jobs: all op slots busy, deferring rest of tick");
+                                break;
+                            }
+                        };
+                        // Claim: push next_poll_at out by a lease so the row
+                        // isn't re-selected while this cycle runs.
+                        job.next_poll_at = now + CLAIM_LEASE_SECS;
+                        if let Err(e) = self.store.update_external_job(&job) {
+                            error!(job_id = %job.id, "external jobs: claim failed: {e:#}");
+                            continue;
+                        }
+                        self.in_flight
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(job.id.clone());
+                        let in_flight = InFlightGuard {
+                            set: Arc::clone(&self.in_flight),
+                            id: job.id.clone(),
+                        };
                         let worker = Arc::clone(&self);
                         let guard = self.shutdown.begin_work();
-                        let sem = Arc::clone(&self.op_semaphore);
                         tokio::spawn(async move {
-                            // acquire_owned awaits a permit so concurrent
-                            // ops are bounded by MAX_CONCURRENT_OPS even if
-                            // 100 jobs become due in the same tick.
-                            let _permit = match sem.acquire_owned().await {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    drop(guard);
-                                    return;
-                                }
-                            };
+                            let _permit = permit;
+                            let _in_flight = in_flight;
                             worker.process_job(job).await;
                             drop(guard);
                         });
@@ -409,7 +458,7 @@ impl ExternalJobsWorker {
             .as_ref()
             .and_then(|m| m.providers.get(provider))
             .and_then(|p| p.api_key.as_ref())
-            .and_then(|k| k.as_plain().map(str::to_owned))
+            .and_then(|k| k.resolve_full(self.config.ops.secrets.as_ref()))
             .or_else(|| std::env::var(env_var).ok())
     }
 

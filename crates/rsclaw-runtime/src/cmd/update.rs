@@ -247,7 +247,14 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     } else {
         url.clone()
     };
-    let downloaded = client.get(&download).send().await?.bytes().await?;
+    let downloaded = client
+        .get(&download)
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| anyhow::anyhow!("download failed: {e}"))?
+        .bytes()
+        .await?;
 
     if downloaded.is_empty() {
         anyhow::bail!("downloaded binary is empty");
@@ -272,7 +279,14 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
             }
         })
     });
-    if let Some(su) = sum_url {
+    // Refuse to install an unverified binary: a missing SHA256SUMS asset or
+    // entry is treated like a mismatch.
+    let Some(su) = sum_url else {
+        anyhow::bail!(
+            "release has no SHA256SUMS asset; refusing to install an unverified binary"
+        );
+    };
+    {
         let su_dl = if su.contains("github.com") || su.contains("githubusercontent.com") {
             proxy_url(&su)
         } else {
@@ -282,9 +296,10 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
             .get(&su_dl)
             .send()
             .await?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("SHA256SUMS download failed: {e}"))?
             .text()
-            .await
-            .unwrap_or_default();
+            .await?;
         let asset_filename = url.rsplit('/').next().unwrap_or("");
         let expected = sums.lines().find_map(|line| {
             let mut parts = line.split_whitespace();
@@ -320,19 +335,11 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
                 }
             }
             None => {
-                if !quiet {
-                    println!(
-                        "  {} no SHA256 entry for {asset_filename} in SHA256SUMS — proceeding without verify",
-                        yellow("[!]")
-                    );
-                }
+                anyhow::bail!(
+                    "no SHA256 entry for {asset_filename} in SHA256SUMS; refusing to install an unverified binary"
+                );
             }
         }
-    } else if !quiet {
-        println!(
-            "  {} release has no SHA256SUMS asset — proceeding without verify",
-            yellow("[!]")
-        );
     }
 
     // 5. Extract binary from archive (tar.gz / zip) if needed.
@@ -406,20 +413,48 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
                 println!("  {} restarting gateway...", dim("[..]"));
             }
             if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-                if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                    let _ = rsclaw_platform::process_terminate(pid as u32);
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    #[allow(unused_mut)]
-                    let mut upd = std::process::Command::new(&current_exe);
-                    upd.arg("gateway").arg("start");
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::process::CommandExt;
-                        upd.creation_flags(0x08000000);
-                    }
-                    let _ = upd.spawn();
-                    if !quiet {
-                        println!("  {} gateway restarted", green("[ok]"));
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    // process_terminate refuses pids that are not rsclaw (stale
+                    // pid file). Never start a second gateway when the old one
+                    // could not be stopped — two gateways on one profile fight
+                    // over the redb lock.
+                    match rsclaw_platform::process_terminate(pid) {
+                        Err(e) => {
+                            tracing::warn!(pid, error = %e, "update: could not stop running gateway; skipping restart");
+                            if !quiet {
+                                println!(
+                                    "  {} could not stop gateway (pid {pid}): {e}; restart it manually",
+                                    yellow("[!!]")
+                                );
+                            }
+                        }
+                        Ok(()) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            #[allow(unused_mut)]
+                            let mut upd = std::process::Command::new(&current_exe);
+                            upd.arg("gateway").arg("start");
+                            #[cfg(windows)]
+                            {
+                                use std::os::windows::process::CommandExt;
+                                upd.creation_flags(0x08000000);
+                            }
+                            match upd.spawn() {
+                                Ok(_) => {
+                                    if !quiet {
+                                        println!("  {} gateway restarted", green("[ok]"));
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "update: failed to start gateway");
+                                    if !quiet {
+                                        println!(
+                                            "  {} failed to start gateway: {e}",
+                                            yellow("[!!]")
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

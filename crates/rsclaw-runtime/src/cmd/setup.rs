@@ -1411,18 +1411,28 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     };
 
     // Load existing config or start fresh.
+    // An existing config that can't be read or parsed must not be silently
+    // replaced by a fresh one (that would wipe the user's settings).
     let mut val: serde_json::Value = if config_path.exists() {
-        std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|raw| json5::from_str(&raw).ok())
-            .unwrap_or_else(|| json!({}))
+        let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+            anyhow::anyhow!("cannot read existing config {}: {e}", config_path.display())
+        })?;
+        json5::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "existing config {} is not valid JSON5 ({e}); fix or move it away before running setup",
+                config_path.display()
+            )
+        })?
     } else {
         json!({})
     };
 
     // Ensure top-level is an object.
     if !val.is_object() {
-        val = json!({});
+        anyhow::bail!(
+            "existing config {} is not a JSON object; fix or move it away before running setup",
+            config_path.display()
+        );
     }
 
     // -- gateway --
@@ -1894,14 +1904,17 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
             && std::fs::read_to_string(&pid_file)
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
-                .is_some_and(|pid| rsclaw_platform::process_alive(pid));
+                .is_some_and(rsclaw_platform::process_is_rsclaw);
 
         if gateway_running {
             hint(&rsclaw_i18n::t("cli_restarting_gateway", lang));
             if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
                 && let Ok(pid) = pid_str.trim().parse::<u32>()
             {
-                let _ = rsclaw_platform::process_terminate(pid);
+                // process_terminate re-verifies the pid names an rsclaw process.
+                if let Err(e) = rsclaw_platform::process_terminate(pid) {
+                    tracing::warn!("gateway restart: terminate failed: {e}");
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             match crate::cmd::gateway::spawn_gateway_bg_pub() {

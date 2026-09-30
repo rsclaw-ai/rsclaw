@@ -262,6 +262,7 @@ mod tests {
             channels: channels.map(|v| v.into_iter().map(str::to_owned).collect()),
             commands: None,
             allowed_commands: None,
+            non_owner_tools: None,
             name: None,
             opencode: None,
             claudecode: None,

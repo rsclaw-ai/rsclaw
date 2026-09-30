@@ -47,8 +47,31 @@ impl GatewayEndpoint {
     }
 }
 
+/// Header the gateway's CSRF guard accepts (together with a Bearer token)
+/// as proof that a loopback request comes from a local CLI, not a browser.
+pub const LOCAL_REQUEST_HEADER: &str = "X-RsClaw-Request";
+
+/// `ClientBuilder` for requests to the local gateway: every request carries
+/// `X-RsClaw-Request: 1`.
+pub fn local_client_builder() -> reqwest::ClientBuilder {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        LOCAL_REQUEST_HEADER,
+        reqwest::header::HeaderValue::from_static("1"),
+    );
+    reqwest::Client::builder().default_headers(headers)
+}
+
+/// Client for requests to the local gateway (see [`local_client_builder`]).
+pub fn local_client() -> reqwest::Client {
+    local_client_builder().build().unwrap_or_else(|e| {
+        tracing::warn!("local gateway client build failed ({e}); using default client");
+        reqwest::Client::new()
+    })
+}
+
 fn client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
+    local_client_builder()
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(2))
         .build()

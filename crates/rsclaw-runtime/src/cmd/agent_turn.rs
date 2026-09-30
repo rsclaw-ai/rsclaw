@@ -51,7 +51,7 @@ pub async fn cmd_agent_turn(args: AgentTurnArgs) -> Result<()> {
     }
 
     let url = format!("http://127.0.0.1:{port}/api/v1/agent/turn");
-    let client = reqwest::Client::new();
+    let client = crate::cmd::gateway_http::local_client();
     let timeout_dur = std::time::Duration::from_secs(args.timeout.unwrap_or(120));
 
     let resp = client

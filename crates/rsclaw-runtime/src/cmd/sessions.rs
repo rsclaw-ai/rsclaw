@@ -30,8 +30,7 @@ fn gateway_token() -> String {
                 .as_ref()?
                 .token
                 .as_ref()?
-                .as_plain()
-                .map(str::to_owned)
+                .resolve_full(c.secrets.as_ref())
         })
         .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
         .unwrap_or_default()
@@ -41,7 +40,7 @@ fn gateway_token() -> String {
 async fn api_get(path: &str) -> Result<serde_json::Value> {
     let url = format!("{}/api/v1{path}", gateway_url());
     let token = gateway_token();
-    let client = reqwest::Client::new();
+    let client = crate::cmd::gateway_http::local_client();
     let mut req = client.get(&url);
     if !token.is_empty() {
         req = req.header("Authorization", format!("Bearer {token}"));

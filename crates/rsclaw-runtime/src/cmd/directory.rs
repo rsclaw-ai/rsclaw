@@ -15,7 +15,7 @@ pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
         .and_then(|c| c.gateway.auth_token.as_deref())
         .unwrap_or("");
     let base = gateway_url(port);
-    let client = reqwest::Client::new();
+    let client = crate::cmd::gateway_http::local_client();
 
     match sub {
         DirectoryCommand::Self_ { channel } => {

@@ -310,7 +310,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(config.gateway.port);
             let api_url = format!("http://127.0.0.1:{port}/api/v1/channels/pair");
-            let client = reqwest::Client::new();
+            let client = crate::cmd::gateway_http::local_client();
             let auth_token_val = config
                 .gateway
                 .auth_token
@@ -394,7 +394,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                 .and_then(|c| c.gateway.auth_token.as_deref())
                 .unwrap_or("");
             let api_url = format!("http://127.0.0.1:{port}/api/v1/channels/unpair");
-            match reqwest::Client::new()
+            match crate::cmd::gateway_http::local_client()
                 .post(&api_url)
                 .header("Authorization", format!("Bearer {auth_token}"))
                 .json(&serde_json::json!({ "channel": channel, "peerId": peer }))
@@ -493,41 +493,12 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             kv("capabilities", &caps.join(", "));
         }
         ChannelsCommand::Resolve { channel, name } => {
-            let config = config::load()?;
-            let port = config.gateway.port;
-            let auth_token_val = config
-                .gateway
-                .auth_token
-                .clone()
-                .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
-                .unwrap_or_default();
-            let auth_token = auth_token_val.as_str();
-            let url = format!("http://127.0.0.1:{port}/api/v1/channels/{channel}/resolve");
-            let client = reqwest::Client::new();
-            match client
-                .get(&url)
-                .header("Authorization", format!("Bearer {auth_token}"))
-                .query(&[("name", &name)])
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                    let id = body["id"].as_str().unwrap_or("(not found)");
-                    ok(&format!(
-                        "{}: {} -> {}",
-                        cyan(&channel),
-                        bold(&name),
-                        green(id)
-                    ));
-                }
-                Ok(resp) => {
-                    err_msg(&format!("resolve failed: HTTP {}", resp.status()));
-                }
-                Err(_) => {
-                    err_msg("gateway not reachable -- start the gateway first");
-                }
-            }
+            // The gateway exposes no name -> id resolve endpoint.
+            err_msg(&format!(
+                "`channels resolve` is not supported: the gateway has no resolve endpoint                  (channel {}, name {})",
+                cyan(&channel),
+                bold(&name)
+            ));
         }
         ChannelsCommand::Paired { channel } => {
             banner(&format!(

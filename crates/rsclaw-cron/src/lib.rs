@@ -348,6 +348,20 @@ pub struct CronJob {
     pub created_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at_ms: Option<u64>,
+    /// Owner tag (`{channel, peer}`) set by the agent cron tool; scopes which
+    /// jobs a non-owner caller may see / edit. Typed so the runner's
+    /// write-back preserves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<CronCreator>,
+}
+
+/// Who created a cron job (the originating channel + peer id).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronCreator {
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub peer: String,
 }
 
 impl CronJob {
@@ -447,6 +461,7 @@ impl From<&CronJobConfig> for CronJob {
             iter: None,
             created_at_ms: None,
             updated_at_ms: None,
+            created_by: None,
         }
     }
 }
@@ -1268,6 +1283,7 @@ mod cron_config_equal_tests {
             iter: None,
             created_at_ms: Some(1_000),
             updated_at_ms: Some(1_000),
+            created_by: None,
         }
     }
 
@@ -1356,6 +1372,7 @@ mod cron_iter_tests {
             iter: None,
             created_at_ms: None,
             updated_at_ms: None,
+            created_by: None,
         }
     }
 

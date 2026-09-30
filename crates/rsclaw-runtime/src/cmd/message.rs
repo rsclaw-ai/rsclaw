@@ -8,7 +8,7 @@ fn gateway_client() -> Result<(reqwest::Client, String, String)> {
     let port = cfg.gateway.port;
     let token = cfg.gateway.auth_token.unwrap_or_default();
     let base = format!("http://127.0.0.1:{port}");
-    Ok((reqwest::Client::new(), base, token))
+    Ok((crate::cmd::gateway_http::local_client(), base, token))
 }
 
 /// POST helper — sends JSON body and prints the response.
