@@ -61,6 +61,8 @@ pub enum WatchStartError {
     InvalidRegex(String),
     #[error("invalid jq expression: {0}")]
     InvalidJq(String),
+    #[error("invalid url: {0}")]
+    InvalidUrl(String),
     #[error("unresolved env var: {0}")]
     UnresolvedEnv(String),
     #[error("shell exited immediately (code={0:?})")]
@@ -79,14 +81,28 @@ pub enum SourceImpl {
     Sse(SseSource),
 }
 
+/// Tails an arbitrary local file.
+///
+/// SECURITY: owner-only. This source can read any file the gateway process
+/// can read; the `/watch file` command must only be reachable by the owner
+/// (enforced by the preparse owner gate, not here).
 pub struct FileSource {
     pub path: PathBuf,
 }
 
+/// Runs an arbitrary shell command (`sh -c` / `powershell -Command`) and
+/// streams its output.
+///
+/// SECURITY: owner-only. This is host command execution; the `/watch shell`
+/// command must only be reachable by the owner (enforced by the preparse
+/// owner gate, not here).
 pub struct ShellSource {
     pub cmd: String,
 }
 
+/// Streams a remote Server-Sent Events endpoint. The URL is restricted to
+/// public http(s) hosts (SSRF guard, re-checked on every reconnect) and only
+/// `${RSCLAW_WATCH_*}` env vars are expanded into the URL / headers.
 pub struct SseSource {
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -99,6 +115,7 @@ impl SseSource {
     pub fn build(url: &str, headers: &[(String, String)]) -> Result<Self, WatchStartError> {
         let url = crate::sse::substitute_env_vars(url)
             .map_err(|e| WatchStartError::UnresolvedEnv(e.to_string()))?;
+        validate_sse_url_static(&url)?;
         let mut subst_headers = Vec::with_capacity(headers.len());
         for (k, v) in headers {
             let v2 = crate::sse::substitute_env_vars(v)
@@ -110,6 +127,40 @@ impl SseSource {
             headers: subst_headers,
         })
     }
+}
+
+/// Cheap synchronous pre-check so obviously bad SSE targets fail at
+/// `/watch` time instead of on the first connect. The authoritative SSRF
+/// check (DNS resolution + address vetting) runs on every connect in
+/// `sse::run_sse_single_tracking`.
+fn validate_sse_url_static(raw: &str) -> Result<(), WatchStartError> {
+    let parsed = url::Url::parse(raw).map_err(|e| WatchStartError::InvalidUrl(e.to_string()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(WatchStartError::InvalidUrl(format!(
+            "scheme `{}` not allowed (http/https only)",
+            parsed.scheme()
+        )));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| WatchStartError::InvalidUrl("missing host".to_owned()))?;
+    let host_l = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if host_l == "localhost" || host_l.ends_with(".localhost") || host_l.ends_with(".local") {
+        return Err(WatchStartError::InvalidUrl(format!(
+            "host `{host}` is a local address"
+        )));
+    }
+    if let Ok(ip) = host_l.parse::<std::net::IpAddr>()
+        && !rsclaw_util::net::is_public_ip(&ip)
+    {
+        return Err(WatchStartError::InvalidUrl(format!(
+            "host `{host}` is not a public address"
+        )));
+    }
+    Ok(())
 }
 
 impl SourceImpl {
@@ -326,4 +377,26 @@ fn inode_from_metadata(m: &std::fs::Metadata) -> Option<u64> {
 #[cfg(not(unix))]
 fn inode_from_metadata(_m: &std::fs::Metadata) -> Option<u64> {
     None
+}
+
+#[cfg(test)]
+mod sse_url_tests {
+    use super::*;
+
+    #[test]
+    fn sse_build_rejects_private_and_non_http_targets() {
+        for bad in [
+            "http://127.0.0.1:18888/api/v1/shutdown",
+            "http://localhost/x",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/x",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                matches!(SseSource::build(bad, &[]), Err(WatchStartError::InvalidUrl(_))),
+                "should reject {bad}"
+            );
+        }
+        assert!(SseSource::build("https://example.com/stream", &[]).is_ok());
+    }
 }

@@ -15,7 +15,9 @@ pub struct SetupArgs {
     #[arg(long)]
     pub remote_url: Option<String>,
     /// Token for remote gateway authentication.
-    #[arg(long)]
+    /// Also read from `RSCLAW_REMOTE_TOKEN` so the secret need not appear in
+    /// argv (visible in `ps` / shell history).
+    #[arg(long, env = "RSCLAW_REMOTE_TOKEN", hide_env_values = true)]
     pub remote_token: Option<String>,
     /// Workspace directory path.
     #[arg(long)]
@@ -37,7 +39,9 @@ pub struct OnboardArgs {
     #[arg(long)]
     pub gateway_port: Option<u16>,
     /// Gateway authentication token.
-    #[arg(long)]
+    /// Also read from `RSCLAW_AUTH_TOKEN` so the secret need not appear in
+    /// argv (visible in `ps` / shell history).
+    #[arg(long, env = "RSCLAW_AUTH_TOKEN", hide_env_values = true)]
     pub gateway_token: Option<String>,
     /// Skip channel configuration.
     #[arg(long)]

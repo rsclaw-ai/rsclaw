@@ -6,7 +6,8 @@
 //! to `agent`, `gateway`, `ws`, and channels — the root knot.
 //!
 //! Schedule format: standard 5-field cron "min hr dom mon dow".
-//! Timezone: stored in schedule but currently executes in UTC.
+//! Timezone: evaluated in the schedule's `tz` (IANA name) when set,
+//! otherwise in the system timezone (`rsclaw_config::system_tz`).
 
 use std::{
     path::PathBuf,
@@ -515,130 +516,191 @@ pub fn cron_jobs_config_equal(a: &CronJob, b: &CronJob) -> bool {
 // Cron expression parsing — next-run computation
 // ---------------------------------------------------------------------------
 
-/// Parse a cron field value (min/hr/dom/mon/dow) and check if a value matches.
-/// Supports: * (any), */n (every n), n (specific), n,m (list).
-/// Does NOT support: n-m (range), n/m (step with start).
-fn field_matches(field: &str, value: u32) -> bool {
-    if field == "*" {
-        return true;
+const MONTH_NAMES: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+const DOW_NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+/// Parse one value of a cron field: a number or (for month/dow) a
+/// three-letter English name. `name_base` is the numeric value of the first
+/// name (1 for JAN, 0 for SUN).
+fn parse_field_value(s: &str, names: &[&str], name_base: u32) -> Option<u32> {
+    if let Ok(n) = s.parse::<u32>() {
+        return Some(n);
     }
-    if let Some(step) = field.strip_prefix("*/") {
-        if let Ok(n) = step.parse::<u32>() {
-            return n > 0 && value % n == 0;
-        }
-    }
-    // Handle comma-separated lists (each part may be a value, range, or step)
-    if field.contains(',') {
-        return field
-            .split(',')
-            .any(|part| field_matches(part.trim(), value));
-    }
-    // Handle range: "9-17" means 9 through 17 inclusive (standard cron semantics)
-    if field.contains('-') {
-        let parts: Vec<&str> = field.split('-').collect();
-        if parts.len() == 2 {
-            if let (Ok(start), Ok(end)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                return value >= start && value <= end;
-            }
-        }
-    }
-    field.parse::<u32>().map(|v| v == value).unwrap_or(false)
+    let lower = s.to_ascii_lowercase();
+    names
+        .iter()
+        .position(|n| *n == lower)
+        .map(|i| i as u32 + name_base)
 }
 
-/// Check if a dow value matches a dow field.
-/// Dow ranges use INCLUSIVE end (e.g., "1-5" = 1,2,3,4,5, where 1=Sunday).
-/// Same inclusive-end semantics as field_matches.
-fn dow_matches(field: &str, dow: u32) -> bool {
-    if field == "*" {
-        return true;
-    }
-    if let Some(step) = field.strip_prefix("*/") {
-        if let Ok(n) = step.parse::<u32>() {
-            return n > 0 && dow % n == 0;
+/// Parse a cron field into a bitmask of allowed values in `min..=max`.
+///
+/// Supports `*`, `n`, `a-b`, lists (`a,b-c`), steps on any of those
+/// (`*/n`, `a-b/n`, `a/n` = `a-max/n`) and, for month/dow, three-letter
+/// names (`JAN`, `MON`). Steps are counted from the start of the range
+/// (the field minimum for `*`), matching standard cron: day-of-month `*/2`
+/// is 1,3,5,… and month `*/3` is 1,4,7,10. Returns `None` on any syntax or
+/// range error.
+fn parse_cron_field(field: &str, min: u32, max: u32, names: &[&str], name_base: u32) -> Option<u64> {
+    let mut mask = 0u64;
+    for part in field.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        let (base, step) = match part.split_once('/') {
+            Some((b, s)) => (b, Some(s.parse::<u32>().ok().filter(|n| *n > 0)?)),
+            None => (part, None),
+        };
+        let (start, end) = if base == "*" {
+            (min, max)
+        } else if let Some((a, b)) = base.split_once('-') {
+            (
+                parse_field_value(a, names, name_base)?,
+                parse_field_value(b, names, name_base)?,
+            )
+        } else {
+            let v = parse_field_value(base, names, name_base)?;
+            // `a/n` means "from a to the field maximum, every n".
+            (v, if step.is_some() { max } else { v })
+        };
+        if start < min || end > max || start > end {
+            return None;
+        }
+        let step = step.unwrap_or(1) as usize;
+        for v in (start..=end).step_by(step) {
+            mask |= 1u64 << v;
         }
     }
-    // Handle comma-separated lists
-    if field.contains(',') {
-        return field.split(',').any(|part| dow_matches(part.trim(), dow));
-    }
-    // Dow ranges: inclusive on end (e.g., "1-5" means 1 through 5 inclusive)
-    if field.contains('-') {
-        let parts: Vec<&str> = field.split('-').collect();
-        if parts.len() == 2 {
-            if let (Ok(start), Ok(end)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                return dow >= start && dow <= end;
-            }
+    Some(mask)
+}
+
+/// Parsed 5-field cron expression.
+#[derive(Debug, Clone, Copy)]
+struct CronSpec {
+    minutes: u64,
+    hours: u64,
+    dom: u64,
+    months: u64,
+    dow: u64,
+    /// True when the day-of-month field starts with `*` (unrestricted).
+    dom_star: bool,
+    /// True when the day-of-week field starts with `*` (unrestricted).
+    dow_star: bool,
+}
+
+impl CronSpec {
+    /// Parse "min hr dom mon dow". Returns `None` on any invalid field.
+    fn parse(expr: &str) -> Option<Self> {
+        let fields: Vec<&str> = expr.split_whitespace().collect();
+        let [min_f, hr_f, dom_f, mon_f, dow_f] = fields[..] else {
+            return None;
+        };
+        let mut dow = parse_cron_field(dow_f, 0, 7, &DOW_NAMES, 0)?;
+        // 7 is an alias for Sunday.
+        if dow & (1 << 7) != 0 {
+            dow = (dow & !(1 << 7)) | 1;
         }
+        Some(Self {
+            minutes: parse_cron_field(min_f, 0, 59, &[], 0)?,
+            hours: parse_cron_field(hr_f, 0, 23, &[], 0)?,
+            dom: parse_cron_field(dom_f, 1, 31, &[], 0)?,
+            months: parse_cron_field(mon_f, 1, 12, &MONTH_NAMES, 1)?,
+            dow,
+            dom_star: dom_f.starts_with('*'),
+            dow_star: dow_f.starts_with('*'),
+        })
     }
-    field.parse::<u32>().map(|v| v == dow).unwrap_or(false)
+
+    /// Standard cron day matching: when both day-of-month and day-of-week
+    /// are restricted, a day matches if EITHER matches; otherwise both must.
+    fn day_matches(&self, date: chrono::NaiveDate) -> bool {
+        if self.months & (1u64 << date.month()) == 0 {
+            return false;
+        }
+        let d = self.dom & (1u64 << date.day()) != 0;
+        let w = self.dow & (1u64 << date.weekday().num_days_from_sunday()) != 0;
+        if self.dom_star || self.dow_star { d && w } else { d || w }
+    }
+}
+
+/// Parse a timezone name. `None`/empty → `Ok(None)` (system timezone).
+fn parse_cron_tz(tz: Option<&str>) -> Result<Option<chrono_tz::Tz>, String> {
+    match tz.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) => s
+            .parse::<chrono_tz::Tz>()
+            .map(Some)
+            .map_err(|_| format!("unknown timezone '{s}' (expected an IANA name like 'Asia/Shanghai')")),
+    }
 }
 
 /// Compute the next UTC timestamp (ms) when a cron expression should fire,
-/// starting from `from_ms`. Returns None if parsing fails.
-/// If `tz` is Some, the cron expression is evaluated in that timezone.
-/// Otherwise, UTC is used.
+/// strictly after `from_ms`. Returns None if parsing fails or nothing matches
+/// within a year.
+///
+/// If `tz` is Some, the cron expression is evaluated in that timezone
+/// (an unknown name logs a warning and falls back to the system timezone);
+/// otherwise the system timezone is used.
+///
+/// The search runs on naive local wall-clock time. DST transitions:
+/// - fall-back (ambiguous local time): the earliest instant is used, and
+///   only if it is still after `from_ms` — a job fires once, not twice;
+/// - spring-forward (non-existent local time): that candidate is skipped.
 pub fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -> Option<u64> {
-    let fields: Vec<&str> = cron_expr.split_whitespace().collect();
-    if fields.len() != 5 {
-        warn!(expr = %cron_expr, "cron: expression must have exactly 5 fields");
-        return None;
-    }
-    let [min_f, hr_f, dom_f, mon_f, dow_f] = fields[..] else {
+    let Some(spec) = CronSpec::parse(cron_expr) else {
+        warn!(expr = %cron_expr, "cron: invalid expression (need 5 valid fields: min hr dom mon dow)");
         return None;
     };
 
-    // Parse from_ms as UTC DateTime
-    let utc_dt = match chrono::DateTime::from_timestamp_millis(from_ms as i64) {
-        Some(dt) => dt,
-        None => return None,
+    let utc_dt = chrono::DateTime::from_timestamp_millis(from_ms as i64)?;
+
+    let tz_for_search: chrono_tz::Tz = match parse_cron_tz(tz) {
+        Ok(Some(t)) => t,
+        Ok(None) => rsclaw_config::system_tz(),
+        Err(e) => {
+            warn!(expr = %cron_expr, "cron: {e}; falling back to system timezone");
+            rsclaw_config::system_tz()
+        }
     };
 
-    // Determine timezone
-    let tz_opt: Option<chrono_tz::Tz> = tz.and_then(|tz_str| tz_str.parse().ok());
-
-    // Search in local time, always using a timezone-aware DateTime.
-    // When no timezone is specified, use the system's local timezone (not UTC).
-    let tz_for_search: chrono_tz::Tz = tz_opt.unwrap_or_else(rsclaw_config::system_tz);
-
-    // Current minute in the target timezone
-    let local_now = utc_dt.with_timezone(&tz_for_search);
+    // Current minute in the target timezone, as naive wall-clock time.
+    let local_now = utc_dt.with_timezone(&tz_for_search).naive_local();
     let mut cand = local_now
-        .with_second(0)
-        .expect("second 0 always valid")
-        .with_nanosecond(0)
-        .expect("nanosecond 0 always valid");
-    cand += chrono::Duration::minutes(1);
+        .date()
+        .and_hms_opt(local_now.hour(), local_now.minute(), 0)?
+        + chrono::Duration::minutes(1);
 
     // Search up to 1 year ahead (in local time).
     let max_cand = cand + chrono::Duration::days(366);
 
     while cand < max_cand {
-        // Use naive date's weekday to get the weekday in local time (not UTC)
-        // chrono weekday IS compatible with openclaw dow (both use Sunday=0/1 as the
-        // anchor)
-        let dow = cand.date_naive().weekday().num_days_from_sunday();
-        let m = field_matches(mon_f, cand.month());
-        let d = field_matches(dom_f, cand.day());
-        let w = dow_matches(dow_f, dow);
-        // Optimization: if the date fields don't match, skip to next day midnight
-        // instead of scanning minute-by-minute.  Reduces worst case from ~525K to ~1460
-        // iterations per year.
-        if !(m && d && w) {
-            // Advance to 00:00 of the next day.
-            cand = (cand.date_naive() + chrono::Days::new(1))
-                .and_hms_opt(0, 0, 0)
-                .and_then(|naive| cand.timezone().from_local_datetime(&naive).single())
-                .unwrap_or_else(|| cand + chrono::Duration::days(1));
+        let date = cand.date();
+        // Skip whole days whose date fields don't match: reduces the worst
+        // case from ~525K to ~1460 iterations per year.
+        if !spec.day_matches(date) {
+            cand = (date + chrono::Days::new(1)).and_hms_opt(0, 0, 0)?;
             continue;
         }
-        let h = field_matches(hr_f, cand.hour());
-        let mi = field_matches(min_f, cand.minute());
-        trace!(expr=%cron_expr, dow, "searching: {} m={} d={} w={} h={} mi={}", cand.date_naive(), m, d, w, h, mi);
-        if h && mi {
-            // Convert the matched local time to UTC
-            let utc_cand = cand.with_timezone(&chrono::Utc);
-            debug!(expr=%cron_expr, "MATCH: {} (UTC: {})", cand, utc_cand);
-            return Some(utc_cand.timestamp_millis() as u64);
+        if spec.hours & (1u64 << cand.hour()) == 0 {
+            cand = date.and_hms_opt(cand.hour(), 0, 0)? + chrono::Duration::hours(1);
+            continue;
+        }
+        if spec.minutes & (1u64 << cand.minute()) == 0 {
+            cand += chrono::Duration::minutes(1);
+            continue;
+        }
+        trace!(expr = %cron_expr, "cron candidate {cand}");
+        // Map the matched local time to an instant. `earliest()` returns
+        // None for a DST gap (skip) and the first instant for a fold.
+        if let Some(dt) = tz_for_search.from_local_datetime(&cand).earliest() {
+            let ms = dt.timestamp_millis();
+            if ms > from_ms as i64 {
+                debug!(expr = %cron_expr, "MATCH: {} (UTC: {})", dt, dt.with_timezone(&Utc));
+                return Some(ms as u64);
+            }
         }
         cand += chrono::Duration::minutes(1);
     }
@@ -737,11 +799,22 @@ pub fn load_cron_jobs() -> (Vec<CronJob>, bool) {
         // so we just read what's in redb here.
         match store.cron_list() {
             Ok(entries) => {
+                let total = entries.len();
                 let jobs: Vec<CronJob> = entries
                     .into_iter()
-                    .filter_map(|(_, json)| serde_json::from_str::<CronJob>(&json).ok())
+                    .filter_map(|(id, json)| match serde_json::from_str::<CronJob>(&json) {
+                        Ok(j) => Some(j),
+                        Err(e) => {
+                            warn!(job_id = %id, err = %e, "cron: undecodable redb entry");
+                            None
+                        }
+                    })
                     .collect();
-                return (jobs, true);
+                // A partial decode must not be treated as the full set: a
+                // caller that saves it back would bulk-replace and silently
+                // drop the undecodable jobs.
+                let ok = jobs.len() == total;
+                return (jobs, ok);
             }
             Err(e) => {
                 warn!(err = %e, "cron: redb load failed; falling back to file");
@@ -842,12 +915,27 @@ pub fn cron_store() -> Option<std::sync::Arc<rsclaw_store::RedbStore>> {
 ///   - Job present in file but not in redb → add to redb.
 ///   - Job present in redb but not in file → user deleted it → remove from
 ///     redb.
-///   - File parse failure → skip the merge (don't wipe redb based on a broken
-///     file).
+///   - File missing / unreadable / empty / parse failure / partially
+///     undecodable → skip the merge (don't wipe redb based on a file that
+///     does not positively state the job list). Only a file that parses to
+///     an explicit (possibly empty) `jobs` list is authoritative.
 ///
 /// Returns the number of jobs in redb after the merge (for logging).
 pub fn reconcile_file_to_redb_on_boot(store: &rsclaw_store::RedbStore) -> usize {
-    let (file_jobs, file_ok) = load_cron_jobs_from_file();
+    let file_jobs = match read_cron_file() {
+        CronFileRead::Parsed(jobs) => jobs,
+        other => {
+            let n = store.cron_list().map(|e| e.len()).unwrap_or(0);
+            if n > 0 || matches!(other, CronFileRead::Invalid) {
+                warn!(
+                    reason = other.describe(),
+                    redb_jobs = n,
+                    "cron: cron.json5 is not authoritative; reconcile skipped, redb left untouched"
+                );
+            }
+            return n;
+        }
+    };
 
     let redb_existing: std::collections::HashMap<String, CronJob> = match store.cron_list() {
         Ok(entries) => entries
@@ -855,19 +943,12 @@ pub fn reconcile_file_to_redb_on_boot(store: &rsclaw_store::RedbStore) -> usize 
             .filter_map(|(id, json)| serde_json::from_str::<CronJob>(&json).ok().map(|j| (id, j)))
             .collect(),
         Err(e) => {
-            warn!(err = %e, "cron: redb cron_list failed during boot reconcile");
-            std::collections::HashMap::new()
+            // Without the current redb view we would drop every job's
+            // runtime state; leave redb alone.
+            warn!(err = %e, "cron: redb cron_list failed during boot reconcile; skipped");
+            return 0;
         }
     };
-
-    if !file_ok {
-        // File parse error — do NOT touch redb. Tell the user.
-        warn!(
-            "cron: cron.json5 parse failed at boot; redb left untouched ({} jobs)",
-            redb_existing.len()
-        );
-        return redb_existing.len();
-    }
 
     if file_jobs.is_empty() && redb_existing.is_empty() {
         return 0;
@@ -912,10 +993,74 @@ pub fn reconcile_file_to_redb_on_boot(store: &rsclaw_store::RedbStore) -> usize 
     merged.len()
 }
 
+/// Outcome of reading `cron.json5`.
+enum CronFileRead {
+    /// File does not exist.
+    Missing,
+    /// File exists but could not be read.
+    Unreadable,
+    /// File is empty / whitespace only.
+    Empty,
+    /// Syntax error, or some job entries failed to decode.
+    Invalid,
+    /// File fully parsed; every job entry decoded.
+    Parsed(Vec<CronJob>),
+}
+
+impl CronFileRead {
+    fn describe(&self) -> &'static str {
+        match self {
+            CronFileRead::Missing => "missing",
+            CronFileRead::Unreadable => "unreadable",
+            CronFileRead::Empty => "empty",
+            CronFileRead::Invalid => "invalid",
+            CronFileRead::Parsed(_) => "parsed",
+        }
+    }
+}
+
 /// File-only loader (legacy path). Kept for tests and as a one-time
 /// migration source. New code should call `load_cron_jobs()` which
 /// uses redb when available.
+///
+/// A missing / empty file yields `(vec![], true)` (nothing configured yet);
+/// an unreadable, unparseable or partially-decodable file yields
+/// `parse_ok = false` so callers never save the partial view back.
 pub fn load_cron_jobs_from_file() -> (Vec<CronJob>, bool) {
+    match read_cron_file() {
+        CronFileRead::Missing | CronFileRead::Empty => (Vec::new(), true),
+        CronFileRead::Unreadable => (Vec::new(), false),
+        CronFileRead::Invalid => {
+            // Keep whatever decoded so read-only callers can still list jobs.
+            (decode_cron_file_lenient(), false)
+        }
+        CronFileRead::Parsed(jobs) => (jobs, true),
+    }
+}
+
+/// Best-effort decode of the jobs that do parse, for read-only display when
+/// the file is partially broken.
+fn decode_cron_file_lenient() -> Vec<CronJob> {
+    let Ok(raw) = std::fs::read_to_string(resolve_cron_store_path()) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = json5::from_str::<serde_json::Value>(&raw)
+        .or_else(|_| serde_json::from_str::<serde_json::Value>(&raw))
+    else {
+        return Vec::new();
+    };
+    let arr = parsed
+        .get("jobs")
+        .and_then(|v| v.as_array())
+        .or_else(|| parsed.as_array())
+        .cloned()
+        .unwrap_or_default();
+    arr.into_iter()
+        .filter_map(|v| serde_json::from_value::<CronJob>(v).ok())
+        .collect()
+}
+
+fn read_cron_file() -> CronFileRead {
     let source = resolve_cron_store_path();
 
     // Auto-migrate legacy cron/jobs.json -> cron.json5
@@ -938,39 +1083,46 @@ pub fn load_cron_jobs_from_file() -> (Vec<CronJob>, bool) {
     }
 
     if !source.exists() {
-        return (Vec::new(), true);
+        return CronFileRead::Missing;
     }
     let raw = match std::fs::read_to_string(&source) {
         Ok(raw) => raw,
-        Err(_) => return (Vec::new(), true),
+        Err(e) => {
+            warn!(file = %source.display(), err = %e, "cron.json5 read failed");
+            return CronFileRead::Unreadable;
+        }
     };
     if raw.trim().is_empty() {
-        return (Vec::new(), true);
+        return CronFileRead::Empty;
     }
-    let parsed_result: Result<serde_json::Value, _> =
-        json5::from_str(&raw).or_else(|_| serde_json::from_str(&raw));
-    if parsed_result.is_err() {
-        warn!(file = %source.display(), "cron.json5 parse failed - keeping original file");
-        return (Vec::new(), false);
-    }
-    let parsed = parsed_result.unwrap();
+    let parsed: serde_json::Value = match json5::from_str(&raw).or_else(|_| serde_json::from_str(&raw)) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(file = %source.display(), err = %e, "cron.json5 parse failed - keeping original file");
+            return CronFileRead::Invalid;
+        }
+    };
     let jobs_array = if let Some(arr) = parsed.get("jobs").and_then(|v| v.as_array()) {
         arr.clone()
-    } else if parsed.is_array() {
-        parsed.as_array().cloned().unwrap_or_default()
+    } else if let Some(arr) = parsed.as_array() {
+        arr.clone()
     } else {
-        Vec::new()
+        // Neither `{ jobs: [...] }` nor a bare array: not a job list.
+        warn!(file = %source.display(), "cron.json5 has no `jobs` array");
+        return CronFileRead::Invalid;
     };
     let total = jobs_array.len();
-    let jobs: Vec<CronJob> = jobs_array
-        .iter()
-        .filter_map(|v| serde_json::from_value::<CronJob>(v.clone()).ok())
-        .collect();
-    let loaded = jobs.len();
-    if loaded < total {
-        return (jobs, false);
+    let mut jobs = Vec::with_capacity(total);
+    for v in jobs_array {
+        match serde_json::from_value::<CronJob>(v) {
+            Ok(j) => jobs.push(j),
+            Err(e) => warn!(file = %source.display(), err = %e, "cron.json5: undecodable job entry"),
+        }
     }
-    (jobs, true)
+    if jobs.len() < total {
+        return CronFileRead::Invalid;
+    }
+    CronFileRead::Parsed(jobs)
 }
 
 /// Best-effort export: write the redb-authoritative job list back to
@@ -1065,13 +1217,13 @@ pub fn validate_cron_expr(expr: &str) -> Result<(), String> {
             hint
         ));
     }
-    // Delegate range parsing to the existing scheduler. If it can compute a
-    // next run, the expression is valid; otherwise reject.
+    // Parse every field first (range / step / name errors), then make sure
+    // the expression can actually fire (e.g. rejects "0 0 31 2 *").
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    if compute_next_run_from_expr(trimmed, now, None).is_none() {
+    if CronSpec::parse(trimmed).is_none() || compute_next_run_from_expr(trimmed, now, None).is_none() {
         return Err(format!(
             "cron expression '{}' could not be parsed. Valid examples: \
              '*/5 * * * *' (every 5 min), '0 17 * * *' (5pm daily), \
@@ -1080,6 +1232,19 @@ pub fn validate_cron_expr(expr: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Validate an optional schedule timezone at save time. `None` / empty means
+/// "system timezone" and is accepted; any other value must be a valid IANA
+/// name (a typo would otherwise silently run in the system timezone).
+pub fn validate_cron_tz(tz: Option<&str>) -> Result<(), String> {
+    parse_cron_tz(tz).map(|_| ())
+}
+
+/// Validate a cron expression together with its optional timezone.
+pub fn validate_cron_expr_tz(expr: &str, tz: Option<&str>) -> Result<(), String> {
+    validate_cron_expr(expr)?;
+    validate_cron_tz(tz)
 }
 
 #[cfg(test)]
@@ -1361,5 +1526,157 @@ mod cron_validate_tests {
     #[test]
     fn rejects_garbage() {
         assert!(validate_cron_expr("not a cron").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cron_schedule_tests {
+    use super::*;
+
+    fn ms(rfc3339: &str) -> u64 {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .expect("valid timestamp")
+            .timestamp_millis() as u64
+    }
+
+    fn next(expr: &str, from: &str, tz: &str) -> Option<String> {
+        compute_next_run_from_expr(expr, ms(from), Some(tz)).map(|t| {
+            chrono::DateTime::from_timestamp_millis(t as i64)
+                .expect("valid ms")
+                .to_rfc3339()
+        })
+    }
+
+    #[test]
+    fn dst_fall_back_ambiguous_hour_does_not_panic() {
+        // 2026-11-01 01:00-02:00 happens twice in New York.
+        // First pass (EDT, UTC-4): 05:00Z = 01:00 EDT.
+        assert_eq!(
+            next("30 1 * * *", "2026-11-01T05:00:00Z", "America/New_York").as_deref(),
+            Some("2026-11-01T05:30:00+00:00")
+        );
+        // Second pass (EST, UTC-5): 06:10Z = 01:10 EST. The 01:30 EDT
+        // instant is in the past, so the job must not fire twice today.
+        assert_eq!(
+            next("30 1 * * *", "2026-11-01T06:10:00Z", "America/New_York").as_deref(),
+            Some("2026-11-02T06:30:00+00:00")
+        );
+        // Minute-level job started inside the ambiguous hour.
+        let n = compute_next_run_from_expr(
+            "*/15 * * * *",
+            ms("2026-11-01T06:10:00Z"),
+            Some("America/New_York"),
+        )
+        .expect("next run");
+        assert!(n > ms("2026-11-01T06:10:00Z"));
+    }
+
+    #[test]
+    fn dst_spring_forward_gap_is_skipped() {
+        // 2026-03-08 02:00-03:00 does not exist in New York.
+        assert_eq!(
+            next("30 2 * * *", "2026-03-08T06:00:00Z", "America/New_York").as_deref(),
+            Some("2026-03-09T06:30:00+00:00")
+        );
+        // 03:00 EDT on the transition day is valid.
+        assert_eq!(
+            next("0 3 * * *", "2026-03-08T06:00:00Z", "America/New_York").as_deref(),
+            Some("2026-03-08T07:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn step_counts_from_field_minimum() {
+        // dom */2 -> 1,3,5,...
+        let s = CronSpec::parse("0 0 */2 * *").expect("parse");
+        assert!(s.dom & (1 << 1) != 0 && s.dom & (1 << 3) != 0);
+        assert!(s.dom & (1 << 2) == 0);
+        // month */3 -> 1,4,7,10
+        let s = CronSpec::parse("0 0 1 */3 *").expect("parse");
+        let months: Vec<u32> = (1..=12).filter(|m| s.months & (1 << m) != 0).collect();
+        assert_eq!(months, vec![1, 4, 7, 10]);
+        // minute range with step
+        let s = CronSpec::parse("0-30/10 * * * *").expect("parse");
+        let mins: Vec<u32> = (0..60).filter(|m| s.minutes & (1u64 << m) != 0).collect();
+        assert_eq!(mins, vec![0, 10, 20, 30]);
+    }
+
+    #[test]
+    fn names_and_sunday_alias() {
+        let s = CronSpec::parse("0 9 * JAN,Mar MON-FRI").expect("parse");
+        assert_eq!(s.months, (1 << 1) | (1 << 3));
+        assert_eq!(s.dow, 0b0111110);
+        let s = CronSpec::parse("0 9 * * 7").expect("parse");
+        assert_eq!(s.dow, 1);
+        assert!(CronSpec::parse("0 9 * * 8").is_none());
+        assert!(CronSpec::parse("60 * * * *").is_none());
+        assert!(CronSpec::parse("0 0 0 * *").is_none());
+        assert!(CronSpec::parse("*/0 * * * *").is_none());
+        assert!(CronSpec::parse("5-1 * * * *").is_none());
+    }
+
+    #[test]
+    fn dom_and_dow_restricted_is_or() {
+        // "1st of month OR Monday". 2026-06-01 is a Monday; from 2026-06-02
+        // the next match is Monday 2026-06-08, before 2026-07-01.
+        assert_eq!(
+            next("0 12 1 * 1", "2026-06-02T00:00:00Z", "UTC").as_deref(),
+            Some("2026-06-08T12:00:00+00:00")
+        );
+        // With dow unrestricted, only the 1st matches.
+        assert_eq!(
+            next("0 12 1 * *", "2026-06-02T00:00:00Z", "UTC").as_deref(),
+            Some("2026-07-01T12:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn invalid_timezone_is_rejected_by_validation() {
+        assert!(validate_cron_tz(Some("Asia/Shanghia")).is_err());
+        assert!(validate_cron_tz(Some("Asia/Shanghai")).is_ok());
+        assert!(validate_cron_tz(None).is_ok());
+        assert!(validate_cron_expr_tz("0 9 * * *", Some("Nowhere/City")).is_err());
+    }
+
+    #[test]
+    fn reconcile_skips_non_authoritative_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: test-only env mutation; run this test by exact name.
+        unsafe { std::env::set_var("RSCLAW_BASE_DIR", tmp.path()) };
+        let store = rsclaw_store::RedbStore::open(
+            &tmp.path().join("cron-test.redb"),
+            rsclaw_platform::MemoryTier::Low,
+        )
+        .expect("open redb");
+        let job = CronJob::from(&CronJobConfig {
+            id: "j1".to_owned(),
+            name: None,
+            agent_id: None,
+            enabled: None,
+            schedule: "0 9 * * *".to_owned(),
+            tz: None,
+            message: "hi".to_owned(),
+            session: None,
+            delivery: None,
+        });
+        let json = serde_json::to_string(&job).expect("serialize");
+        store
+            .cron_bulk_replace(&[("j1".to_owned(), json)])
+            .expect("seed");
+        let cron_file = tmp.path().join("cron.json5");
+
+        // Missing file.
+        assert_eq!(reconcile_file_to_redb_on_boot(&store), 1);
+        // Empty file.
+        std::fs::write(&cron_file, "  \n").expect("write");
+        assert_eq!(reconcile_file_to_redb_on_boot(&store), 1);
+        // Broken file.
+        std::fs::write(&cron_file, "{ jobs: [ ").expect("write");
+        assert_eq!(reconcile_file_to_redb_on_boot(&store), 1);
+        assert_eq!(store.cron_list().expect("list").len(), 1);
+        // Explicit empty list is authoritative.
+        std::fs::write(&cron_file, "{ version: 1, jobs: [] }").expect("write");
+        assert_eq!(reconcile_file_to_redb_on_boot(&store), 0);
+        assert!(store.cron_list().expect("list").is_empty());
     }
 }

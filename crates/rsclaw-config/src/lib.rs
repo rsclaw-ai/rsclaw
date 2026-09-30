@@ -19,7 +19,6 @@ pub mod env_resolution;
 pub mod loader;
 pub mod runtime;
 pub mod schema;
-pub mod secrets;
 pub mod validator;
 
 use anyhow::{Context, Result};
@@ -239,37 +238,41 @@ pub fn build_proxy_client() -> reqwest::ClientBuilder {
     builder
 }
 
-/// Detect the system timezone from the `TZ` env var or the local UTC offset.
+/// Detect the system timezone.
+///
+/// Order: an explicit IANA name in the `TZ` env var (user override), then
+/// the OS-configured zone via `iana-time-zone` (`/etc/localtime` on Unix,
+/// the registry/ICU on Windows), then UTC. A UTC-offset heuristic is NOT
+/// used: an offset does not identify a zone (it cannot tell Europe/London
+/// from UTC, or pick the right DST rules).
 ///
 /// Shared helper used by heartbeat and cron modules to avoid duplication.
 pub fn system_tz() -> chrono_tz::Tz {
-    // Try TZ env var first (works on Linux/macOS with IANA names like
-    // "Asia/Shanghai")
     if let Ok(tz_name) = std::env::var("TZ") {
-        if let Ok(tz) = tz_name.parse() {
+        // POSIX allows a leading ':' ("TZ=:Asia/Shanghai").
+        if let Ok(tz) = tz_name.trim_start_matches(':').parse() {
             return tz;
         }
     }
-    // Fall back to detecting system offset and mapping to a timezone
-    let local_offset = chrono::Local::now().offset().local_minus_utc();
-    match local_offset {
-        25200 => chrono_tz::Asia::Bangkok,     // +07:00
-        28800 => chrono_tz::Asia::Shanghai,    // +08:00
-        32400 => chrono_tz::Asia::Tokyo,       // +09:00
-        36000 => chrono_tz::Australia::Sydney, // +10:00
-        -18000 => chrono_tz::US::Eastern,      // -05:00
-        -21600 => chrono_tz::US::Central,      // -06:00
-        -25200 => chrono_tz::US::Mountain,     // -07:00
-        -28800 => chrono_tz::US::Pacific,      // -08:00
-        0 => chrono_tz::UTC,
-        _ => {
+    // Detected once per process: the lookup is a syscall / FFI call and the
+    // failure warning should not repeat on every cron computation.
+    static DETECTED: std::sync::OnceLock<chrono_tz::Tz> = std::sync::OnceLock::new();
+    *DETECTED.get_or_init(|| match iana_time_zone::get_timezone() {
+        Ok(name) => name.parse().unwrap_or_else(|_| {
             tracing::warn!(
-                offset_secs = local_offset,
-                "unknown system timezone offset, using UTC. Set TZ env var for accuracy."
+                tz = %name,
+                "system timezone is not a known IANA name, using UTC. Set TZ env var for accuracy."
+            );
+            chrono_tz::UTC
+        }),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cannot detect system timezone, using UTC. Set TZ env var for accuracy."
             );
             chrono_tz::UTC
         }
-    }
+    })
 }
 
 pub mod config_json;

@@ -46,10 +46,14 @@ pub struct GatewayRunArgs {
     #[arg(long)]
     pub auth: Option<String>,
     /// Bearer token for gateway authentication.
-    #[arg(long)]
+    /// Also read from `RSCLAW_AUTH_TOKEN` so the secret need not appear in
+    /// argv (visible in `ps` / shell history).
+    #[arg(long, env = "RSCLAW_AUTH_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
     /// Password for gateway authentication.
-    #[arg(long)]
+    /// Also read from `RSCLAW_GATEWAY_PASSWORD` so the secret need not appear in
+    /// argv (visible in `ps` / shell history).
+    #[arg(long, env = "RSCLAW_GATEWAY_PASSWORD", hide_env_values = true)]
     pub password: Option<String>,
     /// Force start even if another instance is running.
     #[arg(long)]

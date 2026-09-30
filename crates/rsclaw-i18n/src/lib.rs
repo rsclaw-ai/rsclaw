@@ -2070,6 +2070,19 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "Агент не ответил вовремя. Ваше сообщение могло быть не обработано — попробуйте снова.",
     );
 
+    msg!("cmd_owner_only",
+        "en" => "This command is only available to the owner.",
+        "zh" => "该命令仅限主人使用。",
+        "ja" => "このコマンドはオーナーのみ使用できます。",
+        "ko" => "이 명령은 소유자만 사용할 수 있습니다.",
+        "fr" => "Cette commande est réservée au propriétaire.",
+        "de" => "Dieser Befehl ist nur für den Besitzer verfügbar.",
+        "th" => "คำสั่งนี้ใช้ได้เฉพาะเจ้าของเท่านั้น",
+        "vi" => "Lệnh này chỉ dành cho chủ sở hữu.",
+        "es" => "Este comando solo está disponible para el propietario.",
+        "ru" => "Эта команда доступна только владельцу.",
+    );
+
     msg!("chat_reply_error",
         "en" => "An error occurred while processing your message. Please try again.",
         "zh" => "处理消息时发生错误，请重试。",
@@ -2600,6 +2613,7 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
 /// Translate a message key to the given language.  Falls back to English.
 pub fn t(key: &str, lang: &str) -> String {
     if lang == "json" {
+        let key = json_escape(key);
         return format!("{{\"key\":\"{key}\",\"status\":\"ok\"}}");
     }
     MESSAGES
@@ -2616,13 +2630,14 @@ pub fn t_fmt(key: &str, lang: &str, args: &[(&str, &str)]) -> String {
     if lang == "json" {
         let pairs: Vec<String> = args
             .iter()
-            .map(|(k, v)| format!("\"{}\":\"{}\"", k, v))
+            .map(|(k, v)| format!("\"{}\":\"{}\"", json_escape(k), json_escape(v)))
             .collect();
         let extra = if pairs.is_empty() {
             String::new()
         } else {
             format!(",{}", pairs.join(","))
         };
+        let key = json_escape(key);
         return format!("{{\"key\":\"{key}\"{extra},\"status\":\"ok\"}}");
     }
     let mut text = t(key, lang);
@@ -2632,11 +2647,35 @@ pub fn t_fmt(key: &str, lang: &str, args: &[(&str, &str)]) -> String {
     text
 }
 
+/// Escape a string for embedding inside a JSON string literal (JSON mode
+/// output). Params may carry user-controlled text (file names, errors), so
+/// quotes, backslashes and control characters must not break the document.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Resolve a human-readable or config language value to a language code.
 ///
-/// Examples: "Chinese" -> "zh", "Thai" -> "th", "ja" -> "ja"
+/// Examples: "Chinese" -> "zh", "Thai" -> "th", "ja" -> "ja".
+/// `"default"` / `"auto"` / empty resolve to the process default language
+/// (see [`default_lang`]), not to German.
 pub fn resolve_lang(config_lang: &str) -> &'static str {
-    let l = config_lang.to_lowercase();
+    let l = config_lang.trim().to_lowercase();
+    if l.is_empty() || l == "default" || l == "auto" {
+        return default_lang();
+    }
     if l.starts_with("zh") || l.starts_with("cn") || l.contains("chinese") || l.contains("中文") {
         "zh"
     } else if l.starts_with("th") || l.contains("thai") || l.contains("ไทย") {
@@ -2688,6 +2727,24 @@ mod tests {
         let msg = t_fmt("file_saved", "json", &[("count", "3")]);
         assert!(msg.contains("\"key\":\"file_saved\""));
         assert!(msg.contains("\"count\":\"3\""));
+    }
+
+    #[test]
+    fn translate_json_mode_escapes_params() {
+        let msg = t_fmt("file_saved", "json", &[("count", "a\"b\\c\nd")]);
+        assert!(
+            msg.contains(r#""count":"a\"b\\c\nd""#),
+            "params must be JSON-escaped: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_lang_default_is_not_german() {
+        assert_eq!(resolve_lang("default"), default_lang());
+        assert_eq!(resolve_lang("Default"), default_lang());
+        assert_eq!(resolve_lang(""), default_lang());
+        assert_eq!(resolve_lang("de"), "de");
+        assert_eq!(resolve_lang("Deutsch"), "de");
     }
 
     #[test]

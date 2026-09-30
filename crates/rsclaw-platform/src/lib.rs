@@ -57,9 +57,101 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Best-effort executable name of process `pid` (lowercased), or `None`
+/// when it cannot be determined (process gone, permission denied, tool
+/// missing).
+fn process_exe_name(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            && let Some(name) = exe.file_name()
+        {
+            return Some(name.to_string_lossy().to_lowercase());
+        }
+        // `exe` is unreadable for other users' processes; `comm` is not.
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // `comm` is the full executable path on macOS/BSD.
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if s.is_empty() {
+            return None;
+        }
+        let base = std::path::Path::new(&s)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or(s);
+        Some(base.to_lowercase())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .creation_flags(0x08000000)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let pid_field = format!("\"{pid}\"");
+        text.lines()
+            .find(|l| l.contains(&pid_field))
+            .and_then(|l| l.split(',').next())
+            .map(|name| name.trim_matches('"').to_lowercase())
+            .filter(|s| !s.is_empty())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// True when `pid` is alive AND its executable name contains `rsclaw`.
+///
+/// Guards against PID reuse: a stale pid file may point at an unrelated
+/// process that inherited the number. Returns `false` when the identity
+/// cannot be verified. Use this before signalling or killing a pid read
+/// from a pid file.
+pub fn process_is_rsclaw(pid: u32) -> bool {
+    if pid == 0 || !process_alive(pid) {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    match process_exe_name(pid) {
+        Some(name) => name.contains("rsclaw"),
+        None => false,
+    }
+}
+
 /// Send a termination signal to the process (SIGTERM on Unix, taskkill on
 /// Windows).
+///
+/// Refuses (returns `Err`) when `pid` is not a live rsclaw process — see
+/// [`process_is_rsclaw`] — so a stale pid file cannot kill an unrelated
+/// process (on Windows, an unrelated process TREE via `taskkill /T`).
 pub fn process_terminate(pid: u32) -> Result<()> {
+    if !process_is_rsclaw(pid) {
+        tracing::warn!(
+            pid,
+            "refusing to terminate process: not a running rsclaw process (stale pid?)"
+        );
+        anyhow::bail!("process {pid} is not a running rsclaw process; refusing to terminate");
+    }
     #[cfg(unix)]
     {
         if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
@@ -93,6 +185,7 @@ pub fn process_terminate(pid: u32) -> Result<()> {
     }
 }
 
+/// Build the main tokio runtime.
 pub fn build_runtime(_tier: MemoryTier) -> Result<tokio::runtime::Runtime> {
     // Use multi_thread with 1 worker and larger stack to avoid stack overflow
     // in debug builds with large code size.
@@ -371,5 +464,13 @@ mod tests {
                 .iter()
                 .all(|path| path.contains("Google\\Chrome"))
         );
+    }
+
+    #[test]
+    fn process_terminate_refuses_non_rsclaw_pid() {
+        // pid 0 is never an rsclaw process; terminate must refuse rather
+        // than signal the process group / system idle process.
+        assert!(!super::process_is_rsclaw(0));
+        assert!(super::process_terminate(0).is_err());
     }
 }

@@ -2,6 +2,13 @@ fn main() {
     // Set RSCLAW_BUILD_VERSION and RSCLAW_BUILD_DATE at compile time.
     // CI overrides these via env vars; local dev gets sensible defaults.
     //
+    // Because this script emits `rerun-if-changed` directives, cargo would
+    // otherwise NOT rerun it when only these env vars change, baking a stale
+    // version/date into the binary.
+    println!("cargo:rerun-if-env-changed=RSCLAW_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=RSCLAW_BUILD_DATE");
+    println!("cargo:rerun-if-env-changed=RSCLAW_BUILD_COMMIT");
+    //
     // VERSION CONVENTION:
     //   RSCLAW_BUILD_VERSION stores the bare version WITHOUT "v" prefix.
     //   Display code (preparse.rs, main.rs) adds "v" when showing to users.

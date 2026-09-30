@@ -126,7 +126,7 @@ pub fn parse_heartbeat_md(raw: &str) -> Result<HeartbeatSpec> {
 
     let every_str = every_raw
         .ok_or_else(|| anyhow!("HEARTBEAT.md frontmatter is missing required field 'every'"))?;
-    let every = parse_duration(&every_str);
+    let every = parse_duration(&every_str)?;
 
     let active_hours = active_hours_raw
         .as_deref()
@@ -154,34 +154,44 @@ pub fn parse_heartbeat_md(raw: &str) -> Result<HeartbeatSpec> {
     })
 }
 
+/// Minimum heartbeat interval. Shorter intervals are clamped up to this so a
+/// typo such as `every: 5s` cannot turn into a near-tight LLM loop.
+const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Parse a human-readable duration string into [`std::time::Duration`].
 ///
-/// Supported forms: `"5m"`, `"30m"`, `"1h"`, `"30s"`, bare integer (treated as
-/// minutes).
-fn parse_duration(s: &str) -> Duration {
+/// Supported forms: `"30s"`, `"5m"`, `"1h"`, `"1d"`, bare integer (treated as
+/// minutes). Zero, unknown units and overflowing values are rejected. Values
+/// below [`MIN_HEARTBEAT_INTERVAL`] are clamped up to it (with a warning).
+fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
-    if let Some(mins) = s.strip_suffix('m') {
-        if let Ok(n) = mins.parse::<u64>() {
-            return Duration::from_secs(n * 60);
-        }
+    let (num, unit_secs) = match s.char_indices().last() {
+        Some((idx, 's')) => (&s[..idx], 1u64),
+        Some((idx, 'm')) => (&s[..idx], 60),
+        Some((idx, 'h')) => (&s[..idx], 3600),
+        Some((idx, 'd')) => (&s[..idx], 86_400),
+        Some((_, c)) if c.is_ascii_digit() => (s, 60),
+        _ => bail!("invalid 'every' value '{s}': expected <n>s, <n>m, <n>h, <n>d or bare minutes"),
+    };
+    let n: u64 = num.trim().parse().map_err(|_| {
+        anyhow!("invalid 'every' value '{s}': expected <n>s, <n>m, <n>h, <n>d or bare minutes")
+    })?;
+    if n == 0 {
+        bail!("invalid 'every' value '{s}': interval must be greater than zero");
     }
-    if let Some(hours) = s.strip_suffix('h') {
-        if let Ok(n) = hours.parse::<u64>() {
-            return Duration::from_secs(n * 3600);
-        }
+    let secs = n
+        .checked_mul(unit_secs)
+        .ok_or_else(|| anyhow!("invalid 'every' value '{s}': interval too large"))?;
+    let dur = Duration::from_secs(secs);
+    if dur < MIN_HEARTBEAT_INTERVAL {
+        warn!(
+            input = %s,
+            min_secs = MIN_HEARTBEAT_INTERVAL.as_secs(),
+            "heartbeat 'every' below minimum, clamping"
+        );
+        return Ok(MIN_HEARTBEAT_INTERVAL);
     }
-    if let Some(secs) = s.strip_suffix('s') {
-        if let Ok(n) = secs.parse::<u64>() {
-            return Duration::from_secs(n);
-        }
-    }
-    // Bare number → minutes
-    if let Ok(n) = s.parse::<u64>() {
-        return Duration::from_secs(n * 60);
-    }
-    // Fallback: 60 seconds minimum to prevent infinite loop if parsing fails.
-    tracing::warn!(input = %s, "parse_duration: unrecognized format, falling back to 60s");
-    Duration::from_secs(60)
+    Ok(dur)
 }
 
 /// Parse a time range string of the form `"HH:MM-HH:MM"`.
@@ -304,7 +314,7 @@ impl HeartbeatRunner {
                     continue;
                 }
 
-                active.insert(key);
+                active.insert(key.clone());
                 let runner = Arc::clone(self);
                 let agent_id = agent_id.clone();
 
@@ -312,6 +322,14 @@ impl HeartbeatRunner {
 
                 tokio::spawn(async move {
                     runner.agent_loop(&agent_id, &hb_path).await;
+                    // Every exit path (spec parse failure, file removed,
+                    // drain) releases the slot so the next rescan can
+                    // restart the loop once the file is fixed / re-added.
+                    runner
+                        .active
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&key);
                 });
             }
         }
@@ -588,10 +606,39 @@ mod tests {
 
     #[test]
     fn parse_duration_variants() {
-        assert_eq!(parse_duration("5m"), Duration::from_secs(5 * 60));
-        assert_eq!(parse_duration("1h"), Duration::from_secs(3600));
-        assert_eq!(parse_duration("30s"), Duration::from_secs(30));
-        assert_eq!(parse_duration("30"), Duration::from_secs(30 * 60));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(5 * 60));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn parse_duration_supports_days() {
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86_400));
+        assert_eq!(parse_duration(" 2d ").unwrap(), Duration::from_secs(2 * 86_400));
+    }
+
+    #[test]
+    fn parse_duration_rejects_zero_and_unknown_units() {
+        assert!(parse_duration("0m").is_err());
+        assert!(parse_duration("0").is_err());
+        assert!(parse_duration("1w").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("m").is_err());
+        assert!(parse_duration("99999999999999999999d").is_err());
+    }
+
+    #[test]
+    fn parse_duration_clamps_to_minimum() {
+        assert_eq!(parse_duration("30s").unwrap(), MIN_HEARTBEAT_INTERVAL);
+        assert_eq!(parse_duration("1s").unwrap(), MIN_HEARTBEAT_INTERVAL);
+    }
+
+    #[test]
+    fn parse_heartbeat_md_rejects_bad_every() {
+        let input = "---\nevery: 1w\n---\nbody\n";
+        assert!(parse_heartbeat_md(input).is_err());
     }
 
     #[test]

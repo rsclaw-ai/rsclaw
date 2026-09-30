@@ -15,6 +15,9 @@ use super::source::{EventRecord, SseSource};
 const ACCEPT: &str = "text/event-stream";
 const CACHE_CONTROL: &str = "no-cache";
 const ACCEPT_ENCODING: &str = "identity"; // forbid gzip — buffering kills SSE
+/// Upper bound on a single SSE connection's lifetime (reqwest whole-request
+/// timeout). Stalls are detected by the heartbeat watchdog instead.
+const SSE_STREAM_MAX_LIFETIME: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Outcome of one connection attempt.
 #[derive(Debug)]
@@ -42,13 +45,33 @@ async fn run_sse_single_tracking(
     out_last_id: &mut Option<String>,
     out_backoff_ms: &mut u64,
 ) -> SseOutcome {
-    let client = match reqwest::Client::builder().build() {
+    // SSRF guard: re-resolve and vet the host on every (re)connect so a DNS
+    // answer that flips to a private address between attempts is caught.
+    // The client is pinned to the vetted addresses and never follows
+    // redirects (a 3xx is treated as fatal below).
+    let parsed = match url::Url::parse(&src.url) {
+        Ok(u) => u,
+        Err(e) => return SseOutcome::Fatal(format!("invalid url: {e}")),
+    };
+    let addrs = match rsclaw_util::net::resolve_public_url(&parsed).await {
+        Ok(a) => a,
+        Err(e) => return SseOutcome::Fatal(format!("url rejected: {e}")),
+    };
+    // `pinned_client` applies a whole-request timeout; SSE streams are
+    // long-lived, so use a very long one and rely on the 90s heartbeat
+    // watchdog below for stall detection.
+    let client = match rsclaw_util::net::pinned_client(
+        reqwest::Client::builder().connect_timeout(Duration::from_secs(15)),
+        &parsed,
+        &addrs,
+        SSE_STREAM_MAX_LIFETIME,
+    ) {
         Ok(c) => c,
         Err(e) => return SseOutcome::Disconnect(format!("client build: {e}")),
     };
 
     let mut req = client
-        .get(&src.url)
+        .get(parsed)
         .header(reqwest::header::ACCEPT, ACCEPT)
         .header(reqwest::header::CACHE_CONTROL, CACHE_CONTROL)
         .header(reqwest::header::ACCEPT_ENCODING, ACCEPT_ENCODING);
@@ -65,6 +88,12 @@ async fn run_sse_single_tracking(
         Err(e) => return SseOutcome::Disconnect(format!("connect: {}", redact_reqwest_err(e))),
     };
     let status = resp.status();
+    if status.is_redirection() {
+        return SseOutcome::Fatal(format!(
+            "server returned {} redirect (redirects are not followed)",
+            status.as_u16()
+        ));
+    }
     if matches!(status.as_u16(), 401 | 403 | 404) {
         return SseOutcome::Fatal(format!("server returned {}", status.as_u16()));
     }
@@ -368,22 +397,42 @@ mod tests {
     }
 }
 
-/// Replace every `${VAR}` occurrence in `s` with `std::env::var("VAR")`.
-/// Returns `Err(VAR)` for the first unresolved or empty-valued variable.
+/// Only env vars whose name starts with this prefix may be expanded inside a
+/// `/watch` source or header. Expanding arbitrary process env (e.g.
+/// `${OPENAI_API_KEY}`) into an SSE URL would let anyone who can issue
+/// `/watch sse` exfiltrate gateway secrets to a host they control.
+pub(crate) const WATCH_ENV_PREFIX: &str = "RSCLAW_WATCH_";
+
+/// Replace every `${VAR}` occurrence in `s` with `std::env::var("VAR")`,
+/// restricted to vars prefixed with [`WATCH_ENV_PREFIX`]. References to any
+/// other var are left verbatim (and logged at warn level).
+/// Returns `Err(VAR)` for the first unresolved or empty-valued allowed var.
 pub(crate) fn substitute_env_vars(s: &str) -> Result<String> {
-    let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap();
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").expect("valid env-var regex")
+    });
     let mut last = 0usize;
     let mut out = String::with_capacity(s.len());
-    for cap in re.captures_iter(s) {
-        let m = cap.get(0).unwrap();
-        let name = cap.get(1).unwrap().as_str();
+    for cap in RE.captures_iter(s) {
+        let (Some(m), Some(name_m)) = (cap.get(0), cap.get(1)) else {
+            continue;
+        };
+        let name = name_m.as_str();
         out.push_str(&s[last..m.start()]);
+        last = m.end();
+        if !name.starts_with(WATCH_ENV_PREFIX) {
+            tracing::warn!(
+                var = name,
+                "watch: refusing to expand env var without {WATCH_ENV_PREFIX} prefix; left verbatim"
+            );
+            out.push_str(m.as_str());
+            continue;
+        }
         let val = std::env::var(name).unwrap_or_default();
         if val.is_empty() {
             return Err(anyhow!("{name}"));
         }
         out.push_str(&val);
-        last = m.end();
     }
     out.push_str(&s[last..]);
     Ok(out)
@@ -399,17 +448,24 @@ mod subst_tests {
     #[test]
     fn substitutes_set_var() {
         // Use a unique name so other tests don't race.
-        unsafe { std::env::set_var("WATCH_TEST_TOKEN", "xyz") };
+        unsafe { std::env::set_var("RSCLAW_WATCH_TEST_TOKEN", "xyz") };
         assert_eq!(
-            substitute_env_vars("Bearer ${WATCH_TEST_TOKEN}").unwrap(),
+            substitute_env_vars("Bearer ${RSCLAW_WATCH_TEST_TOKEN}").unwrap(),
             "Bearer xyz"
         );
-        unsafe { std::env::remove_var("WATCH_TEST_TOKEN") };
+        unsafe { std::env::remove_var("RSCLAW_WATCH_TEST_TOKEN") };
     }
     #[test]
     fn errors_on_missing_var() {
-        unsafe { std::env::remove_var("WATCH_TEST_MISSING") };
-        let err = substitute_env_vars("Bearer ${WATCH_TEST_MISSING}").unwrap_err();
-        assert!(err.to_string().contains("WATCH_TEST_MISSING"));
+        unsafe { std::env::remove_var("RSCLAW_WATCH_TEST_MISSING") };
+        let err = substitute_env_vars("Bearer ${RSCLAW_WATCH_TEST_MISSING}").unwrap_err();
+        assert!(err.to_string().contains("RSCLAW_WATCH_TEST_MISSING"));
+    }
+    #[test]
+    fn non_prefixed_var_left_verbatim() {
+        unsafe { std::env::set_var("WATCH_SUBST_SECRET_NOT_ALLOWED", "leak") };
+        let out = substitute_env_vars("https://x/?k=${WATCH_SUBST_SECRET_NOT_ALLOWED}").unwrap();
+        unsafe { std::env::remove_var("WATCH_SUBST_SECRET_NOT_ALLOWED") };
+        assert_eq!(out, "https://x/?k=${WATCH_SUBST_SECRET_NOT_ALLOWED}");
     }
 }

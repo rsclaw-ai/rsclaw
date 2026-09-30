@@ -1,8 +1,14 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Mutex};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+/// Process-wide lock serializing every read-modify-write of heartbeat state
+/// files. Multiple per-agent heartbeat loops save concurrently; without this
+/// one loop's upsert could clobber another's.
+static STATE_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Per-agent heartbeat run state — one entry per agent_id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +22,7 @@ pub struct HeartbeatState {
 }
 
 impl HeartbeatState {
+    /// Fresh state for `agent_id` (never run, no failures).
     pub fn new(agent_id: impl Into<String>) -> Self {
         Self {
             agent_id: agent_id.into(),
@@ -26,6 +33,7 @@ impl HeartbeatState {
         }
     }
 
+    /// Record a successful tick: stamps `last_run_at` and resets failures.
     pub fn record_success(&mut self) {
         self.last_run_at = Some(Utc::now());
         self.last_status = Some("ok".to_string());
@@ -33,11 +41,12 @@ impl HeartbeatState {
         self.consecutive_failures = 0;
     }
 
+    /// Record a failed tick: stamps `last_run_at` and bumps the failure count.
     pub fn record_failure(&mut self, error: impl Into<String>) {
         self.last_run_at = Some(Utc::now());
         self.last_status = Some("error".to_string());
         self.last_error = Some(error.into());
-        self.consecutive_failures += 1;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
     }
 }
 
@@ -48,21 +57,42 @@ pub struct HeartbeatStore {
 }
 
 impl HeartbeatStore {
+    /// Create a store backed by the JSON file at `path` (created lazily).
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
 
     /// Load all states from the file.  Returns an empty vec if the file does
-    /// not exist yet.
+    /// not exist yet. A corrupted file is logged and treated as empty so the
+    /// next save rewrites it instead of failing forever.
     pub fn load_all(&self) -> Result<Vec<HeartbeatState>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
+        let _guard = STATE_FILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.load_all_unlocked()
+    }
+
+    fn load_all_unlocked(&self) -> Result<Vec<HeartbeatState>> {
+        let data = match std::fs::read_to_string(&self.path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("reading heartbeat state file {}", self.path.display())
+                });
+            }
+        };
+        match serde_json::from_str::<Vec<HeartbeatState>>(&data) {
+            Ok(states) => Ok(states),
+            Err(e) => {
+                warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "heartbeat state file is corrupted; resetting to empty state"
+                );
+                Ok(Vec::new())
+            }
         }
-        let data = std::fs::read_to_string(&self.path)
-            .with_context(|| format!("reading heartbeat state file {}", self.path.display()))?;
-        let states: Vec<HeartbeatState> = serde_json::from_str(&data)
-            .with_context(|| format!("parsing heartbeat state file {}", self.path.display()))?;
-        Ok(states)
     }
 
     /// Load a single agent's state.  Returns a fresh default if not found.
@@ -74,9 +104,13 @@ impl HeartbeatStore {
             .unwrap_or_else(|| HeartbeatState::new(agent_id)))
     }
 
-    /// Upsert `state` into the JSON file.
+    /// Upsert `state` into the JSON file. The read-modify-write runs under a
+    /// process-wide lock and the file is replaced atomically (tmp + rename).
     pub fn save(&self, state: HeartbeatState) -> Result<()> {
-        let mut all = self.load_all()?;
+        let _guard = STATE_FILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut all = self.load_all_unlocked()?;
         match all.iter_mut().find(|s| s.agent_id == state.agent_id) {
             Some(existing) => *existing = state,
             None => all.push(state),
@@ -86,8 +120,13 @@ impl HeartbeatStore {
                 .with_context(|| format!("creating heartbeat state dir {}", parent.display()))?;
         }
         let data = serde_json::to_string_pretty(&all).context("serializing heartbeat states")?;
-        std::fs::write(&self.path, data)
-            .with_context(|| format!("writing heartbeat state file {}", self.path.display()))?;
+        let mut tmp_name = self.path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        let tmp = PathBuf::from(tmp_name);
+        std::fs::write(&tmp, data)
+            .with_context(|| format!("writing heartbeat state tmp file {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("replacing heartbeat state file {}", self.path.display()))?;
         Ok(())
     }
 }
@@ -171,5 +210,22 @@ mod tests {
         let loaded = store.load("agent-up").unwrap();
         assert_eq!(loaded.last_status.as_deref(), Some("error"));
         assert_eq!(loaded.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn store_resets_corrupted_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let store = HeartbeatStore::new(path.clone());
+
+        assert!(store.load_all().unwrap().is_empty());
+        let mut s = HeartbeatState::new("agent-fix");
+        s.record_success();
+        store.save(s).unwrap();
+
+        let loaded = store.load("agent-fix").unwrap();
+        assert_eq!(loaded.last_status.as_deref(), Some("ok"));
+        assert!(!dir.path().join("state.json.tmp").exists());
     }
 }

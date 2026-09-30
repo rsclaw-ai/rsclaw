@@ -562,26 +562,19 @@ fn looks_blank(png: &[u8]) -> bool {
 /// copies the captured region here). Requires STA.
 #[cfg(target_os = "windows")]
 fn clipboard_image_png() -> Result<Vec<u8>, String> {
-    use std::os::windows::process::CommandExt;
     let out_png = std::env::temp_dir().join(format!("rsclaw_clip_{}.png", std::process::id()));
-    let script = format!(
-        r#"Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+    // The output path is passed via env, not interpolated (a quote in the
+    // user's temp dir would otherwise break out of the string literal).
+    let script = r#"Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 $img = [System.Windows.Forms.Clipboard]::GetImage()
-if ($img -eq $null) {{ Write-Output 'NOIMG'; exit 1 }}
-$img.Save('{path}', [System.Drawing.Imaging.ImageFormat]::Png)
-Write-Output 'OK'"#,
-        path = out_png.display()
+if ($img -eq $null) { Write-Output 'NOIMG'; exit 1 }
+$img.Save($env:RSCLAW_PS_OUT_PATH, [System.Drawing.Imaging.ImageFormat]::Png)
+Write-Output 'OK'"#;
+    let mut cmd = powershell_command(
+        &["-NoProfile", "-ExecutionPolicy", "Bypass", "-STA"],
+        script,
+        &[("RSCLAW_PS_OUT_PATH", out_png.as_os_str())],
     );
-    let mut cmd = Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-STA",
-        "-Command",
-        &script,
-    ]);
-    cmd.creation_flags(0x08000000);
     let res = cmd
         .output()
         .map_err(|e| format!("clipboard image spawn failed: {e}"))?;
@@ -759,17 +752,16 @@ if($p){ [FWOCR]::Go($p.MainWindowHandle) } else { Write-Error 'WECHAT_WINDOW_NOT
     std::thread::sleep(std::time::Duration::from_millis(1000));
     // Read PNG from clipboard.
     let tmp = PrivateTempFile::create("rsclaw-ocr-alta-", ".png")?;
-    let ps_read = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; \
+    let ps_read = "Add-Type -AssemblyName System.Windows.Forms; \
          Add-Type -AssemblyName System.Drawing; \
          $img=[System.Windows.Forms.Clipboard]::GetImage(); \
-         if($img -eq $null){{ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }}; \
-         $img.Save('{}',[System.Drawing.Imaging.ImageFormat]::Png); 'ok'",
-        tmp.path().display()
+         if($img -eq $null){ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }; \
+         $img.Save($env:RSCLAW_PS_OUT_PATH,[System.Drawing.Imaging.ImageFormat]::Png); 'ok'";
+    let mut ps_cmd = powershell_command(
+        &["-NoProfile", "-STA"],
+        ps_read,
+        &[("RSCLAW_PS_OUT_PATH", tmp.path().as_os_str())],
     );
-    let mut ps_cmd = Command::new("powershell");
-    ps_cmd.args(["-NoProfile", "-STA", "-Command", &ps_read]);
-    ps_cmd.creation_flags(0x08000000);
     match ps_cmd.output() {
         Ok(out) if out.status.success() => match std::fs::read(tmp.path()) {
             Ok(bytes) => {
@@ -1207,6 +1199,59 @@ fn run_osascript(script: &str) -> Result<String, String> {
     }
 }
 
+/// Build an `osascript` command that runs `script` inside an `on run argv`
+/// handler and passes `args` as argv (read in the script as `item N of argv`).
+///
+/// Untrusted values (bundle ids, app names, file paths, dialog titles) MUST go
+/// through argv instead of being interpolated into the script text: AppleScript
+/// string escaping is easy to get wrong, and an injected quote can reach
+/// `do shell script`. The `--` stops osascript option parsing so a value that
+/// starts with `-` is still treated as an argument.
+fn osascript_argv_command<S: AsRef<std::ffi::OsStr>>(script: &str, args: &[S]) -> Command {
+    let mut cmd = Command::new("osascript");
+    cmd.arg("-e")
+        .arg(format!("on run argv\n{script}\nend run"))
+        .arg("--")
+        .args(args);
+    cmd
+}
+
+/// Run `script` with `args` passed as argv (see [`osascript_argv_command`])
+/// and return trimmed stdout.
+fn run_osascript_argv<S: AsRef<std::ffi::OsStr>>(script: &str, args: &[S]) -> Result<String, String> {
+    match osascript_argv_command(script, args).output() {
+        Ok(out) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => Err(format!(
+            "osascript failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        Err(e) => Err(format!("osascript spawn failed: {e}")),
+    }
+}
+
+/// Build a hidden `powershell` command: `powershell <flags> -Command <script>`.
+///
+/// Untrusted values (paths, process names) are passed through environment
+/// variables and read in the script as `$env:NAME`, never interpolated into
+/// the script text. PowerShell treats the typographic quotes U+2018..U+201B as
+/// single-quote delimiters too, so doubling only `'` is not a safe escape.
+/// Sets CREATE_NO_WINDOW on Windows.
+fn powershell_command(flags: &[&str], script: &str, env: &[(&str, &std::ffi::OsStr)]) -> Command {
+    let mut cmd = Command::new("powershell");
+    cmd.args(flags).arg("-Command").arg(script);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    cmd
+}
+
 /// Convert a key name to an AppleScript key code (macOS).
 fn key_to_applescript_code(name: &str) -> Result<u16, String> {
     let code = match name.trim().to_lowercase().as_str() {
@@ -1508,15 +1553,15 @@ impl DesktopSession for NativeDesktopSession {
                 // Frontmost check (System Events) — used both as a fast-path
                 // (skip the whole activation dance when already frontmost, the
                 // common case in a monitor loop) and as the verify poll.
-                let check_script = format!(
-                    r#"tell application "System Events"
-    return frontmost of (first process whose bundle identifier is "{}")
-end tell"#,
-                    bundle_id.replace('"', r#"\""#)
-                );
+                // The bundle id is passed as argv, never interpolated into the
+                // script text (see `osascript_argv_command`).
+                let check_script = r#"set bid to item 1 of argv
+tell application "System Events"
+    return frontmost of (first process whose bundle identifier is bid)
+end tell"#;
                 let is_frontmost = || {
                     matches!(
-                        Command::new("osascript").args(["-e", &check_script]).output(),
+                        osascript_argv_command(check_script, &[&bundle_id]).output(),
                         Ok(out) if out.status.success()
                             && String::from_utf8_lossy(&out.stdout).trim().eq_ignore_ascii_case("true")
                     )
@@ -1537,23 +1582,14 @@ end tell"#,
                 let _ = Command::new("open").args(["-b", &bundle_id]).output();
                 std::thread::sleep(std::time::Duration::from_millis(250));
 
-                let script_activate = format!(
-                    r#"tell application id "{}" to activate"#,
-                    bundle_id.replace('"', r#"\""#)
-                );
-                let _ = Command::new("osascript")
-                    .args(["-e", &script_activate])
-                    .output();
+                let script_activate = r#"tell application id (item 1 of argv) to activate"#;
+                let _ = osascript_argv_command(script_activate, &[&bundle_id]).output();
 
-                let script_frontmost = format!(
-                    r#"tell application "System Events"
-    set frontmost of (first process whose bundle identifier is "{}") to true
-end tell"#,
-                    bundle_id.replace('"', r#"\""#)
-                );
-                let _ = Command::new("osascript")
-                    .args(["-e", &script_frontmost])
-                    .output();
+                let script_frontmost = r#"set bid to item 1 of argv
+tell application "System Events"
+    set frontmost of (first process whose bundle identifier is bid) to true
+end tell"#;
+                let _ = osascript_argv_command(script_frontmost, &[&bundle_id]).output();
 
                 // Verify frontmost up to 4 times (100ms apart), exit as soon as
                 // confirmed.
@@ -1579,12 +1615,15 @@ end tell"#,
                                 .to_string(),
                         );
                     }
-                    let escaped = bundle_id.replace('`', "``").replace('*', "`*").replace('?', "`?").replace('[', "`[").replace(']', "`]").replace('\'', "''");
-                    let ps = format!(r#"Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; Get-Process | Where-Object {{$_.ProcessName -like '*{}*'}} | ForEach-Object {{ if ($_.MainWindowHandle -ne 0) {{ [N.W]::SetForegroundWindow($_.MainWindowHandle) }} }}"#, escaped);
-                    let mut ps_cmd = Command::new("powershell");
-                    ps_cmd.args(["-NoProfile", "-Command", &ps]);
-                    use std::os::windows::process::CommandExt;
-                    ps_cmd.creation_flags(0x08000000);
+                    // The app name is passed via env and wildcard-escaped inside
+                    // PowerShell; interpolating it into a single-quoted literal
+                    // is unsafe (U+2018..U+201B also terminate PS strings).
+                    let ps = r#"$pat = '*' + [System.Management.Automation.WildcardPattern]::Escape($env:RSCLAW_PS_APP) + '*'; Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; Get-Process | Where-Object {$_.ProcessName -like $pat} | ForEach-Object { if ($_.MainWindowHandle -ne 0) { [N.W]::SetForegroundWindow($_.MainWindowHandle) } }"#;
+                    let mut ps_cmd = powershell_command(
+                        &["-NoProfile"],
+                        ps,
+                        &[("RSCLAW_PS_APP", std::ffi::OsStr::new(&bundle_id))],
+                    );
                     return match ps_cmd.output() {
                         Ok(out) if out.status.success() => Ok("ok".to_string()),
                         Ok(out) => Err(format!("powershell failed: {}", String::from_utf8_lossy(&out.stderr))),
@@ -1708,22 +1747,21 @@ end tell"#;
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
                 let app_name = bundle_to_app_name(&bundle_id);
-                let script = format!(
-                    r#"tell application "System Events" to tell process "{}" to set winList to {{}}
+                // App name goes through argv, not string interpolation.
+                let script = r#"set appName to item 1 of argv
+tell application "System Events" to tell process appName to set winList to {}
 repeat with i from 1 to (count windows)
     set w to window i
     set wName to name of w
     set wPos to position of w
     set wSize to size of w
-    set wInfo to "{{\"idx\":" & i & ",\"title\":\"" & wName & "\",\"x\":" & (item 1 of wPos) & ",\"y\":" & (item 2 of wPos) & ",\"w\":" & (item 1 of wSize) & ",\"h\":" & (item 2 of wSize) & "}}"
+    set wInfo to "{\"idx\":" & i & ",\"title\":\"" & wName & "\",\"x\":" & (item 1 of wPos) & ",\"y\":" & (item 2 of wPos) & ",\"w\":" & (item 1 of wSize) & ",\"h\":" & (item 2 of wSize) & "}"
     set end of winList to wInfo
 end repeat
 set AppleScript's text item delimiters to ","
 return "[" & (winList as string) & "]"
-"#,
-                    app_name.replace('"', r#"\""#)
-                );
-                match run_osascript(&script) {
+"#;
+                match run_osascript_argv(script, &[&app_name]) {
                     Ok(json) => Ok(json),
                     Err(e) => Err(format!("list_windows failed: {e}")),
                 }
@@ -1740,12 +1778,13 @@ return "[" & (winList as string) & "]"
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
                 let app_name = bundle_to_app_name(&bundle_id);
+                // App name goes through argv; window_idx is a u32.
                 let script = format!(
-                    r#"tell application "System Events" to tell process "{}" to click button 1 of window {}"#,
-                    app_name.replace('"', r#"\""#),
+                    r#"set appName to item 1 of argv
+tell application "System Events" to tell process appName to click button 1 of window {}"#,
                     window_idx
                 );
-                match run_osascript(&script) {
+                match run_osascript_argv(&script, &[&app_name]) {
                     Ok(_) => Ok("ok".to_string()),
                     Err(e) => Err(format!("close_window failed: {e}")),
                 }
@@ -1763,8 +1802,9 @@ return "[" & (winList as string) & "]"
             if cfg!(target_os = "macos") {
                 let app_name = bundle_to_app_name(&bundle_id);
                 // Try AppleScript first (most accurate when Accessibility works).
-                let script = format!(
-                    r#"tell application "System Events" to tell process "{}"
+                // App name goes through argv, not string interpolation.
+                let script = r#"set appName to item 1 of argv
+tell application "System Events" to tell process appName
     set winCount to count of windows
     if winCount = 0 then return "0,0,0,0"
     set targetWin to missing value
@@ -1778,10 +1818,8 @@ return "[" & (winList as string) & "]"
     set p to position of targetWin
     set s to size of targetWin
     return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
-end tell"#,
-                    app_name.replace('"', r#"\""#)
-                );
-                match run_osascript(&script) {
+end tell"#;
+                match run_osascript_argv(script, &[&app_name]) {
                     Ok(output) => {
                         let trimmed = output.trim();
                         if trimmed == "0,0,0,0" {
@@ -2280,22 +2318,17 @@ end tell"#,
                 // Retry Set-Clipboard a few times: when a RustDesk/remote viewer is
                 // connected its clipboard sync intermittently holds the clipboard,
                 // making Set-Clipboard throw "failed to open clipboard".
-                let ps = format!(
-                    "$t=[System.IO.File]::ReadAllText('{}',[System.Text.Encoding]::UTF8); \
+                // The temp path is passed via env, not interpolated.
+                let ps = "$t=[System.IO.File]::ReadAllText($env:RSCLAW_PS_IN_PATH,[System.Text.Encoding]::UTF8); \
                      $ok=$false; \
-                     for($i=0;$i -lt 10;$i++){{ try{{ Set-Clipboard -Value $t -ErrorAction Stop; $ok=$true; break }} \
-                     catch{{ Start-Sleep -Milliseconds 250 }} }} \
-                     if(-not $ok){{ Write-Error 'clipboard busy after retries'; exit 1 }}",
-                    tmp.display()
+                     for($i=0;$i -lt 10;$i++){ try{ Set-Clipboard -Value $t -ErrorAction Stop; $ok=$true; break } \
+                     catch{ Start-Sleep -Milliseconds 250 } } \
+                     if(-not $ok){ Write-Error 'clipboard busy after retries'; exit 1 }";
+                let mut ps_cmd = powershell_command(
+                    &["-NoProfile", "-STA"],
+                    ps,
+                    &[("RSCLAW_PS_IN_PATH", tmp.as_os_str())],
                 );
-                #[allow(unused_mut)]
-                let mut ps_cmd = Command::new("powershell");
-                ps_cmd.args(["-NoProfile", "-STA", "-Command", &ps]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    ps_cmd.creation_flags(0x08000000);
-                }
                 let r = ps_cmd.output();
                 let _ = std::fs::remove_file(&tmp);
                 match r {
@@ -2379,11 +2412,11 @@ end tell"#,
         let file_path = file_path.to_owned();
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
-                let script = format!(
-                    "set the clipboard to (POSIX file \"{}\")",
-                    file_path.replace('"', "\\\"").replace('\\', "\\\\")
-                );
-                match Command::new("osascript").args(["-e", &script]).output() {
+                // The path goes through argv. The previous inline escaping ran
+                // `"` -> `\"` BEFORE `\` -> `\\`, turning `\"` back into an
+                // unescaped quote (script injection).
+                let script = "set the clipboard to (POSIX file (item 1 of argv))";
+                match osascript_argv_command(script, &[&file_path]).output() {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
                     Ok(out) => Err(format!(
                         "osascript failed: {}",
@@ -2413,15 +2446,14 @@ end tell"#,
                     Err(e) => Err(format!("xclip spawn failed: {e}")),
                 }
             } else if cfg!(target_os = "windows") {
-                let ps = format!("Set-Clipboard -Path '{}'", file_path.replace('\'', "''"));
-                #[allow(unused_mut)]
-                let mut ps_cmd = Command::new("powershell");
-                ps_cmd.args(["-NoProfile", "-Command", &ps]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    ps_cmd.creation_flags(0x08000000);
-                }
+                // The path is passed via env (doubling `'` alone is not a safe
+                // escape: U+2018..U+201B also delimit PS strings), and
+                // -LiteralPath disables wildcard expansion.
+                let mut ps_cmd = powershell_command(
+                    &["-NoProfile"],
+                    "Set-Clipboard -LiteralPath $env:RSCLAW_PS_IN_PATH",
+                    &[("RSCLAW_PS_IN_PATH", std::ffi::OsStr::new(&file_path))],
+                );
                 match ps_cmd.output() {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
                     Ok(out) => Err(format!(
@@ -2493,23 +2525,18 @@ end try"#,
                 // WDA_EXCLUDEFROMCAPTURE.
                 let tmp = std::env::temp_dir()
                     .join(format!("rsclaw_cb_{}.png", std::process::id()));
-                let ps = format!(
-                    "Add-Type -AssemblyName System.Windows.Forms; \
+                // The temp path is passed via env, not interpolated.
+                let ps = "Add-Type -AssemblyName System.Windows.Forms; \
                      Add-Type -AssemblyName System.Drawing; \
                      $img=[System.Windows.Forms.Clipboard]::GetImage(); \
-                     if($img -eq $null){{ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }}; \
-                     $img.Save('{}',[System.Drawing.Imaging.ImageFormat]::Png); \
-                     'ok'",
-                    tmp.display()
+                     if($img -eq $null){ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }; \
+                     $img.Save($env:RSCLAW_PS_OUT_PATH,[System.Drawing.Imaging.ImageFormat]::Png); \
+                     'ok'";
+                let mut ps_cmd = powershell_command(
+                    &["-NoProfile", "-STA"],
+                    ps,
+                    &[("RSCLAW_PS_OUT_PATH", tmp.as_os_str())],
                 );
-                #[allow(unused_mut)]
-                let mut ps_cmd = Command::new("powershell");
-                ps_cmd.args(["-NoProfile", "-STA", "-Command", &ps]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    ps_cmd.creation_flags(0x08000000);
-                }
                 match ps_cmd.output() {
                     Ok(out) if out.status.success() => match std::fs::read(&tmp) {
                         Ok(bytes) => {
@@ -2559,23 +2586,20 @@ end try"#,
         let title = title.to_owned();
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
-                let script = format!(
-                    r#"choose file with prompt "{}""#,
-                    title.replace('"', "\\\"")
-                );
-                match Command::new("osascript").args(["-e", &script]).output() {
+                // The prompt title goes through argv, not string interpolation.
+                let script = "choose file with prompt (item 1 of argv)";
+                match osascript_argv_command(script, &[&title]).output() {
                     Ok(out) if out.status.success() => {
                         let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
                         // AppleScript returns alias like "alias Macintosh HD:Users:..."
                         // Convert to POSIX path
                         if path.starts_with("alias ") {
                             let alias_path = path.strip_prefix("alias ").unwrap_or(&path);
-                            match Command::new("osascript")
-                                .args([
-                                    "-e",
-                                    &format!("POSIX path of {} \"{}\"", "alias", alias_path),
-                                ])
-                                .output()
+                            match osascript_argv_command(
+                                "POSIX path of alias (item 1 of argv)",
+                                &[alias_path],
+                            )
+                            .output()
                             {
                                 Ok(out2) if out2.status.success() => {
                                     Ok(String::from_utf8_lossy(&out2.stdout).trim().to_string())
@@ -2598,5 +2622,42 @@ end try"#,
         })
         .await
         .map_err(|e| format!("file_dialog_open join failed: {e}"))?
+    }
+}
+
+#[cfg(test)]
+mod script_arg_tests {
+    use super::*;
+
+    #[test]
+    fn osascript_argv_keeps_untrusted_value_out_of_script() {
+        let evil = r#"x\" & (do shell script "id") & "\"#;
+        let cmd = osascript_argv_command("return item 1 of argv", &[evil]);
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "-e");
+        let script = args[1].to_string_lossy();
+        assert!(script.starts_with("on run argv\n"));
+        assert!(script.ends_with("\nend run"));
+        assert!(!script.contains("do shell script"));
+        assert_eq!(args[2], "--");
+        assert_eq!(args[3], evil);
+    }
+
+    #[test]
+    fn powershell_env_carries_value_verbatim() {
+        let evil = "a\u{2019}; Remove-Item C:\\ -Recurse; \u{2018}b'";
+        let cmd = powershell_command(
+            &["-NoProfile"],
+            "Set-Clipboard -LiteralPath $env:RSCLAW_PS_IN_PATH",
+            &[("RSCLAW_PS_IN_PATH", std::ffi::OsStr::new(evil))],
+        );
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args[0], "-NoProfile");
+        assert_eq!(args[1], "-Command");
+        assert!(!args[2].to_string_lossy().contains("Remove-Item"));
+        let env: Vec<_> = cmd.get_envs().collect();
+        assert!(env.iter().any(|(k, v)| *k == "RSCLAW_PS_IN_PATH"
+            && *v == Some(std::ffi::OsStr::new(evil))));
     }
 }

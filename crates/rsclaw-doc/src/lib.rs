@@ -882,11 +882,34 @@ fn edit_excel(args: &Value, path: &Path) -> Result<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Zip entry size caps (zip-bomb protection)
+// ---------------------------------------------------------------------------
+
+/// Maximum uncompressed bytes read from a single zip entry.
+const MAX_ZIP_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum total uncompressed bytes read from one archive.
+const MAX_ZIP_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read one zip entry fully, failing once it exceeds `MAX_ZIP_ENTRY_BYTES`
+/// instead of trusting the (attacker-controlled) declared size.
+fn read_zip_entry_capped<R: std::io::Read>(entry: R, name: &str) -> Result<Vec<u8>> {
+    use std::io::Read as IoRead;
+    let mut buf = Vec::new();
+    let n = entry.take(MAX_ZIP_ENTRY_BYTES + 1).read_to_end(&mut buf)?;
+    if n as u64 > MAX_ZIP_ENTRY_BYTES {
+        return Err(anyhow!(
+            "zip entry '{name}' exceeds {MAX_ZIP_ENTRY_BYTES} bytes uncompressed"
+        ));
+    }
+    Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
 // Edit Word (.docx) — read existing + append/replace content
 // ---------------------------------------------------------------------------
 
 fn edit_word(args: &Value, path: &Path) -> Result<Value> {
-    use std::io::{Read as IoRead, Write};
+    use std::io::Write;
 
     let append_text = args["append"].as_str();
     let replace_text = args["content"].as_str();
@@ -928,13 +951,20 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| anyhow!("edit_word: invalid docx zip: {e}"))?;
 
-    // Read all entries into memory.
+    // Read all entries into memory, capped per entry and in total so a zip
+    // bomb cannot exhaust memory.
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut total: u64 = 0;
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
+        let entry = archive.by_index(i)?;
         let name = entry.name().to_owned();
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
+        let buf = read_zip_entry_capped(entry, &name)?;
+        total += buf.len() as u64;
+        if total > MAX_ZIP_TOTAL_BYTES {
+            return Err(anyhow!(
+                "edit_word: docx uncompressed size exceeds {MAX_ZIP_TOTAL_BYTES} bytes"
+            ));
+        }
         entries.push((name, buf));
     }
 
@@ -966,30 +996,53 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
         }
     }
 
-    // Rewrite the zip with modified document.xml.
-    let out_file = std::fs::File::create(path)?;
-    let mut writer = zip::ZipWriter::new(out_file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    // Rewrite the zip with modified document.xml. Write to a temp file in
+    // the same directory and rename over the original, so a failure midway
+    // never leaves the user's document truncated.
+    drop(archive);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document.docx".to_owned());
+    let tmp_path = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let write_result = (|| -> Result<()> {
+        let out_file = std::fs::File::create(&tmp_path)?;
+        let mut writer = zip::ZipWriter::new(out_file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
 
-    for (name, data) in &entries {
-        writer.start_file(name, opts)?;
-        if name == "word/document.xml" {
-            // Insert new paragraphs before the closing </w:body> tag.
-            let xml = String::from_utf8_lossy(data);
-            if let Some(pos) = xml.rfind("</w:body>") {
-                let (before, after) = xml.split_at(pos);
-                let modified = format!("{before}{new_paras}{after}");
-                writer.write_all(modified.as_bytes())?;
+        for (name, data) in &entries {
+            writer.start_file(name, opts)?;
+            if name == "word/document.xml" {
+                // Insert new paragraphs before the closing </w:body> tag.
+                let xml = String::from_utf8_lossy(data);
+                if let Some(pos) = xml.rfind("</w:body>") {
+                    let (before, after) = xml.split_at(pos);
+                    let modified = format!("{before}{new_paras}{after}");
+                    writer.write_all(modified.as_bytes())?;
+                } else {
+                    // Fallback: write as-is if structure not found.
+                    writer.write_all(data)?;
+                }
             } else {
-                // Fallback: write as-is if structure not found.
                 writer.write_all(data)?;
             }
-        } else {
-            writer.write_all(data)?;
         }
+        let mut out_file = writer.finish()?;
+        out_file.flush()?;
+        out_file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        if let Err(rm_err) = std::fs::remove_file(&tmp_path) {
+            tracing::warn!(
+                path = %tmp_path.display(),
+                "edit_word: failed to remove temp file after error: {rm_err}"
+            );
+        }
+        return Err(e);
     }
-    writer.finish()?;
 
     Ok(json!({
         "edited": true,
@@ -1237,22 +1290,21 @@ fn read_excel(path: &Path) -> Result<Value> {
 }
 
 fn read_docx(path: &Path) -> Result<Value> {
-    use std::io::Read as IoRead;
-
     let file = std::fs::File::open(path)
         .map_err(|e| anyhow!("read_doc: cannot open '{}': {e}", path.display()))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| anyhow!("read_doc: invalid docx zip: {e}"))?;
 
-    let mut xml = String::new();
-    if let Ok(mut entry) = archive.by_name("word/document.xml") {
-        entry.read_to_string(&mut xml)?;
+    let xml = if let Ok(entry) = archive.by_name("word/document.xml") {
+        let buf = read_zip_entry_capped(entry, "word/document.xml")?;
+        String::from_utf8(buf)
+            .map_err(|e| anyhow!("read_doc: word/document.xml is not valid UTF-8: {e}"))?
     } else {
         return Err(anyhow!(
             "read_doc: '{}' is a zip archive but has no word/document.xml — not a valid .docx (possibly an .xlsx/.pptx or renamed file). Check the real format and retry with the matching extension, or re-create it with 'create_word'.",
             path.display()
         ));
-    }
+    };
 
     // Extract text from <w:t> tags.
     let mut text = String::new();

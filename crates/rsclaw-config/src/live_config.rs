@@ -265,6 +265,11 @@ pub fn detect_restart_fields(old: &GatewayRuntime, new: &GatewayRuntime) -> Vec<
     if old.bind != new.bind {
         fields.push("gateway.bind".to_owned());
     }
+    // The listener is bound once at startup: moving 0.0.0.0 -> 127.0.0.1
+    // without a restart would leave the gateway exposed on the old address.
+    if old.bind_address != new.bind_address {
+        fields.push("gateway.bindAddress".to_owned());
+    }
     if old.reload != new.reload {
         fields.push("gateway.reload".to_owned());
     }
@@ -290,7 +295,7 @@ pub fn is_hot_safe_only(old: &RuntimeConfig, new: &RuntimeConfig) -> bool {
 /// for display, e.g. `["gateway.port", "config.channels"]`.
 ///
 /// Implementation:
-///   1. Granular gateway fields (port/bind/reload) come from
+///   1. Granular gateway fields (port/bind/bindAddress/reload) come from
 ///      `detect_restart_fields`.
 ///   2. Top-level `Config` keys are compared via JSON equality on `raw`.
 ///      Hot-safe fields are stripped before comparison so a pure temperature
@@ -522,6 +527,16 @@ mod tests {
         new.bind = BindMode::All;
         let fields = detect_restart_fields(&old, &new);
         assert!(fields.contains(&"gateway.bind".to_owned()));
+    }
+
+    #[test]
+    fn restart_required_for_bind_address_change() {
+        let mut old = base_gw();
+        old.bind_address = Some("0.0.0.0".to_owned());
+        let mut new = old.clone();
+        new.bind_address = Some("127.0.0.1".to_owned());
+        let fields = detect_restart_fields(&old, &new);
+        assert!(fields.contains(&"gateway.bindAddress".to_owned()));
     }
 
     #[tokio::test]

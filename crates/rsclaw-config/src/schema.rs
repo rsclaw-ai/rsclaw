@@ -102,6 +102,14 @@ pub struct GatewayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_address: Option<String>,
     pub auth: Option<GatewayAuth>,
+    /// Explicit owner identities, each `"<channel>:<peer_id>"` (e.g.
+    /// `"telegram:12345"`, `"feishu:ou_abc"`). Owners may use high-risk
+    /// capabilities (shell, file writes, cron, local slash commands such as
+    /// `/sh` `/cat`). Local entry points (desktop, WebSocket, CLI, loopback
+    /// HTTP) and DM senders listed in a channel's static `allowFrom` are
+    /// owners implicitly; paired users and group members are not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owners: Option<Vec<String>>,
     /// A2A endpoint (`/api/v1/a2a`) authentication. When any field here is
     /// populated, the A2A middleware accepts these credentials.
     /// `gateway.auth.token` is also accepted as a Bearer when set
@@ -594,6 +602,13 @@ pub struct AgentEntry {
     /// empty/null = none (default for non-main agents).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_commands: Option<String>,
+    /// High-risk tools that non-owner senders (paired users, group members,
+    /// A2A peers, webhooks) may still call on this agent. By default
+    /// non-owners cannot call any tool in
+    /// `rsclaw_agent::trust::OWNER_ONLY_TOOLS`. Use `["*"]` to lift the
+    /// restriction entirely for this agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_owner_tools: Option<Vec<String>>,
     /// rsclaw extension: use OpenCode ACP client instead of LLM
     /// When set, this agent spawns opencode acp subprocess and routes all
     /// prompts through it.
@@ -2397,8 +2412,14 @@ pub enum SecretOrString {
 }
 
 impl SecretOrString {
-    /// Return the plain string value if this is not a SecretRef.
-    /// For SecretRef variants, resolution happens in `SecretsManager`.
+    /// Return the literal string if this is `Plain`, `None` for ANY SecretRef.
+    ///
+    /// **This is NOT a resolver.** It does not look up `{source:"env"}` /
+    /// file / exec refs and does not expand `${VAR}`. Callers that need the
+    /// secret's value must use [`SecretOrString::resolve_full`] (preferred,
+    /// handles every source) or [`SecretOrString::resolve_early`] (env +
+    /// plain only). Using `as_plain().unwrap_or("")` as an expected token is
+    /// an auth bypass: a ref-configured token becomes the empty string.
     pub fn as_plain(&self) -> Option<&str> {
         match self {
             SecretOrString::Plain(s) => Some(s.as_str()),
@@ -2409,8 +2430,8 @@ impl SecretOrString {
     /// Resolve eagerly without a full `RuntimeConfig`.
     /// - `Plain` → returns the string as-is.
     /// - `Ref { source: Env, id }` → calls `std::env::var(id)`.
-    /// - `Ref { source: File | Exec, .. }` → returns `None` (needs
-    ///   `SecretsManager`).
+    /// - `Ref { source: File | Exec, .. }` → returns `None` (use
+    ///   [`SecretOrString::resolve_full`]).
     pub fn resolve_early(&self) -> Option<String> {
         match self {
             SecretOrString::Plain(s) => {
@@ -2427,6 +2448,11 @@ impl SecretOrString {
     /// `SecretsConfig`. This is the full-resolution path — use when
     /// `secrets.providers` is available (i.e. after the schema is loaded).
     /// Falls back to `resolve_early()` for Env refs and plain strings.
+    ///
+    /// This is the canonical way to obtain a secret value from config.
+    /// `None` means "configured but unresolvable" (missing env var, failed
+    /// file/exec) — callers doing authentication must treat that as
+    /// "reject", never as an empty expected value.
     pub fn resolve_full(&self, secrets: Option<&SecretsConfig>) -> Option<String> {
         match self {
             SecretOrString::Plain(s) => {

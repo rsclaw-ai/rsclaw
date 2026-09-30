@@ -32,8 +32,10 @@ pub struct ArtifactId(pub String);
 
 impl ArtifactId {
     pub fn new() -> Self {
-        // UUID v4 gives 122 bits of randomness — orders of magnitude beyond
-        // what any single session could collide on. Earlier nanosec-mix was
+        // 12 hex chars of a UUID v4 = 48 random bits. Ids only need to be
+        // unique within one session dir (capped at SESSION_FILE_CAP files),
+        // and `write` uses `create_new` so a collision fails loudly instead
+        // of overwriting. Earlier nanosec-mix was
         // collision-prone under parallel dispatch (multiple tools writing
         // within the same microsecond on macOS), causing silent data loss
         // when `File::create` truncated the previous artifact.
@@ -91,18 +93,29 @@ impl ArtifactStore {
     }
 
     fn session_dir(&self, session_key: &str) -> PathBuf {
-        // Sanitize session_key so a key with '/' or '..' can't escape.
-        let safe: String = session_key
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.root.join(safe)
+        // Sanitize session_key so a key with '/' or '..' can't escape. When
+        // sanitization changed anything, append a stable hash of the ORIGINAL
+        // key: distinct keys like `agent:main:飞书:甲` / `agent:main:飞书:乙`
+        // otherwise collapse to the same dir, mixing artifacts and letting
+        // `gc_session` delete another session's data. ASCII-safe keys keep
+        // their historical dir name.
+        let safe = legacy_sanitize(session_key);
+        if safe == session_key {
+            return self.root.join(safe);
+        }
+        // `safe` is ASCII by construction, so byte slicing is char-safe.
+        // Cap it so very long keys stay under filesystem name limits; the
+        // hash keeps them distinct.
+        let prefix = &safe[..safe.len().min(150)];
+        self.root
+            .join(format!("{prefix}-{:016x}", fnv1a64(session_key.as_bytes())))
+    }
+
+    /// Pre-hash directory name (collision-prone). Only consulted as a
+    /// read-only fallback so artifacts written before the hash suffix was
+    /// introduced stay readable until they age out via [`Self::housekeep`].
+    fn legacy_session_dir(&self, session_key: &str) -> PathBuf {
+        self.root.join(legacy_sanitize(session_key))
     }
 
     fn path_for(&self, session_key: &str, id: &ArtifactId) -> PathBuf {
@@ -120,7 +133,7 @@ impl ArtifactStore {
         let id = ArtifactId::new();
         let path = dir.join(format!("{}.txt", id.as_str()));
         // create_new — fail loud on collision instead of silently
-        // truncating an existing artifact. With a 122-bit random id,
+        // truncating an existing artifact. With a 48-bit random id,
         // a real collision is astronomically unlikely; surfacing it
         // as an error protects against restored-backup overlap and
         // RNG-seeded test paths that would otherwise corrupt
@@ -138,7 +151,15 @@ impl ArtifactStore {
     /// Read full artifact text. Returns `Err` if the id is malformed or the
     /// file is missing (e.g. session GC'd).
     pub fn read(&self, session_key: &str, id: &ArtifactId) -> Result<String> {
-        let path = self.path_for(session_key, id);
+        let mut path = self.path_for(session_key, id);
+        if !path.exists() {
+            let legacy = self
+                .legacy_session_dir(session_key)
+                .join(format!("{}.txt", id.as_str()));
+            if legacy.exists() {
+                path = legacy;
+            }
+        }
         let mut f = fs::File::open(&path)
             .with_context(|| format!("artifact not found: {}", path.display()))?;
         let mut buf = String::new();
@@ -157,6 +178,12 @@ impl ArtifactStore {
     /// an optional optimization).
     pub fn read_summary(&self, session_key: &str, id: &ArtifactId) -> Option<String> {
         let path = self.summary_path_for(session_key, id);
+        let path = if path.exists() {
+            path
+        } else {
+            self.legacy_session_dir(session_key)
+                .join(format!("{}.summary.txt", id.as_str()))
+        };
         fs::read_to_string(path)
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -173,7 +200,9 @@ impl ArtifactStore {
         Ok(())
     }
 
-    /// Delete all artifacts for a session (called on session end).
+    /// Delete all artifacts for a session (called on session end). Legacy
+    /// (pre-hash) dirs are shared between colliding keys, so they are never
+    /// removed here; they expire through [`Self::housekeep`].
     pub fn gc_session(&self, session_key: &str) -> io::Result<()> {
         let dir = self.session_dir(session_key);
         if dir.exists() {
@@ -248,6 +277,32 @@ impl Default for ArtifactStore {
     }
 }
 
+/// Historical session-key sanitization: keep ASCII alphanumerics, `-`, `_`;
+/// map everything else to `_`.
+fn legacy_sanitize(session_key: &str) -> String {
+    session_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// 64-bit FNV-1a. Stable across Rust versions and platforms (unlike
+/// `DefaultHasher`), so directory names stay the same after upgrades.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -289,6 +344,34 @@ mod tests {
         assert_eq!(store.read("sess/../escape", &id).unwrap(), "x");
         // The dir is under the root, not above it.
         assert!(store.session_dir("sess/../escape").starts_with(tmp.path()));
+    }
+
+    #[test]
+    fn cjk_session_keys_do_not_collide() {
+        let tmp = tempdir().unwrap();
+        let store = ArtifactStore::at(tmp.path().to_path_buf());
+        let a = "agent:main:feishu:group:甲";
+        let b = "agent:main:feishu:group:乙";
+        assert_ne!(store.session_dir(a), store.session_dir(b));
+        let id_a = store.write(a, "A").unwrap();
+        let id_b = store.write(b, "B").unwrap();
+        store.gc_session(a).unwrap();
+        assert!(store.read(a, &id_a).is_err());
+        assert_eq!(store.read(b, &id_b).unwrap(), "B");
+        // ASCII-safe keys keep their historical directory name.
+        assert_eq!(store.session_dir("sess-1"), tmp.path().join("sess-1"));
+    }
+
+    #[test]
+    fn legacy_dir_still_readable() {
+        let tmp = tempdir().unwrap();
+        let store = ArtifactStore::at(tmp.path().to_path_buf());
+        let key = "agent:main:x";
+        let legacy = store.legacy_session_dir(key);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("tr_abcdef123456.txt"), "old").unwrap();
+        let id = ArtifactId::parse("tr_abcdef123456").unwrap();
+        assert_eq!(store.read(key, &id).unwrap(), "old");
     }
 
     #[test]

@@ -592,6 +592,11 @@ fn resolve_template_defaults(
     (spec.grep.clone(), jq, event_filter)
 }
 
+/// Build the concrete event source for a parsed `/watch` spec.
+///
+/// SECURITY: `shell` and `file` kinds execute host commands / read arbitrary
+/// files and are owner-only; callers must gate them (the preparse owner gate
+/// does). Only `${RSCLAW_WATCH_*}` env vars are expanded, for every kind.
 pub fn build_source_impl(spec: &WatchSpec) -> Result<SourceImpl, WatchStartError> {
     // Resolve `${VAR}` references in raw_source up-front so every source kind
     // gets consistent env-var support. Without this, file paths would be
@@ -618,7 +623,7 @@ pub fn build_source_impl(spec: &WatchSpec) -> Result<SourceImpl, WatchStartError
         })),
         SourceKind::Sse => {
             // SseSource::build runs substitute_env_vars on the URL again, which
-            // is a no-op (the regex finds no remaining `${...}` after our pass)
+            // is harmless (allowed vars are already expanded; others stay verbatim)
             // but keeps the SSE-headers substitution logic local to that path.
             let sse = SseSource::build(&resolved_source, &spec.headers)?;
             Ok(SourceImpl::Sse(sse))
@@ -682,10 +687,10 @@ mod build_tests {
         std::fs::write(&log_path, b"line\n").unwrap();
 
         // Unique env var name so other tests don't race.
-        unsafe { std::env::set_var("WATCH_BUILD_TEST_DIR", dir.path().to_str().unwrap()) };
-        let impl_ = build_source_impl(&spec_file("${WATCH_BUILD_TEST_DIR}/app.log"))
+        unsafe { std::env::set_var("RSCLAW_WATCH_BUILD_TEST_DIR", dir.path().to_str().unwrap()) };
+        let impl_ = build_source_impl(&spec_file("${RSCLAW_WATCH_BUILD_TEST_DIR}/app.log"))
             .expect("env var should resolve and path should exist");
-        unsafe { std::env::remove_var("WATCH_BUILD_TEST_DIR") };
+        unsafe { std::env::remove_var("RSCLAW_WATCH_BUILD_TEST_DIR") };
 
         match impl_ {
             SourceImpl::File(f) => assert_eq!(f.path, log_path),
@@ -695,11 +700,11 @@ mod build_tests {
 
     #[test]
     fn file_source_unset_env_var_errors() {
-        unsafe { std::env::remove_var("WATCH_BUILD_TEST_MISSING") };
-        match build_source_impl(&spec_file("${WATCH_BUILD_TEST_MISSING}/x.log")) {
+        unsafe { std::env::remove_var("RSCLAW_WATCH_BUILD_TEST_MISSING") };
+        match build_source_impl(&spec_file("${RSCLAW_WATCH_BUILD_TEST_MISSING}/x.log")) {
             Ok(_) => panic!("missing env var should error"),
             Err(WatchStartError::UnresolvedEnv(name)) => {
-                assert!(name.contains("WATCH_BUILD_TEST_MISSING"), "got: {name}");
+                assert!(name.contains("RSCLAW_WATCH_BUILD_TEST_MISSING"), "got: {name}");
             }
             Err(other) => panic!("expected UnresolvedEnv, got {other:?}"),
         }
