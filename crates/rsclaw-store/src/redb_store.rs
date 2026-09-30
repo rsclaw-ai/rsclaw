@@ -329,6 +329,33 @@ fn seq_from_message_key(key: &str, session_key: &str) -> Option<u64> {
     None
 }
 
+/// Keys of `session_key`'s active (non-archive) messages, scanning both the
+/// `\0` and legacy `:` prefixes. The legacy `"{sk}:"` prefix also matches
+/// OTHER sessions' keys (`agent:a:c:group:G` is a prefix of
+/// `agent:a:c:group:G:topic:T\0...`), so a key only counts when its whole
+/// remainder parses as the seq — otherwise `/new` or delete on a group
+/// session would wipe its topic sub-sessions and loads would mix them in.
+fn own_active_message_keys<T>(table: &T, session_key: &str) -> Result<Vec<String>>
+where
+    T: ReadableTable<&'static str, &'static str>,
+{
+    let mut out = Vec::new();
+    for sep in [KEY_SEP, LEGACY_KEY_SEP] {
+        let prefix = format!("{session_key}{sep}");
+        for entry in table.range(prefix.as_str()..)? {
+            let (k, _) = entry?;
+            let key = k.value();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if seq_from_message_key(key, session_key).is_some() {
+                out.push(key.to_owned());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Parse an archive key of shape
 /// `archive<sep><session_key><sep>gen<N><sep><seq>` (separator `\0` or `:`)
 /// into `(generation, seq)`. Returns `None` for keys that don't match the shape
@@ -424,22 +451,7 @@ impl RedbStore {
             // Also remove all messages for this session. Scan both `\0` (new)
             // and `:` (legacy) separator prefixes.
             let mut msgs = write.open_table(MESSAGES)?;
-            let keys: Vec<String> = [KEY_SEP, LEGACY_KEY_SEP]
-                .iter()
-                .flat_map(|sep| {
-                    let prefix = format!("{session_key}{sep}");
-                    msgs.range(prefix.as_str()..)
-                        .unwrap()
-                        .take_while(|r| {
-                            r.as_ref()
-                                .map(|(k, _)| k.value().starts_with(&prefix))
-                                .unwrap_or(false)
-                        })
-                        .filter_map(|r| r.ok())
-                        .map(|(k, _)| k.value().to_owned())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
+            let keys = own_active_message_keys(&msgs, session_key)?;
             for key in &keys {
                 msgs.remove(key.as_str())?;
             }
@@ -464,51 +476,43 @@ impl RedbStore {
     /// Called by `/new` to start a fresh conversation on the same session key.
     /// Active messages are deleted; archive is untouched.
     pub fn new_generation(&self, session_key: &str) -> Result<u32> {
-        let meta_opt = self.get_session_meta(session_key)?;
-        let mut meta = meta_opt.unwrap_or_else(|| SessionMeta {
-            session_key: session_key.to_owned(),
-            message_count: 0,
-            last_active: chrono::Utc::now().timestamp(),
-            created_at: chrono::Utc::now().timestamp(),
-            generation: 1,
-        });
-
-        meta.generation += 1;
-        meta.message_count = 0;
-        meta.last_active = chrono::Utc::now().timestamp();
-
-        // Delete active messages (not archive).
         let write = self.db.begin_write()?;
+        // Read meta INSIDE the write tx: reading it outside let a concurrent
+        // `append_message` bump message_count / generation in between, and
+        // this write then clobbered it with the stale copy.
+        let generation = {
+            let mut metas = write.open_table(SESSION_META)?;
+            let now = chrono::Utc::now().timestamp();
+            let mut meta: SessionMeta = metas
+                .get(session_key)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()?
+                .unwrap_or_else(|| SessionMeta {
+                    session_key: session_key.to_owned(),
+                    message_count: 0,
+                    last_active: now,
+                    created_at: now,
+                    generation: 1,
+                });
+            meta.generation += 1;
+            meta.message_count = 0;
+            meta.last_active = now;
+            let meta_json = serde_json::to_string(&meta)?;
+            metas.insert(session_key, meta_json.as_str())?;
+            meta.generation
+        };
         {
+            // Delete active messages (not archive). Scans both `\0` (new)
+            // and `:` (legacy) separator prefixes.
             let mut msgs = write.open_table(MESSAGES)?;
-            // Scan both `\0` (new) and `:` (legacy) separator prefixes.
-            let keys: Vec<String> = [KEY_SEP, LEGACY_KEY_SEP]
-                .iter()
-                .flat_map(|sep| {
-                    let prefix = format!("{session_key}{sep}");
-                    msgs.range(prefix.as_str()..)
-                        .unwrap()
-                        .take_while(|r| {
-                            r.as_ref()
-                                .map(|(k, _)| k.value().starts_with(&prefix))
-                                .unwrap_or(false)
-                        })
-                        .filter_map(|r| r.ok())
-                        .map(|(k, _)| k.value().to_owned())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
+            let keys = own_active_message_keys(&msgs, session_key)?;
             for key in &keys {
                 msgs.remove(key.as_str())?;
             }
-
-            let meta_json = serde_json::to_string(&meta)?;
-            let mut metas = write.open_table(SESSION_META)?;
-            metas.insert(session_key, meta_json.as_str())?;
         }
         write.commit()?;
 
-        Ok(meta.generation)
+        Ok(generation)
     }
 
     // -----------------------------------------------------------------------
@@ -585,26 +589,16 @@ impl RedbStore {
         // The key carries the separator, so a backfill round-trip below can
         // re-derive it from the key itself (no need to remember which prefix
         // a row came from).
-        let mut messages: Vec<(String, serde_json::Value)> = [KEY_SEP, LEGACY_KEY_SEP]
-            .iter()
-            .flat_map(|sep| {
-                let prefix = format!("{session_key}{sep}");
-                table
-                    .range(prefix.as_str()..)
-                    .unwrap()
-                    .take_while(|r| {
-                        r.as_ref()
-                            .map(|(k, _)| k.value().starts_with(&prefix))
-                            .unwrap_or(false)
-                    })
-                    .filter_map(|r| r.ok())
-                    .filter_map(|(k, v)| {
-                        let val: serde_json::Value = serde_json::from_str(v.value()).ok()?;
-                        Some((k.value().to_owned(), val))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let mut messages: Vec<(String, serde_json::Value)> = Vec::new();
+        for key in own_active_message_keys(&table, session_key)? {
+            let Some(v) = table.get(key.as_str())? else {
+                continue;
+            };
+            match serde_json::from_str::<serde_json::Value>(v.value()) {
+                Ok(val) => messages.push((key, val)),
+                Err(e) => tracing::warn!(key = %key.escape_debug(), "skip undecodable message: {e}"),
+            }
+        }
         // Merge order is per-prefix (all `\0` rows then all `:` rows); sort
         // by seq so the final ordering is chronological regardless.
         messages.sort_by_key(|(k, _)| seq_from_message_key(k, session_key).unwrap_or(0));
@@ -617,18 +611,26 @@ impl RedbStore {
         // exist yet, copy all active messages to archive:...:gen1:... keys.
         // Detect archive rows under BOTH separators so sessions whose archive
         // predates the `\0` migration aren't re-backfilled.
-        let has_archive = [KEY_SEP, LEGACY_KEY_SEP].iter().any(|sep| {
+        let mut has_archive = false;
+        for sep in [KEY_SEP, LEGACY_KEY_SEP] {
             let archive_prefix = format!("archive{sep}{session_key}{sep}");
-            table
-                .range(archive_prefix.as_str()..)
-                .unwrap()
-                .next()
-                .is_some_and(|r| {
-                    r.as_ref()
-                        .map(|(k, _)| k.value().starts_with(&archive_prefix))
-                        .unwrap_or(false)
-                })
-        });
+            for entry in table.range(archive_prefix.as_str()..)? {
+                let (k, _) = entry?;
+                let key = k.value();
+                if !key.starts_with(&archive_prefix) {
+                    break;
+                }
+                // Same prefix-collision guard as the active scan: another
+                // session's archive rows can share this prefix.
+                if parse_archive_key(key, session_key).is_some() {
+                    has_archive = true;
+                    break;
+                }
+            }
+            if has_archive {
+                break;
+            }
+        }
 
         if !has_archive {
             drop(table);
@@ -644,7 +646,13 @@ impl RedbStore {
                             .to_string();
                         let archive_key =
                             format!("archive{KEY_SEP}{session_key}{KEY_SEP}gen1{KEY_SEP}{suffix}");
-                        let json_str = serde_json::to_string(val).unwrap_or_default();
+                        let json_str = match serde_json::to_string(val) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                tracing::warn!(key = %archive_key.escape_debug(), "skip archive backfill of unserializable message: {e}");
+                                continue;
+                            }
+                        };
                         if let Err(e) = msgs_table.insert(archive_key.as_str(), json_str.as_str()) {
                             tracing::error!(error = %e, key = %archive_key, "failed to insert archive entry");
                         }
@@ -760,22 +768,21 @@ impl RedbStore {
         Ok(())
     }
 
-    /// List all approved peer IDs for a channel.
-    // TODO: use prefix range query (range(prefix..prefix_end)) instead of full
-    // table scan
+    /// List all approved peer IDs for a channel (prefix range scan).
     pub fn list_pairings(&self, channel: &str) -> Result<Vec<String>> {
         let prefix = format!("{channel}:");
         let read = self.db.begin_read()?;
         let table = read.open_table(PAIRING)?;
         let mut peers = Vec::new();
-        for entry in table.iter()? {
+        for entry in table.range(prefix.as_str()..)? {
             let (key, val) = entry?;
             let k = key.value();
-            if k.starts_with(&prefix) {
-                if let Ok(state) = serde_json::from_str::<PairingState>(val.value()) {
-                    if matches!(state, PairingState::Approved) {
-                        peers.push(k[prefix.len()..].to_owned());
-                    }
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            if let Ok(state) = serde_json::from_str::<PairingState>(val.value()) {
+                if matches!(state, PairingState::Approved) {
+                    peers.push(k[prefix.len()..].to_owned());
                 }
             }
         }
@@ -901,10 +908,17 @@ impl RedbStore {
             let mut table = write.open_table(TASK_QUEUE)?;
             let mut best: Option<rsclaw_types::QueuedTask> = None;
 
-            // Scan all tasks to find the best candidate.
+            // Scan all tasks to find the best candidate. One corrupt row
+            // must not wedge the whole queue: skip it with a warning.
             for entry in table.iter()? {
-                let (_k, v) = entry?;
-                let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
+                let (k, v) = entry?;
+                let task: rsclaw_types::QueuedTask = match serde_json::from_str(v.value()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(task = %k.value(), "task queue: skip undecodable row: {e}");
+                        continue;
+                    }
+                };
                 if task.status != TaskStatus::Pending {
                     continue;
                 }
@@ -943,8 +957,14 @@ impl RedbStore {
             let mut table = write.open_table(TASK_QUEUE)?;
             let mut to_revive = Vec::new();
             for entry in table.iter()? {
-                let (_k, v) = entry?;
-                let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
+                let (k, v) = entry?;
+                let task: rsclaw_types::QueuedTask = match serde_json::from_str(v.value()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(task = %k.value(), "task queue: skip undecodable row: {e}");
+                        continue;
+                    }
+                };
                 if task.status == TaskStatus::Running {
                     to_revive.push(task);
                 }
@@ -1115,8 +1135,14 @@ impl RedbStore {
             let mut table = write.open_table(TASK_QUEUE)?;
             let mut expired_ids = Vec::new();
             for entry in table.iter()? {
-                let (_k, v) = entry?;
-                let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
+                let (k, v) = entry?;
+                let task: rsclaw_types::QueuedTask = match serde_json::from_str(v.value()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(task = %k.value(), "task queue: skip undecodable row: {e}");
+                        continue;
+                    }
+                };
                 if task.is_expired() {
                     expired_ids.push(task.id);
                 }
@@ -1864,6 +1890,27 @@ mod tests {
             .expect("append");
         // Confirm archive write happened.
         assert_eq!(store.archive_stat(sk).unwrap().total_messages, 1);
+    }
+
+    #[test]
+    fn group_session_new_and_delete_keep_topic_sub_sessions() {
+        let (store, _dir) = open_tmp();
+        let group = "agent:a:c:group:G";
+        let topic = "agent:a:c:group:G:topic:T";
+        store
+            .append_message(group, &serde_json::json!({"text": "group"}))
+            .unwrap();
+        store
+            .append_message(topic, &serde_json::json!({"text": "topic"}))
+            .unwrap();
+        // Loads must not mix the topic's messages into the group session.
+        assert_eq!(store.load_messages(group).unwrap().len(), 1);
+        store.new_generation(group).unwrap();
+        assert_eq!(store.load_messages(topic).unwrap().len(), 1);
+        store.delete_session(group).unwrap();
+        let topic_msgs = store.load_messages(topic).unwrap();
+        assert_eq!(topic_msgs.len(), 1);
+        assert_eq!(topic_msgs[0]["text"], "topic");
     }
 
     #[test]

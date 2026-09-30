@@ -86,10 +86,9 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
                         }
                     })
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-                let dim = cfg
-                    .dimensions
-                    .unwrap_or_else(|| rsclaw_embed::openai_model_dim(&model))
-                    as usize;
+                let dim_override = cfg.dimensions.filter(|d| *d > 0).map(|d| d as usize);
+                let dim = dim_override
+                    .unwrap_or_else(|| rsclaw_embed::openai_model_dim(&model) as usize);
                 // base_url empty + rsclaw-* model → the configured rsclaw
                 // provider base (self-hosted fleet honoured), falling back to
                 // RSCLAW_API_BASE_URL; non-rsclaw empty → OpenAI default.
@@ -110,7 +109,10 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
                 };
                 tracing::info!(model = %model, dim, base_url = %base_url, "kb: using remote OpenAI-compatible embedder");
                 return Arc::new(LocalKbEmbedder::remote_openai(
-                    base_url, model, api_key, dim,
+                    base_url,
+                    model,
+                    api_key,
+                    dim_override,
                 ));
             }
             // "local"/unset → fall through to the local-model scan below.

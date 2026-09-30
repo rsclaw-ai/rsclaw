@@ -79,33 +79,35 @@ pub struct SearchCtx {
 
 impl SearchCtx {
     pub fn search(&self, req: &SearchRequest, scope: &CallerScope) -> Result<Vec<RetrievalHit>> {
-        let recall_k = (req.k * 3).max(10);
+        let mut recall_k = (req.k * 3).max(10);
 
-        // 1. Dense recall.
-        let dense = match req.mode {
-            SearchMode::Bm25 => Vec::new(),
+        // 1. Dense query vector (computed once). A failed or degenerate
+        //    (all-zero) query embedding skips dense recall instead of
+        //    failing the search: BM25 still answers in Auto/Hybrid, and a
+        //    zero vector would otherwise match every chunk at distance 0.
+        let qvec: Option<Vec<f32>> = match req.mode {
+            SearchMode::Bm25 => None,
             _ => {
                 // Dense side applies the asymmetric query instruction if set;
                 // BM25 (below) always uses the raw query.
                 let dense_query =
                     rsclaw_embed::format_query(req.query_instruction.as_deref(), &req.query);
-                let qv = self.embedder.embed_batch(&[dense_query])?;
-                match qv.first() {
-                    Some(qvec) => self.index.hnsw.search(qvec, recall_k),
-                    // Embedder returned no vector — skip dense recall rather
-                    // than panic; sparse recall still runs in Auto/Hybrid.
-                    None => Vec::new(),
+                match self.embedder.embed_batch(&[dense_query]) {
+                    Ok(mut v) => v.pop().filter(|q| !rsclaw_embed::is_zero_vector(q)),
+                    Err(e) => {
+                        tracing::warn!("kb search: query embedding failed, dense recall skipped: {e:#}");
+                        None
+                    }
                 }
             }
         };
 
-        // 2. Sparse recall.
-        let sparse = match req.mode {
-            SearchMode::Dense => Vec::new(),
-            _ => self.index.tantivy.search(&req.query, recall_k)?,
-        };
-
-        // 3. Filter (visibility + status + version + tags + source_kind + doc_ids).
+        // 2-3. Recall + filter (visibility + status + version + tags +
+        //      source_kind + doc_ids). Filtering happens after recall, so a
+        //      small collection / private scope can be starved by hits from
+        //      the rest of the KB; widen recall until enough hits survive
+        //      the filter or both indexes are exhausted.
+        const MAX_RECALL: usize = 2000;
         let rtx = self.store.begin_read()?;
         let mut materialised: HashMap<String, (KbChunk, KbDoc)> = HashMap::new();
 
@@ -132,18 +134,39 @@ impl SearchCtx {
                 Ok(true)
             };
 
-        let mut kept_dense: Vec<(String, f32)> = Vec::new();
-        for (cid, score) in &dense {
-            if keep(cid, &mut materialised)? {
-                kept_dense.push((cid.clone(), *score));
+        let (kept_dense, kept_sparse) = loop {
+            let dense = match &qvec {
+                Some(q) => self.index.hnsw.search(q, recall_k),
+                None => Vec::new(),
+            };
+            let sparse = match req.mode {
+                SearchMode::Dense => Vec::new(),
+                _ => self.index.tantivy.search(&req.query, recall_k)?,
+            };
+            let mut kept_dense: Vec<(String, f32)> = Vec::new();
+            for (cid, score) in &dense {
+                if keep(cid, &mut materialised)? {
+                    kept_dense.push((cid.clone(), *score));
+                }
             }
-        }
-        let mut kept_sparse: Vec<(String, f32)> = Vec::new();
-        for (cid, score) in &sparse {
-            if keep(cid, &mut materialised)? {
-                kept_sparse.push((cid.clone(), *score));
+            let mut kept_sparse: Vec<(String, f32)> = Vec::new();
+            for (cid, score) in &sparse {
+                if keep(cid, &mut materialised)? {
+                    kept_sparse.push((cid.clone(), *score));
+                }
             }
-        }
+            let kept_distinct = kept_dense
+                .iter()
+                .chain(kept_sparse.iter())
+                .map(|(cid, _)| cid.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            let exhausted = dense.len() < recall_k && sparse.len() < recall_k;
+            if kept_distinct >= req.k || exhausted || recall_k >= MAX_RECALL {
+                break (kept_dense, kept_sparse);
+            }
+            recall_k = (recall_k * 4).min(MAX_RECALL);
+        };
 
         // 4. Fuse.
         let mut fused = match req.mode {
@@ -271,7 +294,9 @@ impl SearchCtx {
             }
         }
 
-        // 6. MMR.
+        // 6. MMR. Picks a diverse subset but reports each hit's fused /
+        //    reranked relevance (not the MMR marginal, which goes negative
+        //    for any hit similar to an earlier pick).
         let mut final_ids: Vec<(String, f32)> = match req.diversity {
             Diversity::Off => fused.into_iter().take(req.k).collect(),
             Diversity::Mmr => {
@@ -467,6 +492,42 @@ mod tests {
                 .collect();
             assert_eq!(first, again, "search order not stable across calls");
         }
+    }
+
+    #[test]
+    fn hybrid_mmr_search_returns_k_hits_with_positive_scores() {
+        // Regression: RRF-scale relevance vs [0,1] similarity made every
+        // MMR pick after the first negative, and callers filtering at
+        // score >= 0 got a single hit back.
+        // Four large, distinct paragraphs -> four chunks that all mention
+        // "rust" (the chunker merges small paragraphs into one chunk).
+        let body: String = (0..4)
+            .map(|s| {
+                (0..400)
+                    .map(|i| format!("rust section{s} word{s}x{i}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (_tmp, ctx) = ctx_with_ingested(&format!("# Notes\n\n{body}"));
+        let req = SearchRequest {
+            query: "rust".into(),
+            k: 3,
+            filter: SearchFilter::default(),
+            mode: SearchMode::Hybrid,
+            diversity: Diversity::Mmr,
+            mmr_lambda: 0.5,
+            boost_entities: vec![],
+            query_instruction: None,
+        };
+        let hits = ctx.search(&req, &CallerScope::default()).unwrap();
+        assert!(hits.len() >= 2, "expected several hits, got {}", hits.len());
+        assert!(
+            hits.iter().all(|h| h.score > 0.0),
+            "reported scores must be the positive fused scores: {:?}",
+            hits.iter().map(|h| h.score).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -199,7 +199,9 @@ pub async fn safe_send(
         }
         let resp = rb.send().await?;
         let status = resp.status();
-        if !status.is_redirection() {
+        // Only follow real redirects; 300/304/305/306 are returned as-is so
+        // callers can use conditional requests (If-None-Match etc).
+        if !matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
             return Ok(resp);
         }
         if hop == max_redirects {

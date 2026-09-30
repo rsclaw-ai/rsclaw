@@ -10,7 +10,7 @@ use tantivy::{
     collector::TopDocs,
     directory::MmapDirectory,
     doc,
-    query::QueryParser,
+    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
     schema::{
         Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
     },
@@ -114,10 +114,9 @@ impl TantivyIndex {
     /// errors so a typo in user input doesn't propagate.
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<(String, f32)>> {
         let searcher = self.reader.searcher();
-        let parser = QueryParser::for_index(&self.index, vec![self.schema.indexed_text]);
-        let q = match parser.parse_query(query) {
-            Ok(q) => q,
-            Err(_) => return Ok(Vec::new()),
+        let q = match self.build_query(query) {
+            Some(q) => q,
+            None => return Ok(Vec::new()),
         };
         let top = searcher.search(&q, &TopDocs::with_limit(k))?;
         let mut out = Vec::with_capacity(top.len());
@@ -132,8 +131,47 @@ impl TantivyIndex {
         Ok(out)
     }
 
+    /// Build the BM25 query. Natural-language input is tokenized with the
+    /// same jieba tokenizer used at index time and OR-ed as term queries, so
+    /// a CJK question matches chunks sharing any of its words (QueryParser
+    /// would treat the whole run as one word -> a slop-0 phrase query that
+    /// almost never matches). Input containing an explicit `"quoted
+    /// phrase"` keeps QueryParser semantics.
+    fn build_query(&self, query: &str) -> Option<Box<dyn Query>> {
+        if query.contains('"') {
+            let parser = QueryParser::for_index(&self.index, vec![self.schema.indexed_text]);
+            return parser.parse_query(query).ok();
+        }
+        let clauses: Vec<(Occur, Box<dyn Query>)> = crate::index::cjk::query_terms(query)
+            .into_iter()
+            .map(|t| {
+                let term = Term::from_field_text(self.schema.indexed_text, &t);
+                let tq: Box<dyn Query> =
+                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                (Occur::Should, tq)
+            })
+            .collect();
+        if clauses.is_empty() {
+            return None;
+        }
+        Some(Box::new(BooleanQuery::new(clauses)))
+    }
+
+    /// Number of live (non-deleted) documents in the index. Used at startup
+    /// to decide whether the index is consistent with redb.
+    pub fn num_docs(&self) -> u64 {
+        self.reader.searcher().num_docs()
+    }
+
+    /// Remove a chunk from the index. Caller must `commit()` to flush.
+    pub fn delete(&self, chunk_id: &str) {
+        let w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        w.delete_term(Term::from_field_text(self.schema.chunk_id, chunk_id));
+    }
+
     /// Rebuild from redb. Drops all existing docs then re-adds every
-    /// `KbChunk`.
+    /// `KbChunk`. Rows that fail to decode are skipped with a warning so a
+    /// single corrupt chunk can't disable the whole KB.
     pub fn rebuild(&self, store: &KbStore) -> Result<()> {
         {
             let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
@@ -144,14 +182,22 @@ impl TantivyIndex {
         use redb::ReadableTable;
         let tbl = rtx.open_table(crate::store::schema::KB_CHUNKS)?;
         let mut n = 0;
+        let mut skipped = 0usize;
         for entry in tbl.iter()? {
-            let (_, v) = entry?;
-            let c: crate::model::KbChunk = crate::store::codec::decode(v.value())?;
+            let (k, v) = entry?;
+            let c: crate::model::KbChunk = match crate::store::codec::decode(v.value()) {
+                Ok(c) => c,
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!(chunk = %k.value(), "kb tantivy: skip undecodable chunk: {e:#}");
+                    continue;
+                }
+            };
             self.upsert(&c.id, &c.doc_id, &c.indexed_text)?;
             n += 1;
         }
         self.commit()?;
-        tracing::info!(n, "kb tantivy: rebuild complete");
+        tracing::info!(n, skipped, "kb tantivy: rebuild complete");
         Ok(())
     }
 }
@@ -233,5 +279,19 @@ mod tests {
         let hits = idx.search("酸奶", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "c2");
+    }
+
+    #[test]
+    fn chinese_question_matches_without_exact_phrase() {
+        // A natural question must match a chunk sharing some of its words;
+        // the old QueryParser path turned it into a slop-0 phrase query.
+        let (_tmp, idx) = fresh();
+        idx.upsert("c1", "d1", "蒙牛奶粉冲泡指南：建议比例 1:7")
+            .unwrap();
+        idx.upsert("c2", "d1", "伊利酸奶发酵过程详解").unwrap();
+        idx.commit().unwrap();
+        let hits = idx.search("请问奶粉应该怎么冲泡比较好", 5).unwrap();
+        assert!(!hits.is_empty(), "natural question should match");
+        assert_eq!(hits[0].0, "c1");
     }
 }

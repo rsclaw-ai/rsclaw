@@ -174,7 +174,27 @@ impl KnowledgeService {
         let store = Arc::new(KbStore::open(&kb_root.join("kb.redb"))?);
         let embedder = resolve_embedder(&kb_root);
         let dim = embedder.dimension();
-        let index = Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim)?);
+        let (index, scan) = KbIndex::open_and_rebuild_for(
+            &paths,
+            &store,
+            dim,
+            Some(embedder.embedder_id().to_string()),
+        )?;
+        let index = Arc::new(index);
+        // Chunks the dense layer rejected (zero / wrong-dim vectors from a
+        // failed remote embed, or vectors from a different embedder of the
+        // same dimension) are re-embedded in the background.
+        if !scan.stale_docs.is_empty() {
+            match enqueue_reembed(&store, &scan.stale_docs) {
+                Ok(n) if n > 0 => tracing::warn!(
+                    docs = n,
+                    embedder = embedder.embedder_id(),
+                    "kb: chunks embedded by another model or with invalid vectors; re-embedding"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("kb: failed to enqueue re-embed jobs: {e:#}"),
+            }
+        }
         let (events, _) = broadcast::channel(256);
         let cfg = rsclaw_config::load().ok();
         // queryInstruction comes from the SAME effective embed config the
@@ -226,23 +246,49 @@ impl KnowledgeService {
         self.events.subscribe()
     }
 
-    /// Emit a `status_changed=ready` event for each doc that has newly gained
-    /// its first indexed chunk since `emitted` was last updated. `emitted`
-    /// tracks already-announced docs to avoid duplicates.
-    fn emit_ready_transitions(&self, emitted: &mut HashSet<String>) {
-        if let Ok(ready) = self.ready_doc_ids() {
-            for id in ready {
-                if emitted.insert(id.clone()) {
-                    let payload = serde_json::json!({
-                        "type": "knowledge.doc.status_changed",
-                        "docId": id,
-                        "status": "ready",
-                    })
-                    .to_string();
-                    let _ = self.events.send(payload);
-                }
+    /// Emit a `status_changed=ready` event when the doc indexed by a just-
+    /// completed job has gained its first indexed chunk. Only that doc's
+    /// chunks are read (it used to decode every chunk in the KB per job).
+    /// `emitted` tracks already-announced docs to avoid duplicates.
+    fn emit_ready_transition(&self, job: &JobKind, emitted: &mut HashSet<String>) {
+        let JobKind::ChunkAndEmbed { doc_id, .. } = job else {
+            return;
+        };
+        if emitted.contains(doc_id) {
+            return;
+        }
+        match self.doc_has_active_chunk(doc_id) {
+            Ok(true) => {
+                emitted.insert(doc_id.clone());
+                let payload = serde_json::json!({
+                    "type": "knowledge.doc.status_changed",
+                    "docId": doc_id,
+                    "status": "ready",
+                })
+                .to_string();
+                // No SSE subscriber connected is the normal case.
+                let _ = self.events.send(payload);
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("kb: ready-transition check failed: {e:#}"),
+        }
+    }
+
+    /// Whether `doc_id` currently owns at least one Active chunk.
+    fn doc_has_active_chunk(&self, doc_id: &str) -> anyhow::Result<bool> {
+        let rtx = self.store.begin_read()?;
+        let Some(d) = docs::get(&rtx, doc_id)? else {
+            return Ok(false);
+        };
+        for id in crate::store::chunks::chunk_ids_for_logical(&rtx, &d.logical_source_id)? {
+            if let Some(c) = crate::store::chunks::get(&rtx, &id)?
+                && c.doc_id == d.id
+                && c.status == ChunkStatus::Active
+            {
+                return Ok(true);
             }
         }
+        Ok(false)
     }
 
     /// Active doc ids that currently have ≥1 indexed chunk (i.e. `ready`).
@@ -266,13 +312,18 @@ impl KnowledgeService {
     /// Process one queued KB job (chunk + embed + index). Returns whether a
     /// job was claimed. Used by the background worker and tests.
     pub fn drain_once(&self) -> anyhow::Result<bool> {
+        Ok(self.drain_one_job()?.is_some())
+    }
+
+    /// Process one queued KB job; returns the kind of the job handled.
+    fn drain_one_job(&self) -> anyhow::Result<Option<JobKind>> {
         let ctx = HandlerCtx {
             store: self.store.clone(),
             paths: self.paths.clone(),
             embedder: self.embedder.clone(),
             index: self.index.clone(),
         };
-        WorkerPool::run_one_blocking(&ctx, &WorkerConfig::default(), &DefaultDispatcher)
+        WorkerPool::run_one_blocking_job(&ctx, &WorkerConfig::default(), &DefaultDispatcher)
     }
 
     /// Requeue jobs whose claiming worker died mid-flight (claim TTL
@@ -355,11 +406,11 @@ impl KnowledgeService {
                 }
                 next_reclaim = std::time::Instant::now() + reclaim_every;
             }
-            match this.drain_once() {
-                // A job finished — emit status_changed=ready for any doc
-                // that just gained its first indexed chunk.
-                Ok(true) => this.emit_ready_transitions(&mut emitted),
-                Ok(false) => std::thread::sleep(Duration::from_millis(500)),
+            match this.drain_one_job() {
+                // A job finished — emit status_changed=ready if its doc
+                // just gained its first indexed chunk.
+                Ok(Some(job)) => this.emit_ready_transition(&job, &mut emitted),
+                Ok(None) => std::thread::sleep(Duration::from_millis(500)),
                 Err(e) => {
                     tracing::warn!("kb knowledge worker: {e:#}");
                     std::thread::sleep(Duration::from_secs(2));
@@ -421,7 +472,9 @@ impl KnowledgeService {
             // in HNSW + Tantivy. Multiple callers (agent thread, bg
             // worker) may race on claim_next, but the first to claim
             // processes it; the other sees "no job" and returns.
-            let _ = self.drain_once();
+            if let Err(e) = self.drain_once() {
+                tracing::warn!("kb ingest: inline index drain failed (worker retries): {e:#}");
+            }
         }
         Ok((out.doc_id, out.noop))
     }
@@ -519,11 +572,15 @@ impl KnowledgeService {
 
     /// Tombstone a document; the compactor reaps its chunks/vectors later.
     pub fn delete_doc(&self, collection_id: &str, doc_id: &str) -> KResult<()> {
-        let rtx = self.store.begin_read()?;
-        let mut d = self.active_doc_in_collection(&rtx, collection_id, doc_id)?;
-        drop(rtx);
-        d.status = KbStatus::Tombstoned;
+        // Read + write in ONE write tx so a concurrent update can't be
+        // overwritten by a stale copy (or resurrect a deleted doc).
+        let tag = collection_tag(collection_id);
         let wtx = self.store.begin_write()?;
+        let mut d = docs::get_in_wtx(&wtx, doc_id)?
+            .filter(|d| d.status == KbStatus::Active && d.tags.iter().any(|t| t == &tag))
+            .ok_or(KnowledgeError::DocNotFound)?;
+        d.status = KbStatus::Tombstoned;
+        d.updated_at = now_ms();
         docs::put(&wtx, &d)?;
         wtx.commit().map_err(anyhow::Error::from)?;
         Ok(())
@@ -532,7 +589,9 @@ impl KnowledgeService {
     /// O(1) check for "is there anything searchable at all" — gates the
     /// auto-recall path so empty-KB deployments never pay a query embed.
     pub fn has_content(&self) -> bool {
-        !self.index.hnsw.is_empty()
+        // BM25 counts too: while chunks await re-embedding the dense layer
+        // can be empty although the KB is searchable.
+        !self.index.hnsw.is_empty() || self.index.tantivy.num_docs() > 0
     }
 
     /// Semantic search over one or more collections (empty = all). Hits below
@@ -634,6 +693,12 @@ impl KnowledgeService {
         let now = chrono::Utc::now().timestamp_millis();
         let stats =
             run_compactor_tick(&self.store, &self.paths, now).map_err(KnowledgeError::Internal)?;
+        // Drop purged chunks from tantivy and rebuild HNSW (also reaps
+        // orphaned vertices) BEFORE snapshotting, so the snapshot manifest
+        // matches redb and is reusable on the next start.
+        self.index
+            .apply_purge(&self.store, &stats.purged_chunk_ids)
+            .map_err(KnowledgeError::Internal)?;
         let snapshot_ok = match self.index.snapshot_hnsw(&self.paths) {
             Ok(()) => true,
             Err(e) => {
@@ -664,13 +729,12 @@ impl KnowledgeService {
     /// Tombstone a doc by id alone. Same end-state as `delete_doc` but
     /// no collection arg required.
     pub fn delete_doc_by_id(&self, doc_id: &str) -> KResult<()> {
-        let rtx = self.store.begin_read()?;
-        let mut d = docs::get(&rtx, doc_id)?
+        let wtx = self.store.begin_write()?;
+        let mut d = docs::get_in_wtx(&wtx, doc_id)?
             .filter(|d| d.status == KbStatus::Active)
             .ok_or(KnowledgeError::DocNotFound)?;
-        drop(rtx);
         d.status = KbStatus::Tombstoned;
-        let wtx = self.store.begin_write()?;
+        d.updated_at = now_ms();
         docs::put(&wtx, &d)?;
         wtx.commit().map_err(anyhow::Error::from)?;
         Ok(())
@@ -681,26 +745,32 @@ impl KnowledgeService {
     /// HTTP path.
     pub fn tombstone_by_tag(&self, tag: &str) -> KResult<usize> {
         use redb::ReadableTable;
-        let rtx = self.store.begin_read()?;
+        let wtx = self.store.begin_write()?;
         let mut victims: Vec<KbDoc> = Vec::new();
         {
-            let tbl = rtx.open_table(KB_DOCS).map_err(anyhow::Error::from)?;
+            let tbl = wtx.open_table(KB_DOCS).map_err(anyhow::Error::from)?;
             for entry in tbl.iter().map_err(anyhow::Error::from)? {
-                let (_, v) = entry.map_err(anyhow::Error::from)?;
-                let d: KbDoc = decode(v.value())?;
+                let (k, v) = entry.map_err(anyhow::Error::from)?;
+                let d: KbDoc = match decode(v.value()) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(doc = %k.value(), "kb: skip undecodable doc: {e:#}");
+                        continue;
+                    }
+                };
                 if d.status == KbStatus::Active && d.tags.iter().any(|t| t == tag) {
                     victims.push(d);
                 }
             }
         }
-        drop(rtx);
         if victims.is_empty() {
             return Ok(0);
         }
         let n = victims.len();
-        let wtx = self.store.begin_write()?;
+        let now = now_ms();
         for mut d in victims {
             d.status = KbStatus::Tombstoned;
+            d.updated_at = now;
             docs::put(&wtx, &d)?;
         }
         wtx.commit().map_err(anyhow::Error::from)?;
@@ -713,13 +783,13 @@ impl KnowledgeService {
         doc_id: &str,
         visibility: crate::model::KbVisibility,
     ) -> KResult<()> {
-        let rtx = self.store.begin_read()?;
-        let mut d = docs::get(&rtx, doc_id)?
+        // Same tx for read + write: a visibility change must never write
+        // back a stale Active copy over a concurrent delete.
+        let wtx = self.store.begin_write()?;
+        let mut d = docs::get_in_wtx(&wtx, doc_id)?
             .filter(|d| d.status == KbStatus::Active)
             .ok_or(KnowledgeError::DocNotFound)?;
-        drop(rtx);
         d.visibility = visibility;
-        let wtx = self.store.begin_write()?;
         docs::put(&wtx, &d)?;
         wtx.commit().map_err(anyhow::Error::from)?;
         Ok(())
@@ -859,7 +929,9 @@ impl KnowledgeService {
         }
         // Drain the in-process worker so freshly-enqueued chunk+embed
         // jobs are committed before we report counts.
-        let _ = self.drain_once();
+        if let Err(e) = self.drain_once() {
+            tracing::warn!("kb sync-all: inline index drain failed (worker retries): {e:#}");
+        }
         Ok(serde_json::json!({
             "candidates": total,
             "ran": to_run.len(),
@@ -945,8 +1017,14 @@ impl KnowledgeService {
         let mut counts: HashMap<String, usize> = HashMap::new();
         let tbl = rtx.open_table(KB_CHUNKS)?;
         for entry in tbl.iter()? {
-            let (_, v) = entry?;
-            let c: KbChunk = decode(v.value())?;
+            let (k, v) = entry?;
+            let c: KbChunk = match decode(v.value()) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(chunk = %k.value(), "kb: skip undecodable chunk: {e:#}");
+                    continue;
+                }
+            };
             if c.status == ChunkStatus::Active {
                 *counts.entry(c.doc_id).or_default() += 1;
             }
@@ -1080,12 +1158,25 @@ impl KnowledgeService {
     pub fn delete_collection(&self, id: &str) -> KResult<usize> {
         self.get_collection(id)?; // 404 if absent
         let tag = collection_tag(id);
-        let rtx = self.store.begin_read()?;
-        let docs_to_remove = self.collect_active_docs(&rtx, &tag)?;
-        drop(rtx);
         let wtx = self.store.begin_write()?;
+        let mut docs_to_remove: Vec<KbDoc> = Vec::new();
+        {
+            let tbl = wtx.open_table(KB_DOCS).map_err(anyhow::Error::from)?;
+            for entry in tbl.iter().map_err(anyhow::Error::from)? {
+                let (k, v) = entry.map_err(anyhow::Error::from)?;
+                match decode::<KbDoc>(v.value()) {
+                    Ok(d) if d.status == KbStatus::Active && d.tags.iter().any(|t| t == &tag) => {
+                        docs_to_remove.push(d)
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(doc = %k.value(), "kb: skip undecodable doc: {e:#}"),
+                }
+            }
+        }
+        let now = now_ms();
         for mut d in docs_to_remove.iter().cloned() {
             d.status = KbStatus::Tombstoned;
+            d.updated_at = now;
             docs::put(&wtx, &d)?;
         }
         collections::delete(&wtx, id)?;
@@ -1096,6 +1187,37 @@ impl KnowledgeService {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Enqueue a `ChunkAndEmbed` job for every doc in `doc_ids` that is still
+/// Active and the latest version of its source. Enqueue is idempotent on the
+/// job dedupe key. Returns the number of docs considered for re-embedding.
+fn enqueue_reembed(store: &KbStore, doc_ids: &HashSet<String>) -> anyhow::Result<usize> {
+    let wtx = store.begin_write()?;
+    let mut n = 0usize;
+    for id in doc_ids {
+        let Some(d) = docs::get_in_wtx(&wtx, id)? else {
+            continue;
+        };
+        if d.status != KbStatus::Active {
+            continue;
+        }
+        let is_latest = docs::latest_version_in_wtx(&wtx, &d.logical_source_id)?
+            .is_some_and(|p| p.doc_id == d.id);
+        if !is_latest {
+            continue;
+        }
+        crate::store::jobs::enqueue(
+            &wtx,
+            &Job::new(JobKind::ChunkAndEmbed {
+                doc_id: d.id.clone(),
+                doc_version: d.version,
+            }),
+        )?;
+        n += 1;
+    }
+    wtx.commit()?;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -1355,12 +1477,16 @@ mod tests {
             .unwrap();
         while s.drain_once().unwrap() {}
         let mut emitted = HashSet::new();
-        s.emit_ready_transitions(&mut emitted);
+        let job = JobKind::ChunkAndEmbed {
+            doc_id: doc_id.clone(),
+            doc_version: 1,
+        };
+        s.emit_ready_transition(&job, &mut emitted);
         let msg = rx.try_recv().expect("expected an SSE status event");
         assert!(msg.contains("knowledge.doc.status_changed"), "got: {msg}");
         assert!(msg.contains(&doc_id), "got: {msg}");
         // idempotent: no duplicate for the same doc
-        s.emit_ready_transitions(&mut emitted);
+        s.emit_ready_transition(&job, &mut emitted);
         assert!(
             rx.try_recv().is_err(),
             "should not re-emit for the same doc"

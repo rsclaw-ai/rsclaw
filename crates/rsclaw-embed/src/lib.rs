@@ -89,13 +89,73 @@ pub const OLLAMA_DEFAULT_URL: &str = "http://localhost:11434";
 /// runtime — see `MemoryStore::begin_swap` for the hot-migration path used
 /// to upgrade from FNV → BGE (or BGE-small → BGE-base) without restart.
 pub trait Embedder: Send + Sync {
-    fn embed(&self, text: &str) -> Vec<f32>;
+    /// Embed `text`, returning an error on any backend failure. Never
+    /// returns a placeholder: the result is a finite, non-zero-norm vector
+    /// (see [`finalize_vector`]). Use this for anything that gets persisted
+    /// or indexed so a failed embed is retried instead of stored.
+    fn try_embed(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Legacy infallible wrapper around [`Embedder::try_embed`]. On failure it
+    /// logs and returns an all-zero vector of `dimension()` length; callers
+    /// MUST treat an all-zero vector as "no embedding" (see [`is_zero_vector`])
+    /// and never index it. Prefer `try_embed` in new code.
+    fn embed(&self, text: &str) -> Vec<f32> {
+        match self.try_embed(text) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("embedding failed: {e:#}");
+                vec![0.0; self.dimension().max(0) as usize]
+            }
+        }
+    }
+
+    /// Output dimension of the vectors this embedder produces.
     fn dimension(&self) -> i32;
+
+    /// Stable identifier of the model behind this embedder. Stores record it
+    /// next to persisted vectors so a same-dimension model change (whose
+    /// vectors are incompatible but pass every length check) is detected.
+    fn model_id(&self) -> String {
+        format!("unknown-{}", self.dimension())
+    }
+
     /// Count tokens precisely (when tokenizer is available) or estimate.
     fn count_tokens(&self, text: &str) -> usize {
         // Default: heuristic estimation (ASCII/4 + CJK*1.5)
         rsclaw_util::estimate_tokens(text)
     }
+}
+
+/// True when `v` is empty or has (near-)zero norm. Such a vector carries no
+/// semantic signal, and cosine distance treats it as a perfect match for
+/// every query, so it must never be indexed or used as a query.
+pub fn is_zero_vector(v: &[f32]) -> bool {
+    v.iter().map(|x| x * x).sum::<f32>() <= f32::EPSILON
+}
+
+/// Validate and L2-normalise a raw embedding. Rejects empty, non-finite and
+/// zero-norm vectors, and (when `expected_dim` is given) length mismatches.
+pub fn finalize_vector(v: Vec<f32>, expected_dim: Option<usize>) -> Result<Vec<f32>> {
+    if v.is_empty() {
+        anyhow::bail!("embedding backend returned an empty vector");
+    }
+    if let Some(dim) = expected_dim
+        && v.len() != dim
+    {
+        anyhow::bail!(
+            "embedding dimension mismatch: backend returned {} values, expected {dim} \
+             (set `dimensions` in the embed config to the model's output size)",
+            v.len()
+        );
+    }
+    if v.iter().any(|x| !x.is_finite()) {
+        anyhow::bail!("embedding backend returned non-finite values");
+    }
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm <= f32::EPSILON {
+        anyhow::bail!("embedding backend returned an all-zero vector");
+    }
+    Ok(v.into_iter().map(|x| x / norm).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -111,12 +171,12 @@ pub enum EmbedderBackend {
 }
 
 impl Embedder for EmbedderBackend {
-    fn embed(&self, text: &str) -> Vec<f32> {
+    fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
         match self {
-            Self::Local(e) => e.embed(text),
-            Self::Fnv(e) => e.embed(text),
-            Self::OpenAi(e) => e.embed(text),
-            Self::Ollama(e) => e.embed(text),
+            Self::Local(e) => e.try_embed(text),
+            Self::Fnv(e) => e.try_embed(text),
+            Self::OpenAi(e) => e.try_embed(text),
+            Self::Ollama(e) => e.try_embed(text),
         }
     }
 
@@ -126,6 +186,15 @@ impl Embedder for EmbedderBackend {
             Self::Fnv(e) => e.dimension(),
             Self::OpenAi(e) => e.dimension(),
             Self::Ollama(e) => e.dimension(),
+        }
+    }
+
+    fn model_id(&self) -> String {
+        match self {
+            Self::Local(e) => e.model_id(),
+            Self::Fnv(e) => e.model_id(),
+            Self::OpenAi(e) => e.model_id(),
+            Self::Ollama(e) => e.model_id(),
         }
     }
 }
@@ -145,7 +214,7 @@ impl FnvEmbedder {
 }
 
 impl Embedder for FnvEmbedder {
-    fn embed(&self, text: &str) -> Vec<f32> {
+    fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
         let dim = self.dim as usize;
         let mut v = vec![0.0_f32; dim];
         let bytes = text.as_bytes();
@@ -157,13 +226,15 @@ impl Embedder for FnvEmbedder {
             }
             v[i % dim] += f32::from_bits(0x3F80_0000 | (h & 0x007F_FFFF)) - 1.0;
         }
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
-        v.iter_mut().for_each(|x| *x /= norm);
-        v
+        finalize_vector(v, None)
     }
 
     fn dimension(&self) -> i32 {
         self.dim
+    }
+
+    fn model_id(&self) -> String {
+        format!("fnv-{}", self.dim)
     }
 }
 
@@ -176,6 +247,8 @@ pub struct LocalBgeEmbedder {
     model: candle_transformers::models::bert::BertModel,
     device: candle_core::Device,
     hidden_size: usize,
+    /// Model directory name (e.g. `bge-small-zh`), recorded as the model id.
+    name: String,
 }
 
 impl LocalBgeEmbedder {
@@ -206,28 +279,29 @@ impl LocalBgeEmbedder {
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
 
         let hidden_size = config.hidden_size;
+        let name = model_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("bge")
+            .to_owned();
         Ok(Self {
             tokenizer,
             model,
             device,
             hidden_size,
+            name,
         })
     }
 }
 
 impl Embedder for LocalBgeEmbedder {
-    fn embed(&self, text: &str) -> Vec<f32> {
+    fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
         use candle_core::Tensor;
 
-        let dim = self.hidden_size;
-
-        let encoding = match self.tokenizer.encode(text, true) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("tokenizer error: {e}");
-                return vec![0.0; dim];
-            }
-        };
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("tokenizer error: {e}"))?;
 
         // BERT max_position_embeddings is 512 — truncate to avoid
         // "index-select invalid index 512" panics.
@@ -245,62 +319,30 @@ impl Embedder for LocalBgeEmbedder {
             Tensor::from_iter(data.into_iter().map(|x| x as i64), &self.device)?.reshape((1, len))
         };
 
-        let input_ids = match make_tensor(ids) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("tensor error: {e}");
-                return vec![0.0; dim];
-            }
-        };
-        let type_ids_t = match make_tensor(type_ids) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("tensor error: {e}");
-                return vec![0.0; dim];
-            }
-        };
-        let attention_mask =
-            match Tensor::ones((1_usize, len), candle_core::DType::I64, &self.device) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("tensor error: {e}");
-                    return vec![0.0; dim];
-                }
-            };
+        let input_ids = make_tensor(ids).context("tensor error")?;
+        let type_ids_t = make_tensor(type_ids).context("tensor error")?;
+        let attention_mask = Tensor::ones((1_usize, len), candle_core::DType::I64, &self.device)
+            .context("tensor error")?;
 
-        let output = match self
+        let output = self
             .model
             .forward(&input_ids, &type_ids_t, Some(&attention_mask))
-        {
-            Ok(o) => o,
-            Err(e) => {
-                warn!("bert forward error: {e}");
-                return vec![0.0; dim];
-            }
-        };
+            .context("bert forward error")?;
+        let pooled = output.mean(1).context("mean-pool error")?;
+        let flat = pooled
+            .flatten_all()
+            .and_then(|t| t.to_vec1::<f32>())
+            .context("flatten error")?;
 
-        let pooled = match output.mean(1) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("mean-pool error: {e}");
-                return vec![0.0; dim];
-            }
-        };
-
-        let flat = match pooled.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("flatten error: {e}");
-                return vec![0.0; dim];
-            }
-        };
-
-        let norm = flat.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
-        flat.into_iter().map(|x| x / norm).collect()
+        finalize_vector(flat, Some(self.hidden_size))
     }
 
     fn dimension(&self) -> i32 {
         self.hidden_size as i32
+    }
+
+    fn model_id(&self) -> String {
+        format!("local-{}-{}", self.name, self.hidden_size)
     }
 
     fn count_tokens(&self, text: &str) -> usize {
@@ -320,6 +362,14 @@ pub struct OpenAiEmbedder {
     api_key: String,
     model: String,
     dim: i32,
+    /// True when the dimension came from config (`dimensions`) rather than
+    /// the model-name table. Only then is `dimensions` sent on the wire, so
+    /// models that reject the parameter (e.g. `text-embedding-ada-002`)
+    /// keep working with their native size.
+    explicit_dim: bool,
+    /// Cleared after the server rejects the `dimensions` parameter once, so
+    /// later requests skip it instead of paying a failed round-trip each.
+    send_dimensions: std::sync::atomic::AtomicBool,
     /// API root, e.g. `https://api.openai.com/v1` or a GPU fleet's
     /// OpenAI-compatible endpoint. `/embeddings` is appended at request time.
     base_url: String,
@@ -327,9 +377,11 @@ pub struct OpenAiEmbedder {
 
 impl OpenAiEmbedder {
     /// `base_url` points at any OpenAI-compatible API root (defaults to
-    /// OpenAI's). `dim_override` sets the output dimension for models
-    /// `openai_model_dim` doesn't know (e.g. Qwen3-Embedding = 1024);
-    /// when `None`, the dimension is derived from the model name.
+    /// OpenAI's). `dim_override` is the configured output dimension: it is
+    /// sent as the `dimensions` request field (Matryoshka truncation) and
+    /// every response is validated against it. When `None`, the dimension is
+    /// derived from the model name and responses of any other length are
+    /// rejected with an error asking for an explicit `dimensions`.
     pub fn new(
         api_key: String,
         model: Option<String>,
@@ -337,7 +389,10 @@ impl OpenAiEmbedder {
         dim_override: Option<i32>,
     ) -> Self {
         let model = model.unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_owned());
-        let dim = dim_override.unwrap_or_else(|| openai_model_dim(&model));
+        let explicit_dim = dim_override.is_some_and(|d| d > 0);
+        let dim = dim_override
+            .filter(|d| *d > 0)
+            .unwrap_or_else(|| openai_model_dim(&model));
         let base_url = base_url.unwrap_or_else(|| OPENAI_DEFAULT_BASE_URL.to_owned());
         Self {
             // Shared redirect-cached fleet client (308 baseUrl caching). When
@@ -347,53 +402,108 @@ impl OpenAiEmbedder {
             api_key,
             model,
             dim,
+            explicit_dim,
+            send_dimensions: std::sync::atomic::AtomicBool::new(explicit_dim),
             base_url,
         }
     }
 
     fn embed_blocking(&self, text: &str) -> Result<Vec<f32>> {
-        let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": text,
-        });
+        use std::sync::atomic::Ordering;
 
-        let send = || async {
+        let url_owned = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
+        let url = url_owned.as_str();
+
+        // Outcome of one HTTP exchange: body text, or the HTTP status that
+        // rejected it (so a 400/422 on `dimensions` can be told apart from
+        // transport errors).
+        enum Outcome {
+            Body(String),
+            Status(reqwest::StatusCode, String),
+        }
+
+        let send = |body: serde_json::Value| async move {
             let resp = self
                 .client
                 .post_following_redirects(
-                    url.as_str(),
+                    url,
                     &body,
                     Some(self.api_key.as_str()),
                     false,
                     None,
                     Some(Duration::from_secs(120)),
                 )
-                .await?
-                .error_for_status()?;
-            anyhow::Ok(resp.text().await?)
+                .await?;
+            let status = resp.status();
+            let text = resp.text().await?;
+            if status.is_success() {
+                anyhow::Ok(Outcome::Body(text))
+            } else {
+                anyhow::Ok(Outcome::Status(status, text))
+            }
         };
+        let run = |body: serde_json::Value| -> Result<Outcome> {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => tokio::task::block_in_place(|| handle.block_on(send(body))),
+                Err(_) => tokio::runtime::Runtime::new()
+                    .context("failed to create temp runtime for OpenAI embed")?
+                    .block_on(send(body)),
+            }
+        };
+
         // Retry transient transport errors (idempotent for embeddings).
         let mut last_err: Option<anyhow::Error> = None;
         let mut response_text: Option<String> = None;
-        for attempt in 0..EMBED_ATTEMPTS {
-            let r = match tokio::runtime::Handle::try_current() {
-                Ok(handle) => tokio::task::block_in_place(|| handle.block_on(send())),
-                Err(_) => tokio::runtime::Runtime::new()
-                    .context("failed to create temp runtime for OpenAI embed")?
-                    .block_on(send()),
-            };
-            match r {
-                Ok(t) => {
+        let mut attempt = 0;
+        while attempt < EMBED_ATTEMPTS {
+            let with_dims = self.send_dimensions.load(Ordering::Relaxed);
+            let mut body = serde_json::json!({
+                "model": self.model,
+                "input": text,
+            });
+            if with_dims {
+                body["dimensions"] = serde_json::json!(self.dim);
+            }
+            match run(body) {
+                Ok(Outcome::Body(t)) => {
                     response_text = Some(t);
                     break;
                 }
-                Err(e) => {
-                    if attempt + 1 < EMBED_ATTEMPTS {
-                        std::thread::sleep(Duration::from_millis(200 * (attempt as u64 + 1)));
-                    }
-                    last_err = Some(e);
+                Ok(Outcome::Status(status, body_text))
+                    if with_dims
+                        && (status == reqwest::StatusCode::BAD_REQUEST
+                            || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY) =>
+                {
+                    // Server does not accept `dimensions` for this model;
+                    // fall back to the native size (validated below).
+                    warn!(
+                        model = %self.model,
+                        %status,
+                        body = %rsclaw_util::truncate_str(&body_text, 200),
+                        "embedding server rejected `dimensions`; retrying without it"
+                    );
+                    self.send_dimensions.store(false, Ordering::Relaxed);
+                    continue;
                 }
+                Ok(Outcome::Status(status, body_text)) => {
+                    let err = anyhow::anyhow!(
+                        "OpenAI embeddings: HTTP {status}: {}",
+                        rsclaw_util::truncate_str(&body_text, 200)
+                    );
+                    // 4xx other than 408/429 will not heal on retry.
+                    if status.is_client_error()
+                        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                    {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                }
+                Err(e) => last_err = Some(e),
+            }
+            attempt += 1;
+            if attempt < EMBED_ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(200 * attempt as u64));
             }
         }
         let response_text = response_text.ok_or_else(|| {
@@ -405,29 +515,34 @@ impl OpenAiEmbedder {
         let embedding = parsed["data"][0]["embedding"]
             .as_array()
             .context("OpenAI embeddings: missing data[0].embedding")?;
-        Ok(embedding
+        embedding
             .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect())
+            .map(|v| {
+                v.as_f64()
+                    .map(|f| f as f32)
+                    .context("OpenAI embeddings: non-numeric value in embedding")
+            })
+            .collect()
     }
 }
 
 impl Embedder for OpenAiEmbedder {
-    fn embed(&self, text: &str) -> Vec<f32> {
-        match self.embed_blocking(text) {
-            Ok(v) => {
-                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
-                v.into_iter().map(|x| x / norm).collect()
-            }
-            Err(e) => {
-                warn!("OpenAI embedding failed: {e:#}");
-                vec![0.0; self.dim as usize]
-            }
-        }
+    fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
+        let raw = self.embed_blocking(text)?;
+        finalize_vector(raw, Some(self.dim as usize)).with_context(|| {
+            format!(
+                "OpenAI embeddings ({}, explicit dimensions: {})",
+                self.model, self.explicit_dim
+            )
+        })
     }
 
     fn dimension(&self) -> i32 {
         self.dim
+    }
+
+    fn model_id(&self) -> String {
+        format!("openai:{}:{}", self.model, self.dim)
     }
 }
 
@@ -438,10 +553,19 @@ pub fn openai_model_dim(model: &str) -> i32 {
     match model {
         "text-embedding-3-large" => 3072,
         "text-embedding-3-small" | "text-embedding-ada-002" => 1536,
-        // Qwen3-Embedding family (served on the GPU fleet). Set
-        // `memorySearch.dimensions` explicitly to be safe; this is a
-        // best-effort default for the common 0.6B/4B 1024-dim case.
-        m if m.starts_with("Qwen3-Embedding") || m.starts_with("qwen3-embedding") => 1024,
+        // Qwen3-Embedding family (served on the GPU fleet). Native sizes:
+        // 0.6B = 1024, 4B = 2560, 8B = 4096. Set `memorySearch.dimensions`
+        // explicitly to be safe (it is also sent for Matryoshka truncation).
+        m if m.starts_with("Qwen3-Embedding") || m.starts_with("qwen3-embedding") => {
+            let lower = m.to_ascii_lowercase();
+            if lower.contains("8b") {
+                4096
+            } else if lower.contains("4b") {
+                2560
+            } else {
+                1024
+            }
+        }
         // RsClaw first-party embedding model. Native dim; override with
         // `dimensions` for Matryoshka truncation.
         "rsclaw-embedding-v1" => 1024,
@@ -491,6 +615,7 @@ impl OllamaEmbedder {
                         .json(&body)
                         .send()
                         .await?
+                        .error_for_status()?
                         .text()
                         .await
                 })
@@ -506,6 +631,7 @@ impl OllamaEmbedder {
                             .json(&body)
                             .send()
                             .await?
+                            .error_for_status()?
                             .text()
                             .await
                     })
@@ -520,8 +646,12 @@ impl OllamaEmbedder {
             .context("Ollama embed: missing embeddings[0]")?;
         let vec: Vec<f32> = embedding
             .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect();
+            .map(|v| {
+                v.as_f64()
+                    .map(|f| f as f32)
+                    .context("Ollama embed: non-numeric value in embedding")
+            })
+            .collect::<Result<_>>()?;
 
         if !vec.is_empty()
             && let Ok(mut dim) = self.dim.lock()
@@ -534,17 +664,9 @@ impl OllamaEmbedder {
 }
 
 impl Embedder for OllamaEmbedder {
-    fn embed(&self, text: &str) -> Vec<f32> {
-        match self.embed_blocking(text) {
-            Ok(v) => {
-                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
-                v.into_iter().map(|x| x / norm).collect()
-            }
-            Err(e) => {
-                warn!("Ollama embedding failed: {e:#}");
-                vec![0.0; self.default_dim as usize]
-            }
-        }
+    fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
+        let raw = self.embed_blocking(text).context("Ollama embedding failed")?;
+        finalize_vector(raw, None)
     }
 
     fn dimension(&self) -> i32 {
@@ -553,6 +675,10 @@ impl Embedder for OllamaEmbedder {
             .ok()
             .and_then(|d| *d)
             .unwrap_or(self.default_dim)
+    }
+
+    fn model_id(&self) -> String {
+        format!("ollama:{}", self.model)
     }
 }
 
@@ -649,5 +775,37 @@ mod query_instruction_tests {
             None
         );
         assert_eq!(resolve_query_instruction(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod finalize_tests {
+    use super::*;
+
+    #[test]
+    fn finalize_rejects_zero_and_mismatched_vectors() {
+        assert!(finalize_vector(vec![0.0; 4], None).is_err());
+        assert!(finalize_vector(Vec::new(), None).is_err());
+        assert!(finalize_vector(vec![1.0, f32::NAN], None).is_err());
+        assert!(finalize_vector(vec![1.0; 3], Some(4)).is_err());
+        let v = finalize_vector(vec![3.0, 4.0], Some(2)).expect("valid vector");
+        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+        assert!(is_zero_vector(&[0.0, 0.0]));
+        assert!(!is_zero_vector(&v));
+    }
+
+    #[test]
+    fn fnv_empty_text_is_an_error_not_a_zero_vector() {
+        let e = FnvEmbedder::new(8);
+        assert!(e.try_embed("").is_err());
+        assert!(e.try_embed("hello").is_ok());
+        assert!(is_zero_vector(&e.embed("")));
+    }
+
+    #[test]
+    fn qwen3_embedding_dims_follow_model_size() {
+        assert_eq!(openai_model_dim("Qwen3-Embedding-0.6B"), 1024);
+        assert_eq!(openai_model_dim("Qwen3-Embedding-4B"), 2560);
+        assert_eq!(openai_model_dim("qwen3-embedding-8b"), 4096);
     }
 }

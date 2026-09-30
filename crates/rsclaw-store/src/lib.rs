@@ -6,6 +6,7 @@
 //!
 //! Architecture: AGENTS.md §8 "Storage Architecture" + §31 "Memory System"
 
+pub mod cjk;
 pub mod redb_store;
 pub mod search;
 

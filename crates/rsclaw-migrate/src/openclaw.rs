@@ -747,7 +747,33 @@ pub fn import_sessions_to_redb(
         match read_agent_sessions(&agent_dir, &agent_id) {
             Ok(sessions) => {
                 for session in &sessions {
-                    for msg in &session.messages {
+                    // Idempotent re-run: skip the messages a previous run
+                    // (possibly interrupted) already imported into this
+                    // session — they carry the `source: "openclaw"` marker.
+                    let already = match store.load_messages(&session.session_key) {
+                        Ok(existing) => existing
+                            .iter()
+                            .filter(|m| m.get("source").and_then(|v| v.as_str()) == Some("openclaw"))
+                            .count(),
+                        Err(e) => {
+                            warn!(
+                                session = %session.session_key,
+                                error = %e,
+                                "failed to read existing session; skipping import to avoid duplicates"
+                            );
+                            stats.errors += 1;
+                            continue;
+                        }
+                    };
+                    if already > 0 {
+                        info!(
+                            session = %session.session_key,
+                            already,
+                            total = session.messages.len(),
+                            "session previously imported; appending only new messages"
+                        );
+                    }
+                    for msg in session.messages.iter().skip(already) {
                         let json_msg = serde_json::json!({
                             "role": msg.role,
                             "content": msg.content,
@@ -912,8 +938,14 @@ pub async fn import_memories_to_store(
                     tags: vec!["openclaw_import".to_owned()],
                     pinned: false,
                 };
-                let pv = primary.embed(&doc.text);
-                let sv = secondary.as_ref().map(|e| e.embed(&doc.text));
+                // Fallible embed: on failure pass an empty vector so the doc
+                // is stored unindexed and re-embedded later, never indexed
+                // as the zero-vector placeholder.
+                let pv = primary.try_embed(&doc.text).unwrap_or_else(|e| {
+                    warn!(error = %e, "openclaw import: embedding failed");
+                    Vec::new()
+                });
+                let sv = secondary.as_ref().and_then(|e| e.try_embed(&doc.text).ok());
                 (doc, pv, sv)
             })
             .collect();
@@ -1104,8 +1136,14 @@ pub async fn import_workspace_memory(
                     pinned: kind == "openclaw_memory_core",
                 };
                 let _ = i;
-                let pv = primary.embed(&doc.text);
-                let sv = secondary.as_ref().map(|e| e.embed(&doc.text));
+                // Fallible embed: on failure pass an empty vector so the doc
+                // is stored unindexed and re-embedded later, never indexed
+                // as the zero-vector placeholder.
+                let pv = primary.try_embed(&doc.text).unwrap_or_else(|e| {
+                    warn!(error = %e, "openclaw import: embedding failed");
+                    Vec::new()
+                });
+                let sv = secondary.as_ref().and_then(|e| e.try_embed(&doc.text).ok());
                 (doc, pv, sv)
             })
             .collect();

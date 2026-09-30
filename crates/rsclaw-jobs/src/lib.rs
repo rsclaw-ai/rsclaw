@@ -405,17 +405,48 @@ pub async fn download_artifact(
     url: &str,
     kind: ExternalJobKind,
 ) -> Result<String> {
-    let bytes = client
+    let mut resp = client
         .get(url)
         .timeout(Duration::from_secs(120))
         .send()
         .await
-        .map_err(|e| anyhow!("download: {e}"))?
-        .bytes()
+        .map_err(|e| anyhow!("download: {e}"))?;
+    // An expired presigned URL answers 403 with an XML error body; saving
+    // that as `.mp4`/`.png` and reporting success hands the user a broken
+    // file. Fail instead so the job surfaces the error.
+    let st = resp.status();
+    if !st.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "download: {st}: {}",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    if let Some(len) = resp.content_length()
+        && len > MAX_ARTIFACT_BYTES as u64
+    {
+        return Err(anyhow!(
+            "download: artifact too large ({len} bytes, limit {MAX_ARTIFACT_BYTES})"
+        ));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| anyhow!("download read: {e}"))?;
+        .map_err(|e| anyhow!("download read: {e}"))?
+    {
+        if bytes.len() + chunk.len() > MAX_ARTIFACT_BYTES {
+            return Err(anyhow!(
+                "download: artifact exceeds {MAX_ARTIFACT_BYTES} bytes"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     save_artifact_bytes(&bytes, kind).await
 }
+
+/// Upper bound for a downloaded generated artifact (video / image).
+const MAX_ARTIFACT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Download an artifact that requires Bearer auth, following the fleet LB's
 /// 307/308 hops with the bearer re-attached on each hop. Used for the rsclaw

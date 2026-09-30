@@ -39,6 +39,9 @@ pub use rsclaw_embed::{
 
 // redb table for memory docs metadata.
 const REDB_TABLE: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("memory_docs");
+// Store-level metadata (currently: which embedder produced the vectors).
+const META_TABLE: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("memory_meta");
+const META_EMBEDDER_ID: &str = "embedder_model_id";
 
 // ---------------------------------------------------------------------------
 // Process-global live store handle
@@ -471,6 +474,40 @@ impl MemoryStore {
             }
         }
 
+        // Same-dimension model change detection: vectors from a different
+        // model pass every length check but live in another space. When the
+        // recorded embedder differs, drop the in-memory vectors so every doc
+        // counts as pending and the startup re-embed migration rebuilds them
+        // (redb keeps the old vectors until `commit_swap` replaces them).
+        let model_id = embedder.model_id();
+        let stored_model_id: Option<String> = match db.begin_read() {
+            Ok(read) => match read.open_table(META_TABLE) {
+                Ok(t) => t.get(META_EMBEDDER_ID)?.map(|v| v.value().to_owned()),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e).context("open memory meta table"),
+            },
+            Err(e) => return Err(e).context("begin read (memory meta)"),
+        };
+        match stored_model_id {
+            Some(prev) if prev != model_id => {
+                warn!(
+                    previous = %prev,
+                    current = %model_id,
+                    "memory: embedder model changed; re-embedding all memories"
+                );
+                for doc in &mut docs {
+                    doc.vector.clear();
+                }
+            }
+            Some(_) => {}
+            // First run with this metadata: record the current embedder.
+            None => {
+                if let Err(e) = write_embedder_id(&db, &model_id) {
+                    debug!("memory: could not record embedder id (readonly?): {e:#}");
+                }
+            }
+        }
+
         let max_elements = docs.len().max(1024);
         let hnsw = Hnsw::<'static, f32, DistCosine>::new(
             HNSW_MAX_NB_CONN,
@@ -484,7 +521,7 @@ impl MemoryStore {
         let expected_dim = embed_dim as usize;
         let mut skipped = 0usize;
         for (i, doc) in docs.iter().enumerate() {
-            if doc.vector.len() == expected_dim {
+            if doc.vector.len() == expected_dim && !rsclaw_embed::is_zero_vector(&doc.vector) {
                 hnsw.insert((&doc.vector, i));
             } else {
                 skipped += 1;
@@ -548,7 +585,13 @@ impl MemoryStore {
             if doc.id.is_empty() {
                 continue;
             }
-            if let Err(e) = search.index_memory_doc(&doc.id, &doc.scope, &doc.kind, &doc.text) {
+            // No per-doc commit: one tantivy commit for the whole backfill.
+            if let Err(e) = search.index_document(&rsclaw_store::search::IndexDoc {
+                id: doc.id.clone(),
+                scope: doc.scope.clone(),
+                content: doc.text.clone(),
+                kind: doc.kind.clone(),
+            }) {
                 warn!(id = %doc.id, "reindex_bm25: skip doc: {e:#}");
                 continue;
             }
@@ -599,12 +642,12 @@ impl MemoryStore {
         // Embed under lock — backward-compatible path. Hot callers that hold
         // a shared `Mutex<MemoryStore>` should use `add_off_lock` instead so
         // the BERT inference doesn't stall every concurrent read/write.
-        let primary_vec = self.embedder.embed(&doc.text);
+        let primary_vec = embed_or_empty(self.embedder.as_ref(), &doc.text);
         let secondary_vec = self.swap.as_ref().and_then(|ctx| {
             if Arc::ptr_eq(&self.embedder, &ctx.new_embedder) {
                 None
             } else {
-                Some(ctx.new_embedder.embed(&doc.text))
+                ctx.new_embedder.try_embed(&doc.text).ok()
             }
         });
         self.add_pre_embedded(doc, primary_vec, secondary_vec).await
@@ -658,7 +701,7 @@ impl MemoryStore {
                 && existing.kind == doc.kind
                 && normalized_memory_text(&existing.text) == doc_identity
         }) {
-            let mut persisted = {
+            let persisted = {
                 let existing = &mut self.docs[idx];
                 existing.touch();
                 existing.importance = existing.importance.max(doc.importance);
@@ -680,7 +723,8 @@ impl MemoryStore {
                 existing.evaluate_tier_transition();
                 existing.clone()
             };
-            persisted.vector.clear();
+            // Persist WITH the vector: a row stored without it no longer
+            // matches the embedder dim, so every restart re-embedded it.
             self.persist_memory_doc(&persisted)?;
             // Keep BM25 in sync with the merged text — `existing.text` is
             // unchanged here, but tier/tags moved so we re-index to make sure
@@ -700,15 +744,26 @@ impl MemoryStore {
         // between then and now. Recover by re-embedding under lock when
         // their vectors no longer match — slower than the fast path but
         // never loses a doc.
-        let primary_vec = if primary_vec.len() == self.embed_dim as usize {
+        //
+        // An EMPTY vector means the caller's embed already failed: don't
+        // retry here (a remote embedder would pay its full retry budget
+        // twice). The doc is still persisted — BM25 keeps it searchable —
+        // without a vector, so it counts as pending and is re-embedded by
+        // the startup migration instead of being indexed as a zero vector.
+        let dim = self.embed_dim as usize;
+        let primary_vec = if primary_vec.len() == dim && !rsclaw_embed::is_zero_vector(&primary_vec)
+        {
             primary_vec
+        } else if primary_vec.is_empty() {
+            Vec::new()
         } else {
             tracing::debug!(
                 stale = primary_vec.len(),
                 current = self.embed_dim,
                 "add_pre_embedded: stale primary vector (concurrent swap commit?), re-embedding"
             );
-            self.embedder.embed(&doc.text)
+            let v = embed_or_empty(self.embedder.as_ref(), &doc.text);
+            if v.len() == dim { v } else { Vec::new() }
         };
         doc.vector = primary_vec;
 
@@ -717,7 +772,15 @@ impl MemoryStore {
 
         // Insert into HNSW index.
         let idx = self.docs.len();
-        self.hnsw.insert((&doc.vector, idx));
+        if doc.vector.is_empty() {
+            warn!(
+                id = %doc.id,
+                "memory: stored without embedding (embedder failed); keyword-searchable only until re-embedded"
+            );
+            self.pending_migration += 1;
+        } else {
+            self.hnsw.insert((&doc.vector, idx));
+        }
 
         // Dual-write to the migration secondary so new docs added during a
         // swap don't get left out. When the swap target is the SAME embedder
@@ -735,11 +798,13 @@ impl MemoryStore {
                         tracing::debug!(
                             "add_pre_embedded: secondary vector missing or stale, re-embedding"
                         );
-                        ctx.new_embedder.embed(&doc.text)
+                        embed_or_empty(ctx.new_embedder.as_ref(), &doc.text)
                     }
                 }
             };
-            if new_vec.len() == ctx.new_embed_dim as usize {
+            if new_vec.len() == ctx.new_embed_dim as usize
+                && !rsclaw_embed::is_zero_vector(&new_vec)
+            {
                 ctx.new_hnsw.insert((&new_vec, idx));
                 ctx.new_vectors.insert(idx, new_vec);
             } else {
@@ -772,7 +837,12 @@ impl MemoryStore {
         if doc.id.is_empty() {
             return;
         }
-        if let Err(e) = search.index_memory_doc(&doc.id, &doc.scope, &doc.kind, &doc.text) {
+        if let Err(e) = search.index_document(&rsclaw_store::search::IndexDoc {
+            id: doc.id.clone(),
+            scope: doc.scope.clone(),
+            content: doc.text.clone(),
+            kind: doc.kind.clone(),
+        }) {
             warn!(id = %doc.id, "BM25 dual-write failed: {e:#}");
         } else if let Err(e) = search.commit() {
             warn!(id = %doc.id, "BM25 commit failed after add: {e:#}");
@@ -818,30 +888,54 @@ impl MemoryStore {
         }
 
         let q_text = rsclaw_embed::format_query(self.query_instruction.as_deref(), query);
-        let q_vec = self.embedder.embed(&q_text);
-        // Search more than top_k to account for filtered/deleted docs.
-        let ef_search = (top_k * 4).max(32);
-        let neighbours = self.hnsw.search(&q_vec, top_k + 10, ef_search);
+        // A failed / degenerate query embedding skips the vector lane (the
+        // hybrid caller still has BM25): a zero vector is at cosine distance
+        // 0 from everything, and a wrong-length one trips DistCosine's assert.
+        let q_vec = match self.embedder.try_embed(&q_text) {
+            Ok(v) if v.len() == self.embed_dim as usize => v,
+            Ok(v) => {
+                warn!(got = v.len(), expected = self.embed_dim, "memory search: query dim mismatch; vector lane skipped");
+                return Ok(vec![]);
+            }
+            Err(e) => {
+                warn!("memory search: query embedding failed; vector lane skipped: {e:#}");
+                return Ok(vec![]);
+            }
+        };
 
-        let mut result_indices = Vec::new();
-        for n in neighbours {
-            let idx = n.d_id;
-            if idx >= self.docs.len() {
-                continue;
+        // Search more than top_k to account for filtered/deleted docs, and
+        // widen when a scope filter starves the result (a small scope in a
+        // large store used to return nothing).
+        let total = self.docs.len();
+        let mut k = (top_k + 10).min(total.max(1));
+        let result_indices = loop {
+            let ef_search = (k * 4).max(32);
+            let neighbours = self.hnsw.search(&q_vec, k, ef_search);
+            let returned = neighbours.len();
+            let mut result_indices = Vec::new();
+            for n in neighbours {
+                let idx = n.d_id;
+                if idx >= self.docs.len() {
+                    continue;
+                }
+                if self.docs[idx].id.is_empty() {
+                    continue; // deleted
+                }
+                if let Some(s) = scope
+                    && self.docs[idx].scope != s
+                {
+                    continue;
+                }
+                result_indices.push(idx);
+                if result_indices.len() >= top_k {
+                    break;
+                }
             }
-            if self.docs[idx].id.is_empty() {
-                continue; // deleted
+            if result_indices.len() >= top_k || returned < k || k >= total {
+                break result_indices;
             }
-            if let Some(s) = scope
-                && self.docs[idx].scope != s
-            {
-                continue;
-            }
-            result_indices.push(idx);
-            if result_indices.len() >= top_k {
-                break;
-            }
-        }
+            k = (k * 4).min(total);
+        };
 
         // Touch each matched doc (updates access stats & tier).
         let mut results = Vec::with_capacity(result_indices.len());
@@ -980,6 +1074,13 @@ impl MemoryStore {
         let expected = ctx.new_embed_dim as usize;
         let mut applied = 0usize;
         for (idx, vector) in batch {
+            // Legacy `embed()` returns an all-zero vector on failure; never
+            // index it (it would match every query at distance 0). The doc
+            // stays pending for the next migration run.
+            if rsclaw_embed::is_zero_vector(&vector) {
+                tracing::warn!(idx, "swap_apply_batch: embedding failed (zero vector), skipping");
+                continue;
+            }
             if vector.len() != expected {
                 tracing::warn!(
                     idx,
@@ -1014,8 +1115,21 @@ impl MemoryStore {
             new_vectors,
         } = ctx;
 
+        // Every live doc has a new vector → the store is fully on the new
+        // embedder and its id can be recorded. Otherwise keep the old id so
+        // the next start re-detects the change and finishes the migration.
+        let complete = self
+            .docs
+            .iter()
+            .enumerate()
+            .all(|(i, d)| d.id.is_empty() || new_vectors.contains_key(&i));
+
         // Update doc.vector for each migrated doc and persist atomically.
         let write = self.db.begin_write()?;
+        if complete {
+            let mut meta = write.open_table(META_TABLE)?;
+            meta.insert(META_EMBEDDER_ID, new_embedder.model_id().as_str())?;
+        }
         {
             let mut table = write.open_table(REDB_TABLE)?;
             for (idx, vector) in &new_vectors {
@@ -1051,52 +1165,80 @@ impl MemoryStore {
         }
     }
 
+    /// Re-embed every live doc with the active embedder.
+    ///
+    /// Crash-safe: all new vectors are computed first (any embed failure
+    /// aborts with nothing changed), then every row is overwritten in ONE
+    /// write transaction. The table is never deleted, so an interruption can
+    /// no longer lose memories, and rows that failed to decode at load (and
+    /// so aren't in memory) are left untouched instead of being dropped.
     pub async fn reindex(&mut self) -> Result<usize> {
-        let active_docs: Vec<MemoryDoc> = self
+        if self.swap.is_some() {
+            anyhow::bail!("memory: cannot reindex while an embedder migration is in progress");
+        }
+        let dim = self.embed_dim as usize;
+        let active: Vec<usize> = self
             .docs
             .iter()
-            .filter(|d| !d.id.is_empty())
-            .cloned()
+            .enumerate()
+            .filter(|(_, d)| !d.id.is_empty())
+            .map(|(i, _)| i)
             .collect();
-        let count = active_docs.len();
+        let count = active.len();
         if count == 0 {
             return Ok(0);
         }
 
-        // Re-embed all docs.
-        self.docs.clear();
-        let max_elements = count.max(1024);
-        self.hnsw = Hnsw::<'static, f32, DistCosine>::new(
+        // 1. Embed everything up front.
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(count);
+        for &i in &active {
+            let doc = &self.docs[i];
+            let v = self
+                .embedder
+                .try_embed(&doc.text)
+                .with_context(|| format!("reindex: embed memory {}", doc.id))?;
+            if v.len() != dim {
+                anyhow::bail!(
+                    "reindex: embedder returned {} dims for memory {}, expected {dim}",
+                    v.len(),
+                    doc.id
+                );
+            }
+            vectors.push(v);
+        }
+
+        // 2. Overwrite all rows atomically.
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(REDB_TABLE)?;
+            for (&i, v) in active.iter().zip(&vectors) {
+                let mut doc = self.docs[i].clone();
+                doc.vector = v.clone();
+                let serialized = serialize_doc(&doc)?;
+                table.insert(doc.id.as_str(), serialized.as_slice())?;
+            }
+            let mut meta = write.open_table(META_TABLE)?;
+            meta.insert(META_EMBEDDER_ID, self.embedder.model_id().as_str())?;
+        }
+        write.commit()?;
+
+        // 3. Only now swap the in-memory state. HNSW ids stay positions in
+        //    `self.docs` (tombstoned slots are simply not inserted).
+        for (&i, v) in active.iter().zip(vectors) {
+            self.docs[i].vector = v;
+        }
+        let hnsw = Hnsw::<'static, f32, DistCosine>::new(
             HNSW_MAX_NB_CONN,
-            max_elements,
+            self.docs.len().max(1024),
             16,
             HNSW_EF_CONSTRUCTION,
             DistCosine,
         );
-
-        // Clear redb by deleting and recreating the table.
-        {
-            let write = self.db.begin_write()?;
-            write.delete_table(REDB_TABLE)?;
-            let _ = write.open_table(REDB_TABLE)?;
-            write.commit()?;
+        for &i in &active {
+            hnsw.insert((&self.docs[i].vector, i));
         }
-
-        for mut doc in active_docs {
-            doc.vector = self.embedder.embed(&doc.text);
-            let serialized = serialize_doc(&doc)?;
-            {
-                let write = self.db.begin_write()?;
-                {
-                    let mut table = write.open_table(REDB_TABLE)?;
-                    table.insert(doc.id.as_str(), serialized.as_slice())?;
-                }
-                write.commit()?;
-            }
-            let idx = self.docs.len();
-            self.hnsw.insert((&doc.vector, idx));
-            self.docs.push(doc);
-        }
+        self.hnsw = hnsw;
+        self.pending_migration = 0;
 
         info!(count, "memory reindex complete");
         Ok(count)
@@ -1180,7 +1322,10 @@ impl MemoryStore {
             .position(|d| d.id == doc_id)
             .ok_or_else(|| anyhow!("doc not found: {doc_id}"))?;
         let src_vec = &self.docs[src_idx].vector;
-        if src_vec.is_empty() {
+        // A vector from another embedder (pending migration) would trip
+        // DistCosine's dimension assert inside hnsw.search — a panic, and the
+        // meditation loop calls this every cycle.
+        if src_vec.len() != self.embed_dim as usize || rsclaw_embed::is_zero_vector(src_vec) {
             return Ok(vec![]);
         }
 
@@ -1222,10 +1367,14 @@ impl MemoryStore {
         threshold: f32,
     ) -> Option<(String, f32)> {
         // Doc-side embed (no query instruction): this is a doc-to-doc compare.
-        let vec = self.embedder.embed(text);
-        if vec.is_empty() {
-            return None;
-        }
+        let vec = match self.embedder.try_embed(text) {
+            Ok(v) if v.len() == self.embed_dim as usize => v,
+            Ok(_) => return None,
+            Err(e) => {
+                debug!("find_semantic_dup: embedding failed: {e:#}");
+                return None;
+            }
+        };
         let neighbours = self.hnsw.search(&vec, 8, 64);
         let mut best: Option<(String, f32)> = None;
         for n in neighbours {
@@ -1392,6 +1541,30 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // Serialization helpers
 // ---------------------------------------------------------------------------
 
+/// Embed `text`, logging and returning an EMPTY vector on failure. Callers
+/// treat empty as "no embedding yet": the doc is stored unindexed and picked
+/// up by the next re-embed migration, never indexed as a zero vector.
+fn embed_or_empty(embedder: &dyn Embedder, text: &str) -> Vec<f32> {
+    match embedder.try_embed(text) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("memory: embedding failed: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// Record which embedder produced the stored vectors.
+fn write_embedder_id(db: &redb::Database, model_id: &str) -> Result<()> {
+    let write = db.begin_write()?;
+    {
+        let mut meta = write.open_table(META_TABLE)?;
+        meta.insert(META_EMBEDDER_ID, model_id)?;
+    }
+    write.commit()?;
+    Ok(())
+}
+
 fn serialize_doc(doc: &MemoryDoc) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(doc).context("serialize memory doc")?;
     let vec_count = doc.vector.len() as u32;
@@ -1470,8 +1643,8 @@ pub async fn add_off_lock(
         let mem = mem_arc.lock().await;
         mem.embedders_for_dual_write()
     };
-    let primary_vec = primary_embedder.embed(&doc.text);
-    let secondary_vec = secondary_embedder.map(|e| e.embed(&doc.text));
+    let primary_vec = embed_or_empty(primary_embedder.as_ref(), &doc.text);
+    let secondary_vec = secondary_embedder.and_then(|e| e.try_embed(&doc.text).ok());
     let mut mem = mem_arc.lock().await;
     mem.add_pre_embedded(doc, primary_vec, secondary_vec).await
 }
@@ -1581,10 +1754,10 @@ mod swap_tests {
         seed_bias: f32,
     }
     impl Embedder for StubEmbedder {
-        fn embed(&self, text: &str) -> Vec<f32> {
+        fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
             let bias =
                 text.bytes().next().map(|b| b as f32 / 255.0).unwrap_or(0.0) + self.seed_bias;
-            vec![bias; self.dim as usize]
+            Ok(vec![bias; self.dim as usize])
         }
         fn dimension(&self) -> i32 {
             self.dim
@@ -1917,6 +2090,56 @@ mod swap_tests {
             2,
             "expected 2 docs flagged for migration after dim change 16 -> 384"
         );
+    }
+
+    #[tokio::test]
+    async fn find_near_duplicates_skips_foreign_dim_vector() {
+        let (mut store, _tmp) = open_temp_store().await;
+        store.add(doc("d0", "alpha")).await.unwrap();
+        store.add(doc("d1", "alpha beta")).await.unwrap();
+        // Simulate a doc still carrying another embedder's vector (pending
+        // migration): hnsw.search with it used to panic in DistCosine.
+        store.docs[0].vector = vec![1.0; 16];
+        let pairs = store.find_near_duplicates("d0", None, 0.5).unwrap();
+        assert!(pairs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_dim_embedder_change_marks_all_pending() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        {
+            let mut store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+                .await
+                .expect("open");
+            store.add(doc("d0", "alpha")).await.unwrap();
+            store.add(doc("d1", "beta")).await.unwrap();
+            // Pretend a different model with the same dimension wrote them.
+            write_embedder_id(&store.db, "some-other-model-384").unwrap();
+        }
+        let store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+            .await
+            .expect("reopen");
+        assert_eq!(store.embed_dim(), 384);
+        assert_eq!(store.pending_migration_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn reindex_keeps_every_doc_and_persists_vectors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        {
+            let mut store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+                .await
+                .expect("open");
+            for (i, t) in ["alpha", "beta", "gamma"].iter().enumerate() {
+                store.add(doc(&format!("d{i}"), t)).await.unwrap();
+            }
+            assert_eq!(store.reindex().await.unwrap(), 3);
+        }
+        let store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+            .await
+            .expect("reopen");
+        assert_eq!(store.count().await.unwrap(), 3);
+        assert_eq!(store.pending_migration_count(), 0);
     }
 
     #[tokio::test]

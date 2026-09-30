@@ -18,10 +18,15 @@ use tantivy::{
     Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument,
     collector::TopDocs,
     doc,
-    query::QueryParser,
-    schema::{STORED, STRING, Schema, SchemaBuilder, TEXT, document::Value as _},
+    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
+    schema::{
+        IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TextFieldIndexing, TextOptions,
+        document::Value as _,
+    },
 };
-use tracing::debug;
+use tracing::{debug, warn};
+
+use crate::cjk::{CJK_TOKENIZER, JiebaTokenizer, query_terms};
 
 // ---------------------------------------------------------------------------
 // Schema field names
@@ -55,19 +60,50 @@ impl SearchIndex {
         let mut builder = SchemaBuilder::new();
         builder.add_text_field(FIELD_ID, STRING | STORED);
         builder.add_text_field(FIELD_SCOPE, STRING | STORED);
-        builder.add_text_field(FIELD_CONTENT, TEXT | STORED);
+        // jieba tokenizer: the default TEXT analyzer turns a CJK sentence
+        // into ONE token, so Chinese memories were effectively unsearchable.
+        let content_opts = TextOptions::default().set_stored().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(CJK_TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        builder.add_text_field(FIELD_CONTENT, content_opts);
         builder.add_text_field(FIELD_KIND, STRING | STORED);
         let schema = builder.build();
 
         std::fs::create_dir_all(path)
             .with_context(|| format!("create index dir {}", path.display()))?;
 
-        let index = Index::open_or_create(
-            tantivy::directory::MmapDirectory::open(path)
-                .with_context(|| format!("open mmap dir {}", path.display()))?,
-            schema.clone(),
-        )
-        .with_context(|| format!("open tantivy index at {}", path.display()))?;
+        let open = |path: &Path| -> Result<tantivy::Result<Index>> {
+            Ok(Index::open_or_create(
+                tantivy::directory::MmapDirectory::open(path)
+                    .with_context(|| format!("open mmap dir {}", path.display()))?,
+                schema.clone(),
+            ))
+        };
+        let index = match open(path)? {
+            Ok(index) => index,
+            // The index is a derived cache (memory docs are re-indexed from
+            // redb at startup), so a schema change — e.g. the switch to the
+            // CJK tokenizer — just recreates it.
+            Err(tantivy::TantivyError::SchemaError(msg)) => {
+                warn!(path = %path.display(), "search index schema changed ({msg}); recreating");
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("remove stale index {}", path.display()))?;
+                std::fs::create_dir_all(path)
+                    .with_context(|| format!("create index dir {}", path.display()))?;
+                open(path)?
+                    .with_context(|| format!("recreate tantivy index at {}", path.display()))?
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("open tantivy index at {}", path.display()));
+            }
+        };
+        // Tokenizers are not persisted in the index; register on every open,
+        // before any writer tokenizes a document.
+        index
+            .tokenizers()
+            .register(CJK_TOKENIZER, JiebaTokenizer::new());
 
         let writer = index.writer(writer_heap).context("create index writer")?;
 
@@ -147,12 +183,30 @@ impl SearchIndex {
 
         let content_field = self.schema.get_field(FIELD_CONTENT).expect("field");
 
-        let search_fields = vec![content_field];
-        let parser = QueryParser::for_index(&self.index, search_fields);
-
-        let parsed = parser
-            .parse_query(query)
-            .with_context(|| format!("parse query: {query}"))?;
+        // Natural-language input: OR of the jieba terms (same tokenizer as
+        // indexing), so a question matches memories sharing any of its
+        // words. QueryParser would make a multi-token CJK run a slop-0
+        // phrase. Explicit `"quoted phrases"` keep QueryParser semantics.
+        let parsed: Box<dyn Query> = if query.contains('"') {
+            let parser = QueryParser::for_index(&self.index, vec![content_field]);
+            parser
+                .parse_query(query)
+                .with_context(|| format!("parse query: {query}"))?
+        } else {
+            let clauses: Vec<(Occur, Box<dyn Query>)> = query_terms(query)
+                .into_iter()
+                .map(|t| {
+                    let term = tantivy::Term::from_field_text(content_field, &t);
+                    let q: Box<dyn Query> =
+                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                    (Occur::Should, q)
+                })
+                .collect();
+            if clauses.is_empty() {
+                return Ok(Vec::new());
+            }
+            Box::new(BooleanQuery::new(clauses))
+        };
 
         let scan_limit = if scope.is_some() {
             limit.saturating_mul(8).max(limit).max(32)
@@ -203,8 +257,9 @@ impl SearchIndex {
 
     /// Index a memory document in tantivy for BM25 search, then commit.
     ///
-    /// Convenience method used by MemoryStore::add() to keep the BM25 index
-    /// in sync with the hnsw_rs vector store.
+    /// Convenience for single-doc writers. Bulk paths (startup backfill)
+    /// must call `index_document` per doc and `commit` once — a tantivy
+    /// commit per doc is orders of magnitude slower.
     pub fn index_memory_doc(&self, id: &str, scope: &str, kind: &str, text: &str) -> Result<()> {
         self.index_document(&IndexDoc {
             id: id.to_owned(),
@@ -329,5 +384,21 @@ mod tests {
             .expect("search");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "main-doc");
+    }
+
+    #[test]
+    fn chinese_memory_matches_natural_question() {
+        let (idx, _dir) = open_tmp();
+        idx.index_document(&IndexDoc {
+            id: "zh".to_owned(),
+            scope: "global".to_owned(),
+            content: "用户的手机号码是13800138000，住在杭州".to_owned(),
+            kind: "memory".to_owned(),
+        })
+        .expect("index");
+        idx.commit().expect("commit");
+        let results = idx.search("我的手机号码是多少", None, 10).expect("search");
+        assert_eq!(results.len(), 1, "CJK question should match: {results:?}");
+        assert_eq!(results[0].id, "zh");
     }
 }

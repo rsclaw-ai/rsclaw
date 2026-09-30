@@ -80,6 +80,21 @@ impl WorkerPool {
         cfg: &WorkerConfig,
         handler: &dyn JobHandler,
     ) -> Result<bool> {
+        Ok(Self::run_one_blocking_job(ctx, cfg, handler)?.is_some())
+    }
+
+    /// Claim and run one job synchronously. Returns the kind of the job
+    /// handled (whether it succeeded or was requeued / failed), or `None`
+    /// when the queue was empty.
+    ///
+    /// While the handler runs, a helper thread renews the claim every third
+    /// of `claim_ttl_ms`, so a long job (large doc against a slow remote
+    /// embedder) is not reclaimed mid-flight and re-run by another drainer.
+    pub fn run_one_blocking_job(
+        ctx: &HandlerCtx,
+        cfg: &WorkerConfig,
+        handler: &dyn JobHandler,
+    ) -> Result<Option<crate::jobs::JobKind>> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let claimed = {
             let wtx = ctx.store.begin_write()?;
@@ -88,31 +103,38 @@ impl WorkerPool {
             claim
         };
         let Some((job, token)) = claimed else {
-            return Ok(false);
+            return Ok(None);
         };
-        // Isolate handler panics: a panic (e.g. a tokenizer edge case)
-        // must not unwind out of the worker loop and kill it. Convert it
-        // to an Err so the requeue / mark_failed path below applies the
-        // same attempt accounting as a normal failure.
-        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handler.handle(ctx, &job.kind)
-        })) {
-            Ok(r) => r,
-            Err(panic) => {
-                let msg = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                Err(anyhow::anyhow!("handler panicked: {msg}"))
-            }
-        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (job_id, claim_token) = (job.id.as_str(), token.token.as_str());
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(move || renew_claim_until(ctx, cfg, job_id, claim_token, done_rx));
+            // Isolate handler panics: a panic (e.g. a tokenizer edge case)
+            // must not unwind out of the worker loop and kill it. Convert it
+            // to an Err so the requeue / mark_failed path below applies the
+            // same attempt accounting as a normal failure.
+            let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.handle(ctx, &job.kind)
+            })) {
+                Ok(r) => r,
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    Err(anyhow::anyhow!("handler panicked: {msg}"))
+                }
+            };
+            // Wakes the renewal thread immediately so the scope joins now.
+            drop(done_tx);
+            outcome
+        });
         match outcome {
             Ok(()) => {
                 let wtx = ctx.store.begin_write()?;
                 jobs::mark_done(&wtx, &job.id, &token.token)?;
                 wtx.commit()?;
-                Ok(true)
             }
             Err(e) => {
                 let wtx = ctx.store.begin_write()?;
@@ -122,8 +144,43 @@ impl WorkerPool {
                     jobs::requeue(&wtx, &job.id)?;
                 }
                 wtx.commit()?;
-                Ok(true)
             }
+        }
+        Ok(Some(job.kind))
+    }
+}
+
+/// Lease-renewal loop for `run_one_blocking_job`: every `claim_ttl_ms / 3`
+/// push the claim's expiry out by a full TTL, until `done` disconnects (the
+/// handler finished) or the claim is lost.
+fn renew_claim_until(
+    ctx: &HandlerCtx,
+    cfg: &WorkerConfig,
+    job_id: &str,
+    token: &str,
+    done: std::sync::mpsc::Receiver<()>,
+) {
+    let interval = Duration::from_millis((cfg.claim_ttl_ms.max(3) / 3) as u64);
+    loop {
+        match done.recv_timeout(interval) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // Sender dropped (or signalled): the handler is done.
+            _ => return,
+        }
+        let expires = chrono::Utc::now().timestamp_millis() + cfg.claim_ttl_ms;
+        let res = (|| -> Result<bool> {
+            let wtx = ctx.store.begin_write()?;
+            let kept = jobs::renew_claim(&wtx, job_id, token, expires)?;
+            wtx.commit()?;
+            Ok(kept)
+        })();
+        match res {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(job = %job_id, "kb worker: claim lost during job; stop renewing");
+                return;
+            }
+            Err(e) => tracing::warn!(job = %job_id, "kb worker: claim renewal failed: {e:#}"),
         }
     }
 }

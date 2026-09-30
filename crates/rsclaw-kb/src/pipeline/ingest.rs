@@ -143,10 +143,19 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
     let old_paths = if next_version > 1 {
         match docs::latest_version_in_wtx(&wtx, &lsid_str)? {
             Some(ptr) => match docs::get_in_wtx(&wtx, &ptr.doc_id)? {
-                Some(prev) => {
-                    let mut p = vec![prev.markdown_path];
-                    if let Some(raw) = prev.raw_path {
+                Some(mut prev) => {
+                    let mut p = vec![prev.markdown_path.clone()];
+                    if let Some(raw) = prev.raw_path.clone() {
                         p.push(raw);
+                    }
+                    // The superseded version is history now: tombstone it so
+                    // listings/stats stop reporting it as a live doc and the
+                    // compactor eventually purges it (search already hides it
+                    // via the latest-version pointer).
+                    if prev.status == KbStatus::Active {
+                        prev.status = KbStatus::Tombstoned;
+                        prev.updated_at = now_ms;
+                        docs::put(&wtx, &prev)?;
                     }
                     p
                 }

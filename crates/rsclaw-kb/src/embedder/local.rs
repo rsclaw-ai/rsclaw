@@ -44,20 +44,24 @@ impl LocalKbEmbedder {
 
     /// Remote OpenAI-compatible embedder. Point `base_url` at any
     /// `/v1/embeddings` server — e.g. a GPU fleet running
-    /// Qwen3-Embedding via vLLM / SGLang / TEI / infinity. `dim` is
-    /// the model's output dimension (must match the KB's HNSW dim).
+    /// Qwen3-Embedding via vLLM / SGLang / TEI / infinity.
+    /// `dim_override` is the configured `dimensions` (sent to the server for
+    /// Matryoshka truncation); when `None` the model's native size from
+    /// `openai_model_dim` is used. Either way every returned vector is
+    /// validated against the resulting dim (the KB's HNSW dim).
     pub fn remote_openai(
         base_url: String,
         model: String,
         api_key: Option<String>,
-        dim: usize,
+        dim_override: Option<usize>,
     ) -> Self {
         let inner = OpenAiEmbedder::new(
             api_key.unwrap_or_default(),
             Some(model.clone()),
             Some(base_url),
-            Some(dim as i32),
+            dim_override.map(|d| d as i32),
         );
+        let dim = Embedder::dimension(&inner) as usize;
         Self {
             backend: EmbedderBackend::OpenAi(inner),
             dim,
@@ -68,7 +72,13 @@ impl LocalKbEmbedder {
 
 impl KbEmbedder for LocalKbEmbedder {
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|t| self.backend.embed(t)).collect())
+        // Fallible per text: a backend failure fails the whole batch so the
+        // ingest job is retried, instead of indexing a zero-vector
+        // placeholder that cosine distance would rank first for every query.
+        texts
+            .iter()
+            .map(|t| self.backend.try_embed(t))
+            .collect()
     }
 
     fn dimension(&self) -> usize {

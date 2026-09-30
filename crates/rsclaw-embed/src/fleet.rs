@@ -22,6 +22,9 @@ use serde::Serialize;
 const MAX_REDIRECT_HOPS: usize = 5;
 /// Fallback redirect-cache TTL when a 308 omits `Cache-Control: max-age`.
 const DEFAULT_REDIRECT_TTL: Duration = Duration::from_secs(300);
+/// Upper bound on any cached 308, whatever `max-age` the server sends: a
+/// stale or hostile entry must not pin traffic to one target indefinitely.
+const MAX_REDIRECT_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone)]
 struct RedirectEntry {
@@ -82,6 +85,63 @@ fn rewrite_origin(url: &str, new_origin: &str) -> String {
     }
 }
 
+/// Scheme of an absolute URL (`https` for `https://h/p`).
+fn scheme_of(url: &str) -> Option<&str> {
+    url.find("://").map(|i| &url[..i])
+}
+
+/// Lowercased host of an absolute URL: userinfo and port stripped, IPv6
+/// brackets kept.
+fn host_of(url: &str) -> Option<String> {
+    let origin = origin_of(url)?;
+    let authority = &origin[origin.find("://")? + 3..];
+    let hostport = authority.rsplit('@').next()?;
+    let host = if hostport.starts_with('[') {
+        &hostport[..hostport.find(']')? + 1]
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+            _ => hostport,
+        }
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Registrable-domain approximation (last two labels); IP literals are
+/// their own site. Mirrors `rsclaw_provider::rsclaw_http::site_of`.
+fn site_of(host: &str) -> &str {
+    if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
+        return host;
+    }
+    let mut dots = host.rmatch_indices('.');
+    match (dots.next(), dots.next()) {
+        (Some(_), Some((idx, _))) => &host[idx + 1..],
+        _ => host,
+    }
+}
+
+/// Whether a credentialed request may follow a redirect from `from` to `to`:
+/// same host or same registrable domain (LB -> backend pool), and never an
+/// https -> http downgrade. Same rule as
+/// `rsclaw_provider::rsclaw_http::redirect_allowed` (not depended on: the
+/// provider crate depends on this one).
+fn redirect_allowed(from: &str, to: &str) -> bool {
+    let (Some(fs), Some(ts)) = (scheme_of(from), scheme_of(to)) else {
+        return false;
+    };
+    let (fs, ts) = (fs.to_ascii_lowercase(), ts.to_ascii_lowercase());
+    if !matches!(ts.as_str(), "http" | "https") {
+        return false;
+    }
+    if fs == "https" && ts != "https" {
+        return false;
+    }
+    match (host_of(from), host_of(to)) {
+        (Some(a), Some(b)) => a == b || site_of(&a) == site_of(&b),
+        _ => false,
+    }
+}
+
 /// Resolve a `Location` header against the current URL (absolute URL or
 /// absolute path only — what rsclaw-server actually emits).
 fn resolve_location(base: &str, location: &str) -> Option<String> {
@@ -120,13 +180,22 @@ fn parse_max_age(cache_control: Option<&str>) -> Option<Duration> {
 
 /// One-shot transport retry papering over a half-closed pooled connection on
 /// the first request after an idle gap. Genuine 4xx/5xx arrive as `Ok(resp)`.
+///
+/// When `idempotent` is false (no idempotency key, e.g. the agent `/turn`
+/// call) only connect errors are retried: the request provably never reached
+/// the server. A reset / closed connection may have happened AFTER the server
+/// accepted the request, and replaying it would run the turn twice.
 async fn send_with_transport_retry(
     builder: reqwest::RequestBuilder,
+    idempotent: bool,
 ) -> reqwest::Result<reqwest::Response> {
     let retryable = |e: &reqwest::Error| -> bool {
         use std::error::Error;
         if e.is_connect() {
             return true;
+        }
+        if !idempotent {
+            return false;
         }
         let mut src: Option<&dyn Error> = e.source();
         while let Some(s) = src {
@@ -249,7 +318,9 @@ impl FleetHttp {
                 builder = builder.header("authorization", format!("Bearer {k}"));
             }
 
-            let resp = match send_with_transport_retry(builder).await {
+            // `/turn` is never replayed past the connect phase, key or not.
+            let idempotent = idempotency_key.is_some() && !is_turn_url(&current_url);
+            let resp = match send_with_transport_retry(builder, idempotent).await {
                 Ok(r) => r,
                 Err(e) => {
                     // Transport failure against a redirected target → drop the
@@ -289,13 +360,24 @@ impl FleetHttp {
                 );
             };
 
+            // The Bearer is re-attached on every hop, so only follow to the
+            // same host / registrable domain and never downgrade to http.
+            if !redirect_allowed(&current_url, &next_url) {
+                anyhow::bail!(
+                    "rsclaw: refusing {status} redirect from {current_url} to {next_url} \
+                     (cross-site or https->http downgrade)"
+                );
+            }
+
             // 308 only: cache the target origin. 307 is temporary by spec.
             if status == StatusCode::PERMANENT_REDIRECT
                 && let (Some(current_origin), Some(next_origin)) =
                     (origin_of(&current_url), origin_of(&next_url))
                 && current_origin != next_origin
             {
-                let ttl = parse_max_age(cache_control.as_deref()).unwrap_or(DEFAULT_REDIRECT_TTL);
+                let ttl = parse_max_age(cache_control.as_deref())
+                    .unwrap_or(DEFAULT_REDIRECT_TTL)
+                    .min(MAX_REDIRECT_TTL);
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.store(current_origin.to_owned(), next_origin.to_owned(), ttl);
                 }
@@ -327,6 +409,12 @@ impl FleetHttp {
         self.post_following_redirects(url, body, bearer, false, None, None)
             .await
     }
+}
+
+/// True for the agent-turn endpoint (`.../turn`, query string ignored).
+fn is_turn_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.trim_end_matches('/').ends_with("/turn")
 }
 
 #[cfg(test)]
@@ -403,5 +491,31 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(c.lookup("https://a"), None);
+    }
+
+    #[test]
+    fn redirect_rule_same_site_only_and_no_downgrade() {
+        assert!(redirect_allowed(
+            "https://api.rsclaw.ai/v1/x",
+            "https://gpu3.rsclaw.ai:8443/v1/x"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.rsclaw.ai/v1/x",
+            "http://api.rsclaw.ai/v1/x"
+        ));
+        assert!(!redirect_allowed("https://api.rsclaw.ai/v1/x", "https://evil.com/x"));
+        assert!(!redirect_allowed(
+            "https://api.rsclaw.ai/v1/x",
+            "https://api.rsclaw.ai@evil.com/x"
+        ));
+        assert!(redirect_allowed("http://10.0.0.1:8442/a", "http://10.0.0.1:8443/a"));
+        assert!(!redirect_allowed("http://10.0.0.1/a", "http://10.0.0.2/a"));
+    }
+
+    #[test]
+    fn turn_url_detection() {
+        assert!(is_turn_url("https://h/v1/agent/turn"));
+        assert!(is_turn_url("https://h/v1/agent/turn?x=1"));
+        assert!(!is_turn_url("https://h/v1/embeddings"));
     }
 }
