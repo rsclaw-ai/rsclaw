@@ -710,6 +710,10 @@ pub struct AgentRuntime {
     /// Per-session compaction state: (last_compaction_time,
     /// turns_since_compaction).
     pub(crate) compaction_state: std::collections::HashMap<String, (std::time::Instant, u32)>,
+    /// Per-session time of the last completed turn. Drives idle eviction —
+    /// the compaction timestamp is NOT activity (a busy session that never
+    /// needed compaction would otherwise look idle since runtime start).
+    pub(crate) session_last_active: std::collections::HashMap<String, std::time::Instant>,
     /// Pending large files awaiting user confirmation (session_key -> files).
     pending_files: std::collections::HashMap<String, Vec<PendingFile>>,
     /// Shared live status for /btw parallel queries.
@@ -851,6 +855,7 @@ impl AgentRuntime {
             browser: Arc::new(tokio::sync::Mutex::new(None)),
             sessions: std::collections::HashMap::new(),
             compaction_state: std::collections::HashMap::new(),
+            session_last_active: std::collections::HashMap::new(),
             pending_files: std::collections::HashMap::new(),
             runtime_max_file_size: None,
             runtime_max_text_chars: None,
@@ -886,14 +891,23 @@ impl AgentRuntime {
 
         // Spawn a background task that periodically checks for idle browser
         // sessions and drops them to release Chrome memory.  Runs every 60s.
-        // TODO: this spawned task has no JoinHandle and cannot be cancelled on shutdown
+        // Bound to the agent's lifetime token: it stops when the handle is
+        // removed/replaced (hot reload) or once the runtime owning the browser
+        // slot is gone, instead of leaking one task per runtime ever built.
         {
             let browser_handle = Arc::clone(&rt.browser);
+            let lifetime = rt.handle.lifetime.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = lifetime.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
+                    if Arc::strong_count(&browser_handle) == 1 {
+                        break; // runtime dropped; nothing left to reap for
+                    }
                     let mut guard = browser_handle.lock().await;
                     if let Some(ref session) = *guard {
                         if session.is_idle_expired() {
@@ -1211,7 +1225,9 @@ impl AgentRuntime {
         if choice == "4" {
             let names: Vec<String> = files.iter().map(|f| f.filename.clone()).collect();
             for f in &files {
-                let _ = std::fs::remove_file(&f.path);
+                if let Err(e) = std::fs::remove_file(&f.path) {
+                    warn!(path = %f.path.display(), "failed to delete pending video: {e}");
+                }
             }
             return Ok(direct(rsclaw_i18n::t_fmt(
                 "video_deleted",
@@ -1894,12 +1910,12 @@ impl AgentRuntime {
         }
     }
 
-    /// Save summaries of all active sessions to long-term memory.
+    /// Save a summary of ONE session (`session_key`) to long-term memory.
     ///
     /// Called before `/new` — since no summary is injected into the new
     /// session, memory is the only way the LLM can find prior context.
     /// Uses KV cache mode when available (session is still in memory).
-    async fn save_session_summaries_to_memory(&mut self, model: &str) {
+    async fn save_session_summaries_to_memory(&mut self, session_key: &str, model: &str) {
         if self.memory.is_none() {
             return;
         }
@@ -1917,7 +1933,7 @@ impl AgentRuntime {
         let session_data: Vec<(String, String)> = self
             .sessions
             .iter()
-            .filter(|(_, msgs)| msgs.len() > 2)
+            .filter(|(key, msgs)| key.as_str() == session_key && msgs.len() > 2)
             .map(|(key, msgs)| {
                 let transcript = Self::msgs_to_text_static(msgs, 16_000);
                 (key.clone(), transcript)
@@ -1925,6 +1941,7 @@ impl AgentRuntime {
             .collect();
 
         for (session_key, transcript) in &session_data {
+            let session_key = session_key.as_str();
             // Generate summary — try KV cache mode first.
             let summary = if kv_cache_mode >= 1 {
                 let result = self
@@ -2249,19 +2266,19 @@ impl AgentRuntime {
         let ttl = Duration::from_secs(SESSION_IDLE_TTL_SECS);
         let now = std::time::Instant::now();
 
-        // Collect keys to evict: sessions whose compaction_state timestamp
-        // is older than the TTL, or sessions that have no compaction_state
-        // entry at all (never compacted -- use runtime start as proxy).
+        // Collect keys to evict: sessions whose last completed turn is older
+        // than the TTL. Sessions with no recorded turn (loaded but never
+        // finished one) fall back to runtime start.
         let stale_keys: Vec<String> = self
             .sessions
             .keys()
             .filter(|key| {
-                if let Some((last_active, _)) = self.compaction_state.get(*key) {
-                    now.duration_since(*last_active) > ttl
-                } else {
-                    // No compaction state -- compare against runtime start.
-                    now.duration_since(self.started_at) > ttl
-                }
+                let last_active = self
+                    .session_last_active
+                    .get(*key)
+                    .copied()
+                    .unwrap_or(self.started_at);
+                now.duration_since(last_active) > ttl
             })
             .cloned()
             .collect();
@@ -2274,6 +2291,7 @@ impl AgentRuntime {
         for key in &stale_keys {
             self.sessions.remove(key);
             self.compaction_state.remove(key);
+            self.session_last_active.remove(key);
             self.pending_files.remove(key);
         }
 

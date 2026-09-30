@@ -141,6 +141,9 @@ impl LoopCheckResult {
 pub struct ToolCallRecord {
     pub tool_name: String,
     pub args_hash: String,
+    /// Provider tool_call id, when known. Lets results of parallel calls be
+    /// attributed to the right record instead of always the newest one.
+    pub call_id: Option<String>,
     /// Hash of the result (for no-progress detection).
     pub result_hash: Option<String>,
 }
@@ -207,8 +210,11 @@ pub struct LoopDetector {
     any_failure_streak: HashMap<String, usize>,
 }
 
-/// Inspect a tool result value and decide if it represents a failure.
-fn is_result_failure(result: &serde_json::Value) -> bool {
+/// Inspect a tool result value and decide if it represents a failure:
+/// `exit_code != 0`, a non-empty `error` string, or `success`/`ok == false`.
+/// Non-empty stderr alone is NOT a failure (many tools log progress there).
+/// Shared with the agent loop's error-streak accounting so both agree.
+pub fn is_result_failure(result: &serde_json::Value) -> bool {
     // exec-style: exit_code != 0
     if let Some(code) = result.get("exit_code").and_then(|v| v.as_i64()) {
         if code != 0 {
@@ -311,12 +317,34 @@ impl LoopDetector {
         tool_name: &str,
         params: &serde_json::Value,
     ) -> LoopCheckResult {
+        self.check_inner(tool_name, params, None)
+    }
+
+    /// Same as [`Self::check_with_params`], but tags the history record with
+    /// the provider `tool_call_id` so [`Self::record_result_for`] can attach
+    /// the result to the right call when several run in parallel.
+    pub fn check_with_params_id(
+        &mut self,
+        tool_name: &str,
+        params: &serde_json::Value,
+        call_id: &str,
+    ) -> LoopCheckResult {
+        self.check_inner(tool_name, params, Some(call_id))
+    }
+
+    fn check_inner(
+        &mut self,
+        tool_name: &str,
+        params: &serde_json::Value,
+        call_id: Option<&str>,
+    ) -> LoopCheckResult {
         let args_hash = hash_tool_call(tool_name, params);
 
         // Add to history (result_hash will be set later via record_result)
         self.history.push_back(ToolCallRecord {
             tool_name: tool_name.to_owned(),
             args_hash: args_hash.clone(),
+            call_id: call_id.map(str::to_owned),
             result_hash: None,
         });
         if self.history.len() > self.window {
@@ -449,7 +477,42 @@ impl LoopDetector {
         }
 
         let Some(name) = tool_name else { return };
+        self.update_streaks(&name, result);
+    }
 
+    /// Record the result of the call identified by `call_id` (as passed to
+    /// [`Self::check_with_params_id`]). The per-tool error streaks are keyed
+    /// by `tool_name` and are updated even when no history record carries
+    /// that id (e.g. a call rejected before it was checked).
+    pub fn record_result_for(
+        &mut self,
+        call_id: &str,
+        tool_name: &str,
+        result: &serde_json::Value,
+    ) {
+        if let Some(rec) = self
+            .history
+            .iter_mut()
+            .rev()
+            .find(|r| r.call_id.as_deref() == Some(call_id))
+        {
+            let result_str = stable_stringify(result);
+            rec.result_hash = Some(format!("{}", simple_hash(&result_str)));
+        }
+        self.update_streaks(tool_name, result);
+    }
+
+    /// Result hash recorded for the call identified by `call_id`, if any.
+    pub fn result_hash_for(&self, call_id: &str) -> Option<&str> {
+        self.history
+            .iter()
+            .rev()
+            .find(|r| r.call_id.as_deref() == Some(call_id))
+            .and_then(|r| r.result_hash.as_deref())
+    }
+
+    fn update_streaks(&mut self, tool_name: &str, result: &serde_json::Value) {
+        let name = tool_name.to_owned();
         let failure = is_result_failure(result);
         if failure {
             // Normalize the error signature — strip line:col, numeric suffixes.
@@ -790,4 +853,28 @@ mod tests {
         assert!(is_warning(&d.check_with_params("exec", &params))); // count=4
         assert!(is_critical(&d.check_with_params("exec", &params))); // count=5 >= crit(5)
     }
+
+    #[test]
+    fn record_result_for_attributes_parallel_calls_by_id() {
+        let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
+        let a = serde_json::json!({"path": "a"});
+        let b = serde_json::json!({"path": "b"});
+        assert!(is_ok(&d.check_with_params_id("read", &a, "id_a")));
+        assert!(is_ok(&d.check_with_params_id("read", &b, "id_b")));
+        // Results arrive for the first call last — must not land on id_b.
+        d.record_result_for("id_b", "read", &serde_json::json!({"content": "B"}));
+        d.record_result_for("id_a", "read", &serde_json::json!({"content": "A"}));
+        assert_ne!(d.result_hash_for("id_a"), d.result_hash_for("id_b"));
+        assert!(d.result_hash_for("id_a").is_some());
+    }
+
+    #[test]
+    fn stderr_alone_is_not_failure() {
+        assert!(!is_result_failure(
+            &serde_json::json!({"exit_code": 0, "stderr": "Compiling foo"})
+        ));
+        assert!(is_result_failure(&serde_json::json!({"exit_code": 1})));
+        assert!(is_result_failure(&serde_json::json!({"error": "boom"})));
+    }
 }
+

@@ -276,98 +276,13 @@ impl AgentRuntime {
             }
         }
 
-        // Check clear_signal: if /clear was issued via bypass, clear sessions now.
-        // Preserve a brief summary of each session so the agent retains key context.
-        if self.handle.clear_signal.load(Ordering::SeqCst) {
-            self.handle.clear_signal.store(false, Ordering::SeqCst);
-            info!("clear_signal received, clearing all sessions");
-
-            // Build summaries from existing sessions before clearing.
-            let mut summary_msgs: Vec<(String, Message)> = Vec::new();
-            for (key, messages) in &self.sessions {
-                if let Some(msg) = build_clear_summary(messages) {
-                    summary_msgs.push((key.clone(), msg));
-                }
-            }
-
-            self.sessions.clear();
-            self.compaction_state.clear();
-            if let Ok(mut map) = self.handle.session_tokens.write() {
-                map.clear();
-            }
-            // Also clear persisted sessions from redb (and their working
-            // plans — session_key is stable per peer, so a stale todo would
-            // leak into the next conversation after /clear).
-            for key in self.store.db.list_sessions().unwrap_or_default() {
-                if let Err(e) = self.store.db.delete_session(&key) {
-                    tracing::warn!(session = %key, "failed to delete session: {e}");
-                }
-                if let Err(e) = self
-                    .store
-                    .db
-                    .kv_delete(&crate::tools_misc::todo_kv_key(&key))
-                {
-                    tracing::warn!("todo kv cleanup failed for {key}: {e:#}");
-                }
-            }
-
-            // Re-inject summaries so agent retains context, and persist to redb.
-            for (key, msg) in summary_msgs {
-                let val = serde_json::to_value(&msg).unwrap_or_default();
-                if let Err(e) = self.store.db.append_message(&key, &val) {
-                    tracing::warn!("failed to persist clear summary: {e:#}");
-                }
-                self.sessions.insert(key, vec![msg]);
-            }
-            // Refresh installed skills from disk (picks up skill_install/remove
-            // since last load). Only invalidates the prompt cache if the set
-            // actually changed — see reload_skills.
-            self.reload_skills();
-        }
-
-        // /new — start a fresh conversation with new archive generation.
-        if self.handle.new_session_signal.load(Ordering::SeqCst) {
-            self.handle
-                .new_session_signal
-                .store(false, Ordering::SeqCst);
-            info!("new_session_signal received, starting new generation");
-
-            // Save session summary to memory before clearing — no summary
-            // will be injected into the new session, so memory is the only
-            // way the LLM can find prior context.
-            let compaction_model = self
-                .live
-                .agents
-                .read()
-                .await
-                .defaults
-                .compaction
-                .as_ref()
-                .and_then(|c| c.model.clone())
-                .or_else(|| {
-                    self.handle
-                        .config
-                        .model
-                        .as_ref()?
-                        .primary_head()
-                        .map(String::from)
-                })
-                .unwrap_or_else(|| "default".to_owned());
-            self.save_session_summaries_to_memory(&compaction_model)
-                .await;
-
-            self.sessions.clear();
-            self.compaction_state.clear();
-            if let Ok(mut map) = self.handle.session_tokens.write() {
-                map.clear();
-            }
-            for key in self.store.db.list_sessions().unwrap_or_default() {
-                match self.store.db.new_generation(&key) {
-                    Ok(g) => info!(session = %key, generation = g, "new generation started"),
-                    Err(e) => tracing::warn!("failed to start new generation: {e:#}"),
-                }
-            }
-            self.reload_skills();
+        // /clear or /new queued by the preparse bypass for THIS session
+        // (matched by session key, or by the same channel+sender when
+        // preparse could not derive the exact key). Strictly per session:
+        // other users' / agents' sessions and in-flight turns are untouched.
+        if let Some(kind) = self.handle.take_session_reset(session_key, channel, peer_id) {
+            info!(session = session_key, ?kind, "session reset requested, applying");
+            self.apply_session_reset(session_key, kind).await;
         }
 
         // Reclaim idle browser session (kills Chrome process) to free memory.
@@ -383,7 +298,10 @@ impl AgentRuntime {
 
         // Acquire concurrency permit (blocks if too many concurrent turns).
         let sem = Arc::clone(&self.handle.concurrency);
-        let _permit = sem
+        // Held for the rest of the turn; released explicitly before the
+        // voice-transcription re-entry below, which acquires its own permit
+        // (holding both would deadlock at laneConcurrency=1).
+        let lane_permit = sem
             .acquire()
             .await
             .map_err(|_| anyhow!("agent concurrency semaphore closed"))?;
@@ -1369,6 +1287,7 @@ impl AgentRuntime {
                 } else {
                     format!("{text}\n\n{combined}")
                 };
+                drop(lane_permit);
                 return Box::pin(self.run_turn(
                     session_key,
                     &full_text,
@@ -1389,6 +1308,7 @@ impl AgentRuntime {
                 } else {
                     format!("{text}\n\n{combined}")
                 };
+                drop(lane_permit);
                 return Box::pin(self.run_turn(
                     session_key,
                     &full_text,
@@ -2514,20 +2434,14 @@ impl AgentRuntime {
             session_key: session_key.to_string(),
         };
 
-        // Check if abort was requested before starting.
-        if abort_flag.load(Ordering::SeqCst) {
-            abort_flag.store(false, Ordering::SeqCst);
-            return Ok(AgentReply {
-                text: "[aborted]".to_string(),
-                is_empty: false,
-                tool_calls: None,
-                images: vec![],
-                files: vec![],
-                pending_analysis: None,
-                // Pre-loop abort bypasses agent_loop.
-                needs_outer_done_emit: true,
-                outcome: crate::registry::ReplyOutcome::Ok,
-            });
+        // A `true` here is stale: turns on one agent run sequentially, so no
+        // turn is running for this session yet and the flag was set by an
+        // earlier abort (e.g. a cron timeout that fired while the job was
+        // still queued) that no turn consumed. Reset it so this new turn is
+        // not instantly aborted; aborts issued from now on (mid-turn) still
+        // land on this same flag.
+        if abort_flag.swap(false, Ordering::SeqCst) {
+            tracing::debug!(session = %session_key, "cleared stale abort flag at turn start");
         }
 
         let mut ctx = RunContext {
@@ -2553,17 +2467,28 @@ impl AgentRuntime {
                     .and_then(|t| t.loop_detection.clone());
                 let ld_cfg = ld_cfg_owned.as_ref();
                 if ld_cfg.map(|c| c.enabled.unwrap_or(true)).unwrap_or(true) {
-                    let window = ld_cfg.and_then(|c| c.window).unwrap_or(20);
-                    let warning_threshold = ld_cfg.and_then(|c| c.threshold).unwrap_or(20);
+                    // Counts are taken inside the sliding window, so the
+                    // window must be at least as large as every critical
+                    // threshold or CRITICAL can never fire (the old defaults
+                    // window=20 / critical=30 made it unreachable).
+                    let warning_threshold = ld_cfg.and_then(|c| c.threshold).unwrap_or(10);
                     let critical_threshold = warning_threshold
                         .saturating_add(10)
-                        .max(warning_threshold + 1);
+                        .max(warning_threshold.saturating_add(1));
                     let overrides: std::collections::HashMap<String, (usize, usize)> = ld_cfg
                         .and_then(|c| c.overrides.clone())
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|(k, v)| (k, (v, v.saturating_add(10).max(v + 1))))
+                        .map(|(k, v)| (k, (v, v.saturating_add(10).max(v.saturating_add(1)))))
                         .collect();
+                    let max_critical = overrides
+                        .values()
+                        .map(|(_, c)| *c)
+                        .fold(critical_threshold, usize::max);
+                    let window = ld_cfg
+                        .and_then(|c| c.window)
+                        .unwrap_or(30)
+                        .max(max_critical);
                     LoopDetector::with_overrides(
                         window,
                         warning_threshold,
@@ -2874,6 +2799,8 @@ impl AgentRuntime {
         self.compact_if_needed(session_key, &model).await;
 
         // Evict stale sessions if the cache has grown too large.
+        self.session_last_active
+            .insert(session_key.to_owned(), std::time::Instant::now());
         self.evict_stale_sessions();
 
         // Auto-TTS: if session is in voice mode, generate audio for the reply.
@@ -2950,5 +2877,99 @@ impl AgentRuntime {
         .await;
 
         Ok(reply)
+    }
+}
+
+impl AgentRuntime {
+    /// Apply a queued `/clear` or `/new` to exactly one session: in-memory
+    /// history, compaction state, token stats, persisted messages and the
+    /// working plan. No other session is touched.
+    pub(crate) async fn apply_session_reset(
+        &mut self,
+        session_key: &str,
+        kind: crate::registry::SessionResetKind,
+    ) {
+        use crate::registry::SessionResetKind;
+
+        match kind {
+            SessionResetKind::Clear => {
+                // Keep a brief summary so the agent retains key context.
+                let summary = build_clear_summary(self.load_session(session_key));
+                self.forget_session_state(session_key);
+                if let Err(e) = self.store.db.delete_session(session_key) {
+                    warn!(session = %session_key, "failed to delete session: {e:#}");
+                }
+                if let Some(msg) = summary {
+                    match serde_json::to_value(&msg) {
+                        Ok(val) => {
+                            if let Err(e) = self.store.db.append_message(session_key, &val) {
+                                warn!("failed to persist clear summary: {e:#}");
+                            }
+                        }
+                        Err(e) => warn!("failed to serialize clear summary: {e:#}"),
+                    }
+                    self.sessions.insert(session_key.to_owned(), vec![msg]);
+                }
+            }
+            SessionResetKind::NewGeneration => {
+                // No summary is injected into the new generation, so memory is
+                // the only place the LLM can find prior context.
+                let compaction_model = self
+                    .live
+                    .agents
+                    .read()
+                    .await
+                    .defaults
+                    .compaction
+                    .as_ref()
+                    .and_then(|c| c.model.clone())
+                    .or_else(|| {
+                        self.handle
+                            .config
+                            .model
+                            .as_ref()?
+                            .primary_head()
+                            .map(String::from)
+                    })
+                    .unwrap_or_else(|| "default".to_owned());
+                self.load_session(session_key);
+                self.save_session_summaries_to_memory(session_key, &compaction_model)
+                    .await;
+                self.forget_session_state(session_key);
+                match self.store.db.new_generation(session_key) {
+                    Ok(g) => info!(session = %session_key, generation = g, "new generation started"),
+                    Err(e) => warn!(session = %session_key, "failed to start new generation: {e:#}"),
+                }
+            }
+            SessionResetKind::Delete => {
+                // No summary: a deleted session must not be resurrected with
+                // a summary row.
+                self.forget_session_state(session_key);
+                if let Err(e) = self.store.db.delete_session(session_key) {
+                    warn!(session = %session_key, "failed to delete session: {e:#}");
+                }
+            }
+        }
+        // Refresh installed skills from disk (picks up skill_install/remove
+        // since last load). Only invalidates the prompt cache if the set
+        // actually changed — see reload_skills.
+        self.reload_skills();
+    }
+
+    /// Drop the in-memory state of one session (history, compaction state,
+    /// token stats) and its persisted working plan — session keys are stable
+    /// per peer, so a stale todo would leak into the next conversation.
+    fn forget_session_state(&mut self, session_key: &str) {
+        self.sessions.remove(session_key);
+        self.compaction_state.remove(session_key);
+        self.session_last_active.remove(session_key);
+        self.handle.remove_session_tokens(session_key);
+        if let Err(e) = self
+            .store
+            .db
+            .kv_delete(&crate::tools_misc::todo_kv_key(session_key))
+        {
+            warn!("todo kv cleanup failed for {session_key}: {e:#}");
+        }
     }
 }

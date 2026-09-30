@@ -19,6 +19,7 @@ pub mod session;
 pub mod shutdown;
 pub mod startup;
 pub mod task_queue;
+pub mod trust;
 pub use hot_reload::{ConfigChange, FileWatcher};
 pub use live_config::LiveConfig;
 pub use router::{InboundMessage, Router};

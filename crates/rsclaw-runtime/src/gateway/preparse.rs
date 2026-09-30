@@ -253,6 +253,21 @@ fn preparse_session_key(
     })
 }
 
+/// Local slash commands that act on the host (shell, filesystem, screen,
+/// schedulers, coding agents, model switching, memory dumps). Non-owner
+/// senders are refused before any of them runs.
+pub(crate) fn is_owner_only_command(lower: &str, raw: &str) -> bool {
+    const EXACT: &[&str] = &["/ls", "/ss", "/screenshot", "/webshot", "/cap-exit", "/cap-resume", "/cron", "/loop", "/watch"];
+    const PREFIX: &[&str] = &[
+        "/run ", "/sh ", "/exec ", "/ls ", "/cat ", "/ss ", "/webshot ", "/cap ", "/cap-resume ",
+        "/cron ", "/loop ", "/watch ", "/skill ", "/model ", "/remember ", "/recall ",
+    ];
+    raw.starts_with("! ")
+        || raw.starts_with("$ ")
+        || EXACT.contains(&lower)
+        || PREFIX.iter().any(|p| lower.starts_with(p))
+}
+
 /// Handle certain fast preparse commands locally — without going through the
 /// agent queue. Returns `Some(reply_text)` for commands that can be answered
 /// immediately, `None` otherwise. This avoids blocking on the agent's
@@ -269,8 +284,9 @@ pub(crate) async fn try_preparse_locally(
     channel: &str,
     peer_id: &str,
     origin: PreparseOrigin,
+    trust: rsclaw_agent::SenderTrust,
 ) -> Option<OutboundMessage> {
-    try_preparse_locally_with_account(text, handle, channel, peer_id, None, origin).await
+    try_preparse_locally_with_account(text, handle, channel, peer_id, None, origin, trust).await
 }
 
 /// Account-aware variant. Channels that need multi-account routing
@@ -286,10 +302,28 @@ pub(crate) async fn try_preparse_locally_with_account(
     peer_id: &str,
     account: Option<&str>,
     origin: PreparseOrigin,
+    trust: rsclaw_agent::SenderTrust,
 ) -> Option<OutboundMessage> {
     use std::sync::atomic::Ordering;
     let t = text.trim();
     let lower = t.to_lowercase();
+
+    // Host-level commands (shell, file reads, screenshots, schedulers,
+    // coding agents) are owner-only. Channel membership decides who may
+    // talk to the bot; it does not grant access to the host.
+    if !trust.is_owner() && is_owner_only_command(&lower, t) {
+        tracing::warn!(channel, peer_id, "owner-only command refused for non-owner sender");
+        return Some(OutboundMessage {
+            target_id: String::new(),
+            is_group: false,
+            text: rsclaw_i18n::t("cmd_owner_only", rsclaw_i18n::default_lang()),
+            reply_to: None,
+            images: vec![],
+            files: vec![],
+            channel: None,
+            account: None,
+        });
+    }
 
     // Helper: text-only reply (target_id/is_group filled in by caller).
     let txt = |s: String| OutboundMessage {
@@ -416,8 +450,16 @@ pub(crate) async fn try_preparse_locally_with_account(
             f.store(true, Ordering::SeqCst);
         }
         drop(flags);
-        // 2. Signal runtime to clear sessions at next opportunity
-        handle.clear_signal.store(true, Ordering::SeqCst);
+        // 2. Queue a clear for THIS session only. The runtime applies it at
+        //    this session's next turn (or mid-loop if it is running). The
+        //    channel/peer pair lets it match when the turn's key differs from
+        //    `this_session_key` (group chats, non-default dmScope).
+        handle.request_session_reset(rsclaw_agent::SessionResetRequest {
+            kind: rsclaw_agent::SessionResetKind::Clear,
+            session_key: this_session_key.clone(),
+            channel: channel.to_owned(),
+            peer_id: peer_id.to_owned(),
+        });
         return Some(txt(rsclaw_i18n::t(
             "session_cleared",
             rsclaw_i18n::default_lang(),
@@ -434,7 +476,13 @@ pub(crate) async fn try_preparse_locally_with_account(
             f.store(true, Ordering::SeqCst);
         }
         drop(flags);
-        handle.new_session_signal.store(true, Ordering::SeqCst);
+        // Queue a new generation for THIS session only (see /clear above).
+        handle.request_session_reset(rsclaw_agent::SessionResetRequest {
+            kind: rsclaw_agent::SessionResetKind::NewGeneration,
+            session_key: this_session_key.clone(),
+            channel: channel.to_owned(),
+            peer_id: peer_id.to_owned(),
+        });
         return Some(txt(rsclaw_i18n::t(
             "session_new",
             rsclaw_i18n::default_lang(),

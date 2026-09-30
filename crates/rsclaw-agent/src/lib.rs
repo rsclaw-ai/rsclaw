@@ -55,6 +55,7 @@ pub mod tools_video;
 pub mod tools_voice;
 pub mod tools_web;
 pub mod trace_capture;
+pub mod trust;
 pub mod video;
 pub use rsclaw_types::turn_metrics;
 pub mod web_parsers;
@@ -66,8 +67,9 @@ pub use loop_detection::LoopDetector;
 pub use memory::{MemoryDoc, MemoryStore};
 pub use registry::{
     AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, FileAttachment,
-    ImageAttachment, PendingAnalysis, SessionTokens,
+    ImageAttachment, PendingAnalysis, SessionResetKind, SessionResetRequest, SessionTokens,
 };
 pub use runtime::{AgentRuntime, LiveStatus};
-pub use spawner::AgentSpawner;
+pub use spawner::{AgentSpawner, GoalContinuationFn, RuntimeWiring, process_queued_message};
+pub use trust::SenderTrust;
 pub use workspace::{SessionType, WorkspaceContext};

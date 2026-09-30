@@ -872,7 +872,10 @@ fn parse_llm_entities(raw: &str) -> Vec<KeyEntity> {
         Some(i) => i + 1,
         None => return vec![],
     };
-    let json_str = &raw[start..end];
+    // A stray `]` before the first `[` would make the range inverted and panic.
+    let Some(json_str) = raw.get(start..end) else {
+        return vec![];
+    };
 
     let arr: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
         Ok(v) => v,
@@ -1126,6 +1129,64 @@ pub(crate) fn compress_tool_results(messages: &mut Vec<Message>, preserve_tail: 
     }
 }
 
+/// Drop the oldest messages of a turn scratchpad until it holds at most
+/// `max_msgs` messages and `max_tokens` estimated tokens. Always keeps a valid
+/// tool pairing at the front (never starts on an orphaned `Tool` result) and
+/// never drops the newest message. Returns how many messages were removed.
+pub(crate) fn trim_scratchpad_front(
+    scratchpad: &mut Vec<Message>,
+    max_msgs: usize,
+    max_tokens: usize,
+) -> usize {
+    let mut total: usize = scratchpad.iter().map(msg_tokens).sum();
+    let mut drop_n = 0usize;
+    while scratchpad.len() - drop_n > 1
+        && (scratchpad.len() - drop_n > max_msgs || total > max_tokens)
+    {
+        total = total.saturating_sub(msg_tokens(&scratchpad[drop_n]));
+        drop_n += 1;
+    }
+    // Results whose ToolUse was just dropped would be orphans.
+    while drop_n < scratchpad.len().saturating_sub(1) && scratchpad[drop_n].role == Role::Tool {
+        drop_n += 1;
+    }
+    if drop_n > 0 {
+        scratchpad.drain(..drop_n);
+    }
+    drop_n
+}
+
+/// Cap every tool result in `scratchpad` except the newest tool message to
+/// `max_chars` chars (char-boundary safe). A trailing `read_artifact` handle,
+/// when present, is preserved. Used as the fallback when a context-exceeded
+/// retry finds nothing to compact. Returns how many results were shrunk.
+pub(crate) fn shrink_oldest_tool_results(scratchpad: &mut [Message], max_chars: usize) -> usize {
+    let last_tool = scratchpad.iter().rposition(|m| m.role == Role::Tool);
+    let mut shrunk = 0usize;
+    for (i, msg) in scratchpad.iter_mut().enumerate() {
+        if Some(i) == last_tool || msg.role != Role::Tool {
+            continue;
+        }
+        let MessageContent::Parts(parts) = &mut msg.content else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            let ContentPart::ToolResult { content, .. } = part else {
+                continue;
+            };
+            if content.chars().count() <= max_chars {
+                continue;
+            }
+            let (body, marker) = crate::tools_artifact::split_artifact_marker(content);
+            let head: String = body.chars().take(max_chars).collect();
+            let marker = marker.unwrap_or("");
+            *content = format!("{head}\n...(truncated to fit the context window){marker}");
+            shrunk += 1;
+        }
+    }
+    shrunk
+}
+
 /// Build a text description for a generic file attachment.
 #[allow(dead_code)]
 pub(crate) fn describe_file(filename: &str, mime_type: &str) -> String {
@@ -1191,5 +1252,69 @@ mod entity_extraction_tests {
         assert_eq!(addr.len(), 1, "{es:?}");
         assert!(addr[0].value.contains("张三"), "{:?}", addr[0].value);
         assert!(addr[0].value.contains("杭州市西湖区文三路50号"));
+    }
+
+    fn tool_pair(id: &str, content: &str) -> [Message; 2] {
+        [
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                    id: id.to_owned(),
+                    name: "exec".to_owned(),
+                    input: serde_json::json!({}),
+                }]),
+                rsclaw_hidden: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: id.to_owned(),
+                    content: content.to_owned(),
+                    is_error: Some(false),
+                }]),
+                rsclaw_hidden: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn trim_scratchpad_front_keeps_pairs_valid() {
+        let mut pad: Vec<Message> = Vec::new();
+        for i in 0..10 {
+            pad.extend(tool_pair(&format!("t{i}"), "ok"));
+        }
+        // Odd budget would split a pair; the orphan result must go too.
+        let dropped = trim_scratchpad_front(&mut pad, 5, usize::MAX);
+        assert_eq!(dropped, 16);
+        assert_eq!(pad.len(), 4);
+        assert_eq!(pad[0].role, Role::Assistant);
+    }
+
+    #[test]
+    fn shrink_oldest_tool_results_spares_newest_and_keeps_handle() {
+        let long = format!(
+            "{}\n\n[truncated — call read_artifact(tool_result_id=\"tr_1\") for full output]",
+            "字".repeat(3000)
+        );
+        let mut pad: Vec<Message> = Vec::new();
+        pad.extend(tool_pair("a", &long));
+        pad.extend(tool_pair("b", &long));
+        let n = shrink_oldest_tool_results(&mut pad, 100);
+        assert_eq!(n, 1);
+        let MessageContent::Parts(parts) = &pad[1].content else {
+            panic!("parts expected");
+        };
+        let ContentPart::ToolResult { content, .. } = &parts[0] else {
+            panic!("tool result expected");
+        };
+        assert!(content.contains("read_artifact(tool_result_id=\"tr_1\")"));
+        assert!(content.chars().count() < 300);
+        let MessageContent::Parts(parts) = &pad[3].content else {
+            panic!("parts expected");
+        };
+        let ContentPart::ToolResult { content, .. } = &parts[0] else {
+            panic!("tool result expected");
+        };
+        assert_eq!(content, &long);
     }
 }

@@ -110,12 +110,11 @@ pub struct AgentHandle {
     pub last_tools_tokens: Arc<AtomicUsize>,
     /// Message-history tokens of the most recent LLM call.
     pub last_msg_tokens: Arc<AtomicUsize>,
-    /// Signal to clear all sessions (set by /clear bypass, consumed by
-    /// runtime).
-    pub clear_signal: Arc<AtomicBool>,
-    /// Signal to start a new session (set by /new bypass, consumed by runtime).
-    /// Unlike clear_signal, this increments the archive generation.
-    pub new_session_signal: Arc<AtomicBool>,
+    /// Pending per-session `/clear` / `/new` requests queued by the
+    /// preparse bypass and consumed by the runtime (next turn of the matching
+    /// session, or mid-loop if that session is running). Scoped to one
+    /// session — never touches other users' sessions.
+    pub session_resets: Arc<std::sync::Mutex<Vec<SessionResetRequest>>>,
     /// Context window in tokens for this agent's primary model. Resolved
     /// at construction time by looking up the model name (e.g.
     /// `brain/brain-model`) in the provider config's `contextWindow`
@@ -137,6 +136,47 @@ pub struct AgentHandle {
     pub js_plugins: Arc<std::sync::RwLock<Option<Arc<rsclaw_plugin::PluginRegistry>>>>,
 }
 
+/// What a queued session reset does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionResetKind {
+    /// `/clear`: drop the session history, keeping a short summary.
+    Clear,
+    /// `/new`: start a new archive generation (summary goes to memory only).
+    NewGeneration,
+    /// Session deleted (HTTP / WS delete): drop the in-memory state and the
+    /// persisted rows without writing any summary back.
+    Delete,
+}
+
+/// A `/clear` or `/new` request queued for one session.
+///
+/// Preparse cannot always derive the exact session key the turn will use
+/// (group chats, non-default `dmScope`), so a request also matches a turn
+/// from the same `(channel, peer_id)` sender.
+#[derive(Debug, Clone)]
+pub struct SessionResetRequest {
+    pub kind: SessionResetKind,
+    /// Session key as derived by the requester (preparse).
+    pub session_key: String,
+    /// Channel the command arrived on.
+    pub channel: String,
+    /// Sender peer id of the command.
+    pub peer_id: String,
+}
+
+impl SessionResetRequest {
+    fn matches(&self, session_key: &str, channel: &str, peer_id: &str) -> bool {
+        self.session_key == session_key
+            || (!self.channel.is_empty()
+                && !self.peer_id.is_empty()
+                && self.channel == channel
+                && self.peer_id == peer_id)
+    }
+}
+
+/// Upper bound on queued reset requests per agent; the oldest are dropped.
+const MAX_PENDING_SESSION_RESETS: usize = 256;
+
 /// Per-session context token statistics.
 #[derive(Debug, Clone, Default)]
 pub struct SessionTokens {
@@ -151,6 +191,45 @@ pub struct SessionTokens {
 }
 
 impl AgentHandle {
+    /// Queue a `/clear` or `/new` for one session. A newer request for the
+    /// same session replaces an older one.
+    pub fn request_session_reset(&self, req: SessionResetRequest) {
+        let mut q = self
+            .session_resets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        q.retain(|r| r.session_key != req.session_key);
+        q.push(req);
+        if q.len() > MAX_PENDING_SESSION_RESETS {
+            let excess = q.len() - MAX_PENDING_SESSION_RESETS;
+            q.drain(..excess);
+        }
+    }
+
+    /// Remove and return the reset queued for this turn's session, if any.
+    /// When several match, the most recent request wins.
+    pub fn take_session_reset(
+        &self,
+        session_key: &str,
+        channel: &str,
+        peer_id: &str,
+    ) -> Option<SessionResetKind> {
+        let mut q = self
+            .session_resets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut found = None;
+        q.retain(|r| {
+            if r.matches(session_key, channel, peer_id) {
+                found = Some(r.kind);
+                false
+            } else {
+                true
+            }
+        });
+        found
+    }
+
     /// Replace the WASM plugin snapshot visible to slash handlers.
     pub fn set_wasm_plugins(&self, plugins: Arc<Vec<rsclaw_plugin::WasmPlugin>>) {
         if let Ok(mut g) = self.wasm_plugins.write() {
@@ -439,6 +518,10 @@ pub struct TurnContext {
     /// advancing for a while, a tool is genuinely wedged and the turn is
     /// cancelled. `None` for non-A2A/legacy turns (no watchdog wiring).
     pub progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Trust level of the sender driving this turn (copied from
+    /// `AgentMessage.trust`). Defaults to `User` so any path that forgets to
+    /// set it fails closed.
+    pub trust: crate::trust::SenderTrust,
 }
 
 impl TurnContext {
@@ -556,6 +639,10 @@ pub struct AgentMessage {
     pub images: Vec<ImageAttachment>,
     /// File attachments (raw bytes). Empty for text-only messages.
     pub files: Vec<FileAttachment>,
+    /// Trust level of the sender. Gates high-risk tools and local commands;
+    /// see [`crate::trust`]. Every construction site must decide this
+    /// explicitly — there is deliberately no default.
+    pub trust: crate::trust::SenderTrust,
 }
 
 /// Extract `[file:path]` references from user text, read the files from disk,
@@ -815,6 +902,7 @@ impl AgentRegistry {
                 channels: None,
                 commands: None,
                 allowed_commands: None,
+                non_owner_tools: None,
                 opencode,
                 claudecode,
                 codex,
@@ -840,10 +928,12 @@ impl AgentRegistry {
 
             for entry in &agent_list {
                 let (tx, rx) = mpsc::channel::<AgentMessage>(32);
+                // 0 would create a semaphore no turn can ever acquire.
                 let permits = entry
                     .lane_concurrency
                     .map(|n| n as usize)
-                    .unwrap_or(max_concurrent);
+                    .unwrap_or(max_concurrent)
+                    .max(1);
                 let kind = if entry.default == Some(true) {
                     AgentKind::Main
                 } else {
@@ -883,8 +973,7 @@ impl AgentRegistry {
                     last_sys_tokens: Arc::new(AtomicUsize::new(0)),
                     last_tools_tokens: Arc::new(AtomicUsize::new(0)),
                     last_msg_tokens: Arc::new(AtomicUsize::new(0)),
-                    clear_signal: Arc::new(AtomicBool::new(false)),
-                    new_session_signal: Arc::new(AtomicBool::new(false)),
+                    session_resets: Arc::new(std::sync::Mutex::new(Vec::new())),
                     context_window,
                     effective_model,
                     skills: Arc::new(std::sync::RwLock::new(Arc::new(
@@ -1145,6 +1234,7 @@ mod tests {
             name: None,
             commands: None,
             allowed_commands: None,
+            non_owner_tools: None,
             opencode: None,
             claudecode: None,
             codex: None,
@@ -1184,4 +1274,33 @@ mod tests {
         assert!(reg.get("alpha").is_ok());
         assert!(reg.get("nonexistent").is_err());
     }
+
+    #[test]
+    fn session_reset_is_scoped_to_one_session() {
+        let cfg = make_runtime(vec![entry("main", true, None)]);
+        let reg = AgentRegistry::from_config(&cfg);
+        let h = reg.get("main").expect("agent");
+        h.request_session_reset(SessionResetRequest {
+            kind: SessionResetKind::Clear,
+            session_key: "agent:main:telegram:direct:alice".to_owned(),
+            channel: "telegram".to_owned(),
+            peer_id: "alice".to_owned(),
+        });
+        // Another user's turn must not consume (or be affected by) it.
+        assert!(
+            h.take_session_reset("agent:main:telegram:direct:bob", "telegram", "bob")
+                .is_none()
+        );
+        // Same sender in a group session matches via channel + peer.
+        assert_eq!(
+            h.take_session_reset("agent:main:telegram:group:g1", "telegram", "alice"),
+            Some(SessionResetKind::Clear)
+        );
+        // Consumed exactly once.
+        assert!(
+            h.take_session_reset("agent:main:telegram:direct:alice", "telegram", "alice")
+                .is_none()
+        );
+    }
 }
+

@@ -182,7 +182,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     //    drain, opening redb here would fail with "Database locked by another
     //    gateway instance". Wait up to 5s for the parent to actually exit before
     //    letting MemoryStore / KB / a2a tasks open their redbs.
-    wait_for_parent_release();
+    wait_for_parent_release().await;
+
+    // ---- Process-environment mutation window ----------------------------
+    // Every `std::env::set_var` / `remove_var` the gateway performs happens
+    // in this block, first thing in `start_gateway` and before it spawns any
+    // task, subprocess or HTTP client. The tokio runtime (built in main
+    // before config is loaded) already has idle worker threads, so these
+    // writes are not strictly single-threaded; keeping them in one place
+    // before anything else runs is what makes them safe in practice. Do not
+    // add env writes elsewhere.
+    //
     // 0. Refresh the tools/bin shim dir, then enrich the process PATH before
     //    anything spawns a subprocess. Desktop/launchd-started gateways inherit a
     //    stripped PATH; the shim dir + PATH prepend let cap-rs coding-agent drivers
@@ -194,18 +204,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // 0. Apply global proxy env vars before any HTTP clients are created.
     rsclaw_config::apply_proxy_env(&config);
 
-    // 0a. Initialize the self-evolution config singleton from
-    //     `[ext.evolution]` (or built-in defaults if absent). Read by memory
-    //     tier transition, crystallizer, and meditation phases.
-    rsclaw_agent::evolution::init_evolution_config(
-        rsclaw_agent::evolution::EvolutionConfig::from_raw(config.ext.evolution.as_ref()),
-    );
-
     // 0b. Propagate skill-registry credentials from rsclaw.json5 into
     //     process env. Spawned skill subprocesses (python CLIs etc.)
     //     inherit env, so this is the bridge that lets users keep keys
-    //     in the config file instead of shell rc / launchctl. Done here,
-    //     pre-runtime, while the process is still single-threaded.
+    //     in the config file instead of shell rc / launchctl.
     propagate_skill_registry_env(&config);
 
     // 0c. Propagate the root-level `env: { … }` map into process env.
@@ -214,6 +216,18 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     //     and gateway-spawned subprocesses. Shell-provided env wins so
     //     `ASTOCK=... cargo run -- gateway restart` still overrides.
     propagate_user_env(&config);
+    // ---- End of environment mutation window -----------------------------
+
+    // 0. Sender trust: owners (gateway.owners + static channel allowFrom)
+    //    gate high-risk tools and local slash commands.
+    crate::gateway::trust::refresh_from_config(&config);
+
+    // 0a. Initialize the self-evolution config singleton from
+    //     `[ext.evolution]` (or built-in defaults if absent). Read by memory
+    //     tier transition, crystallizer, and meditation phases.
+    rsclaw_agent::evolution::init_evolution_config(
+        rsclaw_agent::evolution::EvolutionConfig::from_raw(config.ext.evolution.as_ref()),
+    );
 
     // 1. Resolve data directory — respects RSCLAW_BASE_DIR for --dev/--profile.
     let base_dir = rsclaw_config::loader::base_dir();
@@ -733,9 +747,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             };
                             if let Some(tx) = tx {
                                 info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
-                                if let Err(e) = tx.send(msg.clone()).await {
-                                    tracing::warn!(error = %e, "notification send failed");
-                                }
+                                route_notification(ch_name, &tx, msg.clone());
                             } else if is_sync_only_channel(ch_name) {
                                 // sync-only channels (HTTP /api/v1/message, future stdio
                                 // MCP, etc.) carry their reply back through their own
@@ -755,20 +767,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                                 warn!(channel = %ch_name, "no channel sender registered for notification");
                             }
                         } else {
-                            // No channel specified — send to first registered channel (default)
-                            let first = {
-                                let guard =
-                                    senders.read().expect("channel_senders RwLock poisoned");
-                                guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
-                            };
-                            if let Some((ch_name, tx)) = first {
-                                info!(channel = %ch_name, "routing notification to default channel");
-                                if let Err(e) = tx.send(msg.clone()).await {
-                                    tracing::warn!(error = %e, "notification send failed");
-                                }
-                            } else {
-                                warn!("notification: no channels registered");
-                            }
+                            // No channel specified. Picking "the first" entry of
+                            // a HashMap is effectively random and would deliver
+                            // to the wrong recipient on the wrong channel; drop.
+                            warn!(
+                                target_id = %msg.target_id,
+                                "notification without a channel dropped"
+                            );
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -867,12 +872,36 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             let old = live_reload.snapshot().await;
                             rsclaw_config::live_config::classify_change(&old, &new_owned)
                         };
+                        crate::gateway::trust::refresh_from_config(&new_owned);
                         live_reload.apply(new_owned).await;
                         drop(guard);
 
+                        // The watcher emits `RequiresRestart` just before the
+                        // `FullReload` of the same save. When a Required
+                        // restart is already pending, don't replace that banner
+                        // with a weaker reload / recommended one.
+                        let required_pending = bridge_pending
+                            .read()
+                            .map(|g| {
+                                g.as_ref().is_some_and(|r| {
+                                    r.urgency == rsclaw_events::RestartUrgency::Required
+                                })
+                            })
+                            .unwrap_or(false);
                         match impact {
                             rsclaw_config::live_config::ChangeImpact::Hot => {
                                 info!("config hot-reload applied (hot-safe fields only)");
+                            }
+                            rsclaw_config::live_config::ChangeImpact::NeedsReload {
+                                sections, ..
+                            }
+                            | rsclaw_config::live_config::ChangeImpact::NeedsRestart { sections }
+                                if required_pending =>
+                            {
+                                info!(
+                                    ?sections,
+                                    "config change applied; a required restart is already pending"
+                                );
                             }
                             // Snapshotted inside components (agent handles,
                             // provider/skill/plugin registries) — a scoped
@@ -931,7 +960,14 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         );
                     }
                     Ok(_) => {}
-                    Err(_) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // A burst of saves overflowed the buffer. Keep the
+                        // bridge alive; the next change carries the latest
+                        // full config anyway.
+                        warn!(skipped = n, "config reload bridge lagged; continuing");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -948,8 +984,52 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             std::collections::HashMap<String, Arc<rsclaw_channel::custom::CustomWebhookChannel>>,
         >,
     > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    // Custom channels named like a local entry point ("ws", "cli", ...) would
+    // inherit owner trust; refuse them.
+    let reserved_custom = config
+        .channel
+        .channels
+        .custom
+        .as_ref()
+        .is_some_and(|cs| cs.iter().any(|c| rsclaw_agent::trust::is_local_channel(&c.name)));
+    let custom_start_cfg;
+    let custom_cfg_ref: &RuntimeConfig = if reserved_custom {
+        let mut c: RuntimeConfig = (*config).clone();
+        if let Some(cs) = c.channel.channels.custom.as_mut() {
+            cs.retain(|ch| {
+                let reserved = rsclaw_agent::trust::is_local_channel(&ch.name);
+                if reserved {
+                    warn!(
+                        channel = %ch.name,
+                        "custom channel uses a reserved local channel name; refusing to start it"
+                    );
+                }
+                !reserved
+            });
+        }
+        custom_start_cfg = c;
+        &custom_start_cfg
+    } else {
+        config.as_ref()
+    };
+    // Webhooks (hooks.* and custom webhook channels) refuse every request
+    // until a non-empty hooks.token resolves.
+    let hooks_enabled = config.ops.hooks.as_ref().is_some_and(|h| h.enabled);
+    let has_custom_webhook = config
+        .channel
+        .channels
+        .custom
+        .as_ref()
+        .is_some_and(|cs| cs.iter().any(|c| c.channel_type == "webhook"));
+    if (hooks_enabled || has_custom_webhook) && crate::hooks::resolve_hooks_token(&config).is_none()
+    {
+        warn!(
+            "webhooks are configured but hooks.token is missing or did not resolve; \
+             /hooks/* will answer 503 until a token is set"
+        );
+    }
     start_custom_channels(
-        &config,
+        custom_cfg_ref,
         Arc::clone(&registry),
         &channel_manager,
         Arc::clone(&custom_webhooks),
@@ -1703,7 +1783,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 /// already exited. Logs at info on actual wait so the next
 /// "why did startup take 3 seconds" question is answerable from the
 /// log alone.
-fn wait_for_parent_release() {
+async fn wait_for_parent_release() {
     let Ok(pid_str) = std::env::var("RSCLAW_PARENT_PID") else {
         return;
     };
@@ -1733,7 +1813,7 @@ fn wait_for_parent_release() {
             return;
         }
         waited = true;
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     warn!(
         parent_pid = pid,
@@ -1943,6 +2023,43 @@ fn registry_env_names(name: &str) -> Option<(&'static str, &'static str)> {
 /// SAFETY: called once during single-threaded gateway startup, before
 /// any async runtime tasks spawn — matches the existing precedent in
 /// `apply_proxy_env` and `propagate_skill_registry_env`.
+/// How long a notification may wait for room in a full channel queue before
+/// it is dropped.
+const NOTIFICATION_SEND_TIMEOUT_SECS: u64 = 30;
+
+/// Hand `msg` to a channel's outbound queue without blocking the notification
+/// router: a full queue (stuck channel) gets a bounded background wait so
+/// other channels keep flowing.
+fn route_notification(
+    ch_name: &str,
+    tx: &mpsc::Sender<OutboundMessage>,
+    msg: OutboundMessage,
+) {
+    match tx.try_send(msg) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(msg)) => {
+            warn!(channel = %ch_name, "notification queue full; delivering in background");
+            let tx = tx.clone();
+            let ch = ch_name.to_owned();
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(NOTIFICATION_SEND_TIMEOUT_SECS),
+                    tx.send(msg),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(channel = %ch, error = %e, "notification send failed"),
+                    Err(_) => warn!(channel = %ch, "notification dropped: channel queue stayed full"),
+                }
+            });
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!(channel = %ch_name, "notification send failed: channel closed");
+        }
+    }
+}
+
 fn propagate_user_env(config: &RuntimeConfig) {
     let Some(env_map) = config.raw.env.as_ref() else {
         return;
@@ -2026,6 +2143,22 @@ fn spawn_agent_tasks(
     cap_manager: std::sync::Arc<rsclaw_cap::CapAgentManager>,
     cap_live_manager: std::sync::Arc<rsclaw_cap::CapLiveManager>,
 ) {
+    let goal_continuation: rsclaw_agent::GoalContinuationFn =
+        Arc::new(enqueue_goal_continuation);
+    // Hand the same gateway wiring to the spawner so dynamically spawned and
+    // hot-replaced agents (config reload) keep MCP, notifications,
+    // computer-use and /goal continuation.
+    if let Some(sp) = spawner.as_ref() {
+        sp.set_runtime_wiring(rsclaw_agent::RuntimeWiring {
+            mcp: mcp.clone(),
+            notification_tx: notification_tx.clone(),
+            computer_permission: Some(Arc::clone(&computer_permission)),
+            computer_permission_tx: Some(computer_permission_tx.clone()),
+            computer_status_tx: Some(computer_status_tx.clone()),
+            computer_runs: Some(Arc::clone(&computer_runs)),
+            goal_continuation: Some(Arc::clone(&goal_continuation)),
+        });
+    }
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
             Ok(h) => h,
@@ -2082,8 +2215,7 @@ fn spawn_agent_tasks(
         runtime.computer_status_tx = Some(computer_status_tx.clone());
         runtime.computer_runs = Some(Arc::clone(&computer_runs));
 
-        let event_tx_task = event_tx.clone();
-        let config_for_task = Arc::clone(&config);
+        let goal_continuation = goal_continuation.clone();
         tokio::spawn(async move {
             info!(agent_id = %handle.id, "agent runtime task started");
             loop {
@@ -2103,356 +2235,45 @@ fn spawn_agent_tasks(
                     channel = %msg.channel,
                     "agent runtime: received msg from queue"
                 );
-                let AgentMessage {
-                    session_key,
-                    text,
-                    channel,
-                    peer_id,
-                    chat_id,
-                    reply_tx,
-                    extra_tools,
-                    images,
-                    files,
-                    account,
-                    task_id,
-                    context_id,
-                    cancel_token,
-                    event_tx,
-                    input_request_tx,
-                } = msg;
-                // Hard-cancel token for this turn. A2A callers supply their own
-                // (CancelTask). For everyone else (WS chat.abort, channels) we
-                // mint one and register it under the session key so chat.abort
-                // can fire `.cancel()` — the `tokio::select!` below then drops
-                // the in-flight `run_turn` future immediately, even if it's
-                // parked on a stalled LLM stream. `registered` tracks whether
-                // we own the map entry so we clean it up afterwards.
-                let (turn_token, registered) = match cancel_token {
-                    Some(t) => (t, false),
-                    None => {
-                        let t = tokio_util::sync::CancellationToken::new();
-                        if let Ok(mut toks) = handle.cancel_tokens.write() {
-                            toks.insert(session_key.clone(), t.clone());
-                        }
-                        (t, true)
-                    }
-                };
-
-                // Build a TurnContext from the A2A wires on AgentMessage.
-                // `cancel_token` is now always set, so the runtime's
-                // cooperative `is_cancelled()` checks (between iterations and
-                // at tool-dispatch boundaries) also observe WS aborts.
-                let is_daemon = runtime.is_daemon_agent(&handle.id);
-                // Progress heartbeat for the daemon watchdog (bumped once per
-                // agent-loop iteration via TurnContext::progress_tick).
-                let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let turn_ctx = rsclaw_agent::registry::TurnContext {
-                    task_id,
-                    context_id,
-                    event_tx,
-                    cancel_token: Some(turn_token.clone()),
-                    input_request_tx,
-                    progress: Some(progress.clone()),
-                };
-                // Stuck-turn watchdog. Two modes:
-                //  - Normal turns: flat 20-min wall-clock cap (a single turn should complete;
-                //    if not, something's wedged).
-                //  - Daemon agents (agent_wechat monitor): they loop FOREVER, so a wall-clock
-                //    cap can't apply. Instead watch PROGRESS — the loop bumps a counter every
-                //    iteration; if it stops advancing for STALL_LIMIT, a tool is genuinely
-                //    wedged (e.g. enter_chat spinning), so cancel and let the cron backstop
-                //    restart. A healthy forever-loop bumps every few seconds → never killed.
-                let watchdog_token = turn_token.clone();
-                let watchdog_agent = handle.id.clone();
-                let watchdog_session = session_key.clone();
-                let watchdog = tokio::spawn(async move {
-                    use std::sync::atomic::Ordering;
-                    if is_daemon {
-                        const POLL: std::time::Duration = std::time::Duration::from_secs(30);
-                        const STALL_LIMIT: std::time::Duration =
-                            std::time::Duration::from_secs(180);
-                        let mut last = progress.load(Ordering::Relaxed);
-                        let mut stalled = std::time::Duration::ZERO;
-                        loop {
-                            tokio::time::sleep(POLL).await;
-                            if watchdog_token.is_cancelled() {
-                                break;
-                            }
-                            let cur = progress.load(Ordering::Relaxed);
-                            if cur != last {
-                                last = cur;
-                                stalled = std::time::Duration::ZERO;
-                                continue;
-                            }
-                            stalled += POLL;
-                            if stalled >= STALL_LIMIT {
-                                tracing::error!(
-                                    agent = %watchdog_agent,
-                                    session = %watchdog_session,
-                                    stall_s = stalled.as_secs(),
-                                    "stuck-turn watchdog (daemon): no loop progress — a tool is \
-                                     wedged; firing cancel_token (cron will restart)"
-                                );
-                                watchdog_token.cancel();
-                                break;
-                            }
-                        }
-                    } else {
-                        const TURN_WALL_CLOCK_LIMIT: std::time::Duration =
-                            std::time::Duration::from_secs(20 * 60);
-                        tokio::time::sleep(TURN_WALL_CLOCK_LIMIT).await;
-                        if !watchdog_token.is_cancelled() {
-                            tracing::error!(
-                                agent = %watchdog_agent,
-                                session = %watchdog_session,
-                                limit_s = TURN_WALL_CLOCK_LIMIT.as_secs(),
-                                "stuck-turn watchdog: firing cancel_token — turn exceeded \
-                                 wall-clock limit; the agent queue must not stay dark"
-                            );
-                            watchdog_token.cancel();
-                        }
-                    }
-                });
-                let result = tokio::select! {
-                    biased;
-                    // Hard cancel: drops the run_turn future (and every await
-                    // it holds — LLM stream, tool calls) the moment the token
-                    // fires. This is what frees the single-threaded queue when
-                    // a turn is wedged on a non-yielding await.
-                    _ = turn_token.cancelled() => Err(anyhow::anyhow!("turn aborted")),
-                    r = runtime.run_turn(
-                        &session_key,
-                        &text,
-                        &channel,
-                        &peer_id,
-                        &chat_id,
-                        account.as_deref(),
-                        extra_tools,
-                        images,
-                        files,
-                        turn_ctx,
-                    ) => r,
-                };
-                // Turn completed (success/error/cancel) — stop the watchdog.
-                // If the watchdog already fired the cancel, the select! above
-                // already exited via the cancellation branch; this abort is
-                // just hygiene to release the spawned task.
-                watchdog.abort();
-                // Drop our registered token so a later abort for this session
-                // can't cancel a future turn, and the map doesn't leak.
-                if registered {
-                    if let Ok(mut toks) = handle.cancel_tokens.write() {
-                        toks.remove(&session_key);
-                    }
-                }
-                let turn_errored = result.is_err();
-                let reply = result.unwrap_or_else(|e| {
-                    // A2A consumers key off `outcome` to publish the right
-                    // terminal status (Failed vs Canceled). Without this
-                    // distinction the A2A reply-watcher saw `Ok(reply)` and
-                    // always published Completed — so cancellations and
-                    // LLM/tool errors were silently reported as success.
-                    //
-                    // Both A2A CancelTask and WS chat.abort produce
-                    // cancellations from the user; only genuine LLM/tool
-                    // failures should map to Error and show
-                    // "backend_unavailable" to the user. "turn aborted" is
-                    // the WS abort path (agent/runtime.rs:5457), "canceled
-                    // by A2A CancelTask" is the A2A path.
-                    let err_str = e.to_string();
-                    let is_user_cancel = err_str.contains("canceled by A2A CancelTask")
-                        || err_str.contains("turn aborted");
-                    // A user-initiated cancel is not an error — log at INFO so
-                    // it doesn't pollute error dashboards / alerting.
-                    if is_user_cancel {
-                        info!(agent = %handle.id, "turn canceled by user: {e:#}");
-                    } else {
-                        error!(agent = %handle.id, "turn error: {e:#}");
-                    }
-                    let outcome = if is_user_cancel {
-                        rsclaw_agent::registry::ReplyOutcome::Canceled
-                    } else {
-                        rsclaw_agent::registry::ReplyOutcome::Error
-                    };
-                    // User-facing text: don't leak the raw anyhow Error
-                    // (HTTP status codes, internal IDs, JSON error bodies)
-                    // to the chat channel — that material is operator-
-                    // debug-only and lives in the ERROR log above. The
-                    // end user sees an i18n'd "service unavailable" line
-                    // for real LLM / transport errors; the original
-                    // outcome tag (Error / Canceled) survives so A2A
-                    // consumers still key off the terminal status.
-                    let i18n_lang = config_for_task
-                        .raw
-                        .gateway
-                        .as_ref()
-                        .and_then(|g| g.language.as_deref())
-                        .map(rsclaw_i18n::resolve_lang)
-                        .unwrap_or("en");
-                    let user_text = match outcome {
-                        rsclaw_agent::registry::ReplyOutcome::Canceled => "[canceled]".to_owned(),
-                        _ => rsclaw_i18n::t("backend_unavailable", i18n_lang),
-                    };
-                    AgentReply {
-                        text: user_text,
-                        is_empty: false,
-                        tool_calls: None,
-                        images: vec![],
-                        files: vec![],
-                        pending_analysis: None,
-                        needs_outer_done_emit: false,
-                        outcome,
-                    }
-                });
-                // Emit to event_bus for any reply path that bypassed
-                // agent_loop (preparse, file-attach short-circuits, /btw,
-                // disk-low, __DIRECT_REPLY__, etc.) *and* for turns that
-                // failed with Err (agent_loop returns early via `?` on LLM
-                // errors and never gets to emit done — WS clients would hang
-                // waiting for the terminator forever). Normal LLM turns
-                // already emit deltas + done from inside agent_loop, so a
-                // second emit would duplicate the done frame.
-                if reply.needs_outer_done_emit || turn_errored {
-                    if !reply.text.is_empty() {
-                        // receiver may have been dropped
-                        let _ = event_tx_task.send(rsclaw_events::AgentEvent {
-                            session_id: session_key.clone(),
-                            agent_id: handle.id.clone(),
-                            delta: reply.text.clone(),
-                            done: false,
-                            files: vec![],
-                            images: vec![],
-                            tool_log: vec![],
-                            question: None,
-                            channel: None,
-                        });
-                    }
-                    // receiver may have been dropped
-                    let _ = event_tx_task.send(rsclaw_events::AgentEvent {
-                        session_id: session_key.clone(),
-                        agent_id: handle.id.clone(),
-                        delta: String::new(),
-                        done: true,
-                        files: vec![],
-                        images: vec![],
-                        tool_log: vec![],
-                        question: None,
-                        channel: None,
-                    });
-                }
-                // /goal — completion-driven turn loop. See
-                // `src/agent/goal.rs`. After every turn, if the
-                // session has an active goal we either:
-                //   * append a terminal status (✅/❌/⚠) to the reply text so the user sees it
-                //     in the same chat bubble, AND clear the goal state, OR
-                //   * schedule the next iteration via the task queue.
-                //
-                // Mutating `reply.text` is safe because nothing on the
-                // path from here to the channel send re-evaluates the
-                // text against goal markers — the hook ran, the
-                // decision is made. Submitting the next turn happens
-                // INSIDE this match arm (not via reply_tx) because the
-                // channel reply path delivers `reply` to the user; the
-                // next /goal turn is a separate enqueued message that
-                // arrives through the normal worker loop.
-                let mut reply = reply;
-                if !turn_errored
-                    && let Some(reaction) =
-                        rsclaw_agent::goal::check_after_turn(&session_key, &reply.text).await
-                {
-                    use rsclaw_agent::goal::Reaction;
-                    match reaction {
-                        Reaction::Done(status_line) => {
-                            // Strip the GOAL_ marker line itself so it
-                            // doesn't read as machine output in the
-                            // user's chat — the human-friendly status
-                            // line we append takes its place.
-                            reply.text = strip_trailing_goal_marker(&reply.text);
-                            if !reply.text.is_empty() {
-                                reply.text.push_str("\n\n");
-                            }
-                            reply.text.push_str(&status_line);
-                            reply.is_empty = reply.text.is_empty()
-                                && reply.images.is_empty()
-                                && reply.files.is_empty();
-                        }
-                        Reaction::Continue(next_prompt) => {
-                            // Strip the user-visible reply of any
-                            // accidentally-leaked GOAL_* marker
-                            // (parse_terminal said Continue, so there
-                            // can't be one — but defensive).
-                            if let Some(tq) = crate::gateway::task_queue::get_task_queue() {
-                                let delivery_channel: &str =
-                                    if channel == "ws" { "desktop" } else { &channel };
-                                if let Err(e) = crate::gateway::task_queue::submit_to_queue(
-                                    &tq,
-                                    &session_key,
-                                    &next_prompt,
-                                    delivery_channel,
-                                    &peer_id,
-                                    &peer_id,
-                                    false,
-                                    crate::gateway::task_queue::Priority::Cron,
-                                ) {
-                                    warn!(
-                                        session = %session_key,
-                                        error = %e,
-                                        "/goal: failed to enqueue continuation turn"
-                                    );
-                                }
-                            } else {
-                                warn!(
-                                    "/goal: task_queue not installed; cannot enqueue continuation"
-                                );
-                            }
-                        }
-                    }
-                }
-                // receiver may have been dropped (e.g. channel timeout)
-                let _ = reply_tx.send(reply);
+                // Shared worker body (trust + A2A wires into TurnContext,
+                // cancel-token registration, watchdog, error mapping, done
+                // emit, /goal hook, reply) — the same function drives
+                // dynamically spawned / hot-replaced agents in AgentSpawner.
+                rsclaw_agent::process_queued_message(&mut runtime, msg, Some(&goal_continuation))
+                    .await;
             }
             info!(agent_id = %handle.id, "agent runtime task ended (channel closed)");
         });
     }
 }
 
+/// `/goal` continuation hook: enqueue the next iteration on the task queue.
+fn enqueue_goal_continuation(session_key: &str, next_prompt: &str, channel: &str, peer_id: &str) {
+    let Some(tq) = crate::gateway::task_queue::get_task_queue() else {
+        warn!("/goal: task_queue not installed; cannot enqueue continuation");
+        return;
+    };
+    if let Err(e) = crate::gateway::task_queue::submit_to_queue(
+        &tq,
+        session_key,
+        next_prompt,
+        channel,
+        peer_id,
+        peer_id,
+        false,
+        crate::gateway::task_queue::Priority::Cron,
+    ) {
+        warn!(
+            session = %session_key,
+            error = %e,
+            "/goal: failed to enqueue continuation turn"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bind address helper
 // ---------------------------------------------------------------------------
-
-/// Drop the trailing `GOAL_ACHIEVED` / `GOAL_FAILED ...` line from a
-/// reply when it terminated a `/goal` loop. Anything after the marker
-/// on the same line is also dropped (per spec the marker must be the
-/// last non-blank line). We then trim any leftover trailing blank
-/// lines so the appended "✅ Goal achieved" status reads as a clean
-/// continuation, not as a margin-floating block.
-fn strip_trailing_goal_marker(text: &str) -> String {
-    let mut lines: Vec<&str> = text.lines().collect();
-    // Find the last non-blank line. If it carries a marker, remove it
-    // plus any blank lines that immediately precede it.
-    while let Some(last) = lines.last() {
-        if last.trim().is_empty() {
-            lines.pop();
-            continue;
-        }
-        break;
-    }
-    if let Some(last) = lines.last() {
-        let t = last.trim();
-        if t == "GOAL_ACHIEVED" || t.starts_with("GOAL_FAILED") {
-            lines.pop();
-            // Strip any blank lines now trailing.
-            while let Some(last) = lines.last() {
-                if last.trim().is_empty() {
-                    lines.pop();
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-    lines.join("\n")
-}
 
 fn resolve_bind_addr(config: &RuntimeConfig) -> SocketAddr {
     let port = config.gateway.port;
@@ -2565,6 +2386,7 @@ pub(crate) async fn handle_pending_analysis(
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
+        trust: rsclaw_agent::trust::channel_trust(&analysis.channel, &analysis.peer_id, is_group),
         session_key: analysis.session_key,
         text: analysis.text,
         channel: analysis.channel,
@@ -2667,6 +2489,11 @@ async fn run_embedder_reembed(
     /// Docs embedded per batch. Keeps each lock window to a few hundred ms
     /// even with the slowest CPU-only BGE inference.
     const BATCH: usize = 50;
+    /// Stop the pass once this many embeds in a row failed with no success in
+    /// between — the embedder is down (or these docs can never embed), so
+    /// spinning further only burns CPU / remote quota. Unmigrated docs stay
+    /// pending and the next start retries them.
+    const MAX_CONSECUTIVE_FAILURES: usize = 20;
 
     let (embedder, expected_total) = {
         let mut mem = mem_arc.lock().await;
@@ -2679,6 +2506,8 @@ async fn run_embedder_reembed(
 
     let mut total = 0usize;
     let mut batch_no = 0usize;
+    let mut consecutive_failures = 0usize;
+    let mut stopped_early = false;
     loop {
         let pending = {
             let mem = mem_arc.lock().await;
@@ -2694,10 +2523,36 @@ async fn run_embedder_reembed(
         // calls are safe.
         let batch_started = std::time::Instant::now();
         use rayon::prelude::*;
-        let batch: Vec<(usize, Vec<f32>)> = pending
+        let results: Vec<(usize, anyhow::Result<Vec<f32>>)> = pending
             .into_par_iter()
-            .map(|(idx, text)| (idx, embedder.embed(&text)))
+            .map(|(idx, text)| (idx, embedder.try_embed(&text)))
             .collect();
+        let mut batch: Vec<(usize, Vec<f32>)> = Vec::with_capacity(results.len());
+        let mut failed = 0usize;
+        for (idx, res) in results {
+            match res {
+                Ok(v) => batch.push((idx, v)),
+                Err(e) => {
+                    failed += 1;
+                    warn!(idx, error = %format!("{e:#}"), "embedder re-embed: embedding failed, skipping doc");
+                }
+            }
+        }
+        if batch.is_empty() {
+            consecutive_failures += failed;
+        } else {
+            consecutive_failures = 0;
+        }
+        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            warn!(
+                consecutive_failures,
+                total,
+                expected = expected_total,
+                "embedder re-embed: embedder keeps failing; stopping early (remaining docs retry on next start)"
+            );
+            stopped_early = true;
+            break;
+        }
         let applied = {
             let mut mem = mem_arc.lock().await;
             match mem.swap_apply_batch(batch) {
@@ -2731,6 +2586,14 @@ async fn run_embedder_reembed(
             batch_ms = batch_started.elapsed().as_millis() as u64,
             "embedder re-embed: batch complete"
         );
+    }
+
+    if stopped_early && total == 0 {
+        // Nothing migrated: keep the old primary index serving instead of
+        // swapping in an empty one.
+        let mut mem = mem_arc.lock().await;
+        mem.abort_swap();
+        anyhow::bail!("embedder re-embed: embedder failed for every doc; migration aborted");
     }
 
     let migrated = {

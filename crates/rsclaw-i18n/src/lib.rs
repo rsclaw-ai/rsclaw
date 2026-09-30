@@ -2083,6 +2083,131 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "Эта команда доступна только владельцу.",
     );
 
+    msg!("cron_backoff_seconds",
+        "en" => "{n}s",
+        "zh" => "{n}秒",
+    );
+
+    msg!("cron_backoff_minutes",
+        "en" => "{n}min",
+        "zh" => "{n}分钟",
+    );
+
+    msg!("cron_backoff_hours",
+        "en" => "{n}h",
+        "zh" => "{n}小时",
+    );
+
+    msg!("cron_oneshot_missed",
+        "en" => "[missed] Scheduled task \"{name}\" did not run: its time passed while the gateway was offline. It has been removed.",
+        "zh" => "[错过] 定时任务「{name}」未执行：计划时间到达时网关处于离线状态，该任务已移除。",
+    );
+
+    msg!("goal_state_error",
+        "en" => "[goal] Stopped: the goal state could not be updated ({condition}). Send `/goal {condition}` to restart.",
+        "zh" => "[goal] 已停止：目标状态无法更新（{condition}）。发送 `/goal {condition}` 重新开始。",
+    );
+
+    msg!("tg_cmd_help",
+        "en" => "Show available commands",
+        "zh" => "显示可用命令",
+    );
+
+    msg!("tg_cmd_run",
+        "en" => "Execute a shell command",
+        "zh" => "执行 shell 命令",
+    );
+
+    msg!("tg_cmd_search",
+        "en" => "Search the web",
+        "zh" => "网页搜索",
+    );
+
+    msg!("tg_cmd_fetch",
+        "en" => "Fetch a web page",
+        "zh" => "抓取网页",
+    );
+
+    msg!("tg_cmd_find",
+        "en" => "Find files",
+        "zh" => "查找文件",
+    );
+
+    msg!("tg_cmd_grep",
+        "en" => "Search file contents",
+        "zh" => "搜索文件内容",
+    );
+
+    msg!("tg_cmd_read",
+        "en" => "Read a file",
+        "zh" => "读取文件",
+    );
+
+    msg!("tg_cmd_status",
+        "en" => "Gateway status",
+        "zh" => "网关状态",
+    );
+
+    msg!("tg_cmd_version",
+        "en" => "Show version",
+        "zh" => "显示版本",
+    );
+
+    msg!("tg_cmd_models",
+        "en" => "List models",
+        "zh" => "列出模型",
+    );
+
+    msg!("tg_cmd_clear",
+        "en" => "Clear session",
+        "zh" => "清空会话",
+    );
+
+    msg!("tg_cmd_remember",
+        "en" => "Save to memory",
+        "zh" => "保存到记忆",
+    );
+
+    msg!("tg_cmd_recall",
+        "en" => "Search memory",
+        "zh" => "搜索记忆",
+    );
+
+    msg!("tg_video_too_large",
+        "en" => "Video exceeds the Telegram 20MB bot limit. Send a smaller file or share a link.",
+        "zh" => "视频超过 Telegram 机器人 20MB 限制，请发送更小的文件或分享链接。",
+    );
+
+    msg!("tg_video_download_failed",
+        "en" => "Video download failed.",
+        "zh" => "视频下载失败。",
+    );
+
+    msg!("matrix_voice_transcription_failed",
+        "en" => "[voice message - transcription failed]",
+        "zh" => "[语音消息 - 转写失败]",
+    );
+
+    msg!("matrix_voice_received",
+        "en" => "[voice message received]",
+        "zh" => "[收到语音消息]",
+    );
+
+    msg!("matrix_file_download_failed",
+        "en" => "[File received: {filename} but download failed]",
+        "zh" => "[收到文件：{filename}，但下载失败]",
+    );
+
+    msg!("wechat_waiting_scan",
+        "en" => "Waiting for WeChat scan...",
+        "zh" => "等待微信扫码...",
+    );
+
+    msg!("wechat_scanned_confirm",
+        "en" => "Scanned! Please confirm on your phone...",
+        "zh" => "已扫码！请在手机上确认...",
+    );
+
     msg!("chat_reply_error",
         "en" => "An error occurred while processing your message. Please try again.",
         "zh" => "处理消息时发生错误，请重试。",

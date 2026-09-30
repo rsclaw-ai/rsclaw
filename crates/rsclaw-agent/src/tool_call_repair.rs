@@ -107,17 +107,10 @@ pub enum RepairKind {
 /// before/after. Returns (json_string, start_index) or None if no valid JSON
 /// found.
 pub fn extract_balanced_json_prefix(raw: &str) -> Option<(String, usize)> {
-    let mut start = 0;
-    while start < raw.len() {
-        let c = raw[start..].chars().next()?;
-        if c == '{' || c == '[' {
-            break;
-        }
-        start += 1;
-    }
-    if start >= raw.len() {
-        return None;
-    }
+    // Locate the first opening bracket by char boundary. Byte-stepping here
+    // would land inside a multi-byte UTF-8 char (e.g. `参数：{...}` or a
+    // curly quote before `{`) and panic on the next slice.
+    let (start, _) = raw.char_indices().find(|&(_, c)| c == '{' || c == '[')?;
 
     let mut depth = 0;
     let mut in_string = false;
@@ -293,7 +286,7 @@ pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
         // Look for patterns like: "key": "value" or "key": number
         let fixed_incomplete = fix_incomplete_json(&incomplete);
         if let Ok(parsed) = serde_json::from_str::<Value>(&fixed_incomplete) {
-            if parsed.is_object() && !parsed.as_object().unwrap().is_empty() {
+            if parsed.as_object().is_some_and(|o| !o.is_empty()) {
                 return Some(ToolCallRepair {
                     args: parsed,
                     kind: RepairKind::Repaired,
@@ -945,5 +938,22 @@ mod tests {
         assert_eq!(result.messages[0].role, Role::Assistant);
         // No synthetic messages added
         assert!(result.synthetic_messages.is_empty());
+    }
+
+    #[test]
+    fn extract_balanced_json_prefix_multibyte_prefix_no_panic() {
+        let raw = "参数：{\"a\":1}";
+        let (json, start) = extract_balanced_json_prefix(raw).expect("json found");
+        assert_eq!(json, "{\"a\":1}");
+        assert_eq!(&raw[start..], "{\"a\":1}");
+
+        let raw2 = "\u{201c}{\"b\":2}\u{201d}";
+        let (json2, _) = extract_balanced_json_prefix(raw2).expect("json found");
+        assert_eq!(json2, "{\"b\":2}");
+
+        // Must not panic on the full repair path either.
+        let _ = try_extract_usable_args(raw);
+        let _ = try_extract_usable_args(raw2);
+        assert!(extract_balanced_json_prefix("没有括号").is_none());
     }
 }

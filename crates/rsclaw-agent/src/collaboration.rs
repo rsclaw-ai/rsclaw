@@ -131,9 +131,10 @@ pub async fn run_parallel(
 /// this function routes the call to the target agent and returns its reply
 /// as a JSON `Value`.
 ///
-/// Input schema expected by an `agent_<id>` tool:
+/// Input schema expected by an `agent_<id>` tool (same as the runtime's
+/// `dispatch_a2a` and `tools_builder`; legacy `message` is still accepted):
 /// ```json
-/// { "message": "the sub-task description" }
+/// { "text": "the sub-task description" }
 /// ```
 /// Output is the text reply from the sub-agent as a JSON string.
 pub async fn dispatch_a2a(
@@ -146,7 +147,8 @@ pub async fn dispatch_a2a(
 ) -> Result<Value> {
     let args_str = args.to_string();
     let message = args
-        .get("message")
+        .get("text")
+        .or_else(|| args.get("message"))
         .and_then(Value::as_str)
         .unwrap_or(&args_str); // fallback: full JSON
 
@@ -177,7 +179,7 @@ pub fn build_a2a_tool_defs(
         .filter(|h| h.id != orchestrator_id) // don't expose self
         .map(|h| {
             let desc = format!(
-                "Invoke sub-agent '{}'. Provide a 'message' parameter with the task.",
+                "Invoke sub-agent '{}'. Provide a 'text' parameter with the task.",
                 h.id
             );
             rsclaw_provider::ToolDef {
@@ -186,12 +188,12 @@ pub fn build_a2a_tool_defs(
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "message": {
+                        "text": {
                             "type": "string",
                             "description": "The task or question for the sub-agent"
                         }
                     },
-                    "required": ["message"]
+                    "required": ["text"]
                 }),
             }
         })
@@ -215,6 +217,7 @@ pub(crate) async fn invoke_agent(
     handle
         .tx
         .send(AgentMessage {
+            trust: crate::trust::queued_trust(channel, peer_id, false),
             session_key: session_key.to_owned(),
             text: text.to_owned(),
             channel: channel.to_owned(),
@@ -277,6 +280,7 @@ mod tests {
                 channels: None,
                 commands: None,
                 allowed_commands: None,
+                non_owner_tools: None,
                 opencode: None,
                 claudecode: None,
                 codex: None,
@@ -366,10 +370,10 @@ mod tests {
     }
 
     #[test]
-    fn a2a_tool_schema_has_message_param() {
+    fn a2a_tool_schema_has_text_param() {
         let reg = make_registry_with_echo(&["main", "sub"]);
         let tools = build_a2a_tool_defs(&reg, "main");
         let props = &tools[0].parameters["properties"];
-        assert!(props.get("message").is_some());
+        assert!(props.get("text").is_some());
     }
 }

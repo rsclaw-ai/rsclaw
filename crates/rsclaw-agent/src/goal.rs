@@ -239,9 +239,12 @@ async fn bump_iter(
         return Ok(());
     };
     let mut store = mem.lock().await;
-    if let Err(e) = store.delete(&old_id).await {
-        tracing::warn!(old_goal_id = %old_id, err = %e, "goal: replace delete failed");
-    }
+    // Abort on delete failure: adding the replacement anyway would leave two
+    // goal docs for the session (and `read` could pick the stale one).
+    store
+        .delete(&old_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("goal: replace delete of {old_id} failed: {e:#}"))?;
     let doc = MemoryDoc {
         id: uuid::Uuid::new_v4().to_string(),
         scope: session_key.to_owned(),
@@ -282,14 +285,14 @@ pub async fn check_after_turn(session_key: &str, reply_text: &str) -> Option<Rea
     let signal = parse_terminal(reply_text);
     match signal {
         TerminalSignal::Achieved => {
-            let _ = clear(&mem, session_key).await;
+            clear_logged(&mem, session_key).await;
             Some(Reaction::Done(format!(
                 "✅ Goal achieved (iter {}/{}): {}",
                 active.iter, active.max_iter, active.condition
             )))
         }
         TerminalSignal::Failed(reason) => {
-            let _ = clear(&mem, session_key).await;
+            clear_logged(&mem, session_key).await;
             let msg = if reason.is_empty() {
                 format!(
                     "❌ Goal could not be achieved (iter {}/{}): {}",
@@ -305,17 +308,56 @@ pub async fn check_after_turn(session_key: &str, reply_text: &str) -> Option<Rea
         }
         TerminalSignal::Continue => {
             if active.iter >= active.max_iter {
-                let _ = clear(&mem, session_key).await;
+                clear_logged(&mem, session_key).await;
                 Some(Reaction::Done(format!(
                     "⚠ Goal hit iter cap ({}): {} — auto-stopped. Type `/goal {}` to restart.",
                     active.max_iter, active.condition, active.condition
                 )))
+            } else if let Err(e) = bump_iter(&mem, session_key, &active).await {
+                // Without a successful bump the iteration counter never
+                // advances and the cap could never trip — stop instead of
+                // looping unbounded.
+                tracing::warn!(session = %session_key, "goal: iteration bump failed, stopping: {e:#}");
+                clear_logged(&mem, session_key).await;
+                Some(Reaction::Done(rsclaw_i18n::t_fmt(
+                    "goal_state_error",
+                    rsclaw_i18n::default_lang(),
+                    &[("condition", &active.condition)],
+                )))
             } else {
-                let _ = bump_iter(&mem, session_key, &active).await;
                 Some(Reaction::Continue(build_continuation_prompt(&active)))
             }
         }
     }
+}
+
+/// `clear` with the error logged (the goal loop can't do anything better
+/// than report it; the terminal reply is delivered either way).
+async fn clear_logged(mem: &Arc<Mutex<MemoryStore>>, session_key: &str) {
+    if let Err(e) = clear(mem, session_key).await {
+        tracing::warn!(session = %session_key, "goal: clear failed: {e:#}");
+    }
+}
+
+/// Drop the trailing `GOAL_ACHIEVED` / `GOAL_FAILED ...` line from a reply
+/// that terminated a `/goal` loop (plus surrounding blank lines), so the
+/// human-friendly status line appended after it reads as a clean
+/// continuation.
+pub fn strip_trailing_goal_marker(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if let Some(last) = lines.last() {
+        let t = last.trim();
+        if t == "GOAL_ACHIEVED" || t.starts_with("GOAL_FAILED") {
+            lines.pop();
+            while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                lines.pop();
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 /// The prompt sent back through the task queue for the next iteration.

@@ -721,15 +721,37 @@ impl AgentRuntime {
         self.reload_skills();
 
         // Persist compacted session to redb (survives restarts).
+        //
+        // The store has no single-transaction "replace session" API, so this
+        // is delete + re-append. Narrow the loss window as far as possible:
+        // serialize everything first (a serialization failure aborts before
+        // anything is deleted), and skip the rewrite entirely if the old
+        // messages could not be deleted (appending would duplicate them).
         if let Some(sess) = self.sessions.get(session_key) {
-            if let Err(e) = self.store.db.delete_session(session_key) {
-                tracing::warn!("compaction: failed to delete old session: {e:#}");
-            }
-            for msg in sess.iter() {
-                let val = serde_json::to_value(msg).unwrap_or_default();
-                if let Err(e) = self.store.db.append_message(session_key, &val) {
-                    tracing::warn!("compaction: failed to persist message: {e:#}");
+            let vals: Result<Vec<serde_json::Value>, _> =
+                sess.iter().map(serde_json::to_value).collect();
+            match vals {
+                Err(e) => {
+                    tracing::warn!(
+                        session = session_key,
+                        "compaction: serialize failed, persisted history left unchanged: {e:#}"
+                    );
                 }
+                Ok(vals) => match self.store.db.delete_session(session_key) {
+                    Err(e) => {
+                        tracing::warn!(
+                            session = session_key,
+                            "compaction: failed to delete old session, persisted history left unchanged: {e:#}"
+                        );
+                    }
+                    Ok(()) => {
+                        for val in &vals {
+                            if let Err(e) = self.store.db.append_message(session_key, val) {
+                                tracing::warn!("compaction: failed to persist message: {e:#}");
+                            }
+                        }
+                    }
+                },
             }
         }
 
@@ -753,12 +775,9 @@ impl AgentRuntime {
         // If compaction barely helped (still >80% of threshold), inject a
         // system hint so the agent will relay the /new suggestion to the user.
         if new_tokens > token_threshold * 4 / 5 {
-            let zh = rsclaw_i18n::default_lang() == "zh";
-            let hint = if zh {
-                "[system] 上下文压缩后仍然较大，响应可能变慢。请告知用户发送 /new 开启新会话以恢复正常速度。"
-            } else {
-                "[system] Context is still large after compaction and responses may slow down. Please tell the user to send /new to start a fresh session."
-            };
+            // LLM-facing instruction: English only (the model relays it in the
+            // user's language).
+            let hint = "[system] Context is still large after compaction and responses may slow down. Please tell the user to send /new to start a fresh session.";
             if let Some(sess) = self.sessions.get_mut(session_key) {
                 sess.push(Message {
                     role: Role::System,
