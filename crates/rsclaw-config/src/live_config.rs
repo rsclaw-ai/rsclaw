@@ -350,6 +350,10 @@ fn strip_live_fields(v: &mut serde_json::Value) {
             obj.remove("bind");
             obj.remove("bindAddress");
             obj.remove("reload");
+            // gateway.owners is pushed into the trust registry on every
+            // reload (rsclaw-runtime gateway::trust::refresh_from_config),
+            // so it never needs a restart.
+            obj.remove("owners");
             // gateway.auth.token is read live via
             // `state.live.gateway.auth_token`. Drop the whole auth block
             // afterwards if only the token was inside.

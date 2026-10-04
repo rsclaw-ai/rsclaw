@@ -1378,6 +1378,9 @@ $g.Dispose();$b.Dispose()"#
             ("sh", "-c")
         };
         let ws = workspace();
+        if let Err(e) = std::fs::create_dir_all(&ws) {
+            tracing::warn!(path = %ws.display(), "failed to create workspace for shell command: {e}");
+        }
         let mut proc = tokio::process::Command::new(shell);
         proc.args([arg, cmd])
             .current_dir(&ws)
