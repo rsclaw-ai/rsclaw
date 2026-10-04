@@ -346,7 +346,15 @@ fn scan_and_delete_orphans(
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let rel_str = format!("{rel_prefix}/{}", rel.display());
+            // Referenced paths are stored with `/` separators; build the
+            // same form on every platform (on Windows `display()` would
+            // yield `\` and every live file would look like an orphan).
+            let rel_joined = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let rel_str = format!("{rel_prefix}/{rel_joined}");
             if referenced.contains(&rel_str) {
                 continue;
             }

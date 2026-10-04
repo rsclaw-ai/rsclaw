@@ -367,19 +367,20 @@ mod sse_url_tests {
     use super::*;
 
     #[test]
-    fn sse_build_rejects_private_and_non_http_targets() {
-        for bad in [
-            "http://127.0.0.1:18888/api/v1/shutdown",
-            "http://localhost/x",
-            "http://169.254.169.254/latest/meta-data",
-            "http://[::1]/x",
-            "file:///etc/passwd",
-        ] {
+    fn sse_build_rejects_non_http_targets_but_allows_private_hosts() {
+        // `/watch` is owner-only, so local / LAN event streams are allowed.
+        for bad in ["file:///etc/passwd", "ftp://example.com/x", "not a url"] {
             assert!(
                 matches!(SseSource::build(bad, &[]), Err(WatchStartError::InvalidUrl(_))),
                 "should reject {bad}"
             );
         }
-        assert!(SseSource::build("https://example.com/stream", &[]).is_ok());
+        for ok in [
+            "https://example.com/stream",
+            "http://127.0.0.1:8080/events",
+            "http://192.168.1.10/stream",
+        ] {
+            assert!(SseSource::build(ok, &[]).is_ok(), "should accept {ok}");
+        }
     }
 }

@@ -54,7 +54,10 @@ fn workspace_never_returns_dot_or_cwd_when_unset() {
     // non-UTF-8 bytes would silently degrade to "." (the gateway's CWD)
     // and let every file tool escape the workspace. The helper must
     // never produce "." or a relative path.
-    let base = std::path::Path::new("/some/abs/base");
+    // Must be absolute on every platform (`/some/abs/base` has no drive
+    // letter and is relative on Windows).
+    let base_buf = std::env::temp_dir().join("some-abs-base");
+    let base = base_buf.as_path();
     let got = resolve_default_workspace(None, None, base);
     assert_ne!(got, std::path::PathBuf::from("."));
     assert!(
