@@ -226,11 +226,13 @@ const THINKING_CACHE_CAP: usize = 256;
 /// their `signature`) that preceded each `tool_use`, keyed by
 /// `(model, tool_use_id)`.
 ///
-/// The internal message model only keeps reasoning TEXT, but the Messages
-/// API requires the assistant turn of an in-flight tool loop to be replayed
-/// with its original thinking blocks unchanged (signature included) when
-/// thinking is on. Keyed by model because thinking blocks are bound to the
-/// model that produced them.
+/// The Messages API requires the assistant turn of an in-flight tool loop to
+/// be replayed with its original thinking blocks unchanged (signature
+/// included) when thinking is on. Signed blocks are persisted on the message
+/// itself (`ContentPart::Reasoning { signature, redacted, .. }`, fed by
+/// `StreamEvent::ReasoningBlock`); this cache is only the fallback for
+/// messages without them. Keyed by model because thinking blocks are bound
+/// to the model that produced them.
 #[derive(Default)]
 struct ThinkingCache {
     map: HashMap<(String, String), Vec<Value>>,
@@ -575,10 +577,19 @@ fn serialize_message(msg: &Message, model: &str) -> Value {
             }
         }
         MessageContent::Parts(parts) => {
+            let is_tool_turn = msg.role == Role::Assistant
+                && parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ToolUse { .. }));
             // Replay the original thinking blocks (with signature) of an
-            // assistant tool turn this process produced. They replace the
-            // plain-text reasoning copy and must come first.
-            let cached_thinking = if msg.role == Role::Assistant {
+            // assistant tool turn. Source of truth is the signed reasoning
+            // persisted on the message; the process cache is the fallback
+            // for turns recorded before signatures were persisted.
+            let persisted_thinking = is_tool_turn
+                && parts
+                    .iter()
+                    .any(|p| replayable_thinking_block(p, model).is_some());
+            let cached_thinking = if is_tool_turn && !persisted_thinking {
                 parts.iter().find_map(|p| match p {
                     ContentPart::ToolUse { id, .. } => recall_thinking(model, id),
                     _ => None,
@@ -591,8 +602,20 @@ fn serialize_message(msg: &Message, model: &str) -> Value {
                 serialized.extend(blocks.iter().cloned());
             }
             for part in parts {
-                if cached_thinking.is_some() && matches!(part, ContentPart::Reasoning { .. }) {
-                    continue;
+                if let ContentPart::Reasoning { text, .. } = part {
+                    if persisted_thinking {
+                        // Signed blocks replay in their stored position; the
+                        // unsigned copies are dropped.
+                        if let Some(block) = replayable_thinking_block(part, model) {
+                            serialized.push(block);
+                        }
+                        continue;
+                    }
+                    // Thinking replaced by cached blocks, or an empty
+                    // replay-only part (an empty text block is rejected).
+                    if cached_thinking.is_some() || text.trim().is_empty() {
+                        continue;
+                    }
                 }
                 serialized.push(serialize_part(part));
             }
@@ -628,6 +651,41 @@ fn serialize_message(msg: &Message, model: &str) -> Value {
     json!({ "role": role, "content": content })
 }
 
+/// Wire `thinking` / `redacted_thinking` block for a signed reasoning part,
+/// when it can be replayed to `model`.
+///
+/// Signed blocks are replayed unchanged. Across genuine Claude models the
+/// API drops blocks the target cannot read, so they are always sent; a block
+/// from (or to) an anthropic-compatible third party is only replayed to the
+/// exact model that produced it — a foreign signature is a hard 400.
+fn replayable_thinking_block(part: &ContentPart, model: &str) -> Option<Value> {
+    let ContentPart::Reasoning {
+        text,
+        signature,
+        redacted,
+        model: produced_by,
+    } = part
+    else {
+        return None;
+    };
+    let produced_by = produced_by.as_deref()?;
+    let compatible = produced_by == model
+        || (claude_family(produced_by) != ClaudeFamily::Other
+            && claude_family(model) != ClaudeFamily::Other);
+    if !compatible {
+        return None;
+    }
+    if let Some(data) = redacted.as_deref().filter(|d| !d.is_empty()) {
+        return Some(json!({ "type": "redacted_thinking", "data": data }));
+    }
+    let signature = signature.as_deref().filter(|s| !s.is_empty())?;
+    Some(json!({
+        "type": "thinking",
+        "thinking": text,
+        "signature": signature,
+    }))
+}
+
 fn serialize_part(part: &ContentPart) -> Value {
     match part {
         ContentPart::Text { text } => json!({ "type": "text", "text": text }),
@@ -654,7 +712,7 @@ fn serialize_part(part: &ContentPart) -> Value {
             "content":     content,
             "is_error":    is_error.unwrap_or(false),
         }),
-        ContentPart::Reasoning { text } => json!({
+        ContentPart::Reasoning { text, .. } => json!({
             "type": "text",
             "text": text,
         }),
@@ -934,7 +992,17 @@ fn parse_event(data: &str, state: &mut SseState) -> Option<StreamEvent> {
                 }
                 Some("redacted_thinking") => {
                     state.completed_thinking.push(block.clone());
-                    None
+                    let data = block["data"].as_str().unwrap_or("");
+                    if data.is_empty() {
+                        None
+                    } else {
+                        Some(StreamEvent::ReasoningBlock {
+                            text: String::new(),
+                            signature: None,
+                            redacted: Some(data.to_owned()),
+                            model: state.model.clone(),
+                        })
+                    }
                 }
                 _ => None,
             }
@@ -948,6 +1016,17 @@ fn parse_event(data: &str, state: &mut SseState) -> Option<StreamEvent> {
                     "thinking": thinking,
                     "signature": signature,
                 }));
+                // Hand the signed block to the runtime so it is persisted on
+                // the assistant message (the process cache is only a
+                // fallback). Unsigned blocks cannot be replayed anyway.
+                if !signature.is_empty() {
+                    return Some(StreamEvent::ReasoningBlock {
+                        text: thinking,
+                        signature: Some(signature),
+                        redacted: None,
+                        model: state.model.clone(),
+                    });
+                }
             }
             None
         }
@@ -1292,9 +1371,7 @@ mod tests {
                 Message {
                     role: Role::Assistant,
                     content: MessageContent::Parts(vec![
-                        ContentPart::Reasoning {
-                            text: "plan".to_owned(),
-                        },
+                        ContentPart::reasoning("plan"),
                         ContentPart::ToolUse {
                             id: tool_id.to_owned(),
                             name: "shell".to_owned(),
@@ -1343,6 +1420,121 @@ mod tests {
         assert_eq!(assistant[0]["type"].as_str(), Some("thinking"));
         assert_eq!(assistant[0]["signature"].as_str(), Some("sig123"));
         assert_eq!(assistant[1]["type"].as_str(), Some("tool_use"));
+    }
+
+    fn signed_tool_turn_request(model: &str, produced_by: &str, tool_id: &str) -> LlmRequest {
+        let mut req = tool_turn_request(model, tool_id);
+        req.messages[1].content = MessageContent::Parts(vec![
+            ContentPart::Reasoning {
+                text: "plan".to_owned(),
+                signature: Some("sig-persisted".to_owned()),
+                redacted: None,
+                model: Some(produced_by.to_owned()),
+            },
+            ContentPart::Reasoning {
+                text: String::new(),
+                signature: None,
+                redacted: Some("opaque".to_owned()),
+                model: Some(produced_by.to_owned()),
+            },
+            ContentPart::ToolUse {
+                id: tool_id.to_owned(),
+                name: "shell".to_owned(),
+                input: json!({"cmd": "ls"}),
+            },
+        ]);
+        req
+    }
+
+    #[test]
+    fn persisted_signed_thinking_is_replayed_without_cache() {
+        let req = signed_tool_turn_request("claude-opus-5", "claude-opus-5", "toolu_persisted_1");
+        let body = build_request_body(&req).expect("build request body");
+        assert_eq!(body["thinking"]["type"].as_str(), Some("adaptive"));
+        let assistant = body["messages"][1]["content"]
+            .as_array()
+            .expect("assistant blocks");
+        assert_eq!(assistant.len(), 3);
+        assert_eq!(assistant[0]["type"].as_str(), Some("thinking"));
+        assert_eq!(assistant[0]["thinking"].as_str(), Some("plan"));
+        assert_eq!(assistant[0]["signature"].as_str(), Some("sig-persisted"));
+        assert_eq!(assistant[1]["type"].as_str(), Some("redacted_thinking"));
+        assert_eq!(assistant[1]["data"].as_str(), Some("opaque"));
+        assert_eq!(assistant[2]["type"].as_str(), Some("tool_use"));
+    }
+
+    #[test]
+    fn persisted_thinking_crosses_claude_models_but_not_third_parties() {
+        // Claude -> Claude model switch: replay, the API drops what it can't read.
+        let req = signed_tool_turn_request("claude-fable-5", "claude-opus-5", "toolu_switch_1");
+        let body = build_request_body(&req).expect("build request body");
+        assert_eq!(
+            body["messages"][1]["content"][0]["type"].as_str(),
+            Some("thinking")
+        );
+        // Third-party signature to Claude: never replayed.
+        let req = signed_tool_turn_request("claude-haiku-4-5", "kimi-k2", "toolu_switch_2");
+        let body = build_request_body(&req).expect("build request body");
+        assert!(body.get("thinking").is_none());
+        let assistant = body["messages"][1]["content"]
+            .as_array()
+            .expect("assistant blocks");
+        // Falls back to the plain-text reasoning copy; the redacted part is dropped.
+        assert_eq!(assistant.len(), 2);
+        assert_eq!(assistant[0]["type"].as_str(), Some("text"));
+        assert_eq!(assistant[1]["type"].as_str(), Some("tool_use"));
+    }
+
+    #[test]
+    fn thinking_stop_and_redacted_start_emit_reasoning_blocks() {
+        let mut state = SseState::new("claude-opus-5".to_owned());
+        parse_event(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            &mut state,
+        );
+        parse_event(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"why"}}"#,
+            &mut state,
+        );
+        parse_event(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s1"}}"#,
+            &mut state,
+        );
+        match parse_event(r#"{"type":"content_block_stop","index":0}"#, &mut state) {
+            Some(StreamEvent::ReasoningBlock {
+                text,
+                signature,
+                redacted,
+                model,
+            }) => {
+                assert_eq!(text, "why");
+                assert_eq!(signature.as_deref(), Some("s1"));
+                assert!(redacted.is_none());
+                assert_eq!(model, "claude-opus-5");
+            }
+            other => panic!("expected ReasoningBlock, got {other:?}"),
+        }
+        match parse_event(
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"enc"}}"#,
+            &mut state,
+        ) {
+            Some(StreamEvent::ReasoningBlock { redacted, .. }) => {
+                assert_eq!(redacted.as_deref(), Some("enc"));
+            }
+            other => panic!("expected redacted ReasoningBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_part_serde_stays_backward_compatible() {
+        let old: ContentPart =
+            serde_json::from_str(r#"{"type":"reasoning","text":"x"}"#).expect("old reasoning");
+        assert!(matches!(
+            &old,
+            ContentPart::Reasoning { signature: None, redacted: None, model: None, .. }
+        ));
+        let v = serde_json::to_value(ContentPart::reasoning("x")).expect("serialize");
+        assert_eq!(v, json!({"type": "reasoning", "text": "x"}));
     }
 
     #[test]

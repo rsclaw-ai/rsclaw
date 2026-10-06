@@ -1097,6 +1097,7 @@ async fn stream_prediction(
         match event? {
             StreamEvent::TextDelta(d) => text.push_str(&d),
             StreamEvent::ReasoningDelta(d) => reasoning.push_str(&d),
+            StreamEvent::ReasoningBlock { .. } => {} // replay metadata only
             StreamEvent::ToolCall { .. } => {} // unused in VLM-driven flow
             StreamEvent::Done { .. } => break,
             StreamEvent::Error(e) => anyhow::bail!("VLM stream error: {e}"),

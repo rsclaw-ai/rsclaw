@@ -378,6 +378,7 @@ async fn distill_once(
         match event {
             Ok(StreamEvent::TextDelta(d)) => output.push_str(&d),
             Ok(StreamEvent::ReasoningDelta(_)) => {}
+            Ok(StreamEvent::ReasoningBlock { .. }) => {} // replay metadata only
             Ok(StreamEvent::Done { .. }) => break,
             Ok(StreamEvent::Error(msg)) => bail!("distill: provider error: {msg}"),
             Ok(StreamEvent::ToolCall { .. }) => {} // no tools requested; ignore

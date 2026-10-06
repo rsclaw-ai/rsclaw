@@ -2002,6 +2002,10 @@ pub struct ExecToolConfig {
     /// Timeout for exec commands in seconds (default: 1800 = 30 minutes).
     /// Matches openclaw's defaultTimeoutSec.
     pub timeout_seconds: Option<u64>,
+    /// Max concurrently running background exec tasks (default: 4, 0 =
+    /// unlimited). Read at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_background: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -829,8 +829,16 @@ impl AgentRuntime {
         );
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
         let live_status = Arc::clone(&handle.live_status);
-        let max_concurrent = config.agents.defaults.max_concurrent.unwrap_or(4);
-        let exec_pool = super::exec_pool::ExecPool::new(max_concurrent as usize);
+        // Background exec concurrency is a tools.exec setting, independent of
+        // agent concurrency (`agents.defaults.maxConcurrent`).
+        let max_background = config
+            .ext
+            .tools
+            .as_ref()
+            .and_then(|t| t.exec.as_ref())
+            .and_then(|e| e.max_background)
+            .unwrap_or(super::exec_pool::DEFAULT_MAX_BACKGROUND);
+        let exec_pool = super::exec_pool::ExecPool::new(max_background);
         let rt = Self {
             handle,
             config,

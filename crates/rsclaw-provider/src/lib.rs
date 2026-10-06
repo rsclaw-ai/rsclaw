@@ -283,7 +283,32 @@ pub enum ContentPart {
     },
     Reasoning {
         text: String,
+        /// Provider signature of this reasoning block (Anthropic `thinking`
+        /// blocks). Required to replay the block unchanged inside a tool
+        /// loop. Providers other than Anthropic ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        /// Opaque payload of an Anthropic `redacted_thinking` block. When
+        /// set, `text` is empty and the part replays as `redacted_thinking`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redacted: Option<String>,
+        /// Model that produced `signature` / `redacted`. Signed blocks are
+        /// bound to the model family that produced them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
+}
+
+impl ContentPart {
+    /// Plain reasoning text without replay metadata.
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self::Reasoning {
+            text: text.into(),
+            signature: None,
+            redacted: None,
+            model: None,
+        }
+    }
 }
 
 /// A tool definition passed to the LLM.
@@ -483,6 +508,20 @@ pub enum StreamEvent {
     /// Reasoning/thinking delta (collected separately, used as fallback if
     /// content is empty)
     ReasoningDelta(String),
+    /// A finished, replayable reasoning block (Anthropic `thinking` /
+    /// `redacted_thinking`). Its text was already streamed as
+    /// `ReasoningDelta`; this event only adds the replay metadata, so
+    /// consumers that merely display reasoning can ignore it.
+    ReasoningBlock {
+        /// Full thinking text of the block (empty for redacted blocks).
+        text: String,
+        /// Block signature (`thinking` blocks).
+        signature: Option<String>,
+        /// Opaque `data` of a `redacted_thinking` block.
+        redacted: Option<String>,
+        /// Model that produced the block.
+        model: String,
+    },
     /// Tool call requested by the model
     ToolCall {
         id: String,

@@ -32,6 +32,10 @@ struct RunningTask {
     started_at: Instant,
 }
 
+/// Default cap on concurrently running background exec tasks
+/// (`tools.exec.maxBackground`).
+pub const DEFAULT_MAX_BACKGROUND: usize = 4;
+
 /// Global exec pool — managed as an Arc on AgentRuntime so all turns
 /// share the same pool and can collect results.
 pub struct ExecPool {

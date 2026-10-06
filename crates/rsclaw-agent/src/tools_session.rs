@@ -139,6 +139,23 @@ impl AgentRuntime {
         }))
     }
 
+    /// Active message count for a session (what history would return). The
+    /// stored `SessionMeta::message_count` is a monotonic seq allocator that
+    /// does not drop after compaction, so it is only a fallback.
+    fn active_message_count(
+        &self,
+        session_key: &str,
+        meta: Option<&rsclaw_store::redb_store::SessionMeta>,
+    ) -> u64 {
+        match self.store.db.count_active_messages(session_key) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(session = %session_key, error = %e, "active message count failed");
+                meta.map(|m| m.message_count).unwrap_or(0)
+            }
+        }
+    }
+
     async fn tool_sessions_list(&self, ctx: &RunContext, args: &Value) -> Result<Value> {
         let explicit_agent = args["agentId"]
             .as_str()
@@ -171,7 +188,7 @@ impl AgentRuntime {
                 let meta = self.store.db.get_session_meta(key).ok().flatten();
                 Some(json!({
                     "session_key": key,
-                    "message_count": meta.as_ref().map(|m| m.message_count).unwrap_or(0),
+                    "message_count": self.active_message_count(key, meta.as_ref()),
                     "last_active": meta.as_ref().map(|m| m.last_active).unwrap_or(0),
                     "created_at": meta.as_ref().map(|m| m.created_at).unwrap_or(0),
                 }))
@@ -234,7 +251,7 @@ impl AgentRuntime {
         match meta {
             Some(m) => Ok(json!({
                 "session_key": session_key,
-                "message_count": m.message_count,
+                "message_count": self.active_message_count(session_key, Some(&m)),
                 "last_active": m.last_active,
                 "created_at": m.created_at,
                 "active": true

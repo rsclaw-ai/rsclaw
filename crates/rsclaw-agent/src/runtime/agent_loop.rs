@@ -1140,6 +1140,12 @@ impl AgentRuntime {
             let mut text_buf = String::new();
             let mut reasoning_buf = String::new();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
+            // Signed reasoning blocks (Anthropic thinking / redacted_thinking)
+            // not yet followed by a tool call, and those anchored to the id
+            // of the tool call they preceded. Persisted on the assistant
+            // tool turn so the provider can replay them unchanged.
+            let mut pending_signed: Vec<rsclaw_provider::ContentPart> = Vec::new();
+            let mut signed_by_tool: Vec<(String, Vec<rsclaw_provider::ContentPart>)> = Vec::new();
             // Track loop detection warnings per tool call id (to inject into result)
             let mut loop_warnings: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
@@ -1256,7 +1262,25 @@ impl AgentRuntime {
                             delta_buf.push_str(&delta);
                         }
                     }
+                    StreamEvent::ReasoningBlock {
+                        text,
+                        signature,
+                        redacted,
+                        model,
+                    } => {
+                        // Text already arrived via ReasoningDelta; keep the
+                        // replay metadata only.
+                        pending_signed.push(rsclaw_provider::ContentPart::Reasoning {
+                            text,
+                            signature,
+                            redacted,
+                            model: Some(model),
+                        });
+                    }
                     StreamEvent::ToolCall { id, name, input } => {
+                        if !id.is_empty() && !pending_signed.is_empty() {
+                            signed_by_tool.push((id.clone(), std::mem::take(&mut pending_signed)));
+                        }
                         if !id.is_empty() && !name.is_empty() {
                             // New tool call with both id and name — start fresh entry.
                             // Loop detection runs in dispatch Phase 1, once the
@@ -1877,19 +1901,41 @@ impl AgentRuntime {
                 // Only save text if there are no tool calls (final reply).
                 parts.push(rsclaw_provider::ContentPart::Text { text: text_buf });
             }
-            // Persist reasoning_content so providers that require it (e.g.
-            // kimi-for-coding) see it on subsequent turns.
-            if !reasoning_buf.is_empty() {
-                parts.push(rsclaw_provider::ContentPart::Reasoning {
-                    text: reasoning_buf,
-                });
-            }
-            for (id, name, input) in &tool_calls {
-                parts.push(rsclaw_provider::ContentPart::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                });
+            let has_signed = !signed_by_tool.is_empty() || !pending_signed.is_empty();
+            if has_signed && !tool_calls.is_empty() {
+                // Signed thinking blocks replace the aggregated reasoning
+                // copy (their texts concatenate to `reasoning_buf`). Each
+                // block keeps its position before the tool call it preceded;
+                // blocks of a dropped tool call lead the turn.
+                for (anchor, blocks) in signed_by_tool.iter_mut() {
+                    if !tool_calls.iter().any(|(id, _, _)| id == anchor) {
+                        parts.append(blocks);
+                    }
+                }
+                for (id, name, input) in &tool_calls {
+                    if let Some((_, blocks)) = signed_by_tool.iter_mut().find(|(a, _)| a == id) {
+                        parts.append(blocks);
+                    }
+                    parts.push(rsclaw_provider::ContentPart::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                }
+                parts.append(&mut pending_signed);
+            } else {
+                // Persist reasoning_content so providers that require it
+                // (e.g. kimi-for-coding) see it on subsequent turns.
+                if !reasoning_buf.is_empty() {
+                    parts.push(rsclaw_provider::ContentPart::reasoning(reasoning_buf));
+                }
+                for (id, name, input) in &tool_calls {
+                    parts.push(rsclaw_provider::ContentPart::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                }
             }
             let assistant_msg = Message {
                 role: Role::Assistant,

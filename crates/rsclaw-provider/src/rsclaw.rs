@@ -2712,7 +2712,13 @@ fn serialize_history_message(msg: &Message) -> Value {
     let content = match &msg.content {
         MessageContent::Text(t) => json!(t),
         MessageContent::Parts(parts) => {
-            let mapped: Vec<Value> = parts.iter().map(serialize_history_part).collect();
+            // Replay-only reasoning blocks (redacted / display-omitted
+            // thinking from another provider) carry no text; skip them.
+            let mapped: Vec<Value> = parts
+                .iter()
+                .filter(|p| !matches!(p, ContentPart::Reasoning { text, .. } if text.is_empty()))
+                .map(serialize_history_part)
+                .collect();
             json!(mapped)
         }
     };
@@ -2752,7 +2758,7 @@ fn serialize_history_part(p: &ContentPart) -> Value {
             }
             obj
         }
-        ContentPart::Reasoning { text } => json!({"type":"thinking","text":text}),
+        ContentPart::Reasoning { text, .. } => json!({"type":"thinking","text":text}),
     }
 }
 

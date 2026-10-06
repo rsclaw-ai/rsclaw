@@ -720,13 +720,10 @@ impl AgentRuntime {
         // the per-session user_system layer, and only if the set changed.
         self.reload_skills();
 
-        // Persist compacted session to redb (survives restarts).
-        //
-        // The store has no single-transaction "replace session" API, so this
-        // is delete + re-append. Narrow the loss window as far as possible:
-        // serialize everything first (a serialization failure aborts before
-        // anything is deleted), and skip the rewrite entirely if the old
-        // messages could not be deleted (appending would duplicate them).
+        // Persist compacted session to redb (survives restarts). One write
+        // transaction swaps the active messages, so a crash keeps either the
+        // old or the new history; the archive (already holding the originals)
+        // is left alone.
         if let Some(sess) = self.sessions.get(session_key) {
             let vals: Result<Vec<serde_json::Value>, _> =
                 sess.iter().map(serde_json::to_value).collect();
@@ -737,21 +734,14 @@ impl AgentRuntime {
                         "compaction: serialize failed, persisted history left unchanged: {e:#}"
                     );
                 }
-                Ok(vals) => match self.store.db.delete_session(session_key) {
-                    Err(e) => {
+                Ok(vals) => {
+                    if let Err(e) = self.store.db.replace_active_messages(session_key, &vals) {
                         tracing::warn!(
                             session = session_key,
-                            "compaction: failed to delete old session, persisted history left unchanged: {e:#}"
+                            "compaction: failed to persist compacted history, persisted history left unchanged: {e:#}"
                         );
                     }
-                    Ok(()) => {
-                        for val in &vals {
-                            if let Err(e) = self.store.db.append_message(session_key, val) {
-                                tracing::warn!("compaction: failed to persist message: {e:#}");
-                            }
-                        }
-                    }
-                },
+                }
             }
         }
 
@@ -1093,7 +1083,7 @@ impl AgentRuntime {
         while let Some(event) = stream.next().await {
             match event {
                 Ok(StreamEvent::TextDelta(d)) => summary.push_str(&d),
-                Ok(StreamEvent::ReasoningDelta(_)) => {}
+                Ok(StreamEvent::ReasoningDelta(_)) | Ok(StreamEvent::ReasoningBlock { .. }) => {}
                 Ok(StreamEvent::Done { .. }) | Ok(StreamEvent::Error(_)) => break,
                 Ok(StreamEvent::ToolCall { .. }) => {
                     // LLM tried to call a tool despite empty tools list — skip
@@ -1227,7 +1217,8 @@ impl AgentRuntime {
         while let Some(event) = stream.next().await {
             match event {
                 Ok(StreamEvent::TextDelta(d)) => summary.push_str(&d),
-                Ok(StreamEvent::ReasoningDelta(_)) => {} // ignore reasoning in compaction
+                // Ignore reasoning in compaction.
+                Ok(StreamEvent::ReasoningDelta(_)) | Ok(StreamEvent::ReasoningBlock { .. }) => {}
                 Ok(StreamEvent::Done { .. }) | Ok(StreamEvent::Error(_)) => break,
                 Ok(StreamEvent::ToolCall { .. }) => {} // unexpected in summarization
                 Err(e) => {

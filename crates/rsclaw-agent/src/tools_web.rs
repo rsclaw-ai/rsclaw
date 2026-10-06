@@ -196,6 +196,30 @@ pub(crate) fn web_allow_private(trust: crate::trust::SenderTrust) -> bool {
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// The browser fallback reached (or would reach) a non-public address.
+/// Callers propagate it instead of swallowing it like other browser errors.
+#[derive(Debug)]
+pub(crate) struct BrowserSsrfBlocked(String);
+
+impl std::fmt::Display for BrowserSsrfBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "web_fetch: blocked by SSRF guard: {}", self.0)
+    }
+}
+
+impl std::error::Error for BrowserSsrfBlocked {}
+
+/// Fail with [`BrowserSsrfBlocked`] unless `url` resolves to public addresses.
+async fn ensure_public_browser_url(url: &reqwest::Url) -> Result<()> {
+    match rsclaw_util::net::resolve_public_url(url).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(anyhow::Error::new(BrowserSsrfBlocked(format!(
+            "browser target `{}` is not a public address: {e}",
+            url.as_str()
+        )))),
+    }
+}
+
 /// Build a client for one hop to `url`: SSRF-vetted and DNS-pinned via
 /// `rsclaw_util::net`, unless `allow_private` (then only the scheme is
 /// checked). Redirects are never followed automatically.
@@ -974,7 +998,7 @@ impl AgentRuntime {
         //    independently of the embeddings, so it still works when they failed. But
         //    with neither usable embeddings NOR a reranker, a random chunk order is
         //    worse than snippets — fall back.
-        let reranker = self.resolve_web_reranker();
+        let reranker = self.resolve_web_reranker().await;
         if !embed_ok && reranker.is_none() {
             return Ok(raw);
         }
@@ -1039,11 +1063,16 @@ impl AgentRuntime {
     /// rerank (caller keeps the local cosine order). ONLY when no `kb.rerank`
     /// block exists do we apply the rsclaw-protocol default: a `rsclaw/`
     /// primary defaults to the fleet `rsclaw-reranker-v1`; otherwise `None`.
-    fn resolve_web_reranker(&self) -> Option<std::sync::Arc<rsclaw_kb::rerank::KbReranker>> {
-        let has_rerank_block = rsclaw_config::load()
-            .ok()
-            .and_then(|c| c.raw.kb.as_ref().and_then(|kb| kb.rerank.clone()))
-            .is_some();
+    async fn resolve_web_reranker(&self) -> Option<std::sync::Arc<rsclaw_kb::rerank::KbReranker>> {
+        // Live config, not a disk re-read on every deep search.
+        let has_rerank_block = self
+            .live
+            .raw
+            .read()
+            .await
+            .kb
+            .as_ref()
+            .is_some_and(|kb| kb.rerank.is_some());
         if has_rerank_block {
             // Respect the explicit config (Some = use it, None = opted out).
             return rsclaw_kb::rerank::KbReranker::from_config();
@@ -1310,6 +1339,9 @@ impl AgentRuntime {
         // A blocked target is returned as an error — no browser fallback,
         // which would happily load loopback / metadata URLs (or file://).
         let allow_private = web_allow_private(ctx.turn_ctx.trust);
+        // The headless-browser fallback follows redirects and runs page JS
+        // on its own, outside the per-hop guard; only owner turns get it.
+        let browser_fallback = ctx.turn_ctx.trust.is_owner();
 
         // Redirects are followed manually, re-validating each hop, with a
         // method-aware, same-host-only policy:
@@ -1349,13 +1381,14 @@ impl AgentRuntime {
                 Err(e) => {
                     // For non-GET, browser fallback is meaningless (it can only
                     // replay GETs). Surface the error directly.
-                    if !is_get {
+                    if !is_get || !browser_fallback {
                         return Err(e.into());
                     }
                     // HTTP request failed — try browser fallback before giving
-                    // up. The URL already passed the SSRF check above.
+                    // up. The URL already passed the SSRF check above; the
+                    // browser's final URL is re-checked after navigation.
                     tracing::warn!(url = %current, error = %e, "web_fetch: HTTP failed, trying browser fallback");
-                    match self.browser_get_article(current.as_str()).await {
+                    match self.browser_get_article(current.as_str(), allow_private).await {
                         Ok((t, md)) if !md.is_empty() => {
                             let raw_chars = md.chars().count();
                             let raw_artifact = self
@@ -1373,6 +1406,7 @@ impl AgentRuntime {
                             attach_raw_artifact(&mut out, raw_artifact, raw_chars);
                             return Ok(out);
                         }
+                        Err(be) if be.is::<BrowserSsrfBlocked>() => return Err(be),
                         _ => return Err(e.into()),
                     }
                 }
@@ -1441,13 +1475,13 @@ impl AgentRuntime {
         // Non-success status (e.g. 412 anti-bot challenge, 5xx server error) —
         // try browser fallback for GET requests before falling through to the
         // empty-body SPA detection below.
-        if !response.status().is_success() && is_get {
+        if !response.status().is_success() && is_get && browser_fallback {
             tracing::warn!(
                 url = %current,
                 status = %response.status(),
                 "web_fetch: non-success status, trying browser fallback"
             );
-            match self.browser_get_article(current.as_str()).await {
+            match self.browser_get_article(current.as_str(), allow_private).await {
                 Ok((t, md)) if !md.is_empty() => {
                     let raw_chars = md.chars().count();
                     let raw_artifact = self
@@ -1464,6 +1498,7 @@ impl AgentRuntime {
                     attach_raw_artifact(&mut out, raw_artifact, raw_chars);
                     return Ok(out);
                 }
+                Err(be) if be.is::<BrowserSsrfBlocked>() => return Err(be),
                 _ => {} // fall through to normal processing (may still get empty body)
             }
         }
@@ -1513,11 +1548,12 @@ impl AgentRuntime {
             tracing::warn!(url = %fetch_url, "web_fetch: CAPTCHA/bot-check detected, trying browser fallback");
         }
 
-        let (final_title, final_md) = if is_get && (is_spa || is_captcha) {
+        let (final_title, final_md) = if is_get && browser_fallback && (is_spa || is_captcha) {
             // Browser fallback only makes sense for GET — POST/PUT can't be
             // safely replayed in a browser tab.
-            match self.browser_get_article(current.as_str()).await {
+            match self.browser_get_article(current.as_str(), allow_private).await {
                 Ok((t, md)) if !md.is_empty() => (t, md),
+                Err(be) if be.is::<BrowserSsrfBlocked>() => return Err(be),
                 _ => (title.clone(), markdown.clone()),
             }
         } else {
@@ -1603,14 +1639,25 @@ impl AgentRuntime {
     }
 
     /// Use web_browser to fetch JS-rendered page content via get_article.
-    pub(crate) async fn browser_get_article(&self, url: &str) -> Result<(String, String)> {
+    ///
+    /// Unless `allow_private`, the start URL and the page's final URL (Chrome
+    /// follows redirects itself) must resolve to public addresses; otherwise
+    /// the content is discarded and a [`BrowserSsrfBlocked`] error returned.
+    pub(crate) async fn browser_get_article(
+        &self,
+        url: &str,
+        allow_private: bool,
+    ) -> Result<(String, String)> {
         // Chrome would happily render file://, chrome://, data: ... — the
         // fallback is only for web pages.
-        let scheme_ok = reqwest::Url::parse(url)
-            .map(|u| matches!(u.scheme(), "http" | "https"))
-            .unwrap_or(false);
-        if !scheme_ok {
+        let start = reqwest::Url::parse(url)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"));
+        let Some(start) = start else {
             bail!("browser fallback only supports http(s) URLs");
+        };
+        if !allow_private {
+            ensure_public_browser_url(&start).await?;
         }
         let tab = rsclaw_browser::pool::BrowserPool::global()
             .acquire_tab()
@@ -1626,11 +1673,21 @@ impl AgentRuntime {
                 || document.querySelector('.content') || document.body;
             var title = document.title || '';
             var html = el ? el.innerHTML || '' : '';
-            return JSON.stringify({title: title, html: html});
+            return JSON.stringify({title: title, html: html, url: location.href});
         })()"#;
         let result = tab.evaluate(js).await?;
         let result_str = result.as_str().unwrap_or("{}");
         let parsed: Value = serde_json::from_str(result_str).unwrap_or_default();
+        if !allow_private {
+            // Where the browser actually landed after its own redirects.
+            let final_url = parsed["url"].as_str().unwrap_or("");
+            let landed = reqwest::Url::parse(final_url).map_err(|e| {
+                anyhow::Error::new(BrowserSsrfBlocked(format!(
+                    "cannot verify the browser's final url `{final_url}`: {e}"
+                )))
+            })?;
+            ensure_public_browser_url(&landed).await?;
+        }
         let title = parsed["title"].as_str().unwrap_or("").to_owned();
         let html = parsed["html"].as_str().unwrap_or("");
         let md = html_dehydrate_to_text(html);
@@ -2406,7 +2463,7 @@ impl AgentRuntime {
 
     /// Open a URL via browser pool and return extracted text, or an error JSON.
     async fn browser_fetch_or_error(&self, url: &str) -> Value {
-        match self.browser_get_article(url).await {
+        match self.browser_get_article(url, false).await {
             Ok((title, text)) if !text.is_empty() => json!({
                 "title": title,
                 "text": text,

@@ -1380,7 +1380,7 @@ fn serialize_message(msg: &Message, thinking_enabled: bool) -> Value {
                         }));
                     }
                     ContentPart::Text { text } => text_parts.push(text.clone()),
-                    ContentPart::Reasoning { text } => reasoning_parts.push(text.clone()),
+                    ContentPart::Reasoning { text, .. } => reasoning_parts.push(text.clone()),
                     _ => {}
                 }
             }
@@ -1448,7 +1448,7 @@ fn serialize_part(part: &ContentPart) -> Value {
             "tool_call_id": tool_use_id,
             "content":      content,
         }),
-        ContentPart::Reasoning { text } => json!({
+        ContentPart::Reasoning { text, .. } => json!({
             "type":     "reasoning",
             "reasoning": text,
         }),
@@ -2401,9 +2401,7 @@ mod tests {
         let msg = Message {
             role: Role::Assistant,
             content: MessageContent::Parts(vec![
-                ContentPart::Reasoning {
-                    text: "Let me think...".into(),
-                },
+                ContentPart::reasoning("Let me think..."),
                 ContentPart::ToolUse {
                     id: "call_2".into(),
                     name: "web_search".into(),

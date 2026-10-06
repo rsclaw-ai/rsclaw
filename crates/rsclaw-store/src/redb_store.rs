@@ -432,6 +432,15 @@ impl RedbStore {
         }
     }
 
+    /// Number of active (non-archive) messages currently stored for
+    /// `session_key`, i.e. what `load_messages` would return. Unlike
+    /// `SessionMeta::message_count` this drops after compaction.
+    pub fn count_active_messages(&self, session_key: &str) -> Result<u64> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(MESSAGES)?;
+        Ok(own_active_message_keys(&table, session_key)?.len() as u64)
+    }
+
     pub fn put_session_meta(&self, session_key: &str, meta: &SessionMeta) -> Result<()> {
         let json = serde_json::to_string(meta)?;
         let write = self.db.begin_write()?;
@@ -575,6 +584,67 @@ impl RedbStore {
         write.commit()?;
 
         Ok(seq)
+    }
+
+    /// Atomically replace a session's active messages (used by compaction).
+    ///
+    /// In ONE write transaction: removes every active message key of
+    /// `session_key` (both the `\0` and legacy `:` separators, exact-match so
+    /// sub-sessions sharing the prefix are untouched) and writes `messages`
+    /// under fresh seqs. A crash leaves either the old or the new history,
+    /// never neither.
+    ///
+    /// The archive is NOT touched: the replaced messages are already archived
+    /// and the compacted rewrite must not be archived again. Seqs continue
+    /// from `message_count` (which keeps increasing) so later appends never
+    /// collide with — and overwrite — existing archive rows of the current
+    /// generation.
+    pub fn replace_active_messages(
+        &self,
+        session_key: &str,
+        messages: &[serde_json::Value],
+    ) -> Result<()> {
+        // Serialize first: a failure aborts before anything is written.
+        let encoded: Vec<String> = messages
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<_, _>>()?;
+        let now = chrono::Utc::now().timestamp();
+
+        let write = self.db.begin_write()?;
+        let first_seq = {
+            let mut metas = write.open_table(SESSION_META)?;
+            let mut meta: SessionMeta = metas
+                .get(session_key)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()?
+                .unwrap_or_else(|| SessionMeta {
+                    session_key: session_key.to_owned(),
+                    message_count: 0,
+                    last_active: now,
+                    created_at: now,
+                    generation: 1,
+                });
+            let first_seq = meta.message_count;
+            meta.message_count = meta.message_count.saturating_add(encoded.len() as u64);
+            meta.last_active = now;
+            let meta_json = serde_json::to_string(&meta)?;
+            metas.insert(session_key, meta_json.as_str())?;
+            first_seq
+        };
+        {
+            let mut msgs = write.open_table(MESSAGES)?;
+            for key in own_active_message_keys(&msgs, session_key)? {
+                msgs.remove(key.as_str())?;
+            }
+            for (i, json) in encoded.iter().enumerate() {
+                let seq = first_seq.saturating_add(i as u64);
+                let msg_key = format!("{session_key}{KEY_SEP}{seq:016}");
+                msgs.insert(msg_key.as_str(), json.as_str())?;
+            }
+        }
+        write.commit()?;
+        Ok(())
     }
 
     /// Load all messages for a session, in order.
@@ -1561,6 +1631,10 @@ impl RedbStore {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionMeta {
     pub session_key: String,
+    /// Seq allocator for the current generation: the number of messages ever
+    /// written in it. Monotonic (compaction does not lower it), so it is NOT
+    /// the number of active messages; use `RedbStore::count_active_messages`
+    /// for that. Reset to 0 on `/new`.
     pub message_count: u64,
     pub last_active: i64, // Unix timestamp
     pub created_at: i64,
@@ -1934,6 +2008,66 @@ mod tests {
         let topic_msgs = store.load_messages(topic).unwrap();
         assert_eq!(topic_msgs.len(), 1);
         assert_eq!(topic_msgs[0]["text"], "topic");
+    }
+
+    #[test]
+    fn replace_active_messages_is_atomic_and_keeps_archive() {
+        let (store, _dir) = open_tmp();
+        let sk = "agent:a:c:group:R";
+        let topic = "agent:a:c:group:R:topic:T";
+        for i in 0..3 {
+            store
+                .append_message(sk, &serde_json::json!({"n": i}))
+                .unwrap();
+        }
+        store
+            .append_message(topic, &serde_json::json!({"text": "topic"}))
+            .unwrap();
+        // A legacy `:`-separated active row of the same session.
+        {
+            let write = store.db.begin_write().unwrap();
+            {
+                let mut msgs = write.open_table(MESSAGES).unwrap();
+                let legacy = format!("{sk}{LEGACY_KEY_SEP}{:016}", 99u64);
+                msgs.insert(legacy.as_str(), r#"{"n":"legacy"}"#).unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        store
+            .replace_active_messages(
+                sk,
+                &[
+                    serde_json::json!({"n": "summary"}),
+                    serde_json::json!({"n": "tail"}),
+                ],
+            )
+            .unwrap();
+
+        let msgs = store.load_messages(sk).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["n"], "summary");
+        assert_eq!(msgs[1]["n"], "tail");
+        // Active count follows the rewrite; the meta seq counter does not drop.
+        assert_eq!(store.count_active_messages(sk).unwrap(), 2);
+        // Sub-session sharing the prefix is untouched.
+        assert_eq!(store.load_messages(topic).unwrap().len(), 1);
+        assert_eq!(store.count_active_messages(topic).unwrap(), 1);
+        // Archive keeps exactly the original appends; the rewrite is not archived.
+        let archived = store.archive_load(sk, None).unwrap();
+        assert_eq!(archived.len(), 3);
+        assert!(archived.iter().all(|(_, _, m)| m["n"].is_number()));
+
+        // Later appends continue after the rewrite and never overwrite archive rows.
+        store
+            .append_message(sk, &serde_json::json!({"n": "next"}))
+            .unwrap();
+        let msgs = store.load_messages(sk).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["n"], "next");
+        let archived = store.archive_load(sk, None).unwrap();
+        assert_eq!(archived.len(), 4);
+        assert_eq!(archived[0].2["n"], 0);
     }
 
     #[test]

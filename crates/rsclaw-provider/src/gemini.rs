@@ -206,7 +206,13 @@ fn serialize_message(msg: &Message) -> Value {
 
     let parts = match &msg.content {
         MessageContent::Text(t) => vec![json!({ "text": t })],
-        MessageContent::Parts(parts) => parts.iter().map(serialize_part).collect(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            // Replay-only reasoning blocks (redacted / display-omitted
+            // thinking) carry no text; an empty text part is invalid here.
+            .filter(|p| !matches!(p, ContentPart::Reasoning { text, .. } if text.is_empty()))
+            .map(serialize_part)
+            .collect(),
     };
 
     json!({ "role": role, "parts": parts })
@@ -251,7 +257,7 @@ fn serialize_part(part: &ContentPart) -> Value {
                 "response": { "content": content },
             }
         }),
-        ContentPart::Reasoning { text } => json!({
+        ContentPart::Reasoning { text, .. } => json!({
             "text": text,
         }),
     }
