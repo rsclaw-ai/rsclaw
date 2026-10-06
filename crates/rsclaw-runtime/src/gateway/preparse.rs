@@ -278,15 +278,29 @@ pub(crate) fn is_owner_only_command(lower: &str, raw: &str) -> bool {
 /// channel/peer (e.g. `/loop`) can populate a `CronDelivery` correctly.
 /// `origin` tells preparse whether the call came from a real user or from
 /// cron's replay of `/loop`-scheduled text.
+/// `session_key` is the exact key the caller would dispatch the turn under
+/// (group / dmScope aware). When given, `/clear` and `/new` reset exactly that
+/// session; when `None`, they fall back to matching the same channel+sender.
 pub(crate) async fn try_preparse_locally(
     text: &str,
     handle: &rsclaw_agent::AgentHandle,
     channel: &str,
     peer_id: &str,
+    session_key: Option<&str>,
     origin: PreparseOrigin,
     trust: rsclaw_agent::SenderTrust,
 ) -> Option<OutboundMessage> {
-    try_preparse_locally_with_account(text, handle, channel, peer_id, None, origin, trust).await
+    try_preparse_locally_with_account(
+        text,
+        handle,
+        channel,
+        peer_id,
+        None,
+        session_key,
+        origin,
+        trust,
+    )
+    .await
 }
 
 /// Account-aware variant. Channels that need multi-account routing
@@ -295,12 +309,14 @@ pub(crate) async fn try_preparse_locally(
 /// route back through the SAME app that received the inbound message.
 /// Open IDs are per-app in feishu — sending via the wrong app fails
 /// with 99992361 "open_id cross app".
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_preparse_locally_with_account(
     text: &str,
     handle: &rsclaw_agent::AgentHandle,
     channel: &str,
     peer_id: &str,
     account: Option<&str>,
+    session_key: Option<&str>,
     origin: PreparseOrigin,
     trust: rsclaw_agent::SenderTrust,
 ) -> Option<OutboundMessage> {
@@ -410,6 +426,12 @@ pub(crate) async fn try_preparse_locally_with_account(
         dm_scope: DmScope::PerChannelPeer,
     });
 
+    // The caller's exact session key (group / dmScope aware) when known;
+    // otherwise the DM-default guess above. /abort, /clear, /new and the
+    // /cap sticky binding all act on this key so they hit the same session
+    // the turn dispatcher (and `resolve_sticky` in run_turn) uses.
+    let target_key: &str = session_key.unwrap_or(&this_session_key);
+
     if let Some(reply) = try_plugin_slash(
         t,
         handle,
@@ -430,7 +452,7 @@ pub(crate) async fn try_preparse_locally_with_account(
             .abort_flags
             .read()
             .expect("abort_flags lock poisoned");
-        let hit = flags.get(&this_session_key).map(|f| {
+        let hit = flags.get(target_key).map(|f| {
             f.store(true, Ordering::SeqCst);
         });
         return Some(txt(if hit.is_some() {
@@ -439,6 +461,17 @@ pub(crate) async fn try_preparse_locally_with_account(
             "nothing to abort".to_owned()
         }));
     }
+    // /clear and /new target the caller's exact session key when known;
+    // otherwise the DM-default guess plus a channel+sender fallback match.
+    let reset_request = |kind: rsclaw_agent::SessionResetKind| match session_key {
+        Some(key) => rsclaw_agent::SessionResetRequest::exact(kind, key),
+        None => rsclaw_agent::SessionResetRequest::with_sender_fallback(
+            kind,
+            this_session_key.clone(),
+            channel,
+            peer_id,
+        ),
+    };
     // /clear — abort current session's running turn + signal session clear
     if lower == "/clear" {
         // 1. Abort the running turn FOR THIS SESSION only.
@@ -446,20 +479,13 @@ pub(crate) async fn try_preparse_locally_with_account(
             .abort_flags
             .read()
             .expect("abort_flags lock poisoned");
-        if let Some(f) = flags.get(&this_session_key) {
+        if let Some(f) = flags.get(target_key) {
             f.store(true, Ordering::SeqCst);
         }
         drop(flags);
         // 2. Queue a clear for THIS session only. The runtime applies it at
-        //    this session's next turn (or mid-loop if it is running). The
-        //    channel/peer pair lets it match when the turn's key differs from
-        //    `this_session_key` (group chats, non-default dmScope).
-        handle.request_session_reset(rsclaw_agent::SessionResetRequest {
-            kind: rsclaw_agent::SessionResetKind::Clear,
-            session_key: this_session_key.clone(),
-            channel: channel.to_owned(),
-            peer_id: peer_id.to_owned(),
-        });
+        //    this session's next turn (or mid-loop if it is running).
+        handle.request_session_reset(reset_request(rsclaw_agent::SessionResetKind::Clear));
         return Some(txt(rsclaw_i18n::t(
             "session_cleared",
             rsclaw_i18n::default_lang(),
@@ -472,17 +498,14 @@ pub(crate) async fn try_preparse_locally_with_account(
             .abort_flags
             .read()
             .expect("abort_flags lock poisoned");
-        if let Some(f) = flags.get(&this_session_key) {
+        if let Some(f) = flags.get(target_key) {
             f.store(true, Ordering::SeqCst);
         }
         drop(flags);
         // Queue a new generation for THIS session only (see /clear above).
-        handle.request_session_reset(rsclaw_agent::SessionResetRequest {
-            kind: rsclaw_agent::SessionResetKind::NewGeneration,
-            session_key: this_session_key.clone(),
-            channel: channel.to_owned(),
-            peer_id: peer_id.to_owned(),
-        });
+        handle.request_session_reset(reset_request(
+            rsclaw_agent::SessionResetKind::NewGeneration,
+        ));
         return Some(txt(rsclaw_i18n::t(
             "session_new",
             rsclaw_i18n::default_lang(),
@@ -569,13 +592,13 @@ pub(crate) async fn try_preparse_locally_with_account(
         match manager.open_session(kind, cwd).await {
             Ok(sid) => {
                 manager
-                    .bind_sticky(this_session_key.clone(), sid.clone(), kind)
+                    .bind_sticky(target_key.to_owned(), sid.clone(), kind)
                     .await;
                 tracing::info!(
                     target: "cap",
                     session_id = %sid,
                     agent = kind.as_str(),
-                    im_session_key = %this_session_key,
+                    im_session_key = %target_key,
                     "cap_live sticky bind"
                 );
                 // Native session id is captured asynchronously by the
@@ -666,7 +689,7 @@ pub(crate) async fn try_preparse_locally_with_account(
         match spawn_result {
             Ok(sid) => {
                 manager
-                    .bind_sticky(this_session_key.clone(), sid.clone(), kind)
+                    .bind_sticky(target_key.to_owned(), sid.clone(), kind)
                     .await;
                 tracing::info!(
                     target: "cap",
@@ -674,7 +697,7 @@ pub(crate) async fn try_preparse_locally_with_account(
                     agent = kind.as_str(),
                     resume_id = %session_id,
                     continue_last = session_id.is_empty(),
-                    im_session_key = %this_session_key,
+                    im_session_key = %target_key,
                     "cap_live sticky bind via /cap-resume"
                 );
                 let label = if session_id.is_empty() {
@@ -710,7 +733,7 @@ pub(crate) async fn try_preparse_locally_with_account(
         let Some(manager) = rsclaw_cap::GLOBAL_CAP_LIVE.get() else {
             return Some(txt(rsclaw_i18n::t("cap_not_initialised", lang)));
         };
-        let Some((sid, kind)) = manager.unbind_sticky(&this_session_key).await else {
+        let Some((sid, kind)) = manager.unbind_sticky(target_key).await else {
             return Some(txt(rsclaw_i18n::t("cap_no_active", lang)));
         };
         // Capture the native session_id BEFORE tearing the actor down
@@ -725,7 +748,7 @@ pub(crate) async fn try_preparse_locally_with_account(
             session_id = %sid,
             agent = kind.as_str(),
             agent_session_id = ?native_sid,
-            im_session_key = %this_session_key,
+            im_session_key = %target_key,
             "cap_live sticky unbind + end"
         );
         // Build the close reply, append the resume hint if we have

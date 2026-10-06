@@ -17,16 +17,6 @@ use super::{display_qr_terminal, load_token, save_token};
 
 const AUTH_URL: &str = "https://login.dingtalk.com/oauth2/auth";
 const TOKEN_URL: &str = "https://api.dingtalk.com/v1.0/oauth2/userAccessToken";
-const CORP_TOKEN_URL: &str = "https://oapi.dingtalk.com/gettoken";
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct CorpTokenResponse {
-    access_token: Option<String>,
-    expires_in: Option<u64>,
-    errcode: Option<i64>,
-    errmsg: Option<String>,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,23 +110,18 @@ pub async fn login(
     Ok(access_token)
 }
 
-/// Get corp-level access token (for robot/app API calls).
+/// Get corp-level (internal app) access token for robot/app API calls.
+///
+/// Uses the v1.0 `POST /v1.0/oauth2/accessToken` endpoint shared with the
+/// DingTalk channel, so `app_secret` is sent in the JSON body rather than the
+/// query string.
 pub async fn get_corp_token(client: &Client, app_key: &str, app_secret: &str) -> Result<String> {
-    let resp: CorpTokenResponse = client
-        .get(CORP_TOKEN_URL)
-        .query(&[("appkey", app_key), ("appsecret", app_secret)])
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if resp.errcode.unwrap_or(0) != 0 {
-        bail!(
-            "DingTalk corp token failed: {} (code {})",
-            resp.errmsg.as_deref().unwrap_or("unknown"),
-            resp.errcode.unwrap_or(-1)
-        );
-    }
-
-    resp.access_token.context("no access_token in response")
+    let (token, _expire_in) = crate::dingtalk::fetch_app_access_token(
+        client,
+        crate::dingtalk::DINGTALK_API_BASE,
+        app_key,
+        app_secret,
+    )
+    .await?;
+    Ok(token)
 }

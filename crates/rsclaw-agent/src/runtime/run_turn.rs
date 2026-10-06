@@ -277,9 +277,10 @@ impl AgentRuntime {
         }
 
         // /clear or /new queued by the preparse bypass for THIS session
-        // (matched by session key, or by the same channel+sender when
-        // preparse could not derive the exact key). Strictly per session:
-        // other users' / agents' sessions and in-flight turns are untouched.
+        // (matched by exact session key; the same channel+sender also matches
+        // only for requests queued without a known key, e.g. cron replay).
+        // Strictly per session: other users' / agents' sessions and in-flight
+        // turns are untouched.
         if let Some(kind) = self.handle.take_session_reset(session_key, channel, peer_id) {
             info!(session = session_key, ?kind, "session reset requested, applying");
             self.apply_session_reset(session_key, kind).await;

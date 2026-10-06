@@ -80,6 +80,8 @@ pub struct WhatsAppChannel {
     access_token: String,
     /// Meta app secret used to verify `X-Hub-Signature-256` on webhooks.
     app_secret: Option<String>,
+    /// Token Meta echoes in `hub.verify_token` on webhook GET verification.
+    verify_token: Option<String>,
     api_base: String,
     client: Client,
     #[allow(clippy::type_complexity)]
@@ -106,6 +108,7 @@ impl WhatsAppChannel {
             phone_number_id: phone_number_id.into(),
             access_token: access_token.into(),
             app_secret: None,
+            verify_token: None,
             api_base: api_base.unwrap_or_else(|| WHATSAPP_API_BASE.to_owned()),
             client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
@@ -119,6 +122,17 @@ impl WhatsAppChannel {
     pub fn with_app_secret(mut self, secret: Option<String>) -> Self {
         self.app_secret = secret.filter(|s| !s.is_empty());
         self
+    }
+
+    /// Set the webhook verify token expected in `hub.verify_token`.
+    pub fn with_verify_token(mut self, token: Option<String>) -> Self {
+        self.verify_token = token.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// Configured webhook verify token, if any.
+    pub fn verify_token(&self) -> Option<&str> {
+        self.verify_token.as_deref()
     }
 
     /// Whether an app secret is configured (webhook verification possible).

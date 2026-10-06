@@ -425,6 +425,7 @@ pub(crate) fn start_discord_if_configured(
                                 &handle,
                                 "discord",
                                 &peer_id,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("discord", &peer_id, is_guild),
                             )

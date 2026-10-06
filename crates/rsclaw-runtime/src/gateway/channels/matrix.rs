@@ -384,6 +384,7 @@ pub(crate) fn start_matrix_if_configured(
                                 &handle,
                                 "matrix",
                                 &sender,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("matrix", &sender, is_group),
                             )

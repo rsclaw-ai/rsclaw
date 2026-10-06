@@ -35,7 +35,8 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 const DINGTALK_OAPI_BASE: &str = "https://oapi.dingtalk.com";
-const DINGTALK_API_BASE: &str = "https://api.dingtalk.com";
+/// Default DingTalk v1.0 API base.
+pub const DINGTALK_API_BASE: &str = "https://api.dingtalk.com";
 
 /// DingTalk single-message text limit.
 const DINGTALK_CHUNK_LIMIT: usize = 20_000;
@@ -43,20 +44,62 @@ const DINGTALK_CHUNK_LIMIT: usize = 20_000;
 /// Access token refresh margin -- refresh 5 minutes before actual expiry.
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(300);
 
+/// Fetch an internal-app access token from the v1.0 endpoint
+/// (`POST {api_base}/v1.0/oauth2/accessToken`). Credentials travel in the
+/// JSON body, never in the URL, so they cannot leak into logs via transport
+/// errors. The token is the same one the legacy `oapi` endpoints (e.g.
+/// `media/upload`) accept. Returns `(access_token, expire_in_secs)`.
+pub async fn fetch_app_access_token(
+    client: &reqwest::Client,
+    api_base: &str,
+    app_key: &str,
+    app_secret: &str,
+) -> Result<(String, u64)> {
+    let url = format!("{}/v1.0/oauth2/accessToken", api_base.trim_end_matches('/'));
+    let http_resp = client
+        .post(&url)
+        .json(&json!({
+            "appKey": app_key,
+            "appSecret": app_secret,
+        }))
+        .send()
+        .await
+        .context("DingTalk accessToken request")?;
+    let status = http_resp.status();
+    let body = http_resp
+        .bytes()
+        .await
+        .context("DingTalk accessToken read")?;
+    let resp: TokenResponse = serde_json::from_slice(&body)
+        .with_context(|| format!("DingTalk accessToken parse (HTTP {})", status.as_u16()))?;
+
+    if !status.is_success() || resp.access_token.is_empty() {
+        bail!(
+            "DingTalk accessToken error (HTTP {}) {}: {}",
+            status.as_u16(),
+            resp.code.unwrap_or_default(),
+            resp.message.unwrap_or_default()
+        );
+    }
+    Ok((resp.access_token, resp.expire_in))
+}
+
 // ---------------------------------------------------------------------------
 // API response types
 // ---------------------------------------------------------------------------
 
+/// Response of `POST /v1.0/oauth2/accessToken`. Errors come back as a
+/// non-2xx status with `code` / `message` instead.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
-    #[serde(default)]
+    #[serde(default, rename = "accessToken")]
     access_token: String,
+    #[serde(default, rename = "expireIn")]
+    expire_in: u64,
     #[serde(default)]
-    expires_in: u64,
+    code: Option<String>,
     #[serde(default)]
-    errcode: i64,
-    #[serde(default)]
-    errmsg: Option<String>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,44 +203,16 @@ impl DingTalkChannel {
             return Ok(cached.token.clone());
         }
 
-        let url = format!(
-            "{}/gettoken?appkey={}&appsecret={}",
-            self.oapi_base, self.app_key, self.app_secret
-        );
-
-        // The legacy gettoken endpoint carries appsecret in the query string;
-        // strip the URL from transport errors so it never reaches the logs.
-        let resp: TokenResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.without_url())
-            .context("DingTalk gettoken request")?
-            .json()
-            .await
-            .map_err(|e| e.without_url())
-            .context("DingTalk gettoken parse")?;
-
-        if resp.errcode != 0 {
-            bail!(
-                "DingTalk gettoken error {}: {}",
-                resp.errcode,
-                resp.errmsg.unwrap_or_default()
-            );
-        }
-
-        let token = resp.access_token.clone();
+        let (token, expire_in) =
+            fetch_app_access_token(&self.client, &self.api_base, &self.app_key, &self.app_secret)
+                .await?;
         *cache = Some(CachedToken {
-            token: resp.access_token,
+            token: token.clone(),
             obtained_at: Instant::now(),
-            expires_in: Duration::from_secs(resp.expires_in),
+            expires_in: Duration::from_secs(expire_in),
         });
 
-        info!(
-            "DingTalk access token refreshed (expires in {}s)",
-            resp.expires_in
-        );
+        info!("DingTalk access token refreshed (expires in {expire_in}s)");
         Ok(token)
     }
 
@@ -1302,6 +1317,19 @@ mod tests {
     #[test]
     fn chunk_limit() {
         assert_eq!(DINGTALK_CHUNK_LIMIT, 20_000);
+    }
+
+    #[test]
+    fn token_response_v1_fields() {
+        let ok: TokenResponse =
+            serde_json::from_str(r#"{"accessToken":"abc","expireIn":7200}"#).expect("parse");
+        assert_eq!(ok.access_token, "abc");
+        assert_eq!(ok.expire_in, 7200);
+        let err: TokenResponse =
+            serde_json::from_str(r#"{"code":"invalidClientId","message":"bad key","requestid":"x"}"#)
+                .expect("parse");
+        assert!(err.access_token.is_empty());
+        assert_eq!(err.code.as_deref(), Some("invalidClientId"));
     }
 
     #[test]

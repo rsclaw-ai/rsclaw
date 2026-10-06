@@ -294,6 +294,7 @@ fn start_custom_webhook(
                             &handle,
                             &ch_name,
                             &sender,
+                            Some(session_key.as_str()),
                             crate::gateway::preparse::PreparseOrigin::User,
                             rsclaw_agent::trust::channel_trust(&ch_name, &sender, is_group),
                         )
@@ -765,6 +766,7 @@ fn start_custom_websocket(
                             &handle,
                             &ch_name,
                             &sender,
+                            Some(session_key.as_str()),
                             crate::gateway::preparse::PreparseOrigin::User,
                             rsclaw_agent::trust::channel_trust(&ch_name, &sender, is_group),
                         )

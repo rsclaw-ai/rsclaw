@@ -413,6 +413,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                 &handle,
                                 "dingtalk",
                                 &sender_id,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("dingtalk", &sender_id, is_group),
                             )

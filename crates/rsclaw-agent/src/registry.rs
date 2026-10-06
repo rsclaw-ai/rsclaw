@@ -150,21 +150,50 @@ pub enum SessionResetKind {
 
 /// A `/clear` or `/new` request queued for one session.
 ///
-/// Preparse cannot always derive the exact session key the turn will use
-/// (group chats, non-default `dmScope`), so a request also matches a turn
-/// from the same `(channel, peer_id)` sender.
+/// When the requester knows the exact session key the turn will use, build
+/// it with [`SessionResetRequest::exact`]: only that session matches. When it
+/// can only guess the key (cron replay, callers without channel context),
+/// [`SessionResetRequest::with_sender_fallback`] also matches a turn from the
+/// same `(channel, peer_id)` sender. Empty `channel` / `peer_id` disable the
+/// sender fallback.
 #[derive(Debug, Clone)]
 pub struct SessionResetRequest {
     pub kind: SessionResetKind,
     /// Session key as derived by the requester (preparse).
     pub session_key: String,
-    /// Channel the command arrived on.
+    /// Channel the command arrived on (empty = exact-key match only).
     pub channel: String,
-    /// Sender peer id of the command.
+    /// Sender peer id of the command (empty = exact-key match only).
     pub peer_id: String,
 }
 
 impl SessionResetRequest {
+    /// Request that matches only the turn whose session key is `session_key`.
+    pub fn exact(kind: SessionResetKind, session_key: impl Into<String>) -> Self {
+        Self {
+            kind,
+            session_key: session_key.into(),
+            channel: String::new(),
+            peer_id: String::new(),
+        }
+    }
+
+    /// Request that matches `session_key`, or any turn from the same
+    /// `(channel, peer_id)` sender. Use only when the exact key is unknown.
+    pub fn with_sender_fallback(
+        kind: SessionResetKind,
+        session_key: impl Into<String>,
+        channel: impl Into<String>,
+        peer_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            session_key: session_key.into(),
+            channel: channel.into(),
+            peer_id: peer_id.into(),
+        }
+    }
+
     fn matches(&self, session_key: &str, channel: &str, peer_id: &str) -> bool {
         self.session_key == session_key
             || (!self.channel.is_empty()
@@ -1280,12 +1309,12 @@ mod tests {
         let cfg = make_runtime(vec![entry("main", true, None)]);
         let reg = AgentRegistry::from_config(&cfg);
         let h = reg.get("main").expect("agent");
-        h.request_session_reset(SessionResetRequest {
-            kind: SessionResetKind::Clear,
-            session_key: "agent:main:telegram:direct:alice".to_owned(),
-            channel: "telegram".to_owned(),
-            peer_id: "alice".to_owned(),
-        });
+        h.request_session_reset(SessionResetRequest::with_sender_fallback(
+            SessionResetKind::Clear,
+            "agent:main:telegram:direct:alice",
+            "telegram",
+            "alice",
+        ));
         // Another user's turn must not consume (or be affected by) it.
         assert!(
             h.take_session_reset("agent:main:telegram:direct:bob", "telegram", "bob")
@@ -1300,6 +1329,26 @@ mod tests {
         assert!(
             h.take_session_reset("agent:main:telegram:direct:alice", "telegram", "alice")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn exact_session_reset_ignores_same_sender_in_other_session() {
+        let cfg = make_runtime(vec![entry("main", true, None)]);
+        let reg = AgentRegistry::from_config(&cfg);
+        let h = reg.get("main").expect("agent");
+        h.request_session_reset(SessionResetRequest::exact(
+            SessionResetKind::Clear,
+            "agent:main:telegram:direct:alice",
+        ));
+        // `/clear` sent in a DM must not clear the sender's group session.
+        assert!(
+            h.take_session_reset("agent:main:telegram:group:g1", "telegram", "alice")
+                .is_none()
+        );
+        assert_eq!(
+            h.take_session_reset("agent:main:telegram:direct:alice", "telegram", "alice"),
+            Some(SessionResetKind::Clear)
         );
     }
 }

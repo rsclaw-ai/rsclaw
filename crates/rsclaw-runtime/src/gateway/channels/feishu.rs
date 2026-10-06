@@ -325,12 +325,31 @@ pub(crate) fn start_feishu_if_configured(
                                 Err(_) => return,
                             }
                         };
+                        // Same derivation as the queue worker below, so
+                        // /clear and /new reset exactly this session.
+                        let session_key = derive_session_key(&SessionKeyParams {
+                            agent_id: handle.id.clone(),
+                            kind: if is_group {
+                                MessageKind::GroupMessage {
+                                    group_id: chat_id.clone(),
+                                    thread_id: None,
+                                }
+                            } else {
+                                MessageKind::DirectMessage {
+                                    account_id: Some(w_acct_outer.clone()),
+                                }
+                            },
+                            channel: "feishu".to_string(),
+                            peer_id: sender_id.clone(),
+                            dm_scope: default_dm_scope(&cfg),
+                        });
                         if let Some(mut reply) = try_preparse_locally_with_account(
                             &text,
                             &handle,
                             "feishu",
                             &sender_id,
                             Some(&w_acct_outer),
+                            Some(session_key.as_str()),
                             crate::gateway::preparse::PreparseOrigin::User,
                             rsclaw_agent::trust::channel_trust("feishu", &sender_id, is_group),
                         )
@@ -568,6 +587,7 @@ pub(crate) fn start_feishu_if_configured(
                                 "feishu",
                                 &sender_id,
                                 Some(&w_acct_for_preparse),
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("feishu", &sender_id, is_group),
                             )

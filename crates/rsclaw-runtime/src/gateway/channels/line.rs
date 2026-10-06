@@ -364,6 +364,7 @@ pub(crate) fn start_line_if_configured(
                                 &handle,
                                 "line",
                                 &user_id,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("line", &user_id, is_group),
                             )

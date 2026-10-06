@@ -83,6 +83,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
             &agent,
             "ws",
             "ws-client",
+            Some(session_key.as_str()),
             PreparseOrigin::User,
             rsclaw_agent::SenderTrust::Owner,
         )

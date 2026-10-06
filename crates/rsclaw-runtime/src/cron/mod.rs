@@ -1595,6 +1595,7 @@ async fn run_cron_job(
             handle.as_ref(),
             preparse_channel,
             preparse_peer,
+            None,
             crate::gateway::preparse::PreparseOrigin::Cron,
             rsclaw_agent::SenderTrust::Owner,
         )

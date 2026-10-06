@@ -452,6 +452,7 @@ pub(crate) fn start_telegram_if_configured(
                                 &handle,
                                 "telegram",
                                 &peer_id_s,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("telegram", &peer_id_s, is_group),
                             )

@@ -52,9 +52,12 @@ pub(crate) fn start_whatsapp_if_configured(
         enforcers.insert("whatsapp".to_owned(), Arc::clone(&enforcer));
     }
 
-    // Collect (account_name, phone_number_id, access_token, app_secret) from
-    // accounts.<name>.{phoneNumberId, accessToken, appSecret}
-    let mut wa_accounts: Vec<(String, String, String, Option<String>)> = Vec::new();
+    // Collect (account_name, phone_number_id, access_token, app_secret,
+    // verify_token) from
+    // accounts.<name>.{phoneNumberId, accessToken, appSecret, verifyToken}
+    #[allow(clippy::type_complexity)]
+    let mut wa_accounts: Vec<(String, String, String, Option<String>, Option<String>)> =
+        Vec::new();
     if let Some(accts) = &wa_cfg.accounts {
         for (name, acct) in accts {
             let pid = acct
@@ -70,8 +73,19 @@ pub(crate) fn start_whatsapp_if_configured(
                 .and_then(|v| v.as_str())
                 .filter(|v| !v.is_empty())
                 .map(rsclaw_config::loader::expand_env_vars);
+            let verify_token = acct
+                .get("verifyToken")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(rsclaw_config::loader::expand_env_vars);
             if !pid.is_empty() && !token.is_empty() {
-                wa_accounts.push((name.clone(), pid.to_owned(), token.to_owned(), app_secret));
+                wa_accounts.push((
+                    name.clone(),
+                    pid.to_owned(),
+                    token.to_owned(),
+                    app_secret,
+                    verify_token,
+                ));
             }
         }
     }
@@ -81,9 +95,9 @@ pub(crate) fn start_whatsapp_if_configured(
         return;
     }
 
-    let bare_acct = bare_account_name(wa_accounts.iter().map(|(n, _, _, _)| n));
+    let bare_acct = bare_account_name(wa_accounts.iter().map(|(n, _, _, _, _)| n));
 
-    for (acct_name, phone_number_id, access_token, app_secret) in wa_accounts {
+    for (acct_name, phone_number_id, access_token, app_secret, verify_token) in wa_accounts {
         let acct_for_log = acct_name.clone();
         let w_acct_outer = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
@@ -320,6 +334,7 @@ pub(crate) fn start_whatsapp_if_configured(
                                 &handle,
                                 "whatsapp",
                                 &from,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("whatsapp", &from, false),
                             )
@@ -432,7 +447,8 @@ pub(crate) fn start_whatsapp_if_configured(
                 wa_cfg.api_base.clone(),
                 on_message,
             )
-            .with_app_secret(app_secret),
+            .with_app_secret(app_secret)
+            .with_verify_token(verify_token),
         );
         // Only expose /hooks/whatsapp when X-Hub-Signature-256 can be
         // verified; without the app secret anyone could forge messages.

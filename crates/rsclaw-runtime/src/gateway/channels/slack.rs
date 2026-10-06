@@ -434,6 +434,7 @@ pub(crate) fn start_slack_if_configured(
                                 &handle,
                                 "slack",
                                 &peer_id,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("slack", &peer_id, is_channel),
                             )

@@ -323,6 +323,7 @@ pub(crate) fn start_zalo_if_configured(
                                 &handle,
                                 "zalo",
                                 &sender_id,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("zalo", &sender_id, false),
                             )

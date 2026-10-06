@@ -361,6 +361,7 @@ pub(crate) fn start_wecom_if_configured(
                                 &handle,
                                 "wecom",
                                 &from,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("wecom", &from, is_group),
                             )

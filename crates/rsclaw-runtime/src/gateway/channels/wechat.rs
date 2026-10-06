@@ -421,6 +421,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 &handle,
                                 "wechat",
                                 &from_user,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("wechat", &from_user, false),
                             )

@@ -398,6 +398,7 @@ pub(crate) fn start_signal_if_configured(
                             &handle,
                             "signal",
                             &sender,
+                            Some(session_key.as_str()),
                             crate::gateway::preparse::PreparseOrigin::User,
                             rsclaw_agent::trust::channel_trust("signal", &sender, is_group),
                         )

@@ -365,6 +365,7 @@ pub(crate) fn start_qq_if_configured(
                                 &handle,
                                 "qq",
                                 &sender_id,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
                                 rsclaw_agent::trust::channel_trust("qq", &sender_id, is_group),
                             )
