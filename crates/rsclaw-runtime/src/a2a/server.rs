@@ -120,10 +120,10 @@ pub fn build_agent_card(state: &AppState, _extended: bool) -> AgentCard {
 // ---------------------------------------------------------------------------
 
 /// A2A §7.5 access control: a caller may touch a task only if it owns it.
-/// A `None` caller (auth disabled / dev pass-through) is unscoped; the unified
-/// `gateway-auth` operator token sees everything; an existing task with no
-/// recorded owner (legacy or dev-created) is unscoped. A task that does not
-/// exist is owned by nobody. Fails closed on a store error.
+/// A `None` caller (auth disabled / dev pass-through) is unscoped, and the
+/// unified `gateway-auth` operator token sees everything. Named principals are
+/// denied access to existing ownerless tasks so enabling auth cannot expose
+/// legacy dev-mode data. Missing tasks and store errors also fail closed.
 pub(crate) fn caller_owns(
     store: &crate::a2a::store::TaskStore,
     caller: &Option<crate::a2a::auth::A2aIdentity>,
@@ -134,8 +134,7 @@ pub(crate) fn caller_owns(
         Some(c) if c.id == "gateway-auth" => true,
         Some(c) => match store.get_owner(task_id) {
             Ok(Some(owner)) => owner == c.id,
-            Ok(None) => matches!(store.get(task_id), Ok(Some(_))),
-            Err(_) => false,
+            Ok(None) | Err(_) => false,
         },
     }
 }
@@ -1446,7 +1445,30 @@ mod tests {
         // The operator token and dev/no-auth mode are unscoped.
         assert!(caller_owns(&store, &ident("gateway-auth"), "task-1"));
         assert!(caller_owns(&store, &None::<A2aIdentity>, "task-1"));
-        // A task that does not exist is owned by nobody.
+
+        let legacy_task = A2aTask {
+            id: "legacy-task".to_owned(),
+            context_id: Some("legacy-context".to_owned()),
+            status: A2aTaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            history: vec![],
+            artifacts: vec![],
+            metadata: None,
+        };
+        store.put(&legacy_task).unwrap();
+
+        // Named principals cannot access a real legacy task that has no owner.
+        assert!(!caller_owns(&store, &ident("bob"), "legacy-task"));
+        // Administrative and no-auth access remain available for migration.
+        assert!(caller_owns(&store, &ident("gateway-auth"), "legacy-task"));
+        assert!(caller_owns(&store, &None::<A2aIdentity>, "legacy-task"));
+        // New IDs remain unreserved so authenticated callers can create tasks;
+        // missing IDs are never treated as owned existing tasks.
+        assert!(!task_reserved(&store, "no-such-task"));
+        assert!(task_reserved(&store, "legacy-task"));
         assert!(!caller_owns(&store, &ident("bob"), "no-such-task"));
     }
 }
