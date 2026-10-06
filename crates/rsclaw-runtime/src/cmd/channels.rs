@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rsclaw_cli::ChannelsCommand;
+use rsclaw_cli::{ChannelsCommand, ChannelsOwnerCommand};
 use rsclaw_config as config;
 
 use super::{
@@ -65,7 +65,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             let (path, mut val) = load_config_json()?;
             let key = format!("channels.{channel}.enabled");
             set_nested_value(&mut val, &key, serde_json::Value::Bool(true))?;
-            std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+            rsclaw_config::loader::write_file_atomic(&path, &serde_json::to_string_pretty(&val)?)?;
             ok(&format!(
                 "enabled channel '{}' -- set the required token in {}",
                 cyan(&channel),
@@ -77,7 +77,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             if let Some(channels) = val.get_mut("channels").and_then(|v| v.as_object_mut()) {
                 channels.remove(&channel);
             }
-            std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+            rsclaw_config::loader::write_file_atomic(&path, &serde_json::to_string_pretty(&val)?)?;
             ok(&format!("removed channel '{}'", cyan(&channel)));
         }
         ChannelsCommand::Login { channel, quiet } => {
@@ -147,7 +147,10 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                             }
                         }
                     }
-                    std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+                    rsclaw_config::loader::write_file_atomic(
+                        &path,
+                        &serde_json::to_string_pretty(&val)?,
+                    )?;
                     if !quiet {
                         ok(&format!("login successful, bot_id={}", bold(&bot_id)));
                         kv("token saved", &dim(&path.display().to_string()));
@@ -206,7 +209,10 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                             }
                         }
                     }
-                    std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+                    rsclaw_config::loader::write_file_atomic(
+                        &path,
+                        &serde_json::to_string_pretty(&val)?,
+                    )?;
                     if !quiet {
                         ok(&format!(
                             "config saved to {}",
@@ -295,14 +301,14 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                 let full = format!("channels.{channel}.{key}");
                 remove_nested_value(&mut val, &full);
             }
-            std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+            rsclaw_config::loader::write_file_atomic(&path, &serde_json::to_string_pretty(&val)?)?;
             ok(&format!(
                 "removed credentials for channel '{}'",
                 cyan(&channel)
             ));
         }
 
-        ChannelsCommand::Pair { code } => {
+        ChannelsCommand::Pair { code, owner } => {
             // Approve a pairing code by calling the running gateway's API.
             let config = config::load()?;
             let port = std::env::var("RSCLAW_PORT")
@@ -339,6 +345,14 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
 
                     // Also persist to openclaw-compatible credentials file.
                     persist_allow_from(channel, peer);
+
+                    if owner {
+                        if channel == "unknown" || peer == "unknown" {
+                            warn_msg("gateway did not report the approved peer; owner not added");
+                        } else {
+                            update_owners(channel, peer, true)?;
+                        }
+                    }
                 }
                 Ok(r) => {
                     let status = r.status();
@@ -364,6 +378,37 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             }
         }
 
+        ChannelsCommand::Owner { action } => match action {
+            ChannelsOwnerCommand::Add { channel, peer } => {
+                update_owners(&channel, &peer, true)?;
+            }
+            ChannelsOwnerCommand::Remove { channel, peer } => {
+                update_owners(&channel, &peer, false)?;
+            }
+            ChannelsOwnerCommand::List { channel } => {
+                let owners = config
+                    .raw
+                    .gateway
+                    .as_ref()
+                    .and_then(|g| g.owners.clone())
+                    .unwrap_or_default();
+                let filter = channel.as_deref().map(owner_base_channel);
+                let shown: Vec<&String> = owners
+                    .iter()
+                    .filter(|o| {
+                        filter.is_none_or(|f| o.split_once(':').is_some_and(|(c, _)| c == f))
+                    })
+                    .collect();
+                if shown.is_empty() {
+                    println!("  {}", dim("no owners configured in gateway.owners"));
+                } else {
+                    for o in shown {
+                        println!("  {o}");
+                    }
+                }
+            }
+        },
+
         ChannelsCommand::Unpair { channel, peer } => {
             let mut changed = false;
 
@@ -377,7 +422,10 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                 let before = arr.len();
                 arr.retain(|v| v.as_str() != Some(&peer));
                 if arr.len() < before {
-                    std::fs::write(&rs_path, serde_json::to_string_pretty(&val)?)?;
+                    rsclaw_config::loader::write_file_atomic(
+                        &rs_path,
+                        &serde_json::to_string_pretty(&val)?,
+                    )?;
                     changed = true;
                 }
             }
@@ -578,6 +626,79 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// gateway.owners helpers
+// ---------------------------------------------------------------------------
+
+/// Owner keys use the base channel name: an account suffix
+/// (`feishu/app2`) is dropped, matching `rsclaw_agent::trust`.
+fn owner_base_channel(channel: &str) -> &str {
+    channel.split('/').next().unwrap_or(channel).trim()
+}
+
+/// Add (`add = true`) or remove `"<channel>:<peer>"` in `gateway.owners`
+/// of the active config file. The file is parsed first and left untouched
+/// on a parse error; the write goes through a temp file + rename.
+fn update_owners(channel: &str, peer: &str, add: bool) -> Result<()> {
+    let channel = owner_base_channel(channel);
+    let peer = peer.trim();
+    if channel.is_empty() || peer.is_empty() || channel.contains(':') {
+        anyhow::bail!("invalid owner identity `{channel}:{peer}`");
+    }
+    let key = format!("{channel}:{peer}");
+    let (path, mut val) = load_config_json()?;
+    if !apply_owner_change(&mut val, &key, add)? {
+        if add {
+            ok(&format!("{} is already an owner", bold(&key)));
+        } else {
+            warn_msg(&format!("{} is not listed in gateway.owners", bold(&key)));
+        }
+        return Ok(());
+    }
+    rsclaw_config::loader::write_file_atomic(&path, &serde_json::to_string_pretty(&val)?)?;
+    if add {
+        ok(&format!("added owner {}", bold(&key)));
+    } else {
+        ok(&format!("removed owner {}", bold(&key)));
+    }
+    Ok(())
+}
+
+/// Edit `gateway.owners` in a parsed config value. Returns whether the
+/// list changed. An emptied list is removed rather than left as `[]`.
+fn apply_owner_change(val: &mut serde_json::Value, key: &str, add: bool) -> Result<bool> {
+    let root = val
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("config root is not an object"))?;
+    let gateway = root
+        .entry("gateway")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("`gateway` in config is not an object"))?;
+    if !add && !gateway.contains_key("owners") {
+        return Ok(false);
+    }
+    let owners = gateway
+        .entry("owners")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("`gateway.owners` in config is not an array"))?;
+    let present = owners.iter().any(|v| v.as_str().map(str::trim) == Some(key));
+    let changed = if add {
+        if !present {
+            owners.push(serde_json::Value::String(key.to_owned()));
+        }
+        !present
+    } else {
+        owners.retain(|v| v.as_str().map(str::trim) != Some(key));
+        present
+    };
+    if owners.is_empty() {
+        gateway.remove("owners");
+    }
+    Ok(changed)
+}
+
+// ---------------------------------------------------------------------------
 // Credentials file helpers
 // ---------------------------------------------------------------------------
 
@@ -648,5 +769,33 @@ fn persist_allow_from(channel: &str, peer_id: &str) {
             &path,
             serde_json::to_string_pretty(&val).unwrap_or_default(),
         );
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    #[test]
+    fn apply_owner_change_adds_dedupes_and_removes() {
+        let mut val = serde_json::json!({ "gateway": { "port": 1 } });
+        assert!(apply_owner_change(&mut val, "telegram:42", true).unwrap());
+        assert!(!apply_owner_change(&mut val, "telegram:42", true).unwrap());
+        assert_eq!(val["gateway"]["owners"], serde_json::json!(["telegram:42"]));
+        assert!(apply_owner_change(&mut val, "telegram:42", false).unwrap());
+        assert!(val["gateway"].get("owners").is_none());
+        assert!(!apply_owner_change(&mut val, "telegram:42", false).unwrap());
+    }
+
+    #[test]
+    fn apply_owner_change_rejects_non_array_owners() {
+        let mut val = serde_json::json!({ "gateway": { "owners": "telegram:1" } });
+        assert!(apply_owner_change(&mut val, "telegram:42", true).is_err());
+    }
+
+    #[test]
+    fn owner_base_channel_strips_account_suffix() {
+        assert_eq!(owner_base_channel("feishu/app2"), "feishu");
+        assert_eq!(owner_base_channel("telegram"), "telegram");
     }
 }

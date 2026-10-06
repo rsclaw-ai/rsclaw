@@ -5664,10 +5664,68 @@ function PairingPage() {
 
   useEffect(() => { fetchPairings(); const iv = setInterval(fetchPairings, 5000); return () => clearInterval(iv); }, [fetchPairings]);
 
-  const handleApprove = async (code: string) => {
+  // gateway.owners ("<channel>:<peer_id>") lives in the desktop config file;
+  // the running gateway picks edits up through its config watcher.
+  const [owners, setOwners] = useState<string[]>([]);
+  const L = Locale.RsClawPanel.Pairing;
+  const ownerKey = (channel: string, peerId: string) => `${channel.split("/")[0].trim()}:${peerId.trim()}`;
+
+  const fetchOwners = useCallback(async () => {
+    if (!isTauri) return;
     try {
-      await gatewayFetch("/api/v1/channels/pair", { method: "POST", body: JSON.stringify({ code }) });
+      const raw: string = await tauriInvokeV2("read_config_file");
+      const list = JSON5.parse(raw || "{}")?.gateway?.owners;
+      setOwners(Array.isArray(list) ? list.filter((o: unknown): o is string => typeof o === "string").map((o: string) => o.trim()) : []);
+    } catch {}
+  }, []);
+
+  useEffect(() => { fetchOwners(); }, [fetchOwners]);
+
+  // Read-modify-write gateway.owners. Aborts without writing when the config
+  // cannot be read or parsed, so a malformed file is never clobbered.
+  const updateOwner = async (key: string, add: boolean): Promise<boolean> => {
+    if (!isTauri) { toast.error(L.DesktopOnly); return false; }
+    try {
+      const raw: string = await tauriInvokeV2("read_config_file");
+      if (!raw || !raw.trim()) { toast.error(L.ConfigUnreadable); return false; }
+      let cfg: any;
+      try { cfg = JSON5.parse(raw); } catch { toast.error(L.ConfigUnreadable); return false; }
+      if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) { toast.error(L.ConfigUnreadable); return false; }
+      const gw = cfg.gateway ?? {};
+      if (typeof gw !== "object" || Array.isArray(gw) || (gw.owners !== undefined && !Array.isArray(gw.owners))) {
+        toast.error(L.ConfigUnreadable);
+        return false;
+      }
+      const same = (o: unknown) => typeof o === "string" && o.trim() === key;
+      let list: unknown[] = Array.isArray(gw.owners) ? [...gw.owners] : [];
+      if (add) {
+        if (!list.some(same)) list.push(key);
+      } else {
+        list = list.filter((o) => !same(o));
+      }
+      if (list.length > 0) gw.owners = list; else delete gw.owners;
+      cfg.gateway = gw;
+      await tauriInvokeV2("write_config", { content: JSON.stringify(cfg, null, 2) });
+      setOwners(list.filter((o): o is string => typeof o === "string").map((o) => o.trim()));
+      toast.success(add ? L.OwnerAdded : L.OwnerRemoved);
+      return true;
+    } catch (e: any) {
+      toast.fromError(L.OwnerUpdateFailed, e);
+      return false;
+    }
+  };
+
+  const handleApprove = async (code: string, asOwner?: { channel: string; peerId: string }) => {
+    try {
+      const res = await gatewayFetch("/api/v1/channels/pair", { method: "POST", body: JSON.stringify({ code }) });
+      if (!res.ok) throw new Error(await res.text());
       toast.success(zh ? "\u5DF2\u901A\u8FC7" : "Approved");
+      if (asOwner) {
+        const body: any = await res.json().catch(() => ({}));
+        const channel = typeof body?.channel === "string" ? body.channel : asOwner.channel;
+        const peerId = typeof body?.peerId === "string" ? body.peerId : asOwner.peerId;
+        await updateOwner(ownerKey(channel, peerId), true);
+      }
       fetchPairings();
     } catch (e: any) {
       toast.fromError(zh ? "\u64CD\u4F5C\u5931\u8D25" : "Action failed", e);
@@ -5719,6 +5777,12 @@ function PairingPage() {
                   style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${V2.gbrd}`, background: V2.glo, color: V2.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
                   {zh ? "\u901A\u8FC7" : "Approve"}
                 </button>
+                {isTauri && (
+                  <button onClick={() => handleApprove(r.code, { channel: r.channel, peerId: r.peerId })} title={L.OwnersHint}
+                    style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${V2.bd2}`, background: V2.bg3, color: V2.or, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                    {L.ApproveAsOwner}
+                  </button>
+                )}
               </div>
             ))}
           </div>
@@ -5735,6 +5799,16 @@ function PairingPage() {
                 <div key={`${r.channel}-${r.peerId}-${i}`} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 9, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
                   <div style={{ width: 6, height: 6, borderRadius: "50%", background: V2.green, flexShrink: 0 }} />
                   <div style={{ flex: 1, fontSize: 11, color: V2.t1, fontFamily: V2.mono }}>{r.peerId.slice(0, 20)}... <span style={{ color: V2.t3 }}>{r.channel}</span></div>
+                  {isTauri && (() => {
+                    const key = ownerKey(r.channel, r.peerId);
+                    const isOwner = owners.includes(key);
+                    return (
+                      <button onClick={() => updateOwner(key, !isOwner)} title={isOwner ? L.RemoveOwner : L.MakeOwner} aria-pressed={isOwner}
+                        style={{ padding: "4px 10px", borderRadius: 6, border: `1px solid ${isOwner ? V2.or : V2.bd2}`, background: isOwner ? "rgba(249,115,22,.12)" : V2.bg3, color: isOwner ? V2.or : V2.t2, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>
+                        {isOwner ? `\u2713 ${L.Owner}` : L.MakeOwner}
+                      </button>
+                    );
+                  })()}
                   <button onClick={() => handleRevoke(r.channel, r.peerId)}
                     style={{ padding: "4px 10px", borderRadius: 6, border: `1px solid ${V2.rbrd}`, background: V2.rlo, color: V2.red, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>
                     {zh ? "\u64A4\u9500" : "Revoke"}
@@ -5744,6 +5818,30 @@ function PairingPage() {
             </div>
           </>
         )}
+
+        {/* Owners (gateway.owners) */}
+        <div style={{ fontSize: 11, fontWeight: 600, color: V2.t1, letterSpacing: 0.4, textTransform: "uppercase", marginTop: 24, marginBottom: 6 }}>
+          {L.Owners} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg3, color: V2.t2 }}>{owners.length}</span>
+        </div>
+        <div style={{ fontSize: 10, color: V2.t3, marginBottom: 10, lineHeight: 1.5 }}>{isTauri ? L.OwnersHint : L.DesktopOnly}</div>
+        {isTauri && (owners.length === 0 ? (
+          <div style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 9, padding: "14px 0", textAlign: "center", color: V2.t3, fontSize: 11 }}>
+            {L.NoOwners}
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {owners.map((o) => (
+              <div key={o} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 9, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 6, height: 6, borderRadius: "50%", background: V2.or, flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0, fontSize: 11, color: V2.t1, fontFamily: V2.mono, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o}</div>
+                <button onClick={() => updateOwner(o, false)}
+                  style={{ padding: "4px 10px", borderRadius: 6, border: `1px solid ${V2.rbrd}`, background: V2.rlo, color: V2.red, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>
+                  {L.RemoveOwner}
+                </button>
+              </div>
+            ))}
+          </div>
+        ))}
       </div>
     </div>
   );

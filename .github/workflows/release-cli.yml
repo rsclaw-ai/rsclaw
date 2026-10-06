@@ -242,7 +242,14 @@ jobs:
           for file in "${expected[@]}"; do
             [[ -f "$file" ]] || { printf 'missing expected artifact: %s\n' "$file" >&2; exit 1; }
           done
-          sha256sum "${expected[@]}" > SHA256SUMS.txt
+          # scripts/install.ps1 downloads the Windows tray controller from the
+          # same release tag and verifies it against SHA256SUMS.txt, so ship it
+          # as a release asset. Copied after the artifact count check above,
+          # which globs rsclaw-* and must only see the CLI archives.
+          tray="rsclaw-tray.ps1"
+          [[ -f "../scripts/$tray" ]] || { printf 'missing tray script: scripts/%s\n' "$tray" >&2; exit 1; }
+          cp "../scripts/$tray" "$tray"
+          sha256sum "${expected[@]}" "$tray" > SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -1103,6 +1103,22 @@ const cn = {
       NotRun: '点击 "检查" 按钮开始诊断。',
     },
 
+    Pairing: {
+      ApproveAsOwner: "通过并设为主人",
+      Owner: "主人",
+      Owners: "主人",
+      OwnersHint:
+        "主人可使用 Shell、文件写入、定时任务和本地斜杠命令等高风险能力。只把你自己的账号设为主人；配对用户默认不是主人。",
+      NoOwners: "gateway.owners 中暂无主人",
+      MakeOwner: "设为主人",
+      RemoveOwner: "取消主人",
+      OwnerAdded: "已加入 gateway.owners",
+      OwnerRemoved: "已从 gateway.owners 移除",
+      OwnerUpdateFailed: "更新 gateway.owners 失败",
+      ConfigUnreadable: "配置文件无法解析，未做任何修改",
+      DesktopOnly: "仅桌面版可管理主人",
+    },
+
     Wizard: {
       PageTitle: "首次上手向导",
       PageSub: "5 步完成 rsclaw 的安装与配置，无需命令行",

@@ -20,14 +20,24 @@ pub struct QrArgs {
 
     /// Override auth token in QR payload.
     /// Also read from `RSCLAW_AUTH_TOKEN` so the secret need not appear in
-    /// argv (visible in `ps` / shell history).
-    #[arg(long, env = "RSCLAW_AUTH_TOKEN", hide_env_values = true)]
+    /// argv (visible in `ps` / shell history). Pass `-` to read it from stdin.
+    #[arg(
+        long,
+        env = "RSCLAW_AUTH_TOKEN",
+        hide_env_values = true,
+        value_parser = crate::secret_input::secret_value,
+    )]
     pub token: Option<String>,
 
     /// Use password instead of token.
     /// Also read from `RSCLAW_GATEWAY_PASSWORD` so the secret need not appear in
-    /// argv (visible in `ps` / shell history).
-    #[arg(long, env = "RSCLAW_GATEWAY_PASSWORD", hide_env_values = true)]
+    /// argv (visible in `ps` / shell history). Pass `-` to read it from stdin.
+    #[arg(
+        long,
+        env = "RSCLAW_GATEWAY_PASSWORD",
+        hide_env_values = true,
+        value_parser = crate::secret_input::secret_value,
+    )]
     pub password: Option<String>,
 
     /// Public URL for remote access.
