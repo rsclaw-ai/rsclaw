@@ -271,6 +271,22 @@ impl BrowserPool {
                 // and relaunch below.
                 *guard = None;
             }
+            // A Chrome rsclaw left running on this profile (e.g. across a
+            // gateway restart) keeps the user's pages and logins: register it
+            // as external instead of killing it to launch a fresh one.
+            if let Some(name) = profile
+                && let Some(ws) = crate::running_profile_chrome(name).await
+            {
+                let port = crate::parse_port_from_ws_url(&ws)?;
+                info!(port, profile = name, "pool: adopted running Chrome on profile");
+                *guard = Some(PooledChrome {
+                    process: None,
+                    port,
+                });
+                self.touch();
+                drop(guard);
+                return self.ws_url_for_port(port).await;
+            }
             can_launch_chrome()?;
             let process = ChromeProcess::launch(chrome_path, headed, profile).await?;
             let port = process.port()?;

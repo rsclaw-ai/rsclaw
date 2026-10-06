@@ -211,6 +211,10 @@ impl ChromeProcess {
                 .join("browser-profiles")
                 .join(profile_name);
             std::fs::create_dir_all(&profile_dir).ok();
+            // A Chrome still running on this profile (e.g. left over from a
+            // gateway restart) is asked to exit cleanly first so it flushes
+            // cookies; pkill below only catches one that doesn't respond.
+            close_profile_chrome_gracefully(profile_name, Duration::from_secs(5)).await;
             // Kill stale Chrome processes using this profile (e.g. after gateway restart).
             let profile_str = profile_dir.to_string_lossy().to_string();
             #[cfg(unix)]
@@ -939,6 +943,11 @@ pub struct BrowserSession {
     /// so callers (e.g. plugins working inside a logged-in portal) don't land
     /// on about:blank.
     last_url: Option<String>,
+    /// Attached to a Chrome rsclaw launched earlier on `profile` (e.g. one
+    /// left running across a gateway restart). Liveness is probed via the
+    /// debug port, and a dead adopted Chrome is relaunched on the same
+    /// profile instead of being re-acquired from the shared pool.
+    adopted: bool,
 }
 
 impl Drop for BrowserSession {
@@ -1013,6 +1022,46 @@ async fn find_chrome_by_profile(profile_name: &str) -> Option<String> {
     Some(ws.to_string())
 }
 
+/// If a Chrome with a live DevTools endpoint is running on rsclaw profile
+/// `profile_name`, send it `Browser.close` and wait up to `timeout` for the
+/// endpoint to go away. Best-effort: callers still hard-kill leftovers.
+async fn close_profile_chrome_gracefully(profile_name: &str, timeout: Duration) {
+    let Some(ws_url) = find_chrome_by_profile(profile_name).await else {
+        return;
+    };
+    info!(profile = profile_name, "closing leftover Chrome on profile gracefully");
+    match tokio::time::timeout(Duration::from_secs(3), CdpClient::connect(&ws_url)).await {
+        Ok(Ok(browser)) => {
+            if let Err(e) = tokio::time::timeout(
+                Duration::from_secs(3),
+                browser.send("Browser.close", json!({})),
+            )
+            .await
+            .map_err(|_| anyhow!("timeout"))
+            .and_then(|r| r)
+            {
+                debug!("Browser.close returned: {e:#}");
+            }
+        }
+        Ok(Err(e)) => debug!("graceful close: CDP connect failed: {e:#}"),
+        Err(_) => debug!("graceful close: CDP connect timed out"),
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if find_chrome_by_profile(profile_name).await.is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    warn!(profile = profile_name, "leftover Chrome did not exit after Browser.close");
+}
+
+/// WebSocket URL of a live Chrome running on rsclaw profile `profile_name`,
+/// if any (see `find_chrome_by_profile`).
+pub(crate) async fn running_profile_chrome(profile_name: &str) -> Option<String> {
+    find_chrome_by_profile(profile_name).await
+}
+
 impl BrowserSession {
     /// Remember a tab rsclaw created so `cmd_open` may reuse it later.
     fn note_rsclaw_tab(&self, target_id: &str) {
@@ -1077,49 +1126,74 @@ impl BrowserSession {
             return Self::connect_existing_reuse(&ws_url).await;
         }
 
-        // 2. rsclaw's named profile already has a chrome alive on it?
-        if let Some(profile_name) = profile {
+        // System Chrome launches on rsclaw's persistent "default" profile
+        // (resolved to ~/.rsclaw/browser-profiles/default by
+        // ChromeProcess::launch). That dir is debuggable under Chrome 136+
+        // (which blocks debugging on the browser's own default profile) and
+        // lives in its own user-data-dir, so it coexists with the user's daily
+        // Chrome. Login state is entered once and persists across restarts.
+        //
+        // An explicitly requested profile always wins: plugins share the
+        // "rsclaw" profile so one portal login covers all of them, and
+        // swapping it for "default" both split their cookie jar between two
+        // dirs and collided with web_browser's pool Chrome on "default".
+        let chosen_profile = match profile {
+            Some(p) => Some(p),
+            None if is_system_chrome(chrome_path) => Some("default"),
+            None => None,
+        };
+
+        // 2. A Chrome rsclaw started earlier is still alive on the profile we
+        //    would use (typically left running across a gateway restart):
+        //    adopt it and keep its open page and login state instead of
+        //    killing it and starting over on about:blank.
+        let mut candidates: Vec<&str> = Vec::new();
+        for p in [chosen_profile, profile].into_iter().flatten() {
+            if !candidates.contains(&p) {
+                candidates.push(p);
+            }
+        }
+        for profile_name in candidates {
             if let Some(ws_url) = find_chrome_by_profile(profile_name).await {
                 info!(
                     profile = profile_name,
-                    "BrowserSession: reusing existing chrome on rsclaw profile"
+                    "BrowserSession: adopting running chrome on rsclaw profile"
                 );
-                return Self::connect_existing_reuse(&ws_url).await;
+                let mut session = Self::connect_existing_reuse(&ws_url).await?;
+                session.chrome_path = chrome_path.to_owned();
+                session.headed = headed;
+                session.profile = Some(profile_name.to_owned());
+                session.adopted = true;
+                return Ok(session);
             }
         }
 
-        // 3. System Chrome: launch it against rsclaw's persistent "default" profile
-        //    (resolved to ~/.rsclaw/browser-profiles/default by ChromeProcess::launch).
-        //    That dir is debuggable under Chrome 136+ (which blocks debugging on the
-        //    browser's own default profile) AND lives in its own user-data-dir, so it
-        //    coexists with the user's daily Chrome — no need to refuse or ask them to
-        //    quit. Login state is entered once and persists across restarts.
-        let mut chosen_profile = profile;
-        if is_system_chrome(chrome_path) {
+        if chosen_profile != profile {
             info!(
                 executable = chrome_path,
                 "BrowserSession: launching system Chromium browser with rsclaw's persistent 'default' profile"
             );
-            chosen_profile = Some("default");
         }
 
-        // 5. Launch (either user's profile via "default" or rsclaw isolated). If the
-        //    path-3 attempt with the user's profile fails (broken Chrome install /
-        //    corrupted local profile / OS sandbox issue — symptom is "Chrome quit
-        //    unexpectedly"), fall back to rsclaw's isolated profile so the gateway
-        //    stays usable instead of returning an error to every tool call.
-        let (chrome, port, cdp) = match Self::try_launch(chrome_path, headed, chosen_profile).await
-        {
-            Ok(triple) => triple,
-            Err(e) if chosen_profile == Some("default") && profile.is_some() => {
-                warn!(
-                    "BrowserSession: launching user's Chrome failed ({e:#}); \
-                     falling back to rsclaw isolated profile"
-                );
-                Self::try_launch(chrome_path, headed, profile).await?
-            }
-            Err(e) => return Err(e),
-        };
+        // 3. Launch. If the system-Chrome attempt on "default" fails (broken
+        //    install / corrupted local profile / OS sandbox issue — symptom is
+        //    "Chrome quit unexpectedly"), fall back to the requested profile so
+        //    the gateway stays usable. Remember the profile actually used so a
+        //    later restart reopens the SAME cookie jar (restarting on a
+        //    different profile looked exactly like being logged out).
+        let (chrome, port, cdp, used_profile) =
+            match Self::try_launch(chrome_path, headed, chosen_profile).await {
+                Ok((c, p, d)) => (c, p, d, chosen_profile),
+                Err(e) if chosen_profile == Some("default") && profile.is_none() => {
+                    warn!(
+                        "BrowserSession: launching user's Chrome failed ({e:#}); \
+                         falling back to rsclaw isolated profile"
+                    );
+                    let (c, p, d) = Self::try_launch(chrome_path, headed, profile).await?;
+                    (c, p, d, profile)
+                }
+                Err(e) => return Err(e),
+            };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1134,7 +1208,7 @@ impl BrowserSession {
             ref_counter: 0,
             chrome_path: chrome_path.to_owned(),
             headed,
-            profile: profile.map(str::to_owned),
+            profile: used_profile.map(str::to_owned),
             pending_dialog: None,
             blocked_urls: Vec::new(),
             intercept_rules: Vec::new(),
@@ -1144,6 +1218,7 @@ impl BrowserSession {
             owned_external_tab: None,
             rsclaw_tabs: std::sync::Mutex::new(std::collections::HashSet::new()),
             last_url: None,
+            adopted: false,
         })
     }
 
@@ -1269,6 +1344,7 @@ impl BrowserSession {
                 initial_tabs
             }),
             last_url: None,
+            adopted: false,
         })
     }
 
@@ -1340,6 +1416,12 @@ impl BrowserSession {
     pub fn is_alive(&mut self) -> bool {
         match self.chrome {
             Some(ref mut chrome) => matches!(chrome.child.try_wait(), Ok(None)),
+            // An adopted Chrome has no child handle; probe its debug port.
+            None if self.adopted => std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], self.debug_port)),
+                Duration::from_millis(300),
+            )
+            .is_ok(),
             None => true,
         }
     }
@@ -1372,7 +1454,7 @@ impl BrowserSession {
     /// browser/mod.rs::execute checks 1 and 2).
     async fn restart(&mut self) -> Result<()> {
         warn!("restarting Chrome browser session");
-        if self.chrome.is_some() {
+        if self.chrome.is_some() || self.adopted {
             // Let the old Chrome exit cleanly first so the profile's cookies
             // and session state are flushed; Drop hard-kills whatever is left.
             if let Some(mut old) = self.chrome.take() {
@@ -1387,6 +1469,8 @@ impl BrowserSession {
             self.debug_port = port;
             self.chrome = Some(new_chrome);
             self.cdp = new_cdp;
+            self.adopted = false;
+            self.owned_external_tab = None;
         } else {
             // External Chrome: create a fresh tab (don't hijack user's existing tabs).
             let browser_ws = format!("ws://127.0.0.1:{}/devtools/browser", self.debug_port);
