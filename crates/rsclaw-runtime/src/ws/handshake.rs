@@ -546,6 +546,38 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer: std::net::Socke
         });
     }
 
+    // 8b'. Restart-cleared relay: when the pending offer is withdrawn
+    //      (auto-applied by the gateway, or dismissed via
+    //      `/api/v1/restart-dismiss`), forward a `restart.cleared` EventFrame
+    //      so an already-visible banner is dropped live.
+    {
+        let rx = state.restart_cleared_tx.subscribe();
+        let relay_tx = outbound_tx.clone();
+        let relay_conn = Arc::clone(&conn);
+        let relay_id = conn_id.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt as _;
+            let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(cleared) => {
+                        let seq = relay_conn.write().await.next_seq();
+                        let payload = serde_json::to_value(&cleared).unwrap_or(json!({}));
+                        let frame = EventFrame::new("restart.cleared", payload, seq);
+                        let json = serde_json::to_string(&frame).unwrap_or_default();
+                        if relay_tx.send(json).await.is_err() {
+                            info!(conn = %relay_id, "ws restart-cleared relay: outbound closed");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(conn = %relay_id, error = %e, "ws restart-cleared relay: recv error");
+                    }
+                }
+            }
+        });
+    }
+
     // 8c. computer_use permission relay: forward every PermissionRequest
     //     to the desktop UI as a `permission_request` EventFrame so the
     //     Tauri shell can show the consent dialog. The UI replies via

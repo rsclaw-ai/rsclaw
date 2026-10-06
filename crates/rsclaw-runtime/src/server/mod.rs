@@ -287,6 +287,9 @@ pub struct AppState {
     /// Broadcast channel for restart-required events
     /// (config changed, model downloaded, etc.). Multi-source, single sink.
     pub restart_request_tx: broadcast::Sender<rsclaw_events::RestartRequest>,
+    /// Broadcast channel for "pending restart/reload offer withdrawn" events,
+    /// relayed to WS clients as `restart.cleared` so open banners drop live.
+    pub restart_cleared_tx: broadcast::Sender<rsclaw_events::RestartCleared>,
     /// Latch holding the current pending restart request, if any.
     /// Read on WS handshake so late-connecting UIs see prior events.
     pub pending_restart: Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>>,
@@ -1554,7 +1557,16 @@ async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn get_session(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match state.store.db.get_session_meta(&id) {
-        Ok(Some(s)) => Json(serde_json::json!(s)).into_response(),
+        Ok(Some(s)) => {
+            // `message_count` is the generation's monotonic seq allocator;
+            // expose the current active count separately.
+            let mut body = serde_json::json!(s);
+            match state.store.db.count_active_messages(&id) {
+                Ok(n) => body["active_message_count"] = serde_json::json!(n),
+                Err(e) => tracing::warn!(session = %id, error = %e, "active message count failed"),
+            }
+            Json(body).into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "not found"})),
@@ -2539,12 +2551,6 @@ async fn http_reload(
         }
     };
 
-    let has = |s: &str| selected.iter().any(|x| *x == "all" || *x == s);
-    let reload_skills = has("skills");
-    let reload_plugins = has("plugins");
-    let reload_providers = has("providers");
-    let reload_mcp = has("mcp");
-
     // Serialize concurrent reload requests to prevent double-spawn races.
     let _reload_guard = state.reload_mutex.lock().await;
 
@@ -2560,11 +2566,51 @@ async fn http_reload(
         }
     };
 
+    let details = apply_reload_scopes(&state, &selected, fresh_config).await;
+
+    let failed_scopes = reload_failed_scopes(&details);
+    let reloaded = failed_scopes.is_empty();
+    let status = if reloaded {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+
+    (
+        status,
+        Json(serde_json::json!({
+            "reloaded": reloaded,
+            "failed_scopes": failed_scopes,
+            "details": details,
+        })),
+    )
+        .into_response()
+}
+
+/// Rebuild the components behind `selected` (canonical scope names from
+/// [`parse_reload_scopes`]; `"all"` selects every scope) from `fresh_config`,
+/// then sync the live config snapshot for the scopes that succeeded.
+///
+/// Shared by `POST /api/v1/reload` and the config file watcher's automatic
+/// channel reload. The caller must hold `state.reload_mutex`. Returns the
+/// per-scope details map reported by the HTTP endpoint.
+pub(crate) async fn apply_reload_scopes(
+    state: &AppState,
+    selected: &[&'static str],
+    fresh_config: RuntimeConfig,
+) -> serde_json::Map<String, serde_json::Value> {
+    let has = |s: &str| selected.iter().any(|x| *x == "all" || *x == s);
+    let reload_skills = has("skills");
+    let reload_plugins = has("plugins");
+    let reload_providers = has("providers");
+    let reload_mcp = has("mcp");
+
     let mut details = serde_json::Map::new();
 
-    // Snapshot the channel block BEFORE `live.apply` overwrites it — the
-    // channels branch below needs the old values to spot a credential change
-    // on an already-running channel (see its `changed` diff).
+    // Snapshot the channel block BEFORE the live snapshot is synced at the
+    // end — the channels branch below needs the old values to spot a
+    // credential change on an already-running channel (see its `changed`
+    // diff).
     let old_channels_json: serde_json::Value = serde_json::to_value(
         state
             .live
@@ -2578,19 +2624,7 @@ async fn http_reload(
     )
     .unwrap_or(serde_json::Value::Null);
 
-    // Propagate hot-safe fields (temperature, auth, loop-detection, etc.)
-    // into LiveConfig — same as the file watcher does. Without this, HTTP
-    // reload reports success while live reads stay stale.
-    {
-        crate::gateway::trust::refresh_from_config(&fresh_config);
-        let restart_fields = state.live.apply(fresh_config.clone()).await;
-        if !restart_fields.is_empty() {
-            details.insert(
-                "restart_recommended".to_owned(),
-                serde_json::json!(restart_fields),
-            );
-        }
-    }
+    crate::gateway::trust::refresh_from_config(&fresh_config);
 
     // --- Skills: rescan directories and swap the registry atomically ---
     if reload_skills {
@@ -3417,23 +3451,23 @@ async fn http_reload(
         );
     }
 
+    // Sync the live snapshot. Hot-safe fields (temperature, auth,
+    // loop-detection, ...) land here, and so do the sections the scopes
+    // above just rebuilt — without the latter, every later file-watcher diff
+    // would keep reporting them (e.g. `config.channels` after a scan-added
+    // account) as still needing a reload/restart.
     let failed_scopes = reload_failed_scopes(&details);
-    let reloaded = failed_scopes.is_empty();
-    let status = if reloaded {
-        StatusCode::OK
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
+    let applied: Vec<&str> = KNOWN_RELOAD_SCOPES
+        .iter()
+        .copied()
+        .filter(|s| *s != "all" && has(s) && !failed_scopes.iter().any(|f| f == s))
+        .collect();
+    let pending = state.live.apply_reloaded_scopes(fresh_config, &applied).await;
+    if !pending.is_empty() {
+        details.insert("restart_recommended".to_owned(), serde_json::json!(pending));
+    }
 
-    (
-        status,
-        Json(serde_json::json!({
-            "reloaded": reloaded,
-            "failed_scopes": failed_scopes,
-            "details": details,
-        })),
-    )
-        .into_response()
+    details
 }
 
 fn reload_failed_scopes(details: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
@@ -3582,9 +3616,18 @@ async fn http_restart_dismiss(
         )
             .into_response();
     }
-    if let Ok(mut guard) = state.pending_restart.write() {
-        *guard = None;
-    }
+    let at_ms = match state.pending_restart.write() {
+        Ok(mut guard) => guard.take().map(|r| r.at_ms),
+        Err(_) => {
+            tracing::warn!("pending_restart lock poisoned; dismiss not latched");
+            None
+        }
+    };
+    // No subscribers (no WS client connected) is normal; nothing to drop.
+    let _ = state.restart_cleared_tx.send(rsclaw_events::RestartCleared {
+        at_ms,
+        reason: rsclaw_events::RestartClearReason::Dismissed,
+    });
     Json(serde_json::json!({ "dismissed": true })).into_response()
 }
 
@@ -5577,13 +5620,36 @@ struct WhatsAppVerifyParams {
 }
 
 /// Meta webhook verification (GET /hooks/whatsapp).
-async fn whatsapp_verify(Query(params): Query<WhatsAppVerifyParams>) -> impl IntoResponse {
+///
+/// The expected token comes from `channels.whatsapp.accounts.<name>.verifyToken`
+/// (falling back to the `WHATSAPP_VERIFY_TOKEN` env var). Without a configured
+/// token every verification attempt is rejected.
+async fn whatsapp_verify(
+    State(state): State<AppState>,
+    Query(params): Query<WhatsAppVerifyParams>,
+) -> impl IntoResponse {
     // Meta sends GET with hub.mode=subscribe, hub.verify_token, hub.challenge.
-    // We accept any verify_token for now (operator should secure via
-    // WHATSAPP_VERIFY_TOKEN env).
-    let expected = std::env::var("WHATSAPP_VERIFY_TOKEN").unwrap_or_default();
+    let expected = state
+        .whatsapp
+        .get()
+        .and_then(|wa| wa.verify_token().map(str::to_owned))
+        .or_else(|| {
+            std::env::var("WHATSAPP_VERIFY_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        });
+    let Some(expected) = expected else {
+        warn!(
+            "whatsapp webhook verification rejected: no verify token configured \
+             (set accounts.<name>.verifyToken or WHATSAPP_VERIFY_TOKEN)"
+        );
+        return (StatusCode::FORBIDDEN, "verification failed").into_response();
+    };
     if params.hub_mode.as_deref() == Some("subscribe")
-        && (expected.is_empty() || params.hub_verify_token.as_deref() == Some(expected.as_str()))
+        && params
+            .hub_verify_token
+            .as_deref()
+            .is_some_and(|t| constant_time_eq(t, &expected))
     {
         if let Some(challenge) = params.hub_challenge {
             return (StatusCode::OK, challenge).into_response();

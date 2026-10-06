@@ -320,6 +320,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         tokio::sync::broadcast::channel::<rsclaw_events::RestartRequest>(16);
     let pending_restart: Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>> =
         Arc::new(std::sync::RwLock::new(None));
+    // "Offer withdrawn" events (latch cleared), relayed as `restart.cleared`.
+    let (restart_cleared_tx, _restart_cleared_rx) =
+        tokio::sync::broadcast::channel::<rsclaw_events::RestartCleared>(16);
 
     // Graceful-shutdown coordinator — wired to task queue worker, axum graceful
     // shutdown, and the /api/v1/restart drain handler. Created here (before the
@@ -842,13 +845,20 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // double-apply.
     let reload_mutex = Arc::new(tokio::sync::Mutex::new(()));
 
+    // Filled once `AppState` exists (step 13) so the watcher bridge can run
+    // the same scoped channel reload as `POST /api/v1/reload?scope=channels`.
+    let reload_app_state: Arc<std::sync::OnceLock<crate::server::AppState>> =
+        Arc::new(std::sync::OnceLock::new());
+
     // 12. Start config hot-reload watcher (if config file is detectable).
     if let Some(config_path) = config::loader::detect_config_path() {
         let (mut watcher, mut reload_rx) = FileWatcher::new(config_path);
         tokio::spawn(async move { watcher.run().await });
         let live_reload = Arc::clone(&live);
+        let bridge_app_state = Arc::clone(&reload_app_state);
         let watcher_reload_mutex = Arc::clone(&reload_mutex);
         let bridge_tx = restart_request_tx.clone();
+        let bridge_cleared_tx = restart_cleared_tx.clone();
         let bridge_pending = Arc::clone(&pending_restart);
         let bridge_shutdown = shutdown.clone();
         let cfg_lang = config
@@ -873,8 +883,62 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             rsclaw_config::live_config::classify_change(&old, &new_owned)
                         };
                         crate::gateway::trust::refresh_from_config(&new_owned);
-                        live_reload.apply(new_owned).await;
+                        live_reload.apply(new_owned.clone()).await;
+
+                        // Channel edits (typically a desktop/CLI QR login
+                        // writing a new `channels.<ch>.accounts` entry) are
+                        // applied right away with the same scoped reload as
+                        // `rsclaw gateway reload --scope channels`: it only
+                        // (re)starts channel listeners and never cancels agent
+                        // turns, and leaving it as an offer meant a freshly
+                        // scanned bot stayed silent. It also syncs the live
+                        // snapshot so later saves don't re-report the section.
+                        // Still under the reload mutex, as the helper expects.
+                        let channels_applied = if impact
+                            .sections()
+                            .iter()
+                            .any(|s| s == "config.channels")
+                        {
+                            match bridge_app_state.get() {
+                                Some(state) => {
+                                    let details = crate::server::apply_reload_scopes(
+                                        state,
+                                        &["channels"],
+                                        new_owned,
+                                    )
+                                    .await;
+                                    info!(
+                                        details = %serde_json::Value::Object(details),
+                                        "config change: channels reloaded automatically"
+                                    );
+                                    true
+                                }
+                                None => {
+                                    warn!(
+                                        "config change touches channels before the server \
+                                         is up; offering a reload instead"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
                         drop(guard);
+                        if channels_applied {
+                            clear_auto_applied_reload_offer(
+                                &bridge_pending,
+                                &bridge_tx,
+                                &bridge_cleared_tx,
+                            );
+                        }
+                        // Sections the automatic channel reload already took
+                        // care of are not part of any banner below.
+                        let not_auto_applied = |list: Vec<String>| -> Vec<String> {
+                            list.into_iter()
+                                .filter(|s| !(channels_applied && s == "config.channels"))
+                                .collect()
+                        };
 
                         // The watcher emits `RequiresRestart` just before the
                         // `FullReload` of the same save. When a Required
@@ -907,14 +971,24 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             // provider/skill/plugin registries) — a scoped
                             // in-process reload rebuilds them in about a
                             // second, no cold boot and no dropped listener.
-                            // Offered rather than auto-applied: re-spawning an
-                            // agent cancels its in-flight turns, and saving a
-                            // config file should not silently kill the
-                            // conversation the user is in the middle of.
+                            // Offered rather than auto-applied (channels
+                            // aside, see above): re-spawning an agent cancels
+                            // its in-flight turns, and saving a config file
+                            // should not silently kill the conversation the
+                            // user is in the middle of.
                             rsclaw_config::live_config::ChangeImpact::NeedsReload {
                                 sections,
                                 scopes,
                             } => {
+                                let sections = not_auto_applied(sections);
+                                let scopes: Vec<String> = scopes
+                                    .into_iter()
+                                    .filter(|s| !(channels_applied && s == "channels"))
+                                    .collect();
+                                if scopes.is_empty() {
+                                    info!("config change applied via automatic channel reload");
+                                    continue;
+                                }
                                 info!(
                                     ?sections,
                                     ?scopes,
@@ -932,6 +1006,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                                 );
                             }
                             rsclaw_config::live_config::ChangeImpact::NeedsRestart { sections } => {
+                                let sections = not_auto_applied(sections);
                                 warn!(?sections, "config change requires gateway restart");
                                 publish_restart(
                                     &bridge_tx,
@@ -1223,6 +1298,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         agent_spawner: Arc::clone(&spawner),
         task_queue: Arc::clone(&task_queue_mgr),
         restart_request_tx: restart_request_tx.clone(),
+        restart_cleared_tx: restart_cleared_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
         task_event_bus: a2a_bus,
@@ -1241,6 +1317,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         // Same cell the file watcher holds — see its definition above.
         reload_mutex: Arc::clone(&reload_mutex),
     };
+    if reload_app_state.set(state.clone()).is_err() {
+        warn!("config watcher app state already set; automatic channel reload keeps the old one");
+    }
     if !rsclaw_types::set_outbound_a2a_host(Arc::new(
         crate::a2a::relay::GatewayOutboundA2aHost::new(state.clone()),
     )) {
@@ -2963,6 +3042,57 @@ pub(crate) async fn ensure_bge_model_present(
     Ok(())
 }
 
+/// After the watcher bridge auto-applied a channel reload, drop the
+/// `channels` scope (and `config.channels` section) from a latched
+/// scoped-reload offer. When nothing is left to offer the latch is cleared and
+/// a `RestartCleared` event is broadcast so open UIs drop the banner live;
+/// when other scopes remain, the trimmed offer is re-broadcast. A pending
+/// full-restart request (`RemedyKind::Restart`) is left untouched.
+fn clear_auto_applied_reload_offer(
+    latch: &Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>>,
+    request_tx: &tokio::sync::broadcast::Sender<rsclaw_events::RestartRequest>,
+    cleared_tx: &tokio::sync::broadcast::Sender<rsclaw_events::RestartCleared>,
+) {
+    let outcome = {
+        let Ok(mut guard) = latch.write() else {
+            warn!("pending_restart lock poisoned; stale reload offer not cleared");
+            return;
+        };
+        let Some(req) = guard.as_mut() else {
+            return;
+        };
+        if req.remedy != rsclaw_events::RemedyKind::Reload
+            || !req.reload_scopes.iter().any(|s| s == "channels")
+        {
+            return;
+        }
+        req.reload_scopes.retain(|s| s != "channels");
+        let rsclaw_events::RestartReason::ConfigChanged { sections } = &mut req.reason;
+        sections.retain(|s| s != "config.channels");
+        if req.reload_scopes.is_empty() {
+            let at_ms = req.at_ms;
+            *guard = None;
+            Err(at_ms)
+        } else {
+            Ok(req.clone())
+        }
+    };
+    // `send` failing just means no WS client is connected; the latch is the
+    // source of truth for late joiners.
+    match outcome {
+        Err(at_ms) => {
+            info!("pending reload offer cleared: channel reload was auto-applied");
+            let _ = cleared_tx.send(rsclaw_events::RestartCleared {
+                at_ms: Some(at_ms),
+                reason: rsclaw_events::RestartClearReason::AutoApplied,
+            });
+        }
+        Ok(trimmed) => {
+            let _ = request_tx.send(trimmed);
+        }
+    }
+}
+
 /// Publish a `RestartRequest` into the broadcast channel and store it in the
 /// `pending_restart` latch so late-connecting UI clients see it on handshake.
 ///
@@ -3005,12 +3135,25 @@ pub(crate) fn publish_restart(
         loop {
             tokio::time::sleep(Duration::from_millis(200)).await;
             if shutdown.inflight() == 0 {
-                let mut updated = req;
-                updated.inflight = 0;
-                if let Ok(mut guard) = latch.write() {
-                    *guard = Some(updated.clone());
+                // Only re-publish the offer that is still latched: if it was
+                // dismissed, auto-cleared or superseded meanwhile, re-latching
+                // it here would resurrect a stale banner.
+                let updated = match latch.write() {
+                    Ok(mut guard) => match guard.as_mut() {
+                        Some(cur) if cur.at_ms == req.at_ms => {
+                            cur.inflight = 0;
+                            Some(cur.clone())
+                        }
+                        _ => None,
+                    },
+                    Err(_) => {
+                        warn!("pending_restart lock poisoned; drained restart not re-published");
+                        None
+                    }
+                };
+                if let Some(updated) = updated {
+                    let _ = tx.send(updated);
                 }
-                let _ = tx.send(updated);
                 return;
             }
             if std::time::Instant::now() >= deadline {
@@ -3075,5 +3218,66 @@ mod user_env_tests {
         );
         unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_REF") };
         unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_TARGET") };
+    }
+}
+
+#[cfg(test)]
+mod reload_offer_tests {
+    use super::*;
+
+    fn latch_with(
+        req: rsclaw_events::RestartRequest,
+    ) -> Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>> {
+        Arc::new(std::sync::RwLock::new(Some(req)))
+    }
+
+    fn reason(sections: &[&str]) -> rsclaw_events::RestartReason {
+        rsclaw_events::RestartReason::ConfigChanged {
+            sections: sections.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn auto_applied_channel_reload_clears_stale_offer() {
+        let (req_tx, mut req_rx) = tokio::sync::broadcast::channel(4);
+        let (clr_tx, mut clr_rx) = tokio::sync::broadcast::channel(4);
+        // Channels-only reload offer: cleared entirely.
+        let latch = latch_with(rsclaw_events::RestartRequest::new_reload(
+            reason(&["config.channels"]),
+            "reload".to_owned(),
+            vec!["channels".to_owned()],
+        ));
+        let at_ms = latch.read().expect("lock").as_ref().map(|r| r.at_ms);
+        clear_auto_applied_reload_offer(&latch, &req_tx, &clr_tx);
+        assert!(latch.read().expect("lock").is_none());
+        let cleared = clr_rx.try_recv().expect("cleared event");
+        assert_eq!(cleared.at_ms, at_ms);
+        assert_eq!(cleared.reason, rsclaw_events::RestartClearReason::AutoApplied);
+
+        // Offer with other scopes left: kept, minus channels.
+        let latch = latch_with(rsclaw_events::RestartRequest::new_reload(
+            reason(&["config.channels", "config.agents"]),
+            "reload".to_owned(),
+            vec!["channels".to_owned(), "agents".to_owned()],
+        ));
+        clear_auto_applied_reload_offer(&latch, &req_tx, &clr_tx);
+        let guard = latch.read().expect("lock");
+        let kept = guard.as_ref().expect("offer kept");
+        assert_eq!(kept.reload_scopes, vec!["agents".to_owned()]);
+        drop(guard);
+        let rebroadcast = req_rx.try_recv().expect("trimmed offer re-broadcast");
+        assert_eq!(rebroadcast.reload_scopes, vec!["agents".to_owned()]);
+        assert!(clr_rx.try_recv().is_err());
+
+        // Hard restart requirement: untouched.
+        let latch = latch_with(rsclaw_events::RestartRequest::new(
+            reason(&["config.channels"]),
+            rsclaw_events::RestartUrgency::Required,
+            "restart".to_owned(),
+        ));
+        clear_auto_applied_reload_offer(&latch, &req_tx, &clr_tx);
+        assert!(latch.read().expect("lock").is_some());
+        assert!(req_rx.try_recv().is_err());
+        assert!(clr_rx.try_recv().is_err());
     }
 }

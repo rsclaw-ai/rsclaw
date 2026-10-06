@@ -31,7 +31,7 @@ impl OcrClient {
     /// block is absent or disabled. base_url may be empty when `model` is
     /// a `rsclaw-*` name (defaults to the fleet API).
     pub fn from_config() -> Option<std::sync::Arc<Self>> {
-        let cfg = rsclaw_config::load().ok()?;
+        let cfg = rsclaw_config::load_cached().ok()?;
         let oc = cfg.raw.kb.as_ref()?.ocr.clone()?;
         if !oc.enabled.unwrap_or(true) {
             return None;
@@ -76,7 +76,7 @@ impl OcrClient {
     /// Whether an OCR endpoint is configured (cheap check for callers that
     /// want to branch before assembling an image payload).
     pub fn is_configured() -> bool {
-        rsclaw_config::load()
+        rsclaw_config::load_cached()
             .ok()
             .and_then(|c| c.raw.kb.as_ref().and_then(|k| k.ocr.clone()))
             .map(|o| o.enabled.unwrap_or(true))

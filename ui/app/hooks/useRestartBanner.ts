@@ -50,6 +50,22 @@ export function useRestartBanner(): RestartBannerControls {
       setState({ visible: true, payload });
     });
 
+    // The gateway withdrew its pending offer (auto-applied the change, or it
+    // was dismissed elsewhere): drop the banner if it shows that offer. A
+    // newer offer (different at_ms) stays visible.
+    const unsubCleared = rsclawWs.onRestartCleared((cleared) => {
+      setState((s) => {
+        if (
+          cleared.at_ms !== undefined &&
+          s.payload &&
+          s.payload.at_ms !== cleared.at_ms
+        ) {
+          return s;
+        }
+        return { visible: false, payload: null };
+      });
+    });
+
     // Each fresh handshake clears the banner. If the new gateway has a
     // latched restart.required it arrives in the very next frame and
     // re-arms the banner above. Without this, banner state leaks across
@@ -62,6 +78,7 @@ export function useRestartBanner(): RestartBannerControls {
 
     return () => {
       unsubEvent();
+      unsubCleared();
       unsubConnect();
     };
   }, []);

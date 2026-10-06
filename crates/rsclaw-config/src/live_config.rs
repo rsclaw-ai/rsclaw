@@ -78,13 +78,73 @@ impl LiveConfig {
         if !restart_fields.is_empty() {
             warn!(
                 ?restart_fields,
-                "hot-reload skipped: fields require gateway restart"
+                "live config not updated: changed sections need a scoped reload or restart"
             );
             return restart_fields;
         }
 
         // Hot-safe — write new values into every live lock so subscribers
         // (e.g. AgentRuntime reading temperature) pick up the change.
+        self.write_all(new).await;
+
+        info!("hot-reload applied — all domains updated");
+        vec![]
+    }
+
+    /// Bring the live snapshot up to date after a scoped reload rebuilt the
+    /// components behind `applied_scopes` (canonical `/api/v1/reload` scope
+    /// names, e.g. `"channels"`) from `new`.
+    ///
+    /// [`apply`](Self::apply) is all-or-nothing, so without this the sections
+    /// a scoped reload just applied would stay stale in the snapshot and every
+    /// later [`classify_change`] would report them as pending again.
+    ///
+    ///   - Every changed section is covered by `applied_scopes`: the whole
+    ///     new config is written, exactly like a hot `apply`.
+    ///   - Otherwise only `config.channels` (when covered) is written, since it
+    ///     maps 1:1 onto `raw.channels` / `channel.channels`; everything else
+    ///     stays as it was.
+    ///
+    /// Returns the sections that are still pending (empty = snapshot is in
+    /// sync with `new`). Callers must serialize this with other config writes
+    /// (the gateway's reload mutex).
+    pub async fn apply_reloaded_scopes(
+        &self,
+        new: RuntimeConfig,
+        applied_scopes: &[&str],
+    ) -> Vec<String> {
+        let old = self.snapshot().await;
+        let sections = diff_restart_sections(&old, &new);
+        let covered = |section: &str| {
+            reload_scope_for(section).is_some_and(|scope| applied_scopes.contains(&scope))
+        };
+        let remaining: Vec<String> = sections
+            .iter()
+            .filter(|s| !covered(s.as_str()))
+            .cloned()
+            .collect();
+
+        if remaining.is_empty() {
+            if !sections.is_empty() {
+                self.write_all(new).await;
+                info!(?sections, "live config updated after scoped reload");
+            }
+            return remaining;
+        }
+
+        if covered("config.channels") && sections.iter().any(|s| s == "config.channels") {
+            self.raw.write().await.channels = new.raw.channels;
+            self.channel.write().await.channels = new.channel.channels;
+            info!(
+                pending = ?remaining,
+                "live config channels updated after scoped reload"
+            );
+        }
+        remaining
+    }
+
+    /// Overwrite every live lock with `new`.
+    async fn write_all(&self, new: RuntimeConfig) {
         *self.gateway.write().await = new.gateway;
         *self.agents.write().await = new.agents;
         *self.channel.write().await = new.channel;
@@ -92,9 +152,6 @@ impl LiveConfig {
         *self.ext.write().await = new.ext;
         *self.ops.write().await = new.ops;
         *self.raw.write().await = new.raw;
-
-        info!("hot-reload applied — all domains updated");
-        vec![]
     }
 
     /// Reconstruct a point-in-time `RuntimeConfig` snapshot.
@@ -929,6 +986,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn classify_is_hot_after_channels_scope_applied() {
+        // A QR login adds a channel account; the watcher auto-applies the
+        // channels scope. The next save must not re-report config.channels.
+        let old = empty_runtime_config();
+        let live = LiveConfig::new(old.clone());
+        let mut new = old;
+        new.raw.channels = Some(
+            serde_json::from_value(serde_json::json!({
+                "wechat": { "accounts": { "wx-a": { "botToken": "t" } } }
+            }))
+            .expect("channels block"),
+        );
+        new.channel.channels = new.raw.channels.clone().unwrap_or_default();
+
+        assert!(!live.apply(new.clone()).await.is_empty());
+        let pending = live.apply_reloaded_scopes(new.clone(), &["channels"]).await;
+        assert!(pending.is_empty(), "{pending:?}");
+        assert_eq!(classify_change(&live.snapshot().await, &new), ChangeImpact::Hot);
+    }
+
+    #[tokio::test]
+    async fn channels_scope_applied_leaves_restart_sections_pending() {
+        let old = empty_runtime_config();
+        let live = LiveConfig::new(old.clone());
+        let mut new = old;
+        new.gateway.port = 19999;
+        new.raw.channels = Some(
+            serde_json::from_value(serde_json::json!({
+                "telegram": { "botToken": "rotated" }
+            }))
+            .expect("channels block"),
+        );
+
+        let pending = live.apply_reloaded_scopes(new.clone(), &["channels"]).await;
+        assert_eq!(pending, vec!["gateway.port".to_owned()]);
+        let snap = live.snapshot().await;
+        assert_eq!(snap.gateway.port, 18888, "port must not be applied live");
+        match classify_change(&snap, &new) {
+            ChangeImpact::NeedsRestart { sections } => {
+                assert_eq!(sections, vec!["gateway.port".to_owned()]);
+            }
+            other => panic!("expected only the port to stay pending, got {other:?}"),
+        }
+    }
+
     #[test]
     fn hot_safe_when_only_auth_token_changes() {
         // gateway.auth.token is read via state.live.gateway.auth_token by
@@ -1291,6 +1394,7 @@ mod tests {
             exec: Some(ExecToolConfig {
                 safety: None,
                 timeout_seconds: Some(30),
+                max_background: None,
             }),
             web_search: None,
             web_fetch: None,
@@ -1306,6 +1410,7 @@ mod tests {
             exec: Some(ExecToolConfig {
                 safety: None,
                 timeout_seconds: Some(60),
+                max_background: None,
             }),
             web_search: None,
             web_fetch: None,

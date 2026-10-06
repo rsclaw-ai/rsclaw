@@ -52,7 +52,9 @@ pub async fn sessions_list(ctx: MethodCtx) -> MethodResult {
                             }
                         })
                         .sum();
-                    (updated, created, m.message_count, (total_chars / 4).max(1))
+                    // Active message count (`m.message_count` is a monotonic
+                    // seq allocator that does not drop after compaction).
+                    (updated, created, msgs.len() as u64, (total_chars / 4).max(1))
                 }
                 None => (String::new(), String::new(), 0, 0),
             };

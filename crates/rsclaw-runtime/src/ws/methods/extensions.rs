@@ -103,9 +103,10 @@ pub async fn memory_status(ctx: MethodCtx) -> MethodResult {
     Ok(serde_json::json!({ "documents": count }))
 }
 
-pub async fn plugins_list(_ctx: MethodCtx) -> MethodResult {
-    let config = rsclaw_config::load().map_err(|e| ErrorShape::internal(e.to_string()))?;
-    let entries = config.ext.plugins.as_ref().and_then(|p| p.entries.as_ref());
+pub async fn plugins_list(ctx: MethodCtx) -> MethodResult {
+    // Live snapshot instead of re-parsing the config file per request.
+    let ext = ctx.state.live.ext.read().await;
+    let entries = ext.plugins.as_ref().and_then(|p| p.entries.as_ref());
     let plugins: Vec<serde_json::Value> = match entries {
         Some(map) => map
             .iter()
@@ -121,10 +122,10 @@ pub async fn plugins_list(_ctx: MethodCtx) -> MethodResult {
     Ok(serde_json::json!({ "plugins": plugins }))
 }
 
-pub async fn hooks_list(_ctx: MethodCtx) -> MethodResult {
-    let config = rsclaw_config::load().map_err(|e| ErrorShape::internal(e.to_string()))?;
-    let mappings = config
-        .ops
+pub async fn hooks_list(ctx: MethodCtx) -> MethodResult {
+    // Live snapshot instead of re-parsing the config file per request.
+    let ops = ctx.state.live.ops.read().await;
+    let mappings = ops
         .hooks
         .as_ref()
         .and_then(|h| h.mappings.as_deref())
@@ -144,7 +145,7 @@ pub async fn hooks_list(_ctx: MethodCtx) -> MethodResult {
         })
         .collect();
     Ok(serde_json::json!({
-        "enabled": config.ops.hooks.as_ref().map(|h| h.enabled).unwrap_or(false),
+        "enabled": ops.hooks.as_ref().map(|h| h.enabled).unwrap_or(false),
         "mappings": list,
     }))
 }

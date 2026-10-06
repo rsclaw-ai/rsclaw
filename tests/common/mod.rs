@@ -202,6 +202,7 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
             rsclaw::plugin::PluginRegistry::default(),
         ))),
         restart_request_tx: restart_request_tx.clone(),
+        restart_cleared_tx: broadcast::channel(16).0,
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
         task_event_bus: rsclaw::a2a::event::TaskEventBus::new(),

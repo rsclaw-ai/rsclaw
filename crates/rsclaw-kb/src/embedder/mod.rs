@@ -77,7 +77,7 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
                     .and_then(|s| s.resolve_early())
                     .or_else(|| {
                         if rsclaw_embed::is_rsclaw_model(&model) {
-                            rsclaw_config::load()
+                            rsclaw_config::load_cached()
                                 .ok()
                                 .as_ref()
                                 .and_then(crate::ocr::rsclaw_provider_key)
@@ -99,7 +99,7 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
                     .unwrap_or("")
                     .is_empty();
                 let base_url = if base_empty && rsclaw_embed::is_rsclaw_model(&model) {
-                    rsclaw_config::load()
+                    rsclaw_config::load_cached()
                         .ok()
                         .as_ref()
                         .and_then(crate::ocr::rsclaw_provider_base_url)
@@ -162,7 +162,7 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
 /// shared `memorySearch`. Centralized so embedder selection and the asymmetric
 /// `queryInstruction` (in `KnowledgeService`) read the same source.
 pub fn effective_embed_config() -> Option<rsclaw_config::schema::EmbedConfig> {
-    let cfg = rsclaw_config::load().ok()?;
+    let cfg = rsclaw_config::load_cached().ok()?;
     cfg.raw
         .kb
         .as_ref()

@@ -382,7 +382,7 @@ async fn transcribe_rsclaw(
     file_name: &str,
     mime_type: &str,
 ) -> Result<String> {
-    let cfg = rsclaw_config::load().context("load config for rsclaw transcription")?;
+    let cfg = rsclaw_config::load_cached().context("load config for rsclaw transcription")?;
     let provider = cfg
         .raw
         .models

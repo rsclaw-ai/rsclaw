@@ -196,7 +196,7 @@ impl KnowledgeService {
             }
         }
         let (events, _) = broadcast::channel(256);
-        let cfg = rsclaw_config::load().ok();
+        let cfg = rsclaw_config::load_cached().ok();
         // queryInstruction comes from the SAME effective embed config the
         // embedder was resolved from (`kb.embed` override, else `memorySearch`),
         // so a KB-specific asymmetric model uses its own instruction.

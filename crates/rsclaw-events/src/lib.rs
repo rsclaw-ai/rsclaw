@@ -121,6 +121,29 @@ impl RestartRequest {
     }
 }
 
+/// Why a latched restart / reload offer was withdrawn.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartClearReason {
+    /// The gateway applied the offered change itself (e.g. the file-watcher
+    /// bridge auto-applied a channel reload), so nothing is left to offer.
+    AutoApplied,
+    /// A client dismissed the pending offer via `POST /api/v1/restart-dismiss`.
+    Dismissed,
+}
+
+/// Published when the `pending_restart` latch is cleared, so open UIs drop a
+/// banner they are already showing. Relayed to WebSocket clients as a
+/// `restart.cleared` event frame (counterpart of `restart.required`).
+#[derive(Debug, Clone, Serialize)]
+pub struct RestartCleared {
+    /// `at_ms` of the [`RestartRequest`] that was withdrawn. `None` when the
+    /// latch was already empty; clients then drop whatever banner they show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
+    pub reason: RestartClearReason,
+}
+
 /// One option in an `AskUserPrompt`.
 ///
 /// Wire format is camelCase (`label`, `description`) — UI consumes via WS

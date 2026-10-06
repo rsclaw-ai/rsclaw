@@ -194,6 +194,7 @@ async fn start_echo_server(addr: SocketAddr) {
             rsclaw::plugin::PluginRegistry::default(),
         ))),
         restart_request_tx: broadcast::channel(16).0,
+        restart_cleared_tx: broadcast::channel(16).0,
         pending_restart: Arc::new(std::sync::RwLock::new(None)),
         shutdown: rsclaw::gateway::ShutdownCoordinator::new(),
         task_event_bus: rsclaw::a2a::event::TaskEventBus::new(),

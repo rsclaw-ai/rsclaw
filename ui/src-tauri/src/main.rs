@@ -743,10 +743,31 @@ fn write_config(content: String) -> Result<String, String> {
     let config_path = rsclaw_base_dir().join("rsclaw.json5");
     // Create dir if needed.
     if let Some(parent) = config_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("[rsclaw-ui] failed to create config dir {}: {e}", parent.display());
+        }
     }
-    std::fs::write(&config_path, &content).map_err(|e| format!("write failed: {e}"))?;
+    write_file_atomic(&config_path, &content).map_err(|e| format!("write failed: {e}"))?;
     Ok(config_path.to_string_lossy().to_string())
+}
+
+/// Replace `path` with `content` via a sibling temp file + rename so a crash
+/// or full disk never leaves a truncated config behind (the gateway's file
+/// watcher would otherwise reload a half-written file).
+fn write_file_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_owned());
+    let tmp = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        if let Err(rm) = std::fs::remove_file(&tmp) {
+            eprintln!("[rsclaw-ui] failed to remove temp file {}: {rm}", tmp.display());
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Read gateway URL and auth token from config file.

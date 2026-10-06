@@ -513,7 +513,11 @@ fn ensure_defaults_toml_up_to_date(path: &Path) -> Result<()> {
 
 /// Write `content` to `path` via a sibling temp file + rename so a crash or
 /// full disk never leaves a truncated file behind.
-fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
+///
+/// The temp file lives in the same directory as `path` (so the rename stays on
+/// one filesystem) and is removed if the rename fails. Use this for every
+/// rewrite of a user-owned config file (`rsclaw.json5`, `defaults.toml`, ...).
+pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

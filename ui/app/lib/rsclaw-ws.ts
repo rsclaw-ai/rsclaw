@@ -185,6 +185,16 @@ export type RestartRequiredPayload = {
   reload_scopes?: string[];
 };
 
+/**
+ * Payload of a `restart.cleared` frame, mirrors rsclaw-events RestartCleared.
+ * Sent when the gateway withdraws a pending restart / reload offer.
+ */
+export type RestartClearedPayload = {
+  /** `at_ms` of the withdrawn request; absent = drop any banner. */
+  at_ms?: number;
+  reason: "auto_applied" | "dismissed";
+};
+
 type ReadyWaiter = {
   resolve: () => void;
   reject: (e: Error) => void;
@@ -204,6 +214,7 @@ class RsClawWsClient {
     (text: string, kind?: string, images?: string[]) => void
   >();
   private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
+  private restartClearedHandlers = new Set<(payload: RestartClearedPayload) => void>();
   private permissionHandlers = new Set<(payload: PermissionRequestPayload) => void>();
   private statusHandlers = new Set<(payload: ComputerUseStatusPayload) => void>();
   private askUserHandlers = new Set<(payload: AskUserPayload) => void>();
@@ -394,6 +405,18 @@ class RsClawWsClient {
   ): () => void {
     this.restartHandlers.add(handler);
     return () => this.restartHandlers.delete(handler);
+  }
+
+  /**
+   * Register a handler for `restart.cleared` event frames: the gateway
+   * withdrew its pending restart / reload offer (auto-applied or dismissed),
+   * so a visible banner should be dropped. Returns an unsubscribe function.
+   */
+  onRestartCleared(
+    handler: (payload: RestartClearedPayload) => void,
+  ): () => void {
+    this.restartClearedHandlers.add(handler);
+    return () => this.restartClearedHandlers.delete(handler);
   }
 
   /**
@@ -658,6 +681,12 @@ class RsClawWsClient {
     if (event === "restart.required") {
       const payload = (data.payload || data.data || {}) as RestartRequiredPayload;
       this.restartHandlers.forEach((h) => h(payload));
+      return;
+    }
+
+    if (event === "restart.cleared") {
+      const payload = (data.payload || data.data || {}) as RestartClearedPayload;
+      this.restartClearedHandlers.forEach((h) => h(payload));
       return;
     }
 

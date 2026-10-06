@@ -43,7 +43,7 @@ pub struct KbReranker {
 /// authenticated fleet, and they all share the one rsclaw provider key.
 fn rerank_api_key(model: Option<&str>) -> Option<String> {
     if model.map(rsclaw_embed::is_rsclaw_model).unwrap_or(false) {
-        rsclaw_config::load()
+        rsclaw_config::load_cached()
             .ok()
             .as_ref()
             .and_then(crate::ocr::rsclaw_provider_key)
@@ -56,7 +56,7 @@ impl KbReranker {
     /// Build from the effective `kb.rerank` config block. Returns `None`
     /// when the block is absent or explicitly disabled.
     pub fn from_config() -> Option<std::sync::Arc<Self>> {
-        let cfg = rsclaw_config::load().ok()?;
+        let cfg = rsclaw_config::load_cached().ok()?;
         let rr = cfg.raw.kb.as_ref()?.rerank.clone()?;
         if !rr.enabled.unwrap_or(true) {
             return None;
