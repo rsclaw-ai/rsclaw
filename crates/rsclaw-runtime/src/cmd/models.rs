@@ -442,6 +442,10 @@ struct ModelDef {
     /// Upstream origin tried when the gitfast mirror 404s/fails — keeps
     /// agent self-install working when the mirror cache lacks the file.
     fallback_url: Option<&'static str>,
+    /// Expected sha256 (hex) of the archive, checked before extraction.
+    /// Applies to `fallback_url` too: both URLs serve the same artifact.
+    /// `None` = unpinned (only the archive format is checked).
+    sha256: Option<&'static str>,
 }
 
 const AVAILABLE_MODELS: &[ModelDef] = &[
@@ -451,6 +455,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         dir: "bge-small-zh",
         url: "https://jp.gitfast.org/cache/releases/rsclaw/tools/models/bge-small-zh-v1.5.zip",
         fallback_url: None,
+        sha256: None,
     },
     ModelDef {
         names: &["bge-base-zh"],
@@ -458,6 +463,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         dir: "bge-base-zh",
         url: "https://jp.gitfast.org/cache/releases/rsclaw/tools/models/bge-base-zh-v1.5.zip",
         fallback_url: None,
+        sha256: None,
     },
     ModelDef {
         names: &["bge-small-en"],
@@ -465,6 +471,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         dir: "bge-small-en",
         url: "https://jp.gitfast.org/cache/releases/rsclaw/tools/models/bge-small-en-v1.5.zip",
         fallback_url: None,
+        sha256: None,
     },
     ModelDef {
         names: &["whisper", "whisper-tiny"],
@@ -474,6 +481,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         fallback_url: Some(
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2",
         ),
+        sha256: None,
     },
     ModelDef {
         names: &["whisper-turbo"],
@@ -483,6 +491,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         fallback_url: Some(
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-turbo.tar.bz2",
         ),
+        sha256: None,
     },
     ModelDef {
         names: &["paraformer-zh", "paraformer", "paraformer-zh-int8"],
@@ -496,6 +505,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         fallback_url: Some(
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2",
         ),
+        sha256: None,
     },
     ModelDef {
         names: &["paraformer-zh-full", "paraformer-full"],
@@ -506,6 +516,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         fallback_url: Some(
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2025-10-07.tar.bz2",
         ),
+        sha256: None,
     },
     ModelDef {
         names: &[
@@ -520,6 +531,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         dir: "vits-melo-tts-zh_en",
         url: "https://jp.gitfast.org/cache/releases/rsclaw/tools/models/vits-melo-tts-zh_en.tar.bz2",
         fallback_url: None,
+        sha256: None,
     },
     ModelDef {
         names: &["vits-theresa", "theresa"],
@@ -527,6 +539,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         dir: "vits-theresa",
         url: "https://jp.gitfast.org/cache/releases/rsclaw/tools/models/vits-zh-hf-theresa.tar.bz2",
         fallback_url: None,
+        sha256: None,
     },
 ];
 
@@ -556,14 +569,14 @@ async fn cmd_download_embedding(model: Option<String>) -> Result<()> {
         return Ok(());
     }
 
-    match download_archive(def.label, &model_dir, def.url).await {
+    match download_archive(def.label, &model_dir, def.url, def.sha256).await {
         Ok(()) => Ok(()),
         Err(e) => {
             let Some(fb) = def.fallback_url else {
                 return Err(e);
             };
             warn_msg(&format!("mirror failed ({e:#}); trying upstream"));
-            download_archive(def.label, &model_dir, fb).await
+            download_archive(def.label, &model_dir, fb, def.sha256).await
         }
     }
 }
@@ -626,14 +639,20 @@ fn cmd_list_installed() {
 
 /// Download an archive and extract to dest.
 ///
-/// Reuses the streaming download + extract logic from `cmd/tools.rs`.
-async fn download_archive(label: &str, dest: &std::path::Path, url: &str) -> Result<()> {
+/// Reuses the streaming download + extract logic from `cmd/tools.rs`. When
+/// `sha256` is set the archive is verified before extraction.
+async fn download_archive(
+    label: &str,
+    dest: &std::path::Path,
+    url: &str,
+    sha256: Option<&str>,
+) -> Result<()> {
     println!("Downloading {} ...", bold(label));
     println!("  {} {}", dim("from:"), dim(url));
     std::fs::create_dir_all(dest)?;
 
     let client = reqwest::Client::new();
-    super::tools::download_and_extract_public(&client, url, dest).await?;
+    super::tools::download_and_extract_verified(&client, url, dest, sha256).await?;
 
     println!();
     ok(&format!("model saved to {}", dest.display()));

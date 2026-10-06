@@ -1055,7 +1055,9 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
         // when present (signed via the hub meta). Absent → unverified (legacy).
         let expected_sha = tool_platform(&manifest, def.name, platform)
             .and_then(|p| p.get("sha256"))
-            .and_then(|v| v.as_str());
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         match download_and_extract(&client, &url, &dest_dir, expected_sha).await {
             Ok(()) => {
@@ -1138,21 +1140,39 @@ fn resolve_download_url(
 // Download and extract archive
 // ---------------------------------------------------------------------------
 
-/// sha256 hex of a file (content-pin verification of downloads).
+/// sha256 hex of a file (content-pin verification of downloads). Streams the
+/// file so multi-hundred-MB model archives are not loaded into memory.
 fn sha256_file_hex(path: &std::path::Path) -> Result<String> {
     use sha2::{Digest, Sha256};
-    let data = std::fs::read(path)?;
-    Ok(format!("{:x}", Sha256::digest(&data)))
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Download an archive and extract to dest. Public so `cmd/models.rs` can
-/// reuse.
+/// reuse. No content pin: only the archive format is checked; prefer
+/// [`download_and_extract_verified`] when a sha256 is known.
 pub async fn download_and_extract_public(
     client: &reqwest::Client,
     url: &str,
     dest: &std::path::Path,
 ) -> Result<()> {
     download_and_extract(client, url, dest, None).await
+}
+
+/// Download an archive, verify it against `expected_sha256` (lowercase or
+/// uppercase hex) BEFORE extracting, and extract to dest. `None` or an empty
+/// string falls back to the unpinned behavior of
+/// [`download_and_extract_public`].
+pub async fn download_and_extract_verified(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> Result<()> {
+    let expected = expected_sha256.map(str::trim).filter(|s| !s.is_empty());
+    download_and_extract(client, url, dest, expected).await
 }
 
 async fn download_and_extract(
@@ -1622,6 +1642,17 @@ mod tests {
         let m = json!({"bun": {"version": "1.3.14"}});
         write_manifest_cache(tmp.path(), &m).unwrap();
         assert_eq!(load_manifest_cache(tmp.path()), Some(m));
+    }
+
+    #[test]
+    fn sha256_file_hex_streams_known_vector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            sha256_file_hex(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

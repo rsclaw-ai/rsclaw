@@ -1858,11 +1858,10 @@ async fn plugin_kv_delete(
     }
 }
 
-/// Env-var prefix a plugin manifest may read through `{source:"env"}`
-/// references: `RSCLAW_PLUGIN_<NAME>_` with the plugin name upper-cased and
-/// every non-alphanumeric character mapped to `_`.
-fn plugin_env_prefix(plugin_name: &str) -> String {
-    let name: String = plugin_name
+/// Plugin name upper-cased with every non-alphanumeric character mapped to
+/// `_` (e.g. `wechat-ios` -> `WECHAT_IOS`).
+fn plugin_env_name(plugin_name: &str) -> String {
+    plugin_name
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -1871,8 +1870,49 @@ fn plugin_env_prefix(plugin_name: &str) -> String {
                 '_'
             }
         })
-        .collect();
-    format!("RSCLAW_PLUGIN_{name}_")
+        .collect()
+}
+
+/// Env-var prefix a plugin manifest may always read through `{source:"env"}`
+/// references: `RSCLAW_PLUGIN_<NAME>_`.
+fn plugin_env_prefix(plugin_name: &str) -> String {
+    format!("RSCLAW_PLUGIN_{}_", plugin_env_name(plugin_name))
+}
+
+/// Env-var namespaces owned by the host or by well-known providers. A plugin
+/// whose name maps onto one of these (e.g. a plugin called `openai`) does not
+/// get the bare `<NAME>_*` namespace, only `RSCLAW_PLUGIN_<NAME>_*`.
+const RESERVED_ENV_NAMESPACES: &[&str] = &[
+    "RSCLAW", "OPENAI", "ANTHROPIC", "CLAUDE", "AWS", "AZURE", "GOOGLE", "GEMINI", "GCP",
+    "GITHUB", "GH", "GITLAB", "DEEPSEEK", "DOUBAO", "ARK", "VOLC", "QWEN", "DASHSCOPE",
+    "MOONSHOT", "KIMI", "ZHIPU", "MINIMAX", "GROQ", "MISTRAL", "XAI", "OPENROUTER", "HF",
+    "HUGGINGFACE", "SSH", "GPG", "NPM", "CARGO", "DOCKER", "KUBE", "DATABASE", "PG", "MYSQL",
+    "REDIS", "HOME", "PATH", "USER", "LD", "DYLD",
+];
+
+/// Bare `<NAME>_` env prefix owned by the plugin (e.g. `ASTOCK_` for
+/// `astock`), or `None` when the name maps onto a reserved namespace.
+/// Plugin identity is the validated install dir name (see
+/// `check_wasm_plugin_identity`), so a plugin cannot pick another's name.
+fn plugin_own_env_prefix(plugin_name: &str) -> Option<String> {
+    let name = plugin_env_name(plugin_name);
+    let head = name.split('_').next().unwrap_or_default();
+    if name.is_empty()
+        || RESERVED_ENV_NAMESPACES.contains(&name.as_str())
+        || RESERVED_ENV_NAMESPACES.contains(&head)
+    {
+        return None;
+    }
+    Some(format!("{name}_"))
+}
+
+/// True when a plugin manifest may read env var `id`: either
+/// `RSCLAW_PLUGIN_<NAME>_*` or the plugin's own `<NAME>_*` namespace.
+fn plugin_env_allowed(plugin_name: &str, id: &str) -> bool {
+    if id.starts_with(&plugin_env_prefix(plugin_name)) {
+        return true;
+    }
+    plugin_own_env_prefix(plugin_name).is_some_and(|p| id.starts_with(&p))
 }
 
 /// Resolve `{source:"env", id:"VAR"}` references in a config tree.
@@ -1895,8 +1935,10 @@ fn resolve_config_env_refs(
                         plugin = %plugin_name,
                         env = %id,
                         allowed_prefix = %plugin_env_prefix(plugin_name),
+                        own_prefix = %plugin_own_env_prefix(plugin_name).unwrap_or_default(),
                         "plugin manifest env reference denied; set the value in \
-                         plugins.entries.<name>.config or use the allowed prefix"
+                         plugins.entries.<name>.config or use an allowed prefix \
+                         (RSCLAW_PLUGIN_<NAME>_* or <NAME>_*)"
                     );
                     return serde_json::Value::Null;
                 }
@@ -1920,11 +1962,10 @@ fn resolve_config_env_refs(
 }
 
 /// Resolve the manifest's `config` block. The manifest is plugin-authored,
-/// so it may only read env vars in its own `RSCLAW_PLUGIN_<NAME>_*`
-/// namespace (not e.g. `OPENAI_API_KEY`).
+/// so it may only read env vars in its own `RSCLAW_PLUGIN_<NAME>_*` or
+/// `<NAME>_*` namespace (not e.g. `OPENAI_API_KEY`).
 fn resolve_plugin_config(raw: &serde_json::Value, plugin_name: &str) -> serde_json::Value {
-    let prefix = plugin_env_prefix(plugin_name);
-    resolve_config_env_refs(raw, plugin_name, &|id: &str| id.starts_with(&prefix))
+    resolve_config_env_refs(raw, plugin_name, &|id: &str| plugin_env_allowed(plugin_name, id))
 }
 
 impl rsclaw::plugin::host_storage::Host for HostState {
@@ -2893,6 +2934,8 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
                 match event {
                     Ok(rsclaw_provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
                     Ok(rsclaw_provider::StreamEvent::ReasoningDelta(d)) => reasoning.push_str(&d),
+                    // Replay metadata only; its text already arrived as deltas.
+                    Ok(rsclaw_provider::StreamEvent::ReasoningBlock { .. }) => {}
                     Ok(rsclaw_provider::StreamEvent::Done { .. }) => break,
                     Ok(rsclaw_provider::StreamEvent::ToolCall { .. }) => {}
                     Ok(rsclaw_provider::StreamEvent::Error(e)) => {
@@ -4176,6 +4219,22 @@ mod android_helper_tests {
         assert_eq!(plugin_env_prefix("my-plugin"), "RSCLAW_PLUGIN_MY_PLUGIN_");
         let resolved = resolve_plugin_config(&raw, "my-plugin");
         assert_eq!(resolved["foreign"], Value::Null);
+    }
+
+    #[test]
+    fn plugin_isolation_own_namespace_env_refs_allowed() {
+        assert!(plugin_env_allowed("astock", "ASTOCK_API_KEY"));
+        assert!(plugin_env_allowed("astock", "ASTOCK_BASE_URL"));
+        assert!(plugin_env_allowed("astock", "RSCLAW_PLUGIN_ASTOCK_TOKEN"));
+        assert!(!plugin_env_allowed("astock", "OPENAI_API_KEY"));
+        assert!(!plugin_env_allowed("astock", "ASTOCKX_API_KEY"));
+        assert!(plugin_env_allowed("wechat-ios", "WECHAT_IOS_X"));
+        assert!(!plugin_env_allowed("wechat-ios", "WECHAT_API_KEY"));
+        // Names that map onto host / provider namespaces get no bare prefix.
+        assert!(!plugin_env_allowed("openai", "OPENAI_API_KEY"));
+        assert!(!plugin_env_allowed("rsclaw", "RSCLAW_AUTH_TOKEN"));
+        assert!(!plugin_env_allowed("aws-tools", "AWS_TOOLS_SECRET"));
+        assert!(plugin_env_allowed("openai", "RSCLAW_PLUGIN_OPENAI_KEY"));
     }
 
     #[test]
