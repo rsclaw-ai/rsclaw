@@ -20,4 +20,10 @@ jobs:
           # xcb's build script and wayland-scanner's proc macro parse only
           # protocol descriptions bundled in checksummed crates. Neither
           # quick-xml instance is shipped or processes runtime user input.
-          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
+          #
+          # RUSTSEC-2026-0292 and RUSTSEC-2026-0318 are confined to the optional
+          # channel-matrix feature. Release artifacts use default features and do
+          # not compile or ship matrix-sdk. matrix-sdk >=0.19 requires Rust 1.96,
+          # above the project's Rust 1.91 MSRV; remove these ignores when Matrix
+          # is upgraded or enabled in release builds.
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2026-0292,RUSTSEC-2026-0318

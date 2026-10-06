@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw-runtime"
-version = "2026.8.28"
+version = "2026.10.1"
 edition = "2024"
 rust-version = "1.91"
 description = "rsclaw composition root: AppState/RPC handlers (a2a, cmd, cron, gateway, hooks, server, ws) + process entry point"
@@ -152,8 +152,8 @@ fs2 = "0.4.3"
 htmd    = "0.5"
 lol_html = "1.2"
 include_dir = "0.7"
-wasmtime = { version = "36.0.13", features = ["async"] }
-wasmtime-wasi = "36.0.13"
+wasmtime = { version = "36.0.17", features = ["async"] }
+wasmtime-wasi = "36.0.17"
 moka = { version = "0.12", features = ["future"] }
 tray-icon = { version = "0.21", optional = true }
 muda = { version = "0.17", optional = true }
