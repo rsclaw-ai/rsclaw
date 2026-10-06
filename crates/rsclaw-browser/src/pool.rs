@@ -407,6 +407,11 @@ impl BrowserPool {
     }
 
     /// Shut down the shared Chrome if idle.
+    ///
+    /// A pool-owned *headed* Chrome (the visible browser `web_browser` uses,
+    /// typically on the user's real profile) is never reaped: killing it
+    /// throws away the user's open pages and session logins. Headless pool
+    /// Chrome is reaped, but closed gracefully so cookies are flushed.
     pub async fn reap_if_idle(&self) {
         if !self.is_idle_expired() {
             return;
@@ -419,9 +424,19 @@ impl BrowserPool {
         if !self.is_idle_expired() {
             return;
         }
-        if guard.is_some() {
+        let headed = guard
+            .as_ref()
+            .and_then(|p| p.process.as_ref())
+            .is_some_and(|proc| proc.headed);
+        if headed {
+            return;
+        }
+        if let Some(mut pooled) = guard.take() {
             info!("pool: idle timeout, shutting down shared Chrome");
-            *guard = None; // ChromeProcess::Drop kills the process
+            if let Some(ref mut proc) = pooled.process {
+                proc.close_gracefully(Duration::from_secs(5)).await;
+            }
+            drop(pooled); // ChromeProcess::Drop kills anything left
         }
     }
 }
@@ -598,6 +613,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_owned_chrome_reuse_refreshes_idle_clock() {
+        // reqwest is built without a default rustls provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (_server, port) = fake_chrome_endpoint().await;
         let pool = BrowserPool::new();
         *pool.chrome.lock().await = Some(PooledChrome {
@@ -653,6 +670,8 @@ mod tests {
 
     #[tokio::test]
     async fn chrome_ws_url_reuse_refreshes_idle_clock() {
+        // reqwest is built without a default rustls provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (_server, port) = fake_chrome_endpoint().await;
         let pool = BrowserPool::new();
         *pool.chrome.lock().await = Some(PooledChrome {

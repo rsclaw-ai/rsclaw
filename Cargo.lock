@@ -7653,6 +7653,7 @@ dependencies = [
  "rsclaw-platform",
  "rsclaw-types",
  "rsclaw-util",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

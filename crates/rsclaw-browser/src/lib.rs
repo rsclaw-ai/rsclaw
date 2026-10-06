@@ -185,6 +185,8 @@ pub(crate) struct ChromeProcess {
     child: tokio::process::Child,
     ws_url: String,
     _tmp_dir: Option<tempfile::TempDir>,
+    /// Launched with a visible window (user-facing; never idle-reaped).
+    pub(crate) headed: bool,
 }
 
 impl ChromeProcess {
@@ -330,7 +332,47 @@ impl ChromeProcess {
             child,
             ws_url,
             _tmp_dir: tmp_dir,
+            headed,
         })
+    }
+
+    /// Ask Chrome to exit cleanly via the browser-level CDP `Browser.close`
+    /// and wait up to `timeout` for the process to exit. A clean exit lets
+    /// Chrome flush cookies / session storage to the profile; the hard kill
+    /// in `Drop` (used as the fallback) can lose the last ~30s of writes and
+    /// leaves a stale SingletonLock behind.
+    pub(crate) async fn close_gracefully(&mut self, timeout: Duration) {
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return; // already exited
+        }
+        match tokio::time::timeout(Duration::from_secs(3), CdpClient::connect(&self.ws_url)).await
+        {
+            Ok(Ok(browser)) => {
+                // The connection usually drops before a reply arrives once
+                // Chrome starts shutting down, so an error here is expected.
+                if let Err(e) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    browser.send("Browser.close", json!({})),
+                )
+                .await
+                .map_err(|_| anyhow!("timeout"))
+                .and_then(|r| r)
+                {
+                    debug!("Browser.close returned: {e:#}");
+                }
+            }
+            Ok(Err(e)) => debug!("graceful close: CDP connect failed: {e:#}"),
+            Err(_) => debug!("graceful close: CDP connect timed out"),
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                debug!("Chrome exited cleanly");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        warn!("Chrome did not exit within {timeout:?} after Browser.close; killing");
     }
 
     /// Extract the debugging port from the ws URL.
@@ -893,6 +935,10 @@ pub struct BrowserSession {
     /// `cmd_open` only reuses these for same-origin navigation so it never
     /// hijacks the user's own tabs in an attached external Chrome.
     rsclaw_tabs: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Last http(s) URL the session was on. Restored after a crash restart
+    /// so callers (e.g. plugins working inside a logged-in portal) don't land
+    /// on about:blank.
+    last_url: Option<String>,
 }
 
 impl Drop for BrowserSession {
@@ -1097,6 +1143,7 @@ impl BrowserSession {
             recording: None,
             owned_external_tab: None,
             rsclaw_tabs: std::sync::Mutex::new(std::collections::HashSet::new()),
+            last_url: None,
         })
     }
 
@@ -1221,6 +1268,7 @@ impl BrowserSession {
                 }
                 initial_tabs
             }),
+            last_url: None,
         })
     }
 
@@ -1297,7 +1345,16 @@ impl BrowserSession {
     }
 
     /// Check idle timeout: returns true if session has been idle too long.
+    ///
+    /// Only throwaway sessions (headless, no named profile) expire. Headed
+    /// sessions and sessions on a persistent profile hold user-visible state
+    /// — open pages and logins in a portal — that an idle restart would
+    /// destroy (back to about:blank, session cookies lost), so they never
+    /// idle-expire; they are restarted only when Chrome actually dies.
     pub fn is_idle_expired(&self) -> bool {
+        if self.headed || self.profile.is_some() {
+            return false;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1316,7 +1373,12 @@ impl BrowserSession {
     async fn restart(&mut self) -> Result<()> {
         warn!("restarting Chrome browser session");
         if self.chrome.is_some() {
-            // Drop old chrome (kills process via Drop) and launch new one.
+            // Let the old Chrome exit cleanly first so the profile's cookies
+            // and session state are flushed; Drop hard-kills whatever is left.
+            if let Some(mut old) = self.chrome.take() {
+                old.close_gracefully(Duration::from_secs(5)).await;
+                drop(old);
+            }
             let new_chrome =
                 ChromeProcess::launch(&self.chrome_path, self.headed, self.profile.as_deref())
                     .await?;
@@ -1416,10 +1478,19 @@ impl BrowserSession {
 
     /// Main dispatch: execute a browser action.
     pub async fn execute(&mut self, action: &str, args: &Value) -> Result<Value> {
-        // Check liveness: if Chrome died, restart
+        // Check liveness: if Chrome died, restart and return to the page we
+        // were on, so a crash doesn't strand the caller on about:blank.
         if !self.is_alive() {
             warn!("Chrome process not alive, restarting");
             self.restart().await?;
+            if let Some(url) = self.last_url.clone()
+                && !matches!(action, "open" | "navigate")
+            {
+                info!(url = %url, "restoring last page after Chrome restart");
+                if let Err(e) = self.cmd_open(&json!({ "url": url })).await {
+                    warn!("failed to restore last page after restart: {e:#}");
+                }
+            }
         }
 
         // Check idle timeout: if expired, restart for fresh state
@@ -1568,6 +1639,25 @@ impl BrowserSession {
             "getbylabel" | "get_by_label" => self.cmd_getby(args, "label").await,
             other => Err(anyhow!("web_browser: unsupported action `{other}`")),
         };
+
+        // Remember where we are so a crash restart can come back here.
+        if let Ok(ref val) = result {
+            let url = val
+                .get("url")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    if matches!(action, "open" | "navigate") {
+                        args.get("url").and_then(|v| v.as_str())
+                    } else {
+                        None
+                    }
+                });
+            if let Some(u) = url
+                && (u.starts_with("http://") || u.starts_with("https://"))
+            {
+                self.last_url = Some(u.to_owned());
+            }
+        }
 
         // Record operation if recording is active.
         if let Ok(ref _val) = result {
@@ -5089,8 +5179,29 @@ mod tests {
         assert_eq!(p, 9999);
     }
 
+    /// Needs a local Chrome; run with
+    /// `cargo test -p rsclaw-browser --lib -- --ignored chrome_closes_gracefully`.
+    #[tokio::test]
+    #[ignore]
+    async fn chrome_closes_gracefully() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let path = rsclaw_platform::detect_chrome().expect("Chrome installed");
+        let mut chrome = crate::ChromeProcess::launch(&path, false, None)
+            .await
+            .expect("launch Chrome");
+        let started = std::time::Instant::now();
+        chrome.close_gracefully(std::time::Duration::from_secs(5)).await;
+        assert!(
+            matches!(chrome.child.try_wait(), Ok(Some(_))),
+            "Chrome should exit on Browser.close without the hard kill"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     #[tokio::test]
     async fn detect_existing_chrome_skips_headless() {
+        // reqwest is built without a default rustls provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let server = MockServer::start().await;
         let port = server.address().port();
         let body = json!({
@@ -5112,6 +5223,8 @@ mod tests {
 
     #[tokio::test]
     async fn detect_existing_chrome_accepts_headed() {
+        // reqwest is built without a default rustls provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let server = MockServer::start().await;
         let port = server.address().port();
         let ws = format!("ws://127.0.0.1:{port}/devtools/browser/def");
