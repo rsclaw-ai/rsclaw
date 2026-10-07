@@ -240,7 +240,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
         }
         GatewayCommand::Reload { scope } => {
             let config = config::load_quiet().ok();
-            let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(18888);
+            let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(rsclaw_brand::DEFAULT_PORT);
             let auth_token = config
                 .and_then(|c| c.gateway.auth_token)
                 .unwrap_or_default();
@@ -278,7 +278,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
         GatewayCommand::Status => gateway_print_status().await,
         GatewayCommand::Health => {
             let config = config::load_quiet().ok();
-            let port = config.map(|c| c.gateway.port).unwrap_or(18888);
+            let port = config.map(|c| c.gateway.port).unwrap_or(rsclaw_brand::DEFAULT_PORT);
             let url = format!("http://127.0.0.1:{port}/api/v1/health");
             match crate::cmd::gateway_http::local_client().get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -315,7 +315,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
         }
         GatewayCommand::UsageCost => {
             let config = config::load_quiet().ok();
-            let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(18888);
+            let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(rsclaw_brand::DEFAULT_PORT);
             let auth_token = config
                 .and_then(|c| c.gateway.auth_token)
                 .unwrap_or_default();
@@ -514,7 +514,7 @@ fn detect_port() -> u16 {
 }
 
 fn detect_port_from_sources(instance_port: Option<u16>, configured_port: Option<u16>) -> u16 {
-    instance_port.or(configured_port).unwrap_or(18888)
+    instance_port.or(configured_port).unwrap_or(rsclaw_brand::DEFAULT_PORT)
 }
 
 fn gateway_target_pid() -> Option<u32> {

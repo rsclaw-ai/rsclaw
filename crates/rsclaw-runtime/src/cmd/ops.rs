@@ -288,7 +288,7 @@ impl TuiState {
                     .collect();
                 (port, list)
             }
-            Err(_) => (18888, vec![]),
+            Err(_) => (rsclaw_brand::DEFAULT_PORT, vec![]),
         };
 
         let logs = read_last_log_lines(10);

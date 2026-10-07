@@ -512,7 +512,7 @@ impl IntoRuntime for Config {
 
         Ok(RuntimeConfig {
             gateway: GatewayRuntime {
-                port: gw.port.unwrap_or(18888),
+                port: gw.port.unwrap_or(rsclaw_brand::DEFAULT_PORT),
                 mode: gw.mode.unwrap_or(GatewayMode::Local),
                 bind: gw.bind.unwrap_or(BindMode::Loopback),
                 bind_address: gw.bind_address.clone(),

@@ -436,7 +436,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             let port = std::env::var("RSCLAW_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
-                .unwrap_or_else(|| config.as_ref().map_or(18888, |c| c.gateway.port));
+                .unwrap_or_else(|| config.as_ref().map_or(rsclaw_brand::DEFAULT_PORT, |c| c.gateway.port));
             let auth_token = config
                 .as_ref()
                 .and_then(|c| c.gateway.auth_token.as_deref())

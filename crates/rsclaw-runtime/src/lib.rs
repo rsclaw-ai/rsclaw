@@ -145,8 +145,8 @@ use tracing_subscriber::EnvFilter;
 ///   2. `--dev`     → ~/.rsclaw-dev,    port 18889
 ///   3. `--profile` → ~/.rsclaw-<name>, port 18890..N (deterministic hash)
 ///   4. default     → ~/.rsclaw,        port 18888
-const BASE_PORT: u16 = 18888;
-const DEV_PORT: u16 = 18889;
+const BASE_PORT: u16 = rsclaw_brand::DEFAULT_PORT;
+const DEV_PORT: u16 = rsclaw_brand::DEV_PORT;
 
 /// Best-effort read of `gateway.port` from `<base_dir>/rsclaw.json5`.
 /// Returns None when the file doesn't exist, doesn't parse, or doesn't set
@@ -364,7 +364,7 @@ async fn cmd_pairing(sub: rsclaw_cli::PairingCommand) -> Result<()> {
             let port = std::env::var("RSCLAW_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
-                .unwrap_or_else(|| config.as_ref().map_or(18888, |c| c.gateway.port));
+                .unwrap_or_else(|| config.as_ref().map_or(BASE_PORT, |c| c.gateway.port));
             let auth_token_val = config
                 .as_ref()
                 .and_then(|c| c.gateway.auth_token.clone())

@@ -13,7 +13,7 @@ fn gateway_url() -> String {
     let port = rsclaw_config::loader::load_json5(&config_path)
         .ok()
         .and_then(|c| c.gateway.as_ref()?.port)
-        .unwrap_or(18888);
+        .unwrap_or(rsclaw_brand::DEFAULT_PORT);
     format!("http://127.0.0.1:{port}")
 }
 

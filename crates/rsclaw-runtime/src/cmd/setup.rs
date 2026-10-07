@@ -149,12 +149,13 @@ fn confirm_step(prompt: &str, default: bool) -> StepResult<bool> {
 fn default_config(lang: &str) -> String {
     let lang_name = lang_code_to_name(lang);
     let auth_token = generate_auth_token();
+    let port = rsclaw_brand::DEFAULT_PORT;
     format!(
         r#"// rsclaw configuration (JSON5)
 // Docs: https://github.com/rsclaw-ai/rsclaw
 {{
   gateway: {{
-    port: 18888,
+    port: {port},
     bind: "loopback",
     language: "{lang_name}",
     auth: {{ token: "{auth_token}" }},
@@ -513,7 +514,7 @@ fn load_existing_defaults(defs: &Defaults) -> ExistingConfig {
         api_key_display: String::new(),
         base_url: String::new(),
         model: String::new(),
-        port: 18888,
+        port: rsclaw_brand::DEFAULT_PORT,
         bind_idx: 0,
         enabled_channels: vec![],
         provider_models: std::collections::HashMap::new(),

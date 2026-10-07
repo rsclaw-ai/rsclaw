@@ -269,6 +269,22 @@ mod tests {
     }
 
     #[test]
+    fn default_port_generates_numeric_constants() {
+        assert_eq!(DEFAULT_PORT, 18888);
+        assert_eq!(DEV_PORT, 18889);
+        let spec = spec::parse(&acme().replace("default_port = 18888", "default_port = 19188")).expect("parse");
+        spec::validate(&spec).expect("validate");
+        let code = spec::generate(&spec);
+        assert!(code.contains("pub const DEFAULT_PORT: u16 = 19188;"));
+        assert!(code.contains("pub const DEV_PORT: u16 = 19189;"));
+        for bad in ["default_port = 80", "default_port = 70000", "default_port = \"x\""] {
+            let src = acme().replace("default_port = 18888", bad);
+            let ok = spec::parse(&src).and_then(|s| spec::validate(&s));
+            assert!(ok.is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
     fn empty_app_url_disables_release_and_catalog_endpoints() {
         let src = acme().replace("app = \"https://app.rsclaw.ai\"", "app = \"\"");
         let spec = spec::parse(&src).expect("parse");

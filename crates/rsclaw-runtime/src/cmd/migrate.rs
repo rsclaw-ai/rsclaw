@@ -304,7 +304,7 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
 
         // Gateway: migrate compatible fields, set port to 18888.
         let mut gw = serde_json::Map::new();
-        gw.insert("port".to_owned(), serde_json::json!(18888));
+        gw.insert("port".to_owned(), serde_json::json!(rsclaw_brand::DEFAULT_PORT));
         if let Some(oc_gw) = config.get("gateway").and_then(|v| v.as_object()) {
             // Supported gateway fields to migrate as-is.
             let supported = ["bind", "auth", "language", "mode", "controlUi"];

@@ -45,6 +45,7 @@ back silently to another brand's value.
 | `windows_service` | `rsclaw` | Windows service name (`sc`) |
 | `service_display` | `RsClaw AI Gateway` | Windows service display name |
 | `user_agent` | `rsclaw` | User-Agent product token (`<token>/<version>`) |
+| `default_port` | `18888` | Gateway default port (integer). `--dev` uses +1 and named profiles +2..=+255, so brands that may run on the same machine need ports at least 256 apart. |
 | `release_repo` | `rsclaw-ai/rsclaw` | GitHub `owner/repo` used as the release fallback for `update`. Empty disables the fallback. |
 | `urls.api` | `https://api.rsclaw.ai` | Managed model, media and embedding API (`/v1` is appended) |
 | `urls.hub` | `https://hub.rsclaw.ai` | Skill, plugin and tool hub (`/tools/manifest.json`, `/meta.json`, allowlists) |

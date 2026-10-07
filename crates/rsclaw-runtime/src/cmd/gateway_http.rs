@@ -21,7 +21,7 @@ use anyhow::{Context, Result, anyhow};
 use rsclaw_config as config;
 use serde::{Serialize, de::DeserializeOwned};
 
-const DEFAULT_PORT: u16 = 18888;
+const DEFAULT_PORT: u16 = rsclaw_brand::DEFAULT_PORT;
 
 /// Resolved gateway endpoint config: which port to hit and which bearer
 /// token to send. `token` is `None` when the user runs the gateway with

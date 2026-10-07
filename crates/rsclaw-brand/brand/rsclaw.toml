@@ -18,6 +18,9 @@ service_unit = "rsclaw-gateway"
 windows_service = "rsclaw"
 service_display = "RsClaw AI Gateway"
 user_agent = "rsclaw"
+# Gateway default port. `--dev` uses +1 and named profiles +2..=+255, so
+# brands that may share a machine need ports at least 256 apart.
+default_port = 18888
 
 # GitHub `owner/repo` used as the release fallback for `update`; "" disables it.
 release_repo = "rsclaw-ai/rsclaw"
