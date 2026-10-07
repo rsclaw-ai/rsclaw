@@ -158,6 +158,12 @@ pub struct FeishuChannel {
     pub ws_url_override: Option<String>,
     /// Max file size for downloads (from config tools.upload.maxFileSize).
     pub max_file_size: usize,
+    /// Sender display names are resolved via the contact API at most once
+    /// per open_id; ids already attempted live here.
+    name_lookup_tried: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Set once the app turns out to lack contact permission, so the
+    /// lookup isn't retried on every new sender.
+    name_lookup_disabled: std::sync::atomic::AtomicBool,
     /// Idle read timeout (secs) for resource downloads (config
     /// tools.upload.downloadTimeoutSecs, default 600). Read-idle, not total:
     /// a progressing download is never killed, a stalled one fails after this.
@@ -326,6 +332,90 @@ fn build_feishu_card(text: &str, brand: &str) -> serde_json::Value {
 
 #[allow(dead_code)]
 impl FeishuChannel {
+    /// Look up a sender's display name through the contact API (needs the
+    /// `contact:user.base:readonly` scope) and record it in the peer-name
+    /// cache. Best-effort: at most one attempt per open_id, bounded by a
+    /// short timeout, and disabled for this app after a permission error.
+    async fn resolve_sender_name(&self, open_id: &str) {
+        use std::sync::atomic::Ordering;
+        if open_id.is_empty()
+            || crate::peer_names::peer_name("feishu", open_id).is_some()
+            || self.name_lookup_disabled.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        match self.name_lookup_tried.lock() {
+            Ok(mut tried) => {
+                if tried.len() >= 10_000 {
+                    tried.clear();
+                }
+                if !tried.insert(open_id.to_owned()) {
+                    return;
+                }
+            }
+            Err(e) => {
+                warn!("feishu: name lookup set lock poisoned: {e}");
+                return;
+            }
+        }
+        let token = match self.get_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                debug!("feishu: name lookup skipped, no token: {e:#}");
+                return;
+            }
+        };
+        let url = format!(
+            "{}/contact/v3/users/{}?user_id_type=open_id",
+            self.api_base(),
+            open_id
+        );
+        let resp = match tokio::time::timeout(
+            Duration::from_secs(3),
+            self.client.get(&url).bearer_auth(&token).send(),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                debug!("feishu: name lookup request failed: {}", e.without_url());
+                return;
+            }
+            Err(_) => {
+                debug!("feishu: name lookup timed out");
+                return;
+            }
+        };
+        let status = resp.status();
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("feishu: name lookup response not JSON: {}", e.without_url());
+                return;
+            }
+        };
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code == 0 {
+            if let Some(name) = body.pointer("/data/user/name").and_then(|v| v.as_str()) {
+                crate::peer_names::record_peer_name("feishu", open_id, name);
+            }
+            return;
+        }
+        // 99991672 / 99991679: app lacks the contact scope; 41050: user not
+        // visible to the app. Stop trying for this app on permission errors.
+        if status == reqwest::StatusCode::FORBIDDEN || code == 99991672 || code == 99991679 {
+            self.name_lookup_disabled.store(true, Ordering::Relaxed);
+            warn!(
+                app_id = %self.app_id,
+                code,
+                "feishu: contact permission missing (contact:user.base:readonly); \
+                 sender names will not be shown"
+            );
+        } else {
+            debug!(code, "feishu: name lookup returned an error");
+        }
+    }
+
     fn api_base(&self) -> &str {
         if let Some(ref ov) = self.api_base_override {
             return ov.as_str();
@@ -393,6 +483,8 @@ impl FeishuChannel {
             api_base_override: None,
             ws_url_override: None,
             max_file_size: 128_000_000, // default 128MB, overridden by startup
+            name_lookup_tried: std::sync::Mutex::new(std::collections::HashSet::new()),
+            name_lookup_disabled: std::sync::atomic::AtomicBool::new(false),
             download_timeout_secs: 600, // overridden by startup from config
             ws_reconnect_delay_secs: 5,
             on_message,
@@ -1474,6 +1566,12 @@ impl FeishuChannel {
 
         let is_group = chat_type == "group";
         info!(from = %sender_id, chat = %chat_id, is_group, text_len = text.len(), files = file_attachments.len(), "feishu: message received");
+
+        // Feishu events carry only the open_id; resolve a display name once
+        // per sender so DM session lists show a person, not an id.
+        if !is_group {
+            self.resolve_sender_name(&sender_id).await;
+        }
 
         (self.on_message)(sender_id, text, chat_id, is_group, images, file_attachments);
 
