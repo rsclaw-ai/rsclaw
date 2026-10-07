@@ -18,6 +18,9 @@ pub async fn sessions_list(ctx: MethodCtx) -> MethodResult {
     let sessions: Vec<serde_json::Value> = keys
         .into_iter()
         .map(|k| {
+            if let Err(e) = ctx.state.store.db.ensure_session_title(&k) {
+                tracing::warn!(session = %k, error = %e, "session title backfill failed");
+            }
             let meta = ctx.state.store.db.get_session_meta(&k).ok().flatten();
             let (updated_ts, created_ts, msg_count, tokens) = match &meta {
                 Some(m) => {
@@ -70,7 +73,20 @@ pub async fn sessions_list(ctx: MethodCtx) -> MethodResult {
             } else {
                 created_ts.clone().into()
             };
+            let title = meta.as_ref().and_then(|m| m.title.clone());
+            let title_source = meta.as_ref().and_then(|m| m.title_source).map(|s| match s {
+                rsclaw_store::redb_store::TitleSource::Auto => "auto",
+                rsclaw_store::redb_store::TitleSource::User => "user",
+            });
+            let (agent_id, channel) = crate::gateway::session::parse_session_key(&k);
             serde_json::json!({
+                // session title (auto from first message, or user-renamed)
+                "title": title,
+                "titleSource": title_source,
+                "channel": channel,
+                "peerName": meta.as_ref().and_then(|m| m.peer_name.clone()),
+                "pinned": meta.as_ref().is_some_and(|m| m.pinned),
+                "archived": meta.as_ref().is_some_and(|m| m.archived),
                 // primary key — openclaw UI reads "sessionKey"
                 "key": k,
                 "sessionKey": k,
@@ -87,8 +103,8 @@ pub async fn sessions_list(ctx: MethodCtx) -> MethodResult {
                 "estimatedTokens": tokens,
                 "tokens": tokens,
                 // openclaw compat — label, agentId, model
-                "label": serde_json::Value::Null,
-                "agentId": "main",
+                "label": title,
+                "agentId": agent_id.unwrap_or_else(|| "main".to_owned()),
                 "model": serde_json::Value::Null,
             })
         })
@@ -476,11 +492,34 @@ pub async fn sessions_patch(ctx: MethodCtx) -> MethodResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| ErrorShape::bad_request("missing required param: key or sessionKey"))?;
 
-    // Session metadata (title, tags, ...) storage is not implemented; do not
-    // report a successful patch that was silently dropped.
-    Err(ErrorShape::not_implemented(format!(
-        "sessions.patch is not implemented (session `{key}` unchanged)"
-    )))
+    // Same semantics as HTTP `PATCH /api/v1/sessions/{id}`: `title`
+    // (string | null; empty/null clears the user title), `pinned`, `archived`.
+    let mut body = serde_json::Map::new();
+    for field in ["title", "pinned", "archived"] {
+        if let Some(v) = params.get(field) {
+            body.insert(field.to_owned(), v.clone());
+        }
+    }
+    let body = serde_json::Value::Object(body);
+    let db = std::sync::Arc::clone(&ctx.state.store.db);
+    let key = key.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::server::sessions_api::apply_patch(&db, &key, &body)
+    })
+    .await
+    .map_err(|e| ErrorShape::internal(format!("session task failed: {e}")))?;
+    match result {
+        Ok(detail) => Ok(detail.to_ws_json()),
+        Err(crate::server::sessions_api::PatchError::BadRequest(msg)) => {
+            Err(ErrorShape::bad_request(msg))
+        }
+        Err(crate::server::sessions_api::PatchError::NotFound) => {
+            Err(ErrorShape::not_found("session not found"))
+        }
+        Err(crate::server::sessions_api::PatchError::Internal(msg)) => {
+            Err(ErrorShape::internal(msg))
+        }
+    }
 }
 
 pub async fn sessions_compact(ctx: MethodCtx) -> MethodResult {

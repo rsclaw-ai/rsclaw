@@ -102,7 +102,24 @@ pub struct TgFile {
 pub struct TgUser {
     pub id: i64,
     pub first_name: String,
+    #[serde(default)]
+    pub last_name: Option<String>,
     pub username: Option<String>,
+}
+
+impl TgUser {
+    /// Human display name: "first last", falling back to the username.
+    pub fn display_name(&self) -> String {
+        let full = match self.last_name.as_deref() {
+            Some(last) if !last.trim().is_empty() => format!("{} {}", self.first_name, last),
+            _ => self.first_name.clone(),
+        };
+        if full.trim().is_empty() {
+            self.username.clone().unwrap_or_default()
+        } else {
+            full
+        }
+    }
 }
 
 /// Minimal fields returned by sendMessage (used for preview streaming).
@@ -989,6 +1006,13 @@ impl Channel for TelegramChannel {
                             let Some(msg) = update.message else {
                                 continue;
                             };
+                            if let Some(from) = msg.from.as_ref() {
+                                crate::peer_names::record_peer_name(
+                                    "telegram",
+                                    &from.id.to_string(),
+                                    &from.display_name(),
+                                );
+                            }
                             let has_media = msg.voice.is_some()
                                 || msg.audio.is_some()
                                 || msg.video.is_some()

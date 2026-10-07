@@ -560,6 +560,30 @@ pub struct AgentDefaults {
     /// Codex MCP configuration for default agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexConfig>,
+    /// Session title generation (`agents.defaults.sessionTitles`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_titles: Option<SessionTitlesConfig>,
+}
+
+/// Session title generation settings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTitlesConfig {
+    /// After the first assistant reply of a conversation, ask the flash
+    /// model for a concise title replacing the first-message-derived one
+    /// (never overrides a user-set title). Default: true.
+    #[serde(default = "session_titles_llm_default")]
+    pub llm: bool,
+}
+
+impl Default for SessionTitlesConfig {
+    fn default() -> Self {
+        Self { llm: true }
+    }
+}
+
+fn session_titles_llm_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -47,6 +47,9 @@ struct SignalNotification {
 #[derive(Debug, Deserialize)]
 struct SignalMessage {
     source: Option<String>,
+    /// Sender profile name (signal-cli `sourceName`).
+    #[serde(rename = "sourceName", default)]
+    source_name: Option<String>,
     #[serde(rename = "dataMessage")]
     data_message: Option<SignalDataMessage>,
 }
@@ -322,6 +325,9 @@ impl Channel for SignalChannel {
                         continue;
                     }
                     let chat_id = group_id.unwrap_or_else(|| sender.clone());
+                    if let Some(name) = msg.source_name.as_deref() {
+                        crate::peer_names::record_peer_name("signal", sender, name);
+                    }
                     let text = crate::strip_inbound_sentinels(text);
                     debug!(sender, is_group, "Signal message received");
                     (self.on_message)(sender.clone(), chat_id, text, is_group);

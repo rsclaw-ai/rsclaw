@@ -39,6 +39,7 @@ pub mod discord;
 pub mod feishu;
 pub mod line;
 pub mod matrix;
+pub mod peer_names;
 pub mod qq;
 // retry helpers extracted to rsclaw-retry (crate-split); re-exported so
 // crate::retry::{SendRetry, send_with_retry} keeps resolving.

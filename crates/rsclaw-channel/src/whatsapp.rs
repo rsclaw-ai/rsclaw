@@ -43,6 +43,20 @@ pub struct WhatsAppChange {
 #[derive(Debug, Deserialize)]
 pub struct WhatsAppValue {
     pub messages: Option<Vec<WhatsAppMessage>>,
+    /// Sender profiles delivered alongside `messages` (`contacts[].profile.name`).
+    #[serde(default)]
+    pub contacts: Option<Vec<WhatsAppContact>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WhatsAppContact {
+    pub wa_id: Option<String>,
+    pub profile: Option<WhatsAppProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WhatsAppProfile {
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +204,14 @@ impl WhatsAppChannel {
     pub async fn handle_webhook(&self, payload: &WebhookPayload) {
         for entry in &payload.entry {
             for change in &entry.changes {
+                for contact in change.value.contacts.iter().flatten() {
+                    if let (Some(wa_id), Some(name)) = (
+                        contact.wa_id.as_deref(),
+                        contact.profile.as_ref().and_then(|p| p.name.as_deref()),
+                    ) {
+                        crate::peer_names::record_peer_name("whatsapp", wa_id, name);
+                    }
+                }
                 if let Some(messages) = &change.value.messages {
                     for msg in messages {
                         // Meta retries webhooks; drop redeliveries by message id.
@@ -617,6 +639,7 @@ mod tests {
             entry: vec![WhatsAppEntry {
                 changes: vec![WhatsAppChange {
                     value: WhatsAppValue {
+                        contacts: None,
                         messages: Some(vec![WhatsAppMessage {
                             from: "447911123456".to_owned(),
                             id: "wamid.xxx".to_owned(),

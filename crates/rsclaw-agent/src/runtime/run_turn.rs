@@ -2404,6 +2404,9 @@ impl AgentRuntime {
                 tracing::warn!("failed to persist user message: {e:#}");
             }
         }
+        if !is_internal {
+            self.record_session_metadata(session_key, text, !has_user_msg, channel, peer_id);
+        }
 
         // Timeout wrapper. Daemon agents (long-lived monitor loops) run with NO
         // turn timeout — they loop forever by design; see `daemon_agent_ids`.
@@ -2589,6 +2592,13 @@ impl AgentRuntime {
 
         // Append to JSONL transcript (AGENTS.md §20 step 11).
         self.append_transcript(session_key, text, &reply.text).await;
+
+        // First reply of a conversation: refine the auto title in the
+        // background (flash model, non-blocking).
+        if !has_user_msg && !reply.is_empty {
+            self.spawn_llm_session_title(session_key, text, &reply.text)
+                .await;
+        }
 
         // Loop A (organic evolution): adjust importance of recalled memories
         // based on the outcome of this turn.

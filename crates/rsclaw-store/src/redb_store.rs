@@ -356,6 +356,52 @@ where
     Ok(out)
 }
 
+/// Active message keys of `session_key` sorted chronologically by seq.
+fn sorted_active_keys<T>(table: &T, session_key: &str) -> Result<Vec<String>>
+where
+    T: ReadableTable<&'static str, &'static str>,
+{
+    let mut keys = own_active_message_keys(table, session_key)?;
+    keys.sort_by_key(|k| seq_from_message_key(k, session_key).unwrap_or(0));
+    Ok(keys)
+}
+
+/// How many leading active messages are scanned for the first user message
+/// when deriving a title.
+const TITLE_SCAN_LIMIT: usize = 20;
+
+/// Derive an automatic title from the first real user message among the
+/// session's first [`TITLE_SCAN_LIMIT`] active messages. Compaction
+/// summaries are skipped and the runtime-injected context prefix is stripped.
+fn first_user_title<T>(table: &T, session_key: &str) -> Result<Option<String>>
+where
+    T: ReadableTable<&'static str, &'static str>,
+{
+    use rsclaw_util::session_text::{derive_title, message_text, strip_injected_context};
+
+    let keys = sorted_active_keys(table, session_key)?;
+    for key in keys.iter().take(TITLE_SCAN_LIMIT) {
+        let Some(v) = table.get(key.as_str())? else {
+            continue;
+        };
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(v.value()) else {
+            continue;
+        };
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let text = message_text(&msg);
+        if text.starts_with("[CONTEXT COMPACTION") {
+            continue;
+        }
+        let (_, body) = strip_injected_context(&text);
+        if let Some(title) = derive_title(body) {
+            return Ok(Some(title));
+        }
+    }
+    Ok(None)
+}
+
 /// Parse an archive key of shape
 /// `archive<sep><session_key><sep>gen<N><sep><seq>` (separator `\0` or `:`)
 /// into `(generation, seq)`. Returns `None` for keys that don't match the shape
@@ -496,16 +542,16 @@ impl RedbStore {
                 .get(session_key)?
                 .map(|v| serde_json::from_str(v.value()))
                 .transpose()?
-                .unwrap_or_else(|| SessionMeta {
-                    session_key: session_key.to_owned(),
-                    message_count: 0,
-                    last_active: now,
-                    created_at: now,
-                    generation: 1,
-                });
+                .unwrap_or_else(|| SessionMeta::new(session_key, now));
             meta.generation += 1;
             meta.message_count = 0;
             meta.last_active = now;
+            // A new conversation starts: automatic titles described the old
+            // one, user-chosen titles name the session itself and survive.
+            if !meta.has_user_title() {
+                meta.title = None;
+                meta.title_source = None;
+            }
             let meta_json = serde_json::to_string(&meta)?;
             metas.insert(session_key, meta_json.as_str())?;
             meta.generation
@@ -522,6 +568,206 @@ impl RedbStore {
         write.commit()?;
 
         Ok(generation)
+    }
+
+    // -----------------------------------------------------------------------
+    // Session titles / user-editable metadata
+    // -----------------------------------------------------------------------
+
+    /// Read-modify-write one session's metadata inside a single write
+    /// transaction. `f` returns whether it changed anything; nothing is
+    /// written otherwise. Returns the resulting meta, or `None` when the
+    /// session does not exist.
+    fn update_session_meta<F>(&self, session_key: &str, f: F) -> Result<Option<SessionMeta>>
+    where
+        F: FnOnce(&mut SessionMeta, &redb::Table<'_, &'static str, &'static str>) -> Result<bool>,
+    {
+        let write = self.db.begin_write()?;
+        let result = {
+            let mut metas = write.open_table(SESSION_META)?;
+            let current: Option<SessionMeta> = metas
+                .get(session_key)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()?;
+            match current {
+                None => None,
+                Some(mut meta) => {
+                    let msgs = write.open_table(MESSAGES)?;
+                    let changed = f(&mut meta, &msgs)?;
+                    drop(msgs);
+                    if changed {
+                        let json = serde_json::to_string(&meta)?;
+                        metas.insert(session_key, json.as_str())?;
+                    }
+                    Some(meta)
+                }
+            }
+        };
+        write.commit()?;
+        Ok(result)
+    }
+
+    /// Set (`Some`) or clear (`None`) a session title.
+    ///
+    /// Clearing drops the current title and immediately re-derives an `Auto`
+    /// title from the session's first user message (if one exists). Returns
+    /// the updated meta, or `None` when the session does not exist.
+    pub fn set_session_title(
+        &self,
+        session_key: &str,
+        title: Option<&str>,
+        source: TitleSource,
+    ) -> Result<Option<SessionMeta>> {
+        self.update_session_meta(session_key, |meta, msgs| {
+            match title {
+                Some(t) => {
+                    meta.title = Some(t.to_owned());
+                    meta.title_source = Some(source);
+                }
+                None => {
+                    meta.title = first_user_title(msgs, session_key)?;
+                    meta.title_source = meta.title.as_ref().map(|_| TitleSource::Auto);
+                }
+            }
+            Ok(true)
+        })
+    }
+
+    /// Store `title` as an automatic title unless the user has set one.
+    /// Overwrites a previous automatic title. Returns `true` when written;
+    /// `false` when the session is unknown or carries a user title.
+    pub fn set_auto_title_if_absent(&self, session_key: &str, title: &str) -> Result<bool> {
+        self.set_auto_title_guarded(session_key, title, None)
+    }
+
+    /// Like [`Self::set_auto_title_if_absent`], but only while the session is
+    /// still in `generation` — a background title computed for a
+    /// conversation that `/new` has since replaced is dropped.
+    pub fn set_auto_title_for_generation(
+        &self,
+        session_key: &str,
+        title: &str,
+        generation: u32,
+    ) -> Result<bool> {
+        self.set_auto_title_guarded(session_key, title, Some(generation))
+    }
+
+    fn set_auto_title_guarded(
+        &self,
+        session_key: &str,
+        title: &str,
+        generation: Option<u32>,
+    ) -> Result<bool> {
+        let mut written = false;
+        self.update_session_meta(session_key, |meta, _| {
+            if meta.has_user_title()
+                || generation.is_some_and(|g| g != meta.generation)
+                || meta.title.as_deref() == Some(title)
+            {
+                return Ok(false);
+            }
+            meta.title = Some(title.to_owned());
+            meta.title_source = Some(TitleSource::Auto);
+            written = true;
+            Ok(true)
+        })?;
+        Ok(written)
+    }
+
+    /// Return the session title, lazily deriving and persisting an `Auto`
+    /// title from the first user message when none is stored yet (backfill
+    /// for sessions created before titles existed). `None` when the session
+    /// is unknown or no title can be derived.
+    pub fn ensure_session_title(&self, session_key: &str) -> Result<Option<String>> {
+        let Some(meta) = self.get_session_meta(session_key)? else {
+            return Ok(None);
+        };
+        if meta.title.is_some() {
+            return Ok(meta.title);
+        }
+        let derived = {
+            let read = self.db.begin_read()?;
+            let msgs = read.open_table(MESSAGES)?;
+            first_user_title(&msgs, session_key)?
+        };
+        let Some(derived) = derived else {
+            return Ok(None);
+        };
+        if self.set_auto_title_if_absent(session_key, &derived)? {
+            return Ok(Some(derived));
+        }
+        // Lost a race with a concurrent title write: report what is stored.
+        Ok(self.get_session_meta(session_key)?.and_then(|m| m.title))
+    }
+
+    /// Apply a [`SessionPatch`] atomically. Returns the updated meta, or
+    /// `None` when the session does not exist.
+    pub fn patch_session(&self, session_key: &str, patch: &SessionPatch) -> Result<Option<SessionMeta>> {
+        self.update_session_meta(session_key, |meta, msgs| {
+            match &patch.title {
+                Some(Some(t)) => {
+                    meta.title = Some(t.clone());
+                    meta.title_source = Some(TitleSource::User);
+                }
+                Some(None) => {
+                    meta.title = first_user_title(msgs, session_key)?;
+                    meta.title_source = meta.title.as_ref().map(|_| TitleSource::Auto);
+                }
+                None => {}
+            }
+            if let Some(p) = patch.pinned {
+                meta.pinned = p;
+            }
+            if let Some(a) = patch.archived {
+                meta.archived = a;
+            }
+            Ok(true)
+        })
+    }
+
+    /// Record the channel peer's display name on the session. Reads first and
+    /// only opens a write transaction when the name actually changed.
+    /// Returns `true` when written.
+    pub fn set_peer_name_if_changed(&self, session_key: &str, name: &str) -> Result<bool> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(false);
+        }
+        match self.get_session_meta(session_key)? {
+            Some(meta) if meta.peer_name.as_deref() != Some(name) => {}
+            _ => return Ok(false),
+        }
+        let mut written = false;
+        self.update_session_meta(session_key, |meta, _| {
+            if meta.peer_name.as_deref() == Some(name) {
+                return Ok(false);
+            }
+            meta.peer_name = Some(name.to_owned());
+            written = true;
+            Ok(true)
+        })?;
+        Ok(written)
+    }
+
+    /// Load up to `max` of the session's most recent active messages, in
+    /// chronological order. Read-only (unlike [`Self::load_messages`] it never
+    /// backfills the archive), for bounded scans such as session search.
+    pub fn load_recent_messages(&self, session_key: &str, max: usize) -> Result<Vec<serde_json::Value>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(MESSAGES)?;
+        let keys = sorted_active_keys(&table, session_key)?;
+        let skip = keys.len().saturating_sub(max);
+        let mut out = Vec::with_capacity(keys.len() - skip);
+        for key in &keys[skip..] {
+            let Some(v) = table.get(key.as_str())? else {
+                continue;
+            };
+            match serde_json::from_str::<serde_json::Value>(v.value()) {
+                Ok(val) => out.push(val),
+                Err(e) => tracing::warn!(key = %key.escape_debug(), "skip undecodable message: {e}"),
+            }
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -553,13 +799,7 @@ impl RedbStore {
                 .get(session_key)?
                 .map(|v| serde_json::from_str(v.value()))
                 .transpose()?
-                .unwrap_or_else(|| SessionMeta {
-                    session_key: session_key.to_owned(),
-                    message_count: 0,
-                    last_active: now,
-                    created_at: now,
-                    generation: 1,
-                });
+                .unwrap_or_else(|| SessionMeta::new(session_key, now));
 
             let seq = meta.message_count;
             meta.message_count += 1;
@@ -618,13 +858,7 @@ impl RedbStore {
                 .get(session_key)?
                 .map(|v| serde_json::from_str(v.value()))
                 .transpose()?
-                .unwrap_or_else(|| SessionMeta {
-                    session_key: session_key.to_owned(),
-                    message_count: 0,
-                    last_active: now,
-                    created_at: now,
-                    generation: 1,
-                });
+                .unwrap_or_else(|| SessionMeta::new(session_key, now));
             let first_seq = meta.message_count;
             meta.message_count = meta.message_count.saturating_add(encoded.len() as u64);
             meta.last_active = now;
@@ -1643,6 +1877,68 @@ pub struct SessionMeta {
     /// Defaults to 1 for new sessions and pre-upgrade sessions (missing field).
     #[serde(default = "default_generation")]
     pub generation: u32,
+    /// Human-readable session title. `None` until derived from the first
+    /// user message (or set by the user).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Who set `title`. `User` titles are never overwritten by automatic
+    /// derivation and survive `/new`; `Auto` titles are cleared by `/new`.
+    #[serde(default)]
+    pub title_source: Option<TitleSource>,
+    /// Pinned sessions sort first in session lists.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Archived sessions are hidden from session lists by default.
+    #[serde(default)]
+    pub archived: bool,
+    /// Display name of the channel peer (e.g. Telegram first name), when the
+    /// inbound channel event carries one.
+    #[serde(default)]
+    pub peer_name: Option<String>,
+}
+
+impl SessionMeta {
+    /// Fresh metadata for a session first seen at `now` (Unix seconds).
+    pub fn new(session_key: &str, now: i64) -> Self {
+        Self {
+            session_key: session_key.to_owned(),
+            message_count: 0,
+            last_active: now,
+            created_at: now,
+            generation: 1,
+            title: None,
+            title_source: None,
+            pinned: false,
+            archived: false,
+            peer_name: None,
+        }
+    }
+
+    /// Whether the current title was set explicitly by the user.
+    pub fn has_user_title(&self) -> bool {
+        self.title_source == Some(TitleSource::User)
+    }
+}
+
+/// Origin of a session title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TitleSource {
+    /// Derived automatically (first user message or LLM refinement).
+    Auto,
+    /// Set explicitly by the user (rename).
+    User,
+}
+
+/// A partial update of user-editable session metadata, applied atomically
+/// by [`RedbStore::patch_session`]. `None` fields are left unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct SessionPatch {
+    /// `Some(Some(t))` sets a user title; `Some(None)` clears the user title
+    /// and re-derives an automatic one from the first user message.
+    pub title: Option<Option<String>>,
+    pub pinned: Option<bool>,
+    pub archived: Option<bool>,
 }
 
 fn default_generation() -> u32 {
@@ -1868,6 +2164,7 @@ mod tests {
             last_active: 1_700_000_000,
             created_at: 1_699_000_000,
             generation: 1,
+            ..SessionMeta::new("", 0)
         };
         store
             .put_session_meta(&meta.session_key, &meta)
@@ -2110,5 +2407,98 @@ mod tests {
         for k in &keys {
             assert!(listed.contains(&k.to_string()), "missing {k}");
         }
+    }
+
+    #[test]
+    fn session_title_lifecycle() {
+        let (store, _dir) = open_tmp();
+        let sk = "agent:main:feishu:direct:ou_title";
+
+        // Unknown session: nothing to title, nothing written.
+        assert!(store.ensure_session_title(sk).expect("ensure").is_none());
+        assert!(!store.set_auto_title_if_absent(sk, "x").expect("auto"));
+
+        // Legacy session (no title stored): lazy backfill from the first
+        // user message, with the injected context prefix stripped.
+        store
+            .append_message(sk, &serde_json::json!({"role": "user", "content":
+                "Now: 2026-10-06 07:23 Mon CST\n[Session started: 2026-10-06 07:23 Monday, CST, via feishu]\n帮我写一份周报"}))
+            .expect("append user");
+        store
+            .append_message(sk, &serde_json::json!({"role": "assistant", "content": "好的"}))
+            .expect("append assistant");
+        assert!(store.get_session_meta(sk).expect("meta").expect("some").title.is_none());
+        assert_eq!(
+            store.ensure_session_title(sk).expect("ensure").as_deref(),
+            Some("帮我写一份周报")
+        );
+        let meta = store.get_session_meta(sk).expect("meta").expect("some");
+        assert_eq!(meta.title_source, Some(TitleSource::Auto));
+
+        // Auto titles can be refined; a stale generation is ignored.
+        assert!(store.set_auto_title_if_absent(sk, "周报撰写").expect("auto"));
+        assert!(!store.set_auto_title_for_generation(sk, "旧的", 99).expect("gen guard"));
+
+        // User title wins over later automatic titles.
+        let meta = store
+            .set_session_title(sk, Some("我的周报"), TitleSource::User)
+            .expect("set")
+            .expect("exists");
+        assert_eq!(meta.title.as_deref(), Some("我的周报"));
+        assert!(!store.set_auto_title_if_absent(sk, "auto").expect("auto"));
+        assert_eq!(store.ensure_session_title(sk).expect("ensure").as_deref(), Some("我的周报"));
+
+        // Patch: flags + clearing the user title re-derives an Auto title.
+        let meta = store
+            .patch_session(sk, &SessionPatch { title: Some(None), pinned: Some(true), archived: Some(true) })
+            .expect("patch")
+            .expect("exists");
+        assert_eq!(meta.title.as_deref(), Some("帮我写一份周报"));
+        assert_eq!(meta.title_source, Some(TitleSource::Auto));
+        assert!(meta.pinned && meta.archived);
+        assert!(store.patch_session("nope", &SessionPatch::default()).expect("patch").is_none());
+
+        // Peer name: written once, unchanged name is a no-op.
+        assert!(store.set_peer_name_if_changed(sk, "张三").expect("peer"));
+        assert!(!store.set_peer_name_if_changed(sk, "张三").expect("peer"));
+
+        // /new clears an Auto title but keeps pin/archive/peer name.
+        store.new_generation(sk).expect("new gen");
+        let meta = store.get_session_meta(sk).expect("meta").expect("some");
+        assert!(meta.title.is_none() && meta.title_source.is_none());
+        assert!(meta.pinned);
+        assert_eq!(meta.peer_name.as_deref(), Some("张三"));
+
+        // /new keeps a User title.
+        store.set_session_title(sk, Some("固定标题"), TitleSource::User).expect("set");
+        store.new_generation(sk).expect("new gen");
+        let meta = store.get_session_meta(sk).expect("meta").expect("some");
+        assert_eq!(meta.title.as_deref(), Some("固定标题"));
+        assert_eq!(meta.title_source, Some(TitleSource::User));
+
+        // Recent-message window is bounded and chronological.
+        let sk2 = "api:recent";
+        for i in 0..5 {
+            store.append_message(sk2, &serde_json::json!({"role": "user", "content": format!("m{i}")})).expect("append");
+        }
+        let recent = store.load_recent_messages(sk2, 2).expect("recent");
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["content"], "m3");
+        assert_eq!(recent[1]["content"], "m4");
+    }
+
+    #[test]
+    fn session_meta_without_title_fields_deserializes() {
+        let legacy = r#"{"session_key":"k","message_count":3,"last_active":5,"created_at":1}"#;
+        let meta: SessionMeta = serde_json::from_str(legacy).expect("legacy meta");
+        assert_eq!(meta.generation, 1);
+        assert!(meta.title.is_none() && meta.title_source.is_none());
+        assert!(!meta.pinned && !meta.archived && meta.peer_name.is_none());
+        let json = serde_json::to_value(SessionMeta {
+            title_source: Some(TitleSource::User),
+            ..SessionMeta::new("k", 0)
+        })
+        .expect("ser");
+        assert_eq!(json["title_source"], "user");
     }
 }

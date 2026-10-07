@@ -460,6 +460,13 @@ impl DiscordChannel {
                         "MESSAGE_CREATE" => {
                             let d = &payload["d"];
                             let peer_id = d["author"]["id"].as_str().unwrap_or("").to_owned();
+                            if let Some(name) = d["author"]["global_name"]
+                                .as_str()
+                                .filter(|n| !n.is_empty())
+                                .or_else(|| d["author"]["username"].as_str())
+                            {
+                                crate::peer_names::record_peer_name("discord", &peer_id, name);
+                            }
                             // Never react to our own messages, even with
                             // allowBots=true (would self-reply forever).
                             let own_id = self.bot_user_id.read().ok().and_then(|g| g.clone());

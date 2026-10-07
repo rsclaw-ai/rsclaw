@@ -17,6 +17,7 @@
 mod agent_loop;
 mod dispatch;
 mod run_turn;
+mod session_title;
 
 use std::{
     sync::{

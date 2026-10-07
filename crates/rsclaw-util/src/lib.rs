@@ -2,6 +2,7 @@
 
 pub mod fs_guard;
 pub mod net;
+pub mod session_text;
 
 /// Estimate token count for mixed-language text.
 /// - ASCII/Latin: ~4 chars per token

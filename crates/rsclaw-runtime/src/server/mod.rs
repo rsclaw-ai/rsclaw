@@ -3,8 +3,10 @@
 //!
 //! Endpoints:
 //!   POST   /api/v1/message                  send message to agent
-//!   GET    /api/v1/sessions                 list sessions
+//!   GET    /api/v1/sessions                 list sessions (`?detail=1` for titles)
+//!   GET    /api/v1/sessions/search          search titles + message content
 //!   GET    /api/v1/sessions/:id             get session
+//!   PATCH  /api/v1/sessions/:id             rename / pin / archive session
 //!   DELETE /api/v1/sessions/:id             delete session
 //!   GET    /api/v1/sessions/:id/messages    session message history
 //!   POST   /api/v1/sessions/:id/clear       clear session context
@@ -69,6 +71,7 @@ use tracing::{info, warn};
 use crate::{cmd::config_json::load_config_json, gateway::LiveConfig, ws::types::EventFrame};
 
 mod knowledge;
+pub(crate) mod sessions_api;
 
 const MAX_LOCAL_MEDIA_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_TRACKED_RATE_LIMIT_IPS: usize = 10_000;
@@ -620,7 +623,13 @@ pub fn build_router(state: AppState) -> Router {
         // `rsclaw agent-turn` CLI alias — same handler, camelCase field aliases.
         .route("/agent/turn", post(send_message))
         .route("/sessions", get(list_sessions))
-        .route("/sessions/{id}", get(get_session).delete(delete_session))
+        .route("/sessions/search", get(search_sessions))
+        .route(
+            "/sessions/{id}",
+            get(get_session)
+                .patch(patch_session)
+                .delete(delete_session),
+        )
         .route("/sessions/{id}/messages", get(get_session_messages))
         .route("/sessions/{id}/clear", post(clear_session))
         .route("/agents", get(list_agents).post(create_agent))
@@ -1544,7 +1553,56 @@ mod tests {
     }
 }
 
-async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
+/// `true` when query param `name` is set to `1` / `true` / `yes`.
+fn query_flag(params: &HashMap<String, String>, name: &str) -> bool {
+    params
+        .get(name)
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// Run blocking session-store work off the async workers and map the
+/// outcome to a JSON response.
+async fn run_sessions_blocking<F>(f: F) -> Response
+where
+    F: FnOnce() -> anyhow::Result<serde_json::Value> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("session task failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/v1/sessions — plain key list (legacy). With `?detail=1`, returns
+/// detail objects (title, agent, channel, pin/archive, counts) sorted pinned
+/// first then by `last_active` desc; archived sessions are included only
+/// with `?archived=1` / `?include_archived=1`.
+async fn list_sessions(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if query_flag(&params, "detail") {
+        let include_archived =
+            query_flag(&params, "archived") || query_flag(&params, "include_archived");
+        let db = Arc::clone(&state.store.db);
+        return run_sessions_blocking(move || {
+            let sessions: Vec<serde_json::Value> =
+                sessions_api::list_details(&db, include_archived)?
+                    .iter()
+                    .map(sessions_api::SessionDetail::to_json)
+                    .collect();
+            Ok(serde_json::json!({"sessions": sessions}))
+        })
+        .await;
+    }
     match state.store.db.list_sessions() {
         Ok(sessions) => Json(serde_json::json!({"sessions": sessions})).into_response(),
         Err(e) => (
@@ -1553,6 +1611,69 @@ async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+/// PATCH /api/v1/sessions/{id} — body `{"title"?, "pinned"?, "archived"?}`.
+/// A non-empty title becomes a user title; `""` / `null` clears it and
+/// re-derives an automatic one. Returns the session's detail object.
+async fn patch_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let db = Arc::clone(&state.store.db);
+    let result =
+        tokio::task::spawn_blocking(move || sessions_api::apply_patch(&db, &id, &body)).await;
+    match result {
+        Ok(Ok(detail)) => Json(detail.to_json()).into_response(),
+        Ok(Err(sessions_api::PatchError::BadRequest(msg))) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response(),
+        Ok(Err(sessions_api::PatchError::NotFound)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not found"})),
+        )
+            .into_response(),
+        Ok(Err(sessions_api::PatchError::Internal(msg))) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("session task failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/v1/sessions/search?q=...&limit=50 — case-insensitive search over
+/// session titles and recent message content.
+async fn search_sessions(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let q = params.get("q").map(|s| s.trim().to_owned()).unwrap_or_default();
+    if q.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing query parameter: q"})),
+        )
+            .into_response();
+    }
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(sessions_api::SEARCH_DEFAULT_LIMIT)
+        .clamp(1, sessions_api::SEARCH_MAX_LIMIT);
+    let db = Arc::clone(&state.store.db);
+    run_sessions_blocking(move || {
+        let results = sessions_api::search(&db, &q, limit)?;
+        Ok(serde_json::json!({"results": results}))
+    })
+    .await
 }
 
 async fn get_session(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
@@ -4897,6 +5018,7 @@ async fn get_session_messages(
                 .into_iter()
                 .filter(|v| !is_compaction_message(v))
                 .map(rsclaw_provider::redact_rsclaw_hidden_value)
+                .map(sessions_api::decorate_message)
                 .collect();
             Json(serde_json::json!({"messages": visible})).into_response()
         }

@@ -499,6 +499,9 @@ impl DingTalkChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
+        if let Some(nick) = payload.get("senderNick").and_then(|v| v.as_str()) {
+            crate::peer_names::record_peer_name("dingtalk", &sender_id, nick);
+        }
 
         let conversation_id = payload
             .get("conversationId")
