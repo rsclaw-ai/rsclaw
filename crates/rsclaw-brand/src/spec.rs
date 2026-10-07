@@ -1,0 +1,208 @@
+// Brand file parsing, validation and code generation.
+//
+// Shared by `build.rs` (via `include!`) and the crate's unit tests, so it
+// must not refer to `crate::` items and may only depend on `toml` + `std`.
+
+/// Every string field of a brand file, in generation order.
+/// `(toml key, const name)`; `urls.*` keys live under the `[urls]` table.
+pub const FIELDS: &[(&str, &str)] = &[
+    ("id", "ID"),
+    ("product_name", "PRODUCT_NAME"),
+    ("product_name_zh", "PRODUCT_NAME_ZH"),
+    ("assistant_name", "ASSISTANT_NAME"),
+    ("assistant_name_zh", "ASSISTANT_NAME_ZH"),
+    ("emoji", "EMOJI"),
+    ("website", "WEBSITE"),
+    ("cli_name", "CLI_NAME"),
+    ("home_dir", "HOME_DIR"),
+    ("config_file", "CONFIG_FILE"),
+    ("service_label", "SERVICE_LABEL"),
+    ("service_unit", "SERVICE_UNIT"),
+    ("windows_service", "WINDOWS_SERVICE"),
+    ("service_display", "SERVICE_DISPLAY"),
+    ("user_agent", "USER_AGENT"),
+    ("release_repo", "RELEASE_REPO"),
+    ("urls.api", "API_URL"),
+    ("urls.hub", "HUB_URL"),
+    ("urls.app", "APP_URL"),
+];
+
+/// A parsed brand file: one value per entry of [`FIELDS`], same order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrandSpec {
+    pub values: Vec<(String, String)>,
+}
+
+impl BrandSpec {
+    /// Value of a field by toml key (`"cli_name"`, `"urls.api"`).
+    pub fn get(&self, key: &str) -> &str {
+        self.values
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    }
+}
+
+/// Parse a brand TOML document. Every field is required; unknown keys are
+/// rejected so a typo cannot silently fall back to another brand's value.
+pub fn parse(src: &str) -> Result<BrandSpec, String> {
+    let table: toml::Table = src.parse().map_err(|e| format!("not valid TOML: {e}"))?;
+    let urls = match table.get("urls") {
+        Some(toml::Value::Table(t)) => t.clone(),
+        Some(_) => return Err("`urls` must be a table".to_owned()),
+        None => return Err("missing `[urls]` table".to_owned()),
+    };
+    for key in table.keys() {
+        if key != "urls" && !FIELDS.iter().any(|(k, _)| k == key) {
+            return Err(format!("unknown field `{key}`"));
+        }
+    }
+    for key in urls.keys() {
+        if !FIELDS.iter().any(|(k, _)| k.strip_prefix("urls.") == Some(key.as_str())) {
+            return Err(format!("unknown field `urls.{key}`"));
+        }
+    }
+    let mut values = Vec::with_capacity(FIELDS.len());
+    for (key, _) in FIELDS {
+        let raw = match key.strip_prefix("urls.") {
+            Some(sub) => urls.get(sub),
+            None => table.get(*key),
+        };
+        let value = match raw {
+            Some(toml::Value::String(s)) => s.clone(),
+            Some(_) => return Err(format!("`{key}` must be a string")),
+            None => return Err(format!("missing field `{key}`")),
+        };
+        values.push(((*key).to_owned(), value));
+    }
+    Ok(BrandSpec { values })
+}
+
+fn is_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+fn is_base_url(s: &str) -> bool {
+    let rest = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"));
+    match rest {
+        Some(host_and_path) => {
+            !host_and_path.is_empty()
+                && !s.ends_with('/')
+                && !s.contains(['?', '#', ' ', '"', '\\'])
+                && !s.chars().any(char::is_control)
+        }
+        None => false,
+    }
+}
+
+/// Check every field. Errors name the offending key.
+pub fn validate(spec: &BrandSpec) -> Result<(), String> {
+    for (key, value) in &spec.values {
+        if value.chars().any(char::is_control) {
+            return Err(format!("`{key}` contains control characters"));
+        }
+        let ok = match key.as_str() {
+            "id" | "cli_name" | "service_unit" | "windows_service" | "user_agent" => is_slug(value),
+            "home_dir" => {
+                value.len() > 1
+                    && value.starts_with('.')
+                    && !value.contains("..")
+                    && value[1..].chars().all(|c| {
+                        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+                    })
+            }
+            "config_file" => {
+                is_slug(value.trim_end_matches(".json5")) && value.ends_with(".json5")
+            }
+            "service_label" => {
+                !value.is_empty()
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            }
+            "website" => {
+                !value.is_empty()
+                    && !value.contains("://")
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            }
+            "release_repo" => {
+                value.is_empty()
+                    || value.split_once('/').is_some_and(|(owner, repo)| {
+                        let part = |p: &str| {
+                            !p.is_empty()
+                                && p.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+                                })
+                        };
+                        part(owner) && part(repo)
+                    })
+            }
+            "emoji" => true,
+            k if k.starts_with("urls.") => is_base_url(value),
+            _ => !value.trim().is_empty(),
+        };
+        if !ok {
+            return Err(format!("invalid value for `{key}`: {value:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// Rust source for `$OUT_DIR/brand.rs`: one `pub const` per field, derived
+/// URL constants, and a `brand_<name>!()` literal macro for each so values
+/// can feed `concat!` and attribute positions.
+pub fn generate(spec: &BrandSpec) -> String {
+    let api = spec.get("urls.api");
+    let hub = spec.get("urls.hub");
+    let app = spec.get("urls.app");
+    let repo = spec.get("release_repo");
+    let mut consts: Vec<(String, String, &str)> = FIELDS
+        .iter()
+        .map(|(key, name)| ((*name).to_owned(), spec.get(key).to_owned(), *key))
+        .collect();
+    let releases = if repo.is_empty() {
+        String::new()
+    } else {
+        format!("https://api.github.com/repos/{repo}/releases?per_page=10")
+    };
+    for (name, value, doc) in [
+        ("API_V1_URL", format!("{api}/v1"), "`urls.api` + `/v1`"),
+        ("DEFAULTS_URL", format!("{app}/defaults.toml"), "`urls.app` + `/defaults.toml`"),
+        ("VERSION_URL", format!("{app}/api/version"), "`urls.app` + `/api/version`"),
+        (
+            "TOOLS_MANIFEST_URL",
+            format!("{hub}/tools/manifest.json"),
+            "`urls.hub` + `/tools/manifest.json`",
+        ),
+        ("HUB_META_URL", format!("{hub}/meta.json"), "`urls.hub` + `/meta.json`"),
+        (
+            "RELEASES_API_URL",
+            releases,
+            "GitHub releases API for `release_repo` (empty when unset)",
+        ),
+    ] {
+        consts.push((name.to_owned(), value, doc));
+    }
+
+    let mut out = String::from("// @generated by rsclaw-brand/build.rs — do not edit.\n");
+    for (name, value, doc) in &consts {
+        out.push_str(&format!("/// Brand value: {doc}.\npub const {name}: &str = {value:?};\n"));
+    }
+    for (name, value, _) in &consts {
+        let mac = format!("brand_{}", name.to_ascii_lowercase());
+        out.push_str(&format!(
+            "/// Literal form of [`{name}`] for `concat!` and attributes.\n\
+             #[macro_export]\nmacro_rules! {mac} {{ () => {{ {value:?} }}; }}\n"
+        ));
+    }
+    out
+}

@@ -1,0 +1,17 @@
+[package]
+name = "rsclaw-brand"
+version = "0.1.0"
+description = "Compile-time brand identity for RsClaw — internal workspace crate, not for direct use"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+include = ["src/**", "brand/**", "build.rs", "Cargo.toml"]
+
+[dependencies]
+
+[build-dependencies]
+toml = "1"
+
+[dev-dependencies]
+toml = "1"

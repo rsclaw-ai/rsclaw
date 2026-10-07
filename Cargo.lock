@@ -7638,6 +7638,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsclaw-brand"
+version = "0.1.0"
+dependencies = [
+ "toml 1.1.0+spec-1.1.0",
+]
+
+[[package]]
 name = "rsclaw-browser"
 version = "0.1.0"
 dependencies = [
