@@ -868,7 +868,8 @@ async fn compact(State(svc): State<Arc<KnowledgeService>>) -> Response {
 
 /// SSE stream of `knowledge.doc.status_changed` events, so the UI can react to
 /// async indexing finishing without polling. Each event's data is the JSON
-/// `{ type, docId, status }`.
+/// `{ type, docId, docTitle, collectionId, status }` (`collectionId` may be
+/// null for a doc with no collection tag).
 async fn events(
     State(svc): State<Arc<KnowledgeService>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {

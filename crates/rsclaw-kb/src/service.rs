@@ -257,38 +257,45 @@ impl KnowledgeService {
         if emitted.contains(doc_id) {
             return;
         }
-        match self.doc_has_active_chunk(doc_id) {
-            Ok(true) => {
+        match self.doc_with_active_chunk(doc_id) {
+            Ok(Some(d)) => {
                 emitted.insert(doc_id.clone());
+                // Collections are tags on the doc; report the first one.
+                let collection_id = d
+                    .tags
+                    .iter()
+                    .find_map(|t| t.strip_prefix(COLLECTION_TAG_PREFIX).map(str::to_owned));
                 let payload = serde_json::json!({
                     "type": "knowledge.doc.status_changed",
                     "docId": doc_id,
+                    "docTitle": d.title,
+                    "collectionId": collection_id,
                     "status": "ready",
                 })
                 .to_string();
                 // No SSE subscriber connected is the normal case.
                 let _ = self.events.send(payload);
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(e) => tracing::warn!("kb: ready-transition check failed: {e:#}"),
         }
     }
 
-    /// Whether `doc_id` currently owns at least one Active chunk.
-    fn doc_has_active_chunk(&self, doc_id: &str) -> anyhow::Result<bool> {
+    /// The doc `doc_id`, when it currently owns at least one Active chunk.
+    fn doc_with_active_chunk(&self, doc_id: &str) -> anyhow::Result<Option<KbDoc>> {
         let rtx = self.store.begin_read()?;
         let Some(d) = docs::get(&rtx, doc_id)? else {
-            return Ok(false);
+            return Ok(None);
         };
         for id in crate::store::chunks::chunk_ids_for_logical(&rtx, &d.logical_source_id)? {
             if let Some(c) = crate::store::chunks::get(&rtx, &id)?
                 && c.doc_id == d.id
                 && c.status == ChunkStatus::Active
             {
-                return Ok(true);
+                return Ok(Some(d));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Active doc ids that currently have ≥1 indexed chunk (i.e. `ready`).
@@ -1485,6 +1492,10 @@ mod tests {
         let msg = rx.try_recv().expect("expected an SSE status event");
         assert!(msg.contains("knowledge.doc.status_changed"), "got: {msg}");
         assert!(msg.contains(&doc_id), "got: {msg}");
+        let ev: serde_json::Value = serde_json::from_str(&msg).expect("event JSON");
+        // Title comes from the doc record (here: the markdown H1).
+        assert_eq!(ev["docTitle"], "A", "got: {msg}");
+        assert_eq!(ev["collectionId"], serde_json::json!(c.id), "got: {msg}");
         // idempotent: no duplicate for the same doc
         s.emit_ready_transition(&job, &mut emitted);
         assert!(

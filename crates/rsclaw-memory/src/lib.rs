@@ -1432,6 +1432,26 @@ impl MemoryStore {
         Ok(true)
     }
 
+    /// Pin or unpin a live doc and re-evaluate its tier (pinned docs are
+    /// Core; an unpinned doc falls back to the normal promotion rules). The
+    /// `"pinned"` string tag the L0 writer adds is kept in sync. Persists in a
+    /// single redb write transaction. Returns `false` when the doc is gone.
+    pub fn set_pinned(&mut self, id: &str, pinned: bool) -> Result<bool> {
+        let Some(idx) = self.docs.iter().position(|d| !d.id.is_empty() && d.id == id) else {
+            return Ok(false);
+        };
+        {
+            let doc = &mut self.docs[idx];
+            doc.pinned = pinned;
+            if !pinned {
+                doc.tags.retain(|t| t != "pinned");
+            }
+            doc.evaluate_tier_transition();
+        }
+        self.persist_doc(idx)?;
+        Ok(true)
+    }
+
     /// Mark every entity doc in `scope` that carries the same `"label:"`
     /// prefix but a DIFFERENT value as superseded: unpin, demote to Working,
     /// floor the importance so decay retires it, tag "superseded". The stale
@@ -2293,6 +2313,29 @@ mod dedup_supersede_tests {
                 .find_semantic_dup("other-scope", "用户手机号: 13900001234", 0.92)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn set_pinned_toggles_and_persists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        {
+            let mut store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+                .await
+                .expect("open");
+            store.add(doc("p1", "fact", "用户生日: 5月1日")).await.unwrap();
+            assert!(store.set_pinned("p1", true).unwrap());
+            let d = store.get_sync("p1").unwrap();
+            assert!(d.pinned);
+            assert_eq!(d.tier, MemDocTier::Core);
+            assert!(!store.set_pinned("missing", true).unwrap());
+        }
+        // Reopen: the pin survived the redb round-trip.
+        let mut store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+            .await
+            .expect("reopen");
+        assert!(store.get_sync("p1").unwrap().pinned);
+        assert!(store.set_pinned("p1", false).unwrap());
+        assert!(!store.get_sync("p1").unwrap().pinned);
     }
 
     #[tokio::test]
