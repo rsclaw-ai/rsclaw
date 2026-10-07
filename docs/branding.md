@@ -66,6 +66,26 @@ fields accept lowercase ASCII letters, digits, `-` and `_`.
   borrowed. Use it for text blocks, such as translations and bootstrap
   prompts, where splicing in constants would be awkward.
 
+## CLI output and help
+
+CLI messages are written with the default brand's words and are rebranded
+where they leave the process:
+
+- **Printed lines.** In the CLI command modules (`rsclaw-runtime` `cmd/` and
+  `rsclaw-tools`), `println!`/`eprintln!`/`print!`/`eprint!` are shadowed by
+  macros that call `rsclaw_brand::brand_line(template, line)`. A line is
+  rebranded only when its format template contains default-brand words, so
+  data printed through `"{}"`-style templates (JSON, replies, file contents)
+  is never rewritten. The styling helpers (`bold`, `dim`, `ok`, `banner`, …)
+  rebrand their text, and non-default brands get a plain title instead of
+  the RSCLAW word mark.
+- **Errors.** CLI errors that name a command use `brand_bail!` (in `cmd/`),
+  `rebrand(...)`, or `concat!(…, brand_cli_name!(), …)`.
+- **`--help`.** The root `Cli` runs every argument and subcommand through
+  `rebrand` after the command tree is built (`rsclaw-cli/src/brand_help.rs`),
+  so doc comments keep the default wording.
+- **Shell completions** are generated for `cli_name`.
+
 ## What does not follow the brand
 
 Some identifiers are compatibility or protocol surface, not branding. They

@@ -100,6 +100,27 @@ fn rebrand_with<'a>(text: &'a str, tokens: &[(&'static str, String)]) -> Cow<'a,
     }
 }
 
+/// One printed line, branded the way CLI output is: `line` goes through
+/// [`rebrand`] when its format `template` contains default-brand words, and
+/// is returned as is otherwise. Interpolated data (JSON dumps, replies, file
+/// contents) printed through a brand-free template such as `"{}"` is never
+/// rewritten.
+pub fn brand_line<'a>(template: &str, line: &'a str) -> Cow<'a, str> {
+    brand_line_with(template, line, &ACTIVE_TOKENS)
+}
+
+fn brand_line_with<'a>(
+    template: &str,
+    line: &'a str,
+    tokens: &[(&'static str, String)],
+) -> Cow<'a, str> {
+    if matches!(rebrand_with(template, tokens), Cow::Owned(_)) {
+        rebrand_with(line, tokens)
+    } else {
+        Cow::Borrowed(line)
+    }
+}
+
 /// Data directory name for a `--dev` / `--profile <name>` instance:
 /// `<home_dir>-<suffix>` (e.g. `.rsclaw-dev`).
 pub fn profile_home_dir(suffix: &str) -> String {
@@ -149,7 +170,10 @@ mod tests {
         assert_eq!(API_URL, "https://api.rsclaw.ai");
         assert_eq!(API_V1_URL, "https://api.rsclaw.ai/v1");
         assert_eq!(HUB_URL, "https://hub.rsclaw.ai");
-        assert_eq!(TOOLS_MANIFEST_URL, "https://hub.rsclaw.ai/tools/manifest.json");
+        assert_eq!(
+            TOOLS_MANIFEST_URL,
+            "https://hub.rsclaw.ai/tools/manifest.json"
+        );
         assert_eq!(HUB_META_URL, "https://hub.rsclaw.ai/meta.json");
         assert_eq!(DEFAULTS_URL, "https://app.rsclaw.ai/defaults.toml");
         assert_eq!(VERSION_URL, "https://app.rsclaw.ai/api/version");
@@ -225,6 +249,75 @@ mod tests {
         assert_eq!(rebrand_with("rsclaw doctor", &tokens), "acme doctor");
     }
 
+    fn acme_tokens() -> Vec<(&'static str, String)> {
+        vec![
+            ("RsClaw", "Acme".to_owned()),
+            ("~/.rsclaw", "~/.acme".to_owned()),
+            ("rsclaw.json5", "acme.json5".to_owned()),
+            (CLI_TOKEN, "acme ".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn cli_messages_are_rebranded() {
+        let tokens = acme_tokens();
+        for (from, to) in [
+            (
+                "run `rsclaw doctor --fix` to apply 2 auto-fix(es)",
+                "run `acme doctor --fix` to apply 2 auto-fix(es)",
+            ),
+            (
+                "gateway not reachable at port 18888; start it with: rsclaw gateway start",
+                "gateway not reachable at port 18888; start it with: acme gateway start",
+            ),
+            ("rsclaw tools v2026.10.1", "acme tools v2026.10.1"),
+            (
+                "  installed      ~/.rsclaw/tools",
+                "  installed      ~/.acme/tools",
+            ),
+            (
+                "no config file found. Edit rsclaw.json5 or run `rsclaw setup`.",
+                "no config file found. Edit acme.json5 or run `acme setup`.",
+            ),
+            (
+                "Isolate state to ~/.rsclaw-dev, port offset applied.",
+                "Isolate state to ~/.acme-dev, port offset applied.",
+            ),
+        ] {
+            assert_eq!(rebrand_with(from, &tokens), to);
+        }
+    }
+
+    #[test]
+    fn brand_line_only_rewrites_branded_templates() {
+        let tokens = acme_tokens();
+        // A prose template that names the CLI: the whole line follows the brand.
+        let line = "start it with: rsclaw gateway start (port 18888)";
+        assert_eq!(
+            brand_line_with(
+                "start it with: rsclaw gateway start (port {port})",
+                line,
+                &tokens
+            ),
+            "start it with: acme gateway start (port 18888)"
+        );
+        // Data printed through a brand-free template stays byte for byte.
+        let data = r#"{"reply":"RsClaw says: run rsclaw doctor"}"#;
+        assert!(matches!(
+            brand_line_with("{}", data, &tokens),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            brand_line_with("{text}", data, &tokens),
+            Cow::Borrowed(_)
+        ));
+        // Default brand: nothing changes.
+        assert!(matches!(
+            brand_line_with("run `rsclaw x`", "run `rsclaw x`", &[]),
+            Cow::Borrowed(_)
+        ));
+    }
+
     #[test]
     fn invalid_brand_files_are_rejected() {
         let check = |src: String| spec::parse(&src).and_then(|s| spec::validate(&s));
@@ -237,8 +330,17 @@ mod tests {
             check(base.replace("https://hub.rsclaw.ai\"", "https://hub.rsclaw.ai/\"")).is_err()
         );
         assert!(check(base.replace("https://app.rsclaw.ai", "ftp://app.rsclaw.ai")).is_err());
-        assert!(check(base.replace("config_file = \"rsclaw.json5\"", "config_file = \"x.json\"")).is_err());
-        assert!(check(base.replace("release_repo = \"rsclaw-ai/rsclaw\"", "release_repo = \"nope\"")).is_err());
+        assert!(
+            check(base.replace("config_file = \"rsclaw.json5\"", "config_file = \"x.json\""))
+                .is_err()
+        );
+        assert!(
+            check(base.replace(
+                "release_repo = \"rsclaw-ai/rsclaw\"",
+                "release_repo = \"nope\""
+            ))
+            .is_err()
+        );
         assert!(check(format!("{base}\nextra = \"x\"\n")).is_err());
         assert!(check(base.replace("emoji = \"🦀\"\n", "")).is_err());
     }
