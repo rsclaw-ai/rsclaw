@@ -692,7 +692,10 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         }
         // Seed workspace with default SOUL.md, AGENTS.md, USER.md
         let workspace = base.join("workspace");
-        let _ = rsclaw_agent::bootstrap::seed_workspace(&workspace);
+        let _ = rsclaw_agent::bootstrap::seed_workspace_with_lang(
+            &workspace,
+            brand_default_language().as_deref(),
+        );
         // Seed tool prompts + embedded knowledge trees (web_browser
         // site-rules + computer_use app-rules). Previously skipped on
         // the non-interactive path, leaving the per-host skill library
@@ -1613,7 +1616,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     }
 
     let workspace = base.join("workspace");
-    let _ = agent::seed_workspace(&workspace);
+    let _ = agent::seed_workspace_with_lang(&workspace, brand_default_language().as_deref());
 
     // Summary
     header(&rsclaw_i18n::t("cli_onboard_complete", lang));
@@ -3922,4 +3925,14 @@ mod account_helper_tests {
         let v3 = json!({ "channels": { "feishu": { "enabled": true } } });
         assert!(!channel_is_configured(&v3, "feishu"));
     }
+}
+
+/// `gateway.language` from the brand's default config layer, so
+/// non-interactive setup seeds workspace templates in the brand's language.
+/// `None` for the default brand (English templates, as before).
+fn brand_default_language() -> Option<String> {
+    rsclaw_config::brand_layers::apply(serde_json::json!({}))
+        .pointer("/gateway/language")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }
