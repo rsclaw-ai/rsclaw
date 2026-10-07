@@ -374,3 +374,90 @@ mod load_cached_tests {
         assert_eq!(reloaded.gateway.port, 18002);
     }
 }
+
+#[cfg(test)]
+mod defaults_overlay_tests {
+    include!("defaults_overlay.rs");
+
+    const CATALOG: &str = r#"[meta]
+defaults_version = "1"
+
+# hosted fleet
+[[providers]]
+name     = "rsclaw"
+label    = "RsClaw (recommended)"
+base_url = "https://api.rsclaw.ai/v1"
+
+[[providers]]
+name     = "openai"
+base_url = "https://api.openai.com/v1"
+
+[exec_safety]
+deny = [
+  "cat.*/\\.rsclaw/credentials",
+  "cat.*rsclaw\\.json5",
+]
+"#;
+
+    #[test]
+    fn embedded_catalog_is_workspace_file_for_default_brand() {
+        let src = include_str!("../../../defaults.toml");
+        assert_eq!(crate::loader::embedded_defaults_toml(), src);
+    }
+
+    #[test]
+    fn rebrand_rewrites_urls_and_escaped_paths() {
+        let out = rebrand_catalog(
+            CATALOG,
+            &CatalogBrand {
+                api_url: "https://api.acme.example",
+                hub_url: "https://hub.acme.example",
+                app_url: "https://app.acme.example",
+                home_dir: ".acme-agent",
+                config_file: "acme-agent.json5",
+            },
+        );
+        assert!(out.contains(r#"base_url = "https://api.acme.example/v1""#));
+        assert!(out.contains(r#""cat.*/\\.acme-agent/credentials""#));
+        assert!(out.contains(r#""cat.*acme-agent\\.json5""#));
+        assert!(out.contains("# hosted fleet"));
+        assert!(out.contains(r#"label    = "RsClaw (recommended)""#));
+    }
+
+    #[test]
+    fn override_merges_by_name_removes_and_appends() {
+        let overlay = r#"[meta]
+defaults_version = "2"
+
+[[providers]]
+name  = "rsclaw"
+label = "Acme Cloud (recommended)"
+
+[[providers]]
+name    = "openai"
+_remove = true
+
+[[providers]]
+name     = "acme-private"
+base_url = "https://llm.acme.example/v1"
+"#;
+        let out = apply_override(CATALOG, overlay).expect("merge");
+        let t: toml::Table = out.parse().expect("valid toml");
+        assert_eq!(t["meta"]["defaults_version"].as_str(), Some("2"));
+        let providers = t["providers"].as_array().expect("providers");
+        let names: Vec<_> = providers.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["rsclaw", "acme-private"]);
+        assert_eq!(providers[0]["label"].as_str(), Some("Acme Cloud (recommended)"));
+        // untouched keys and comments survive
+        assert_eq!(providers[0]["base_url"].as_str(), Some("https://api.rsclaw.ai/v1"));
+        assert!(out.contains("# hosted fleet"));
+        assert!(!out.contains("_remove"));
+    }
+
+    #[test]
+    fn override_errors_are_reported() {
+        assert!(apply_override(CATALOG, "[[providers]]\nlabel = \"x\"\n").unwrap_err().contains("needs a string `name`"));
+        assert!(apply_override(CATALOG, "[[providers]]\nname = \"nope\"\n_remove = true\n").unwrap_err().contains("nothing to remove"));
+        assert!(apply_override(CATALOG, "not = [valid").is_err());
+    }
+}

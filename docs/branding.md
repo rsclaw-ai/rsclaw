@@ -88,3 +88,38 @@ keep their names in every build:
   `.rsclaw-source.json` and `.rsclaw-managed`. They live under the branded
   `home_dir` and are never shown to users.
 - **The desktop UI (`ui/`).** It has its own branding.
+
+## Defaults catalog
+
+The catalog compiled into the binary (`defaults.toml`: providers, channels,
+search engines, exec-safety rules, ...) is produced by
+`crates/rsclaw-config/build.rs`:
+
+1. With the default brand and no override it is the workspace
+   `defaults.toml`, byte for byte.
+2. With another brand, the hosted URLs (`urls.api`, `urls.hub`, `urls.app`)
+   and the data-dir paths in the exec-safety rules follow the brand file.
+3. `RSCLAW_DEFAULTS_OVERRIDE=<file>` (absolute or workspace-relative) merges
+   an override document on top, keeping the catalog's comments and layout:
+   - tables merge key by key;
+   - `[[providers]]`, `[[channels]]` and other arrays of tables match
+     entries by `name`: a match is merged, `_remove = true` drops it, an
+     unmatched entry is appended;
+   - any other value replaces the catalog's value.
+
+```toml
+# defaults.override.toml
+[meta]
+defaults_version = "2026.10.7-acme.1"   # bump so existing installs refresh
+
+[[providers]]
+name  = "rsclaw"
+label = "Acme Cloud (recommended)"
+
+[[providers]]
+name    = "openrouter"
+_remove = true
+```
+
+Bump `meta.defaults_version` whenever an override changes shipped entries;
+installed copies only refresh on a version change.

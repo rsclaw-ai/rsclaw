@@ -473,8 +473,11 @@ pub fn cache_dir() -> PathBuf {
 
 /// Defaults bundled into this binary. Unlike [`load_defaults_toml`], this
 /// never reads the user-editable `$base_dir/defaults.toml`.
+///
+/// Built by `build.rs` from the workspace `defaults.toml`, shaped by the
+/// brand and an optional `RSCLAW_DEFAULTS_OVERRIDE` file.
 pub fn embedded_defaults_toml() -> &'static str {
-    include_str!("../../../defaults.toml")
+    include_str!(concat!(env!("OUT_DIR"), "/defaults.toml"))
 }
 
 /// Load defaults.toml: prefer external file at `$base_dir/defaults.toml`,
