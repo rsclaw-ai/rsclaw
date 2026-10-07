@@ -710,7 +710,55 @@ pub fn build_user_system(
     toolset: Option<&str>,
     cap_available: bool,
 ) -> String {
+    let zh = config
+        .gateway
+        .as_ref()
+        .and_then(|g| g.language.as_deref())
+        .is_some_and(|l| rsclaw_i18n::resolve_lang(l) == "zh");
+    build_user_system_with_policy(
+        ws_ctx,
+        skills,
+        wasm_plugins,
+        js_plugins,
+        config,
+        toolset,
+        cap_available,
+        rsclaw_brand::prompt_policy(zh),
+        zh,
+    )
+}
+
+/// The brand's distributor policy as a system-prompt block, or `None`.
+///
+/// It opens the user suffix, i.e. sits right after the shared prefix: the
+/// shared (kvCache) prefix stays byte-identical for every brand, and the
+/// block is stable per build so it caches with the rest of the suffix.
+pub(crate) fn distributor_policy_block(policy: Option<&str>, zh: bool) -> Option<String> {
+    let body = policy?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let title = if zh { "## 发行方规则" } else { "## Distributor policy" };
+    Some(format!("{title}\n\n{body}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_user_system_with_policy(
+    ws_ctx: &WorkspaceContext,
+    skills: &SkillRegistry,
+    wasm_plugins: &[WasmPlugin],
+    js_plugins: Option<&PluginRegistry>,
+    config: &rsclaw_config::schema::Config,
+    toolset: Option<&str>,
+    cap_available: bool,
+    policy: Option<&str>,
+    zh: bool,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
+
+    if let Some(block) = distributor_policy_block(policy, zh) {
+        parts.push(block);
+    }
 
     if let Some(lang) = config.gateway.as_ref().and_then(|g| g.language.as_deref()) {
         parts.push(format!(
@@ -1060,10 +1108,13 @@ pub use rsclaw_types::BUILTIN_TOOL_NAMES;
 /// on every tick. This minimal prompt keeps the identity + the single
 /// instruction the session actually needs.
 pub(crate) fn build_minimal_system_prompt() -> String {
-    "You are an internal rsclaw task agent. Only the `memory` tool is available.\n\
+    let base = "You are an internal rsclaw task agent. Only the `memory` tool is available.\n\
      Follow the instructions in the user message. Be terse — no preamble, no\n\
-     closing pleasantries. If nothing actionable to report, reply HEARTBEAT_OK."
-        .to_owned()
+     closing pleasantries. If nothing actionable to report, reply HEARTBEAT_OK.";
+    match distributor_policy_block(rsclaw_brand::prompt_policy(false), false) {
+        Some(block) => format!("{base}\n\n{block}"),
+        None => base.to_owned(),
+    }
 }
 
 /// Return a relative time label for memory recall.
@@ -1139,6 +1190,48 @@ mod tests {
         let skills = SkillRegistry::new();
         let config = rsclaw_config::schema::Config::default();
         build_user_system(&ws, &skills, &[], None, &config, None, cap_available)
+    }
+
+    #[test]
+    fn distributor_policy_opens_the_user_suffix() {
+        let ws = WorkspaceContext::default();
+        let skills = SkillRegistry::new();
+        let config = rsclaw_config::schema::Config::default();
+        let suffix = build_user_system_with_policy(
+            &ws,
+            &skills,
+            &[],
+            None,
+            &config,
+            None,
+            false,
+            Some("Never quote prices.\n"),
+            false,
+        );
+        assert!(
+            suffix.starts_with("## Distributor policy\n\nNever quote prices."),
+            "policy must open the suffix: {suffix}"
+        );
+        // Full prompt layout: the shared prefix stays first and untouched.
+        let prefix = build_shared_system_prefix();
+        let full = format!("{prefix}\n\n{suffix}");
+        let at = full.find("## Distributor policy").expect("policy present");
+        assert!(at > prefix.len(), "policy must follow the shared prefix");
+
+        let zh = distributor_policy_block(Some("不得报价。"), true).expect("block");
+        assert_eq!(zh, "## 发行方规则\n\n不得报价。");
+        assert!(distributor_policy_block(Some("  \n"), false).is_none());
+        assert!(distributor_policy_block(None, true).is_none());
+    }
+
+    #[test]
+    fn default_brand_adds_no_policy() {
+        if rsclaw_brand::prompt_policy(false).is_none() && rsclaw_brand::prompt_policy(true).is_none() {
+            let prompt = empty_user_system(false);
+            assert!(!prompt.contains("## Distributor policy"));
+            assert!(!prompt.contains("## 发行方规则"));
+            assert!(!build_minimal_system_prompt().contains("Distributor policy"));
+        }
     }
 
     #[test]
