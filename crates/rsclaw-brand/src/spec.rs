@@ -147,6 +147,9 @@ pub fn validate(spec: &BrandSpec) -> Result<(), String> {
                     })
             }
             "emoji" => true,
+            // An empty `urls.app` turns off release checks and the remote
+            // defaults refresh (for brands without their own release host).
+            "urls.app" => value.is_empty() || is_base_url(value),
             k if k.starts_with("urls.") => is_base_url(value),
             _ => !value.trim().is_empty(),
         };
@@ -176,8 +179,16 @@ pub fn generate(spec: &BrandSpec) -> String {
     };
     for (name, value, doc) in [
         ("API_V1_URL", format!("{api}/v1"), "`urls.api` + `/v1`"),
-        ("DEFAULTS_URL", format!("{app}/defaults.toml"), "`urls.app` + `/defaults.toml`"),
-        ("VERSION_URL", format!("{app}/api/version"), "`urls.app` + `/api/version`"),
+        (
+            "DEFAULTS_URL",
+            if app.is_empty() { String::new() } else { format!("{app}/defaults.toml") },
+            "`urls.app` + `/defaults.toml` (empty when `urls.app` is empty)",
+        ),
+        (
+            "VERSION_URL",
+            if app.is_empty() { String::new() } else { format!("{app}/api/version") },
+            "`urls.app` + `/api/version` (empty when `urls.app` is empty)",
+        ),
         (
             "TOOLS_MANIFEST_URL",
             format!("{hub}/tools/manifest.json"),

@@ -1473,6 +1473,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     tokio::spawn(async {
         const DEFAULTS_URL: &str = rsclaw_brand::DEFAULTS_URL;
         const THROTTLE: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+        if DEFAULTS_URL.is_empty() {
+            // The brand ships no remote catalog; the embedded one is final.
+            return;
+        }
 
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 

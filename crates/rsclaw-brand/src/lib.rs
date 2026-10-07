@@ -269,6 +269,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_app_url_disables_release_and_catalog_endpoints() {
+        let src = acme().replace("app = \"https://app.rsclaw.ai\"", "app = \"\"");
+        let spec = spec::parse(&src).expect("parse");
+        spec::validate(&spec).expect("empty urls.app is allowed");
+        let code = spec::generate(&spec);
+        assert!(code.contains("pub const VERSION_URL: &str = \"\";"));
+        assert!(code.contains("pub const DEFAULTS_URL: &str = \"\";"));
+        let bad = acme().replace("api = \"https://api.acme.example\"", "api = \"\"");
+        assert!(spec::validate(&spec::parse(&bad).expect("parse")).is_err());
+    }
+
+    #[test]
     fn rebrand_scan_replaces_tokens_and_respects_word_bounds() {
         let tokens = vec![
             ("Crab AI Assistant", "Acme Helper".to_owned()),

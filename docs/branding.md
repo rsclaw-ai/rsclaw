@@ -48,9 +48,9 @@ back silently to another brand's value.
 | `release_repo` | `rsclaw-ai/rsclaw` | GitHub `owner/repo` used as the release fallback for `update`. Empty disables the fallback. |
 | `urls.api` | `https://api.rsclaw.ai` | Managed model, media and embedding API (`/v1` is appended) |
 | `urls.hub` | `https://hub.rsclaw.ai` | Skill, plugin and tool hub (`/tools/manifest.json`, `/meta.json`, allowlists) |
-| `urls.app` | `https://app.rsclaw.ai` | Release metadata (`/api/version`) and the shipped defaults catalog (`/defaults.toml`) |
+| `urls.app` | `https://app.rsclaw.ai` | Release metadata (`/api/version`) and the remote defaults catalog (`/defaults.toml`). **Empty** turns both off: `update` reports that the distributor delivers updates, and the gateway never replaces the brand's catalog with a remote one. A brand without its own release host must leave it empty; pointing it at another brand's host would offer that brand's binaries and catalog. |
 
-URLs must start with `http://` or `https://` and must not end with `/`. Slug
+URLs must start with `http://` or `https://` and must not end with `/`; only `urls.app` may be empty. Slug
 fields accept lowercase ASCII letters, digits, `-` and `_`.
 
 ## Using the brand in code

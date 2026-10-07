@@ -46,7 +46,10 @@ pub(crate) const RSCLAW_VERSION_URL: &str = rsclaw_brand::VERSION_URL;
 /// then (when the brand names a release repo) the GitHub releases list via
 /// `GITHUB_PROXY`.
 fn release_sources() -> Vec<String> {
-    let mut sources = vec![RSCLAW_VERSION_URL.to_owned()];
+    let mut sources = Vec::new();
+    if !RSCLAW_VERSION_URL.is_empty() {
+        sources.push(RSCLAW_VERSION_URL.to_owned());
+    }
     if !rsclaw_brand::RELEASES_API_URL.is_empty() {
         sources.push(proxy_url(rsclaw_brand::RELEASES_API_URL));
     }
@@ -84,6 +87,15 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
             rsclaw_brand::CLI_NAME,
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         ));
+    }
+
+    if release_sources().is_empty() {
+        if quiet {
+            println!("{}", serde_json::json!({"updated": false, "reason": "updates_managed_by_distributor"}));
+        } else {
+            println!("  {}", dim("Updates for this build are delivered by its distributor."));
+        }
+        return Ok(());
     }
 
     let timeout_secs = args.timeout.unwrap_or(30);
@@ -562,6 +574,12 @@ async fn update_status() -> Result<()> {
         rsclaw_brand::CLI_NAME,
         option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
     ));
+
+    if release_sources().is_empty() {
+        kv("Current:", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"));
+        println!("  {}", dim("Updates for this build are delivered by its distributor."));
+        return Ok(());
+    }
 
     let client = build_update_client(10)?;
 
