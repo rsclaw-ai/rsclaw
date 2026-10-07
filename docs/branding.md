@@ -33,6 +33,7 @@ back silently to another brand's value.
 | `id` | `rsclaw` | Machine id of the brand (slug) |
 | `product_name` | `RsClaw` | Product name in CLI output, channel messages, the tray and prompts |
 | `product_name_zh` | `螃蟹AI` | Chinese product name |
+| `tagline` | `AI Agent Engine Compatible with OpenClaw` | One-line description: the `--help` header and the A2A agent card |
 | `assistant_name` | `Crab AI Assistant` | Default assistant identity in the bootstrap workspace files |
 | `assistant_name_zh` | `螃蟹AI助手` | Chinese assistant identity |
 | `emoji` | `🦀` | Brand mark in channel messages (may be empty) |

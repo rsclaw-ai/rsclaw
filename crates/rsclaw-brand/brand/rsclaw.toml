@@ -4,6 +4,8 @@ id = "rsclaw"
 # Names shown to people.
 product_name = "RsClaw"
 product_name_zh = "螃蟹AI"
+# One-line description: `--help` header and the A2A agent card.
+tagline = "AI Agent Engine Compatible with OpenClaw"
 assistant_name = "Crab AI Assistant"
 assistant_name_zh = "螃蟹AI助手"
 emoji = "🦀"

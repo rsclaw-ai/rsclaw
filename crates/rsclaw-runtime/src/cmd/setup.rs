@@ -259,21 +259,25 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::R
 }
 
 fn header(title: &str) {
+    let title = &*rsclaw_brand::rebrand(title);
     println!();
     println!("  {title}");
     println!("  {}", "-".repeat(title.len()));
 }
 
 fn step(icon: &str, msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!("  {icon} {msg}");
 }
 
 fn done(msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!();
     println!("  [ok] {msg}");
 }
 
 fn hint(msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!("       {msg}");
 }
 

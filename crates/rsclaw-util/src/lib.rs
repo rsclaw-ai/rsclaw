@@ -166,8 +166,16 @@ mod tests {
 // from agent/runtime.rs so plugin/tools can normalize paths without the agent
 // knot.
 /// Expand a leading `~/` to the user's home directory.
+///
+/// Tool definitions are part of the cached shared prompt prefix, so they
+/// name the default data dir literally (`~/.rsclaw/...`) in every build.
+/// When this build's data dir differs (another brand), that canonical
+/// prefix maps onto the running instance's data dir.
 pub fn expand_tilde(p: &str) -> std::path::PathBuf {
     if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
+        if let Some(path) = canonical_data_dir(rest) {
+            return path;
+        }
         dirs_next::home_dir().unwrap_or_default().join(rest)
     } else if p == "~" {
         dirs_next::home_dir().unwrap_or_default()
@@ -175,6 +183,27 @@ pub fn expand_tilde(p: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(p)
     }
 }
+/// `rest` (the part after `~/`) under the canonical `.rsclaw` data dir,
+/// resolved against this build's data dir; `None` for the default brand or
+/// any other path.
+fn canonical_data_dir(rest: &str) -> Option<std::path::PathBuf> {
+    const CANONICAL: &str = ".rsclaw";
+    if rsclaw_brand::HOME_DIR == CANONICAL {
+        return None;
+    }
+    let tail = if rest == CANONICAL {
+        ""
+    } else {
+        rest.strip_prefix(CANONICAL)?
+            .strip_prefix(['/', '\\'])?
+    };
+    let base = std::env::var_os("RSCLAW_BASE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dirs_next::home_dir().unwrap_or_default().join(rsclaw_brand::HOME_DIR));
+    Some(if tail.is_empty() { base } else { base.join(tail) })
+}
+
 /// Canonicalize a path received from an external source (tool output, plugin
 /// result, LLM-generated argument). Performs:
 ///   1. `~/...` expansion via [`expand_tilde`]

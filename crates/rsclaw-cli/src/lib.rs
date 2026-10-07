@@ -95,7 +95,7 @@ pub use webhooks::WebhooksCommand;
 #[command(
     name = rsclaw_brand::CLI_NAME,
     version = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
-    about = "AI Agent Engine Compatible with OpenClaw",
+    about = rsclaw_brand::TAGLINE,
     long_about = None,
     mut_args = brand_help::brand_arg,
     mut_subcommands = brand_help::brand_command,

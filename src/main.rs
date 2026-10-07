@@ -1,5 +1,6 @@
 #![allow(unused)]
-//! rsclaw — AI Agent Engine Compatible with OpenClaw
+//! rsclaw — AI Agent Engine Compatible with OpenClaw (the `--help` header
+//! comes from the brand file's `tagline`)
 //!
 //! Thin binary shim. The composition root + dispatch logic lives in the
 //! `rsclaw-runtime` crate (`rsclaw_runtime::run`). `main` only installs the TLS
@@ -30,5 +31,5 @@ fn main() -> Result<()> {
 
     // Build an appropriate tokio runtime for the detected hardware tier.
     let rt = rsclaw_platform::build_runtime(tier)?;
-    rt.block_on(rsclaw_runtime::run())
+    rt.block_on(rsclaw_runtime::run()).map_err(rsclaw_runtime::brand_error)
 }

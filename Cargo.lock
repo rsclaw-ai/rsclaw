@@ -8435,6 +8435,7 @@ dependencies = [
  "dirs-next",
  "image",
  "reqwest",
+ "rsclaw-brand",
  "serde_json",
  "tokio",
  "url",

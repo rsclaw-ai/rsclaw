@@ -9,6 +9,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("id", "ID"),
     ("product_name", "PRODUCT_NAME"),
     ("product_name_zh", "PRODUCT_NAME_ZH"),
+    ("tagline", "TAGLINE"),
     ("assistant_name", "ASSISTANT_NAME"),
     ("assistant_name_zh", "ASSISTANT_NAME_ZH"),
     ("emoji", "EMOJI"),
@@ -113,6 +114,7 @@ pub fn validate(spec: &BrandSpec) -> Result<(), String> {
         let ok = match key.as_str() {
             "id" | "cli_name" | "service_unit" | "windows_service" | "user_agent" => is_slug(value),
             // The dev instance uses port + 1, named profiles port + 2 ..= port + 255.
+            "tagline" => !value.trim().is_empty(),
             "default_port" => value.parse::<u16>().is_ok_and(|p| (1024..=65000).contains(&p)),
             "home_dir" => {
                 value.len() > 1

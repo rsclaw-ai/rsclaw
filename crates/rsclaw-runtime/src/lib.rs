@@ -217,6 +217,15 @@ fn resolve_instance(cli: &Cli) -> (std::path::PathBuf, u16) {
     (root, BASE_PORT)
 }
 
+/// Rewrite a top-level error's text (and its cause chain) into this build's
+/// brand before `main` prints it. Identity for the default brand.
+pub fn brand_error(e: anyhow::Error) -> anyhow::Error {
+    if rsclaw_brand::ID == "rsclaw" {
+        return e;
+    }
+    anyhow::anyhow!(rsclaw_brand::rebrand(&format!("{e:?}")).into_owned())
+}
+
 /// Top-level async dispatch. Called by `main.rs` inside the tokio runtime.
 #[allow(clippy::large_futures)]
 pub async fn run() -> Result<()> {

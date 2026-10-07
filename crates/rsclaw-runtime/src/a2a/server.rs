@@ -83,7 +83,7 @@ pub fn build_agent_card(state: &AppState, _extended: bool) -> AgentCard {
     AgentCard {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         name: "rsclaw".to_owned(),
-        description: Some("AI Agent Engine Compatible with OpenClaw".to_owned()),
+        description: Some(rsclaw_brand::TAGLINE.to_owned()),
         url: base_url.clone(),
         provider: Some(AgentProvider {
             organization: "rsclaw".to_owned(),

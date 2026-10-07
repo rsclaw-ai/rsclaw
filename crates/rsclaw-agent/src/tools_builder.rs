@@ -608,12 +608,9 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "skill_list".to_owned(),
-        description: concat!(
-            "List installed local skills with pagination. Use query first to filter by skill name/description, then use limit/offset for more results. Do not use shell to run `",
-            rsclaw_brand::brand_cli_name!(),
-            " skills list`; this tool is the authoritative installed-skill listing."
-        )
-        .to_owned(),
+        // Tool definitions are part of the cached shared prefix: keep them
+        // byte-identical across brands (see tests/baseline_*.rs).
+        description: "List installed local skills with pagination. Use query first to filter by skill name/description, then use limit/offset for more results. Do not use shell to run `rsclaw skills list`; this tool is the authoritative installed-skill listing.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1430,7 +1427,7 @@ pub fn build_tool_list(
             evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, \
             new_tab, switch_tab, close_tab.\n\
             Site-rules: verified per-site selectors/routes/gotchas live under \
-            `~/{home}/tools/web_browser/site-rules/` as `<domain>.md` or \
+            `~/.rsclaw/tools/web_browser/site-rules/` as `<domain>.md` or \
             `<domain>/<task>.md`. When opening a matching host, read_file the rule FIRST \
             instead of guessing selectors. Before using a nested `<domain>/<task>.md`, read \
             `site-rules/_VOCABULARY.md` once per session — it maps imported helper syntax \
@@ -1439,7 +1436,7 @@ pub fn build_tool_list(
             captures, one call). Desktop screenshot → NOT this tool; tell the user to type \
             `/ss`. Bare `action=screenshot` with no url captures the persistent session — \
             usually a blank tab; don't.\n\n{}", crate::bootstrap::web_browser_guide(),
-            home = rsclaw_brand::HOME_DIR),
+            ),
         parameters: json!({
             "type": "object",
             "properties": {
