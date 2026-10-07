@@ -119,7 +119,8 @@ fn process_exe_name(pid: u32) -> Option<String> {
     }
 }
 
-/// True when `pid` is alive AND its executable name contains `rsclaw`.
+/// True when `pid` is alive AND its executable name contains `rsclaw` or
+/// this build's CLI name (a branded build's binary is not called rsclaw).
 ///
 /// Guards against PID reuse: a stale pid file may point at an unrelated
 /// process that inherited the number. Returns `false` when the identity
@@ -133,7 +134,9 @@ pub fn process_is_rsclaw(pid: u32) -> bool {
         return true;
     }
     match process_exe_name(pid) {
-        Some(name) => name.contains("rsclaw"),
+        Some(name) => {
+            name.contains("rsclaw") || name.contains(&rsclaw_brand::CLI_NAME.to_lowercase())
+        }
         None => false,
     }
 }

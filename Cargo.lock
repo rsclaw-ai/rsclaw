@@ -8083,6 +8083,7 @@ dependencies = [
  "dirs-next",
  "image",
  "libc",
+ "rsclaw-brand",
  "rsclaw-config",
  "serde",
  "serde_json",
