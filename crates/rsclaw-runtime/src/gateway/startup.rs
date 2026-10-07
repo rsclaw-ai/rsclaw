@@ -1387,7 +1387,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         let client = reqwest::Client::builder()
-            .user_agent("rsclaw/dev")
+            .user_agent(concat!(rsclaw_brand::brand_user_agent!(), "/dev"))
             .timeout(std::time::Duration::from_secs(10))
             .build();
 
@@ -1400,10 +1400,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         // updater agree on what "latest" means.
         let sources = [
             crate::cmd::update::RSCLAW_VERSION_URL,
-            "https://api.github.com/repos/rsclaw-ai/rsclaw/releases?per_page=10",
+            rsclaw_brand::RELEASES_API_URL,
         ];
         let mut release: Option<serde_json::Value> = None;
-        for url in sources {
+        for url in sources.into_iter().filter(|u| !u.is_empty()) {
             if let Ok(resp) = client.get(url).send().await {
                 if resp.status().is_success() {
                     let body = resp.bytes().await.unwrap_or_default();
@@ -1450,7 +1450,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                     info!(
                         current = current_raw,
                         latest = latest_raw,
-                        "new rsclaw version available -- run `rsclaw update` to upgrade"
+                        "new {cli} version available -- run `{cli} update` to upgrade",
+                        cli = rsclaw_brand::CLI_NAME
                     );
                 }
             }
@@ -1470,7 +1471,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // defaults.toml is always the fallback. Takes effect on the next config
     // load / restart, never mutating the already-running config in place.
     tokio::spawn(async {
-        const DEFAULTS_URL: &str = "https://app.rsclaw.ai/defaults.toml";
+        const DEFAULTS_URL: &str = rsclaw_brand::DEFAULTS_URL;
         const THROTTLE: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
@@ -1487,7 +1488,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
 
         let Ok(client) = reqwest::Client::builder()
-            .user_agent("rsclaw/dev")
+            .user_agent(concat!(rsclaw_brand::brand_user_agent!(), "/dev"))
             .timeout(std::time::Duration::from_secs(10))
             .build()
         else {
@@ -2054,7 +2055,7 @@ fn try_service_self_restart() -> bool {
         // path stops us and leaves it to a human / monitoring system.
         use std::os::windows::process::CommandExt;
         let status = std::process::Command::new("sc")
-            .args(["stop", "rsclaw"])
+            .args(["stop", rsclaw_brand::WINDOWS_SERVICE])
             .creation_flags(0x08000000)
             .status();
         if matches!(status, Ok(s) if s.success()) {
@@ -2160,7 +2161,7 @@ fn apply_user_env_map(env_map: &std::collections::HashMap<String, String>) {
         let expanded = rsclaw_config::loader::expand_env_vars(raw_val);
         // SAFETY: pre-async-runtime, single-threaded.
         unsafe { std::env::set_var(key, &expanded) };
-        info!(key = %key, "exported user env var from rsclaw.json5");
+        info!(key = %key, "exported user env var from {}", rsclaw_brand::CONFIG_FILE);
     }
 }
 

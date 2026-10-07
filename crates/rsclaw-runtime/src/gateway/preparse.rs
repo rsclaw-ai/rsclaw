@@ -177,7 +177,10 @@ fn render_headlines_for_plugin(plugin: &str) -> String {
         .join("plugins")
         .join(plugin);
     if !plugin_dir.exists() {
-        return format!("plugin `{plugin}` not installed (no dir at ~/.rsclaw/plugins/{plugin})");
+        return format!(
+            "plugin `{plugin}` not installed (no dir at ~/{home}/plugins/{plugin})",
+            home = rsclaw_brand::HOME_DIR
+        );
     }
     let manifest = match rsclaw_plugin::manifest::load_manifest(&plugin_dir) {
         Ok(m) => m,
@@ -371,7 +374,7 @@ pub(crate) async fn try_preparse_locally_with_account(
     // the reply. Make it a local fast response listing all preparse
     // slash commands, so it lands within milliseconds on every channel.
     if lower == "/help" || lower == "/?" {
-        return Some(txt(help_text(rsclaw_i18n::default_lang())));
+        return Some(txt(rsclaw_brand::rebrand(&help_text(rsclaw_i18n::default_lang())).into_owned()));
     }
     // /version
     if lower == "/version" {

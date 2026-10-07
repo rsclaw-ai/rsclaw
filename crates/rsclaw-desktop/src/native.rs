@@ -171,8 +171,9 @@ fn new_enigo() -> Result<Enigo, String> {
                 });
                 return format!(
                     "enigo init failed: {e} (macOS: a permission request was raised \
-                    — enable RsClaw under System Settings → Privacy & Security → \
-                    Accessibility AND Input Monitoring, then quit & reopen RsClaw)"
+                    — enable {app} under System Settings → Privacy & Security → \
+                    Accessibility AND Input Monitoring, then quit & reopen {app})",
+                    app = rsclaw_brand::PRODUCT_NAME
                 );
             }
             #[cfg(not(target_os = "macos"))]

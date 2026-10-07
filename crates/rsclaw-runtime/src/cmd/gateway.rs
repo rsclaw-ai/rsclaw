@@ -878,6 +878,18 @@ pub fn gateway_signal_stop() -> Result<()> {
     }
 }
 
+/// `Library/LaunchAgents/<service_label>.plist`, relative to `$HOME`.
+#[cfg(target_os = "macos")]
+fn launchd_plist_rel() -> String {
+    format!("Library/LaunchAgents/{}.plist", rsclaw_brand::SERVICE_LABEL)
+}
+
+/// `.config/systemd/user/<service_unit>.service`, relative to `$HOME`.
+#[cfg(target_os = "linux")]
+fn systemd_user_unit_rel() -> String {
+    format!(".config/systemd/user/{}.service", rsclaw_brand::SERVICE_UNIT)
+}
+
 /// Check if gateway is installed as a system service.
 /// Returns true if the service unit/plist/sc entry exists (even if not
 /// running).
@@ -885,7 +897,7 @@ fn service_installed() -> bool {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = dirs_next::home_dir() {
-            let plist = home.join("Library/LaunchAgents/ai.rsclaw.gateway.plist");
+            let plist = home.join(launchd_plist_rel());
             if plist.exists() {
                 return true;
             }
@@ -895,13 +907,14 @@ fn service_installed() -> bool {
     #[cfg(target_os = "linux")]
     {
         if let Some(home) = dirs_next::home_dir() {
-            let unit = home.join(".config/systemd/user/rsclaw-gateway.service");
+            let unit = home.join(systemd_user_unit_rel());
             if unit.exists() {
                 return true;
             }
         }
         // Also check system-level.
-        let sys_unit = std::path::Path::new("/etc/systemd/system/rsclaw-gateway.service");
+        let sys_unit_path = format!("/etc/systemd/system/{}.service", rsclaw_brand::SERVICE_UNIT);
+        let sys_unit = std::path::Path::new(&sys_unit_path);
         if sys_unit.exists() {
             return true;
         }
@@ -912,7 +925,7 @@ fn service_installed() -> bool {
         // sc query returns non-zero if service doesn't exist.
         #[allow(unused_mut)]
         let mut sc_cmd = std::process::Command::new("sc");
-        sc_cmd.args(["query", "rsclaw"]);
+        sc_cmd.args(["query", rsclaw_brand::WINDOWS_SERVICE]);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -935,7 +948,7 @@ fn try_service_start() -> bool {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = dirs_next::home_dir() {
-            let plist = home.join("Library/LaunchAgents/ai.rsclaw.gateway.plist");
+            let plist = home.join(launchd_plist_rel());
             if plist.exists() {
                 let status = std::process::Command::new("launchctl")
                     .args(["load", "-w"])
@@ -950,19 +963,20 @@ fn try_service_start() -> bool {
     {
         // Try user service first.
         if let Some(home) = dirs_next::home_dir() {
-            let unit = home.join(".config/systemd/user/rsclaw-gateway.service");
+            let unit = home.join(systemd_user_unit_rel());
             if unit.exists() {
                 let status = std::process::Command::new("systemctl")
-                    .args(["--user", "start", "rsclaw-gateway"])
+                    .args(["--user", "start", rsclaw_brand::SERVICE_UNIT])
                     .status();
                 return status.map(|s| s.success()).unwrap_or(false);
             }
         }
         // System-level.
-        let sys_unit = std::path::Path::new("/etc/systemd/system/rsclaw-gateway.service");
+        let sys_unit_path = format!("/etc/systemd/system/{}.service", rsclaw_brand::SERVICE_UNIT);
+        let sys_unit = std::path::Path::new(&sys_unit_path);
         if sys_unit.exists() {
             let status = std::process::Command::new("systemctl")
-                .args(["start", "rsclaw-gateway"])
+                .args(["start", rsclaw_brand::SERVICE_UNIT])
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
         }
@@ -972,7 +986,7 @@ fn try_service_start() -> bool {
     {
         use std::os::windows::process::CommandExt;
         let status = std::process::Command::new("sc")
-            .args(["start", "rsclaw"])
+            .args(["start", rsclaw_brand::WINDOWS_SERVICE])
             .creation_flags(0x08000000)
             .status();
         return status.map(|s| s.success()).unwrap_or(false);
@@ -988,7 +1002,7 @@ fn try_service_stop() -> bool {
     #[cfg(target_os = "macos")]
     {
         let plist =
-            dirs_next::home_dir().map(|h| h.join("Library/LaunchAgents/ai.rsclaw.gateway.plist"));
+            dirs_next::home_dir().map(|h| h.join(launchd_plist_rel()));
         if let Some(ref path) = plist {
             if path.exists() {
                 // Use unload (without -w) to stop without disabling auto-start.
@@ -1009,25 +1023,25 @@ fn try_service_stop() -> bool {
     {
         // Check if systemd service exists and is active.
         let is_active = std::process::Command::new("systemctl")
-            .args(["--user", "is-active", "rsclaw-gateway"])
+            .args(["--user", "is-active", rsclaw_brand::SERVICE_UNIT])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         if is_active {
             let status = std::process::Command::new("systemctl")
-                .args(["--user", "stop", "rsclaw-gateway"])
+                .args(["--user", "stop", rsclaw_brand::SERVICE_UNIT])
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
         }
         // Try system-level service too.
         let is_active = std::process::Command::new("systemctl")
-            .args(["is-active", "rsclaw-gateway"])
+            .args(["is-active", rsclaw_brand::SERVICE_UNIT])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         if is_active {
             let status = std::process::Command::new("systemctl")
-                .args(["stop", "rsclaw-gateway"])
+                .args(["stop", rsclaw_brand::SERVICE_UNIT])
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
         }
@@ -1037,14 +1051,14 @@ fn try_service_stop() -> bool {
     {
         use std::os::windows::process::CommandExt;
         let is_active = std::process::Command::new("sc")
-            .args(["query", "rsclaw"])
+            .args(["query", rsclaw_brand::WINDOWS_SERVICE])
             .creation_flags(0x08000000)
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
             .unwrap_or(false);
         if is_active {
             let status = std::process::Command::new("sc")
-                .args(["stop", "rsclaw"])
+                .args(["stop", rsclaw_brand::WINDOWS_SERVICE])
                 .creation_flags(0x08000000)
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
@@ -1117,7 +1131,7 @@ async fn cmd_gateway_install() -> Result<()> {
     let binary = std::env::current_exe()?;
     let plist_dir = home.join("Library/LaunchAgents");
     std::fs::create_dir_all(&plist_dir)?;
-    let plist_path = plist_dir.join("ai.rsclaw.gateway.plist");
+    let plist_path = plist_dir.join(format!("{}.plist", rsclaw_brand::SERVICE_LABEL));
 
     let log_path = rsclaw_config::loader::log_file();
     let plist = format!(
@@ -1127,7 +1141,7 @@ async fn cmd_gateway_install() -> Result<()> {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>ai.rsclaw.gateway</string>
+  <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
     <string>{binary}</string>
@@ -1147,6 +1161,7 @@ async fn cmd_gateway_install() -> Result<()> {
 "#,
         binary = binary.display(),
         log = log_path.display(),
+        label = rsclaw_brand::SERVICE_LABEL,
     );
 
     std::fs::write(&plist_path, &plist)?;
@@ -1168,7 +1183,7 @@ async fn cmd_gateway_install() -> Result<()> {
 #[cfg(target_os = "macos")]
 async fn cmd_gateway_uninstall() -> Result<()> {
     let home = dirs_next::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?;
-    let plist_path = home.join("Library/LaunchAgents/ai.rsclaw.gateway.plist");
+    let plist_path = home.join(launchd_plist_rel());
 
     let status = std::process::Command::new("launchctl")
         .args(["unload", "-w"])
@@ -1195,7 +1210,7 @@ async fn cmd_gateway_install() -> Result<()> {
     let log_path = rsclaw_config::loader::log_file();
     let unit = format!(
         "[Unit]\n\
-         Description=rsclaw AI gateway\n\
+         Description={cli} AI gateway\n\
          After=network.target\n\
          \n\
          [Service]\n\
@@ -1211,17 +1226,18 @@ async fn cmd_gateway_install() -> Result<()> {
          WantedBy=default.target\n",
         binary = binary.display(),
         log = log_path.display(),
+        cli = rsclaw_brand::CLI_NAME,
     );
 
     let unit_dir = home.join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
-    let unit_path = unit_dir.join("rsclaw-gateway.service");
+    let unit_path = unit_dir.join(format!("{}.service", rsclaw_brand::SERVICE_UNIT));
     std::fs::write(&unit_path, &unit)?;
     println!("  [+] {}", unit_path.display());
 
     for cmd in [
         vec!["systemctl", "--user", "daemon-reload"],
-        vec!["systemctl", "--user", "enable", "--now", "rsclaw-gateway"],
+        vec!["systemctl", "--user", "enable", "--now", rsclaw_brand::SERVICE_UNIT],
     ] {
         let status = std::process::Command::new(cmd[0])
             .args(&cmd[1..])
@@ -1237,10 +1253,10 @@ async fn cmd_gateway_install() -> Result<()> {
 #[cfg(target_os = "linux")]
 async fn cmd_gateway_uninstall() -> Result<()> {
     let home = dirs_next::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?;
-    let unit_path = home.join(".config/systemd/user/rsclaw-gateway.service");
+    let unit_path = home.join(systemd_user_unit_rel());
 
     for cmd in [
-        vec!["systemctl", "--user", "disable", "--now", "rsclaw-gateway"],
+        vec!["systemctl", "--user", "disable", "--now", rsclaw_brand::SERVICE_UNIT],
         vec!["systemctl", "--user", "daemon-reload"],
     ] {
         let _ = std::process::Command::new(cmd[0]).args(&cmd[1..]).status();
@@ -1266,13 +1282,13 @@ async fn cmd_gateway_install() -> Result<()> {
     let status = std::process::Command::new("sc")
         .args([
             "create",
-            "rsclaw",
+            rsclaw_brand::WINDOWS_SERVICE,
             "binPath=",
             &bin_path,
             "start=",
             "auto",
             "DisplayName=",
-            "RsClaw AI Gateway",
+            rsclaw_brand::SERVICE_DISPLAY,
         ])
         .creation_flags(0x08000000)
         .status()?;
@@ -1280,11 +1296,11 @@ async fn cmd_gateway_install() -> Result<()> {
         eprintln!("  [!] sc create failed. Try running as Administrator.");
         return Ok(());
     }
-    println!("  [+] Service registered: rsclaw");
+    println!("  [+] Service registered: {}", rsclaw_brand::WINDOWS_SERVICE);
 
     // Start the service.
     let _ = std::process::Command::new("sc")
-        .args(["start", "rsclaw"])
+        .args(["start", rsclaw_brand::WINDOWS_SERVICE])
         .creation_flags(0x08000000)
         .status();
     println!("  [ok] Service installed and started");
@@ -1296,13 +1312,13 @@ async fn cmd_gateway_uninstall() -> Result<()> {
     use std::os::windows::process::CommandExt;
     // Stop first.
     let _ = std::process::Command::new("sc")
-        .args(["stop", "rsclaw"])
+        .args(["stop", rsclaw_brand::WINDOWS_SERVICE])
         .creation_flags(0x08000000)
         .status();
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let status = std::process::Command::new("sc")
-        .args(["delete", "rsclaw"])
+        .args(["delete", rsclaw_brand::WINDOWS_SERVICE])
         .creation_flags(0x08000000)
         .status()?;
     if !status.success() {

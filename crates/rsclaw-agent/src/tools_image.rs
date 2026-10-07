@@ -49,7 +49,7 @@ async fn save_generated_image_bytes(bytes: &[u8], mime: &str) -> Result<String> 
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw")
+        .join(rsclaw_brand::CLI_NAME)
         .join(category);
     tokio::fs::create_dir_all(&save_dir)
         .await

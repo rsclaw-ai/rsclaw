@@ -303,7 +303,7 @@ fn plugin_downloads_root() -> PathBuf {
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw")
+        .join(rsclaw_brand::CLI_NAME)
 }
 
 /// Private per-plugin data dir `~/.rsclaw/var/plugins/<plugin>`. `None`
@@ -408,7 +408,7 @@ fn canonicalize_browser_upload_path(plugin_name: &str, input: &str) -> Result<Pa
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw");
+        .join(rsclaw_brand::CLI_NAME);
     canonicalize_existing_file_in_roots(
         input,
         &workspace,
@@ -441,8 +441,9 @@ fn canonicalize_existing_file_in_roots(
         }
     }
     Err(format!(
-        "{context}: path '{}' resolves outside allowed dirs (workspace, plugin artifacts, or Downloads/rsclaw)",
-        input
+        "{context}: path '{}' resolves outside allowed dirs (workspace, plugin artifacts, or Downloads/{})",
+        input,
+        rsclaw_brand::CLI_NAME
     ))
 }
 
@@ -2254,7 +2255,7 @@ pub(crate) fn allocate_dl_paths(filename: &str, count: usize) -> Result<Vec<Stri
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw")
+        .join(rsclaw_brand::CLI_NAME)
         .join(category);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Err(format!("allocate_artifact: create_dir: {e}"));
@@ -2969,7 +2970,10 @@ impl rsclaw::plugin::host_ocr::Host for HostState {
     ) -> wasmtime::Result<Result<String, String>> {
         let Some(client) = rsclaw_kb::OcrClient::from_config() else {
             return Ok(Err(
-                "ocr-image: no OCR endpoint configured (set kb.ocr in rsclaw.json5)".to_string(),
+                format!(
+                    "ocr-image: no OCR endpoint configured (set kb.ocr in {})",
+                    rsclaw_brand::CONFIG_FILE
+                ),
             ));
         };
         let result = tokio::task::spawn_blocking(move || {

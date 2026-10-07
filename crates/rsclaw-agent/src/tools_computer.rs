@@ -418,7 +418,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     .unwrap_or_else(rsclaw_config::loader::base_dir)
                     .join("Downloads")
             })
-            .join("rsclaw")
+            .join(rsclaw_brand::CLI_NAME)
             .join("screenshots");
         tokio::fs::create_dir_all(&save_dir)
             .await

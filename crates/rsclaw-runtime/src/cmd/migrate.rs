@@ -298,7 +298,7 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
         .unwrap_or_default();
 
     // Migrate config: extract compatible parts from openclaw.json -> rsclaw.json5
-    let rsclaw_config = rsclaw_dir.join("rsclaw.json5");
+    let rsclaw_config = rsclaw_dir.join(rsclaw_brand::CONFIG_FILE);
     if config_path.is_file() && !rsclaw_config.exists() {
         let mut rsclaw_cfg = serde_json::Map::new();
 
@@ -519,7 +519,10 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
 
         let pretty = serde_json::to_string_pretty(&serde_json::Value::Object(rsclaw_cfg))?;
         std::fs::write(&rsclaw_config, &pretty)?;
-        item("*", "config migrated: openclaw.json -> rsclaw.json5");
+        item(
+            "*",
+            &format!("config migrated: openclaw.json -> {}", rsclaw_brand::CONFIG_FILE),
+        );
         if config.get("bindings").is_some() {
             item(" ", "bindings converted to per-agent channels");
         }

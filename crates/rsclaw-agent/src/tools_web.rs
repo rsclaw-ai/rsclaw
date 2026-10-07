@@ -1596,14 +1596,15 @@ impl AgentRuntime {
         });
         if !skills.is_empty() {
             result["applicable_site_rules"] = json!(skills);
-            result["site_rules_hint"] = json!(
+            result["site_rules_hint"] = json!(format!(
                 "VERIFIED selectors / URL patterns / API tricks for this host \
                  already exist. read_file each path under \
-                 ~/.rsclaw/tools/web_browser/site-rules/ BEFORE deciding how to \
+                 ~/{}/tools/web_browser/site-rules/ BEFORE deciding how to \
                  fetch or scrape — they document the working approach (e.g. \
                  .json suffix for reddit, JSON API for tradingview) and the \
-                 dead ends to avoid."
-            );
+                 dead ends to avoid.",
+                rsclaw_brand::HOME_DIR
+            ));
         }
         attach_raw_artifact(&mut result, raw_artifact, raw_chars);
         Ok(result)

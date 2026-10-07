@@ -664,7 +664,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     if args.non_interactive {
         let base = rsclaw_config::loader::base_dir();
         std::fs::create_dir_all(&base)?;
-        let config_path = base.join("rsclaw.json5");
+        let config_path = base.join(rsclaw_brand::CONFIG_FILE);
         if !config_path.exists() {
             let token = generate_auth_token();
             let body =
@@ -843,7 +843,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     }
 
     let config_path = {
-        let p = base.join("rsclaw.json5");
+        let p = base.join(rsclaw_brand::CONFIG_FILE);
         if !p.exists() {
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -3770,7 +3770,7 @@ fn resolve_config_path_for_write() -> std::path::PathBuf {
         return existing;
     }
     // Nothing exists -> new file in base_dir (RSCLAW_BASE_DIR or ~/.rsclaw/).
-    rsclaw_config::loader::base_dir().join("rsclaw.json5")
+    rsclaw_config::loader::base_dir().join(rsclaw_brand::CONFIG_FILE)
 }
 
 fn rotate_backups(path: &std::path::Path) {

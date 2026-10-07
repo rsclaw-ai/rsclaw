@@ -43,8 +43,9 @@ pub async fn cmd_sandbox(sub: SandboxCommand) -> Result<()> {
             ));
             println!("  Each agent runs in its own isolated environment.");
             println!(
-                "  Configure via {} in rsclaw.json5 / openclaw.json",
-                cyan("sandbox.docker.image")
+                "  Configure via {} in {} / openclaw.json",
+                cyan("sandbox.docker.image"),
+                rsclaw_brand::CONFIG_FILE
             );
         }
         SandboxCommand::Recreate { id } => {

@@ -1224,7 +1224,7 @@ const REBRAND_FILES: &[&str] = &[
 /// remaining `openclaw` / `OPENCLAW` / mixed-case occurrences.
 fn rebrand_content(input: &str) -> String {
     // 1. Exact CamelCase first.
-    let step1 = input.replace("OpenClaw", "RsClaw");
+    let step1 = input.replace("OpenClaw", rsclaw_brand::PRODUCT_NAME);
     // 2. Case-insensitive sweep for the lowercase form. Done by scanning
     //    byte-by-byte to avoid pulling in the regex crate just for one literal
     //    pattern.
@@ -1235,7 +1235,7 @@ fn rebrand_content(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if i + n <= bytes.len() && bytes[i..i + n].eq_ignore_ascii_case(needle.as_bytes()) {
-            out.push_str("rsclaw");
+            out.push_str(rsclaw_brand::CLI_NAME);
             i += n;
         } else {
             // Push the current char (handles multi-byte UTF-8 correctly).
@@ -1254,7 +1254,7 @@ fn rebrand_content(input: &str) -> String {
         }
     }
     // 3. Mascot rewrite — lobster → crab.
-    out.replace("龙虾", "螃蟹").replace("🦞", "🦀")
+    out.replace("龙虾", "螃蟹").replace("🦞", rsclaw_brand::EMOJI)
 }
 
 /// Copy workspace .md files from an OpenClaw workspace dir to rsclaw workspace.

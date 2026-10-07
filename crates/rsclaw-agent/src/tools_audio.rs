@@ -33,7 +33,8 @@ impl super::runtime::AgentRuntime {
             .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
             .ok_or_else(|| {
                 anyhow!(
-                    "{kind}_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in rsclaw.json5 or export RSCLAW_API_KEY, then retry."
+                    "{kind}_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in {cfg} or export RSCLAW_API_KEY, then retry.",
+                    cfg = rsclaw_brand::CONFIG_FILE
                 )
             })?;
         let host = rsclaw_provider::rsclaw_http::gen_host_base(None);
@@ -166,7 +167,7 @@ async fn save_generated_audio(bytes: &[u8], fmt: &str) -> Result<String> {
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw")
+        .join(rsclaw_brand::CLI_NAME)
         .join(category);
     tokio::fs::create_dir_all(&dir)
         .await

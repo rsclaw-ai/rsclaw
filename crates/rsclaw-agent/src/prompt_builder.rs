@@ -790,10 +790,11 @@ pub fn build_user_system(
          write_file, list_dir, search_file, shell cwd) resolve against \
          this directory. When the user says \"my files\" / \"my .md files\" / \
          \"the workspace\", they mean files inside this directory — NOT the \
-         rsclaw base dir at `~/.rsclaw/` which contains internal state \
+         rsclaw base dir at `~/{home}/` which contains internal state \
          (skills, plugins, models, credentials, var/data, tools/) that you \
          must not modify.",
-        ws = ws_ctx.workspace_dir.display()
+        ws = ws_ctx.workspace_dir.display(),
+        home = rsclaw_brand::HOME_DIR
     ));
 
     // KV-cache ordering rationale: append blocks from most-stable to most-volatile

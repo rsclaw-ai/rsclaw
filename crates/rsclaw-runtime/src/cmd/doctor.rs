@@ -227,7 +227,7 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
         }
 
         if c.gateway.auth_token.is_none() {
-            let config_path = config::loader::base_dir().join("rsclaw.json5");
+            let config_path = config::loader::base_dir().join(rsclaw_brand::CONFIG_FILE);
             issues.push(Issue {
                 message: "gateway.auth.token not set \u{2014} gateway accepts all connections without auth".to_owned(),
                 fix_hint: Some("auto-generate a 64-char auth token"),
@@ -323,7 +323,11 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
 
     // -- env vars referenced in config ----------------------------------------
     println!();
-    println!("  {} env vars referenced in rsclaw.json5", bold("Env:"));
+    println!(
+        "  {} env vars referenced in {}",
+        bold("Env:"),
+        rsclaw_brand::CONFIG_FILE
+    );
     if let Some(cfg_path) = config::loader::detect_config_path() {
         match std::fs::read_to_string(&cfg_path) {
             Ok(raw) => {

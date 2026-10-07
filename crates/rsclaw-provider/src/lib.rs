@@ -20,7 +20,8 @@ use std::pin::Pin;
 use anyhow::Result;
 
 /// Default User-Agent for all LLM provider HTTP requests.
-pub const DEFAULT_USER_AGENT: &str = concat!("rsclaw/", env!("CARGO_PKG_VERSION"));
+pub const DEFAULT_USER_AGENT: &str =
+    concat!(rsclaw_brand::brand_user_agent!(), "/", env!("CARGO_PKG_VERSION"));
 
 /// Install the rustls aws-lc-rs crypto provider once before any test runs.
 ///

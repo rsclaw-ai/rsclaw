@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 /// Hub root. Layout: `/meta.json` (signed), `/skills/manifest.json`,
 /// `/plugins/manifest.json`, `/tools/manifest.json`.
-const HUB_BASE: &str = "https://hub.rsclaw.ai";
+const HUB_BASE: &str = rsclaw_brand::HUB_URL;
 
 /// One audited entry. `sha256` pins the audited SKILL.md (same convention as
 /// the clawhub lockfile); empty means "not content-pinned yet" → slug-gate

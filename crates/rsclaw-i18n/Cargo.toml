@@ -7,3 +7,4 @@ rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+rsclaw-brand = { path = "../rsclaw-brand", version = "0.1.0" }

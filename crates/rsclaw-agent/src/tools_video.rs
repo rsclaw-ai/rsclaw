@@ -270,7 +270,8 @@ impl super::runtime::AgentRuntime {
                     .await
                     .map(|id| ("seedance", id)),
                     None => Err(anyhow!(
-                        "video_gen: no API key for doubao/Seedance. Set `model.models.providers.doubao.apiKey` in rsclaw.json5 or export ARK_API_KEY, then retry — or tell the user the doubao key is missing."
+                        "video_gen: no API key for doubao/Seedance. Set `model.models.providers.doubao.apiKey` in {cfg} or export ARK_API_KEY, then retry — or tell the user the doubao key is missing.",
+                        cfg = rsclaw_brand::CONFIG_FILE
                     )),
                 },
                 "agnes" => match resolve_key("agnes", "AGNES_API_KEY") {
@@ -286,7 +287,8 @@ impl super::runtime::AgentRuntime {
                     .await
                     .map(|id| ("agnes", id)),
                     None => Err(anyhow!(
-                        "video_gen: no API key for Agnes. Set `model.models.providers.agnes.apiKey` in rsclaw.json5 or export AGNES_API_KEY, then retry — or tell the user the Agnes key is missing."
+                        "video_gen: no API key for Agnes. Set `model.models.providers.agnes.apiKey` in {cfg} or export AGNES_API_KEY, then retry — or tell the user the Agnes key is missing.",
+                        cfg = rsclaw_brand::CONFIG_FILE
                     )),
                 },
                 "openai" => match resolve_key("openai", "OPENAI_API_KEY") {
@@ -317,7 +319,8 @@ impl super::runtime::AgentRuntime {
                         .map(|id| ("openai", id))
                     }
                     None => Err(anyhow!(
-                        "video_gen: no API key for OpenAI. Set `model.models.providers.openai.apiKey` in rsclaw.json5 or export OPENAI_API_KEY, then retry — or tell the user the OpenAI key is missing."
+                        "video_gen: no API key for OpenAI. Set `model.models.providers.openai.apiKey` in {cfg} or export OPENAI_API_KEY, then retry — or tell the user the OpenAI key is missing.",
+                        cfg = rsclaw_brand::CONFIG_FILE
                     )),
                 },
                 "rsclaw" => match resolve_key("rsclaw", "RSCLAW_API_KEY") {
@@ -336,7 +339,8 @@ impl super::runtime::AgentRuntime {
                     .await
                     .map(|id| ("rsclaw_native", id)),
                     None => Err(anyhow!(
-                        "video_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in rsclaw.json5 or export RSCLAW_API_KEY, then retry — or tell the user the rsclaw key is missing."
+                        "video_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in {cfg} or export RSCLAW_API_KEY, then retry — or tell the user the rsclaw key is missing.",
+                        cfg = rsclaw_brand::CONFIG_FILE
                     )),
                 },
                 other => Err(anyhow!("video_gen: unsupported provider {other}")),
@@ -588,7 +592,8 @@ impl super::runtime::AgentRuntime {
             .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
             .ok_or_else(|| {
                 anyhow!(
-                    "{endpoint}_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in rsclaw.json5 or export RSCLAW_API_KEY, then retry."
+                    "{endpoint}_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in {cfg} or export RSCLAW_API_KEY, then retry.",
+                    cfg = rsclaw_brand::CONFIG_FILE
                 )
             })?;
 

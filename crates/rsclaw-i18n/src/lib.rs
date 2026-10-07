@@ -2736,6 +2736,7 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
 // ---------------------------------------------------------------------------
 
 /// Translate a message key to the given language.  Falls back to English.
+/// Product names, paths and CLI invocations follow the build's brand.
 pub fn t(key: &str, lang: &str) -> String {
     if lang == "json" {
         let key = json_escape(key);
@@ -2744,7 +2745,9 @@ pub fn t(key: &str, lang: &str) -> String {
     MESSAGES
         .get(key)
         .and_then(|lm| lm.get(lang).or_else(|| lm.get("en")))
-        .map(|s| (*s).to_owned())
+        // Strings are written with the default brand's names; rebrand()
+        // is a borrow-through no-op for the default build.
+        .map(|s| rsclaw_brand::rebrand(s).into_owned())
         .unwrap_or_else(|| key.to_owned())
 }
 

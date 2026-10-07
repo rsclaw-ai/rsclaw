@@ -303,7 +303,7 @@ impl ClawhubClient {
         let token = std::env::var("CLAWHUB_TOKEN").ok();
         Self {
             client: Client::builder()
-                .user_agent("rsclaw/dev")
+                .user_agent(concat!(rsclaw_brand::brand_user_agent!(), "/dev"))
                 .build()
                 .expect("reqwest client"),
             base_url: CLAWHUB_API_BASE.to_owned(),

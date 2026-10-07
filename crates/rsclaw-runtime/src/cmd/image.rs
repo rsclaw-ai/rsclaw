@@ -28,7 +28,7 @@ pub async fn cmd_image(sub: ImageCommand) -> Result<()> {
         ImageCommand::Ocr(args) => {
             let data_uri = image_to_data_uri(&args.path)?;
             let client = rsclaw_kb::OcrClient::from_config()
-                .ok_or_else(|| anyhow::anyhow!("OCR not configured; set kb.ocr in rsclaw.json5"))?;
+                .ok_or_else(|| anyhow::anyhow!("OCR not configured; set kb.ocr in {}", rsclaw_brand::CONFIG_FILE))?;
 
             let result = client.ocr_with_options(
                 &data_uri,

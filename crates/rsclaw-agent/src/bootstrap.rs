@@ -416,7 +416,8 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
     for (name, content) in files {
         let path = workspace.join(name);
         if !path.exists() {
-            std::fs::write(&path, content)?;
+            // Templates name the default brand; rebrand() is a no-op there.
+            std::fs::write(&path, rsclaw_brand::rebrand(content).as_bytes())?;
             info!(file = %path.display(), "seeded workspace file");
             created += 1;
         }

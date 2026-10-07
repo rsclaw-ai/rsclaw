@@ -26,7 +26,10 @@ impl super::runtime::AgentRuntime {
         let Some(client) = OcrClient::from_config() else {
             return Ok(json!({
                 "error": "ocr: no OCR endpoint configured",
-                "hint": "Set `kb.ocr` in rsclaw.json5 (model rsclaw-ocr-v1 needs no baseUrl), then retry."
+                "hint": format!(
+                    "Set `kb.ocr` in {} (model rsclaw-ocr-v1 needs no baseUrl), then retry.",
+                    rsclaw_brand::CONFIG_FILE
+                )
             }));
         };
 

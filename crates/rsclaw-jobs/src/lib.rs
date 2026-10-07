@@ -492,7 +492,7 @@ async fn save_artifact_bytes(bytes: &[u8], kind: ExternalJobKind) -> Result<Stri
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw")
+        .join(rsclaw_brand::CLI_NAME)
         .join(category);
     tokio::fs::create_dir_all(&dir)
         .await

@@ -376,7 +376,7 @@ impl BrowserPool {
         let profile = {
             let mut profile_guard = self.profile.lock().await;
             if profile_guard.is_none() {
-                let config_path = rsclaw_config::loader::base_dir().join("rsclaw.json5");
+                let config_path = rsclaw_config::loader::base_dir().join(rsclaw_brand::CONFIG_FILE);
                 let cfg_profile = rsclaw_config::loader::load_json5(&config_path)
                     .ok()
                     .and_then(|c| c.tools)

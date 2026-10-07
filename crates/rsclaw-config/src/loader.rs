@@ -281,7 +281,7 @@ pub fn detect_config_path() -> Option<PathBuf> {
 
     // 2. Base dir config (set by --base-dir / --dev / --profile).
     if let Ok(bd) = std::env::var("RSCLAW_BASE_DIR") {
-        let p = expand_tilde_path(&bd).join("rsclaw.json5");
+        let p = expand_tilde_path(&bd).join(rsclaw_brand::CONFIG_FILE);
         if p.exists() {
             return Some(p);
         }
@@ -290,13 +290,13 @@ pub fn detect_config_path() -> Option<PathBuf> {
     let home = dirs_next::home_dir()?;
 
     // 3. rsclaw-native default.
-    let rsclaw = home.join(".rsclaw/rsclaw.json5");
+    let rsclaw = home.join(rsclaw_brand::HOME_DIR).join(rsclaw_brand::CONFIG_FILE);
     if rsclaw.exists() {
         return Some(rsclaw);
     }
 
     // 4. Current directory fallback.
-    let local = PathBuf::from(".rsclaw.json5");
+    let local = PathBuf::from(rsclaw_brand::local_config_file());
     if local.exists() {
         return Some(local);
     }
@@ -326,7 +326,7 @@ pub fn base_dir() -> PathBuf {
     }
 
     // 3. Default
-    dirs_next::home_dir().unwrap_or_default().join(".rsclaw")
+    dirs_next::home_dir().unwrap_or_default().join(rsclaw_brand::HOME_DIR)
 }
 
 /// Gateway PID file path: `$base_dir/var/run/gateway.pid`

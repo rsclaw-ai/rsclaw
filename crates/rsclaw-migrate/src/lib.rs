@@ -141,7 +141,7 @@ pub fn maybe_print_openclaw_notice() -> bool {
 pub fn check_needs_setup() -> bool {
     // Resolve base_dir (respects RSCLAW_BASE_DIR from --profile/--dev/--base-dir).
     let base = rsclaw_config::loader::base_dir();
-    let config_path = base.join("rsclaw.json5");
+    let config_path = base.join(rsclaw_brand::CONFIG_FILE);
 
     if config_path.is_file() {
         return false;

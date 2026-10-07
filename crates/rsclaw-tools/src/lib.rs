@@ -109,11 +109,11 @@ fn err_msg(msg: &str) {
 
 /// Tools manifest — schema-2 JSON: `{schema, updated_at, tools:{name:{version,
 /// platforms:{platform:{url,sha256}}}}}`. All download metadata is explicit.
-const MANIFEST_URL: &str = "https://hub.rsclaw.ai/tools/manifest.json";
+const MANIFEST_URL: &str = rsclaw_brand::TOOLS_MANIFEST_URL;
 
 /// Signed hub meta — its `sha256.tools` (covered by the ed25519 signature) pins
 /// the tools manifest. The install path verifies the manifest against it.
-const META_URL: &str = "https://hub.rsclaw.ai/meta.json";
+const META_URL: &str = rsclaw_brand::HUB_META_URL;
 
 // ---------------------------------------------------------------------------
 // Tool definitions
@@ -822,7 +822,7 @@ fn cmd_status() {
         let status = tool_status(def);
         let (icon, label) = match (status, def.optional) {
             ("system", _) => (green("✓"), green("system PATH")),
-            ("installed", _) => (green("✓"), cyan("~/.rsclaw/tools")),
+            ("installed", _) => (green("✓"), cyan(&format!("~/{}/tools", rsclaw_brand::HOME_DIR))),
             ("missing", true) => (dim("·"), dim("not installed (optional)")),
             _ => (red("✗"), red("not found")),
         };

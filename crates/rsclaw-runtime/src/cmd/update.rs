@@ -10,11 +10,15 @@ pub async fn cmd_update(sub: UpdateCommand) -> Result<()> {
         UpdateCommand::Status => update_status().await?,
         UpdateCommand::Wizard => {
             banner(&format!(
-                "rsclaw update wizard v{}",
+                "{} update wizard v{}",
+                rsclaw_brand::CLI_NAME,
                 option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
             ));
             warn_msg("update wizard: not yet implemented");
-            println!("  {}", dim("use `rsclaw update run` for now"));
+            println!(
+                "  {}",
+                dim(&format!("use `{} update run` for now", rsclaw_brand::CLI_NAME))
+            );
         }
     }
     Ok(())
@@ -36,7 +40,18 @@ fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     parse(a).cmp(&parse(b))
 }
 
-pub(crate) const RSCLAW_VERSION_URL: &str = "https://app.rsclaw.ai/api/version";
+pub(crate) const RSCLAW_VERSION_URL: &str = rsclaw_brand::VERSION_URL;
+
+/// Release metadata sources in priority order: the brand's version endpoint,
+/// then (when the brand names a release repo) the GitHub releases list via
+/// `GITHUB_PROXY`.
+fn release_sources() -> Vec<String> {
+    let mut sources = vec![RSCLAW_VERSION_URL.to_owned()];
+    if !rsclaw_brand::RELEASES_API_URL.is_empty() {
+        sources.push(proxy_url(rsclaw_brand::RELEASES_API_URL));
+    }
+    sources
+}
 
 /// Apply GITHUB_PROXY env to a URL: proxy + "/" + url
 fn proxy_url(url: &str) -> String {
@@ -51,7 +66,7 @@ fn proxy_url(url: &str) -> String {
 
 fn build_update_client(timeout_secs: u64) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent("rsclaw/dev")
+        .user_agent(concat!(rsclaw_brand::brand_user_agent!(), "/dev"))
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()?)
 }
@@ -65,7 +80,8 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
 
     if !quiet {
         banner(&format!(
-            "rsclaw update v{}",
+            "{} update v{}",
+            rsclaw_brand::CLI_NAME,
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         ));
     }
@@ -92,13 +108,7 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     // the binary.
     let release: serde_json::Value = {
         let mut data = None;
-        let sources = [
-            RSCLAW_VERSION_URL.to_owned(),
-            proxy_url(&format!(
-                "https://api.github.com/repos/{}/releases?per_page=10",
-                "rsclaw-ai/rsclaw"
-            )),
-        ];
+        let sources = release_sources();
         for url in &sources {
             if let Ok(resp) = client.get(url).send().await {
                 if resp.status().is_success() {
@@ -349,16 +359,16 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     // archive's gzipped/zipped bytes as the executable, then chmod +x'd
     // it — a pretty reliable way to brick the install.
     let binary_name = if std::env::consts::OS == "windows" {
-        "rsclaw.exe"
+        format!("{}.exe", rsclaw_brand::CLI_NAME)
     } else {
-        "rsclaw"
+        rsclaw_brand::CLI_NAME.to_owned()
     };
     let url_lower = download.to_lowercase();
     let looks_archived = url_lower.ends_with(".tar.gz")
         || url_lower.ends_with(".tgz")
         || url_lower.ends_with(".zip");
     let binary = if looks_archived {
-        extract_binary(&downloaded, binary_name, &download)?
+        extract_binary(&downloaded, &binary_name, &download)?
     } else {
         downloaded.to_vec()
     };
@@ -548,7 +558,8 @@ fn extract_binary(data: &[u8], filename: &str, url: &str) -> Result<Vec<u8>> {
 
 async fn update_status() -> Result<()> {
     banner(&format!(
-        "rsclaw update status v{}",
+        "{} update status v{}",
+        rsclaw_brand::CLI_NAME,
         option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
     ));
 
@@ -562,13 +573,7 @@ async fn update_status() -> Result<()> {
     // Try app.rsclaw.ai first (object or array), fallback GitHub releases list
     // (array)
     let mut latest_tag: Option<String> = None;
-    let sources = [
-        RSCLAW_VERSION_URL.to_owned(),
-        proxy_url(&format!(
-            "https://api.github.com/repos/{}/releases?per_page=10",
-            "rsclaw-ai/rsclaw"
-        )),
-    ];
+    let sources = release_sources();
     for url in &sources {
         if let Ok(resp) = client.get(url).send().await {
             if resp.status().is_success() {
@@ -592,7 +597,7 @@ async fn update_status() -> Result<()> {
             let current = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
             if version_cmp(latest, current) == std::cmp::Ordering::Greater {
                 println!("  {} update available: {latest}", yellow("[!]"));
-                println!("  Run: rsclaw update");
+                println!("  Run: {} update", rsclaw_brand::CLI_NAME);
             } else {
                 println!("  {} up to date", green("[ok]"));
             }

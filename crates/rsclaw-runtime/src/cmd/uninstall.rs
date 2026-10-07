@@ -16,7 +16,7 @@ pub async fn cmd_uninstall(args: UninstallArgs) -> Result<()> {
         println!("nothing selected -- use --service, --state, --workspace, --app, or --all");
         println!();
         println!("  --service    remove launchd/systemd service");
-        println!("  --state      remove ~/.rsclaw/ state directory");
+        println!("  --state      remove ~/{}/ state directory", rsclaw_brand::HOME_DIR);
         println!("  --workspace  remove agent workspace directories");
         println!("  --app        remove the rsclaw binary");
         println!("  --all        all of the above");

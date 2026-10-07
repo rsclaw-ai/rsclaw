@@ -41,7 +41,7 @@ async fn cmd_backup_create(args: rsclaw_cli::BackupCreateArgs) -> Result<()> {
     }
 
     // Include config (redacted: replace secret values with placeholders).
-    let config_path = base.join("rsclaw.json5");
+    let config_path = base.join(rsclaw_brand::CONFIG_FILE);
     if config_path.exists() {
         let raw = std::fs::read_to_string(&config_path)?;
         let redacted = redact_config(&raw);
@@ -49,7 +49,7 @@ async fn cmd_backup_create(args: rsclaw_cli::BackupCreateArgs) -> Result<()> {
         header.set_size(redacted.len() as u64);
         header.set_mode(0o600);
         header.set_cksum();
-        tar.append_data(&mut header, "rsclaw.json5", redacted.as_bytes())?;
+        tar.append_data(&mut header, rsclaw_brand::CONFIG_FILE, redacted.as_bytes())?;
     }
 
     // Optionally include session transcripts.

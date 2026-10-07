@@ -58,7 +58,7 @@ pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// RsClaw fleet's OpenAI/Cohere-compatible API root (embeddings, rerank,
 /// ocr). Convention-over-config: a `rsclaw-*` model name with no explicit
 /// base_url resolves here, mirroring the rsclaw chat provider's treatment.
-pub const RSCLAW_API_BASE_URL: &str = "https://api.rsclaw.ai/v1";
+pub const RSCLAW_API_BASE_URL: &str = rsclaw_brand::API_V1_URL;
 
 /// True for first-party fleet model names (`rsclaw-embedding-v1`,
 /// `rsclaw-reranker-v1`, `rsclaw-ocr-v1`, …).

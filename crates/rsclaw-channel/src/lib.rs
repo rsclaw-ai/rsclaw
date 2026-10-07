@@ -789,7 +789,7 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRef
                 .map(|h| h.join("Downloads"))
                 .unwrap_or_else(|| workspace.to_path_buf())
         })
-        .join("rsclaw");
+        .join(rsclaw_brand::CLI_NAME);
 
     // Three provenance buckets: up/ (channel uploads), dl/ (plugin or agent
     // downloads), a2a/ (received from A2A peers). Filenames share the

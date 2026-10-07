@@ -11,6 +11,7 @@ name = "rsclaw_agent"
 path = "src/lib.rs"
 
 [dependencies]
+rsclaw-brand = { path = "../rsclaw-brand", version = "0.1.0" }
 # Externals (versions mirrored from the root workspace Cargo.toml)
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

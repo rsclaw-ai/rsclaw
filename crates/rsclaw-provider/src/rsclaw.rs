@@ -41,7 +41,7 @@ use super::{
 /// window (1h by default). First request through any provider
 /// instance pays the redirect cost; everything within the TTL after
 /// goes direct, so steady-state latency matches a direct deployment.
-pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1";
+pub const RSCLAW_DEFAULT_BASE: &str = rsclaw_brand::API_V1_URL;
 
 /// Default `prefix_id` per protocol §2.1.1 / §2.10.1 — namespaced
 /// `<ns>/<ver>` string the gateway sends on `POST /sessions`. It's a

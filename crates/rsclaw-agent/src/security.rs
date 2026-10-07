@@ -142,7 +142,7 @@ fn sensitive_write_reason(full: &Path) -> Option<&'static str> {
         "crontab",
         ".env",
         "openclaw.json",
-        "rsclaw.json5",
+        rsclaw_brand::CONFIG_FILE,
         "auth-profiles.json",
     ];
     const SENSITIVE_DIRS: &[&str] = &[
@@ -320,7 +320,7 @@ pub(crate) fn check_read_safety(path: &str, full: &std::path::Path) -> anyhow::R
         "logins.json",
         // AI tool config files (contain API keys)
         "openclaw.json",
-        "rsclaw.json5",
+        rsclaw_brand::CONFIG_FILE,
         "auth-profiles.json",
     ];
 
@@ -392,7 +392,7 @@ pub(crate) fn rsclaw_downloads_dir() -> PathBuf {
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw")
+        .join(rsclaw_brand::CLI_NAME)
 }
 
 /// Where a tool may read local files from during one turn.

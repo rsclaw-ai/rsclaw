@@ -154,7 +154,7 @@ const DEV_PORT: u16 = 18889;
 /// uses raw JSON5 here (not the schema deserializer) so a malformed
 /// unrelated config field never blocks port resolution.
 fn read_config_port(base_dir: &std::path::Path) -> Option<u16> {
-    let path = base_dir.join("rsclaw.json5");
+    let path = base_dir.join(rsclaw_brand::CONFIG_FILE);
     let text = std::fs::read_to_string(&path).ok()?;
     let value: serde_json::Value = json5::from_str(&text).ok()?;
     value
@@ -197,7 +197,7 @@ fn resolve_instance(cli: &Cli) -> (std::path::PathBuf, u16) {
                 root.file_name().unwrap_or_default().to_string_lossy()
             ))
         } else {
-            home.join(".rsclaw-dev")
+            home.join(rsclaw_brand::profile_home_dir("dev"))
         };
         return (dir, DEV_PORT);
     }
@@ -208,7 +208,7 @@ fn resolve_instance(cli: &Cli) -> (std::path::PathBuf, u16) {
                 root.file_name().unwrap_or_default().to_string_lossy()
             ))
         } else {
-            home.join(format!(".rsclaw-{name}"))
+            home.join(rsclaw_brand::profile_home_dir(name))
         };
         let offset =
             (name.bytes().fold(0u32, |a, b| a.wrapping_add(u32::from(b))) % 254) as u16 + 1;

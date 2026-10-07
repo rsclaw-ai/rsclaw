@@ -2117,8 +2117,9 @@ async fn canonicalize_media_path_in_roots(
         }
     }
     anyhow::bail!(
-        "media path '{}' resolves outside allowed dirs (workspace, var, or Downloads/rsclaw)",
-        media
+        "media path '{}' resolves outside allowed dirs (workspace, var, or Downloads/{})",
+        media,
+        rsclaw_brand::CLI_NAME
     )
 }
 
@@ -2129,7 +2130,7 @@ fn allowed_media_roots(base: &std::path::Path) -> Vec<PathBuf> {
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw");
+        .join(rsclaw_brand::CLI_NAME);
     vec![base.join("workspace"), base.join("var"), downloads_rsclaw]
 }
 
@@ -5246,7 +5247,7 @@ async fn list_pairings(State(state): State<AppState>) -> Response {
 async fn get_config(State(_state): State<AppState>) -> Response {
     // Return the raw config file content for the UI editor.
     let config_path = rsclaw_config::loader::detect_config_path()
-        .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("rsclaw.json5"));
+        .unwrap_or_else(|| rsclaw_config::loader::base_dir().join(rsclaw_brand::CONFIG_FILE));
     match std::fs::read_to_string(&config_path) {
         Ok(content) => Json(serde_json::json!({
             "raw": content,
@@ -5272,7 +5273,7 @@ async fn save_config(
     Json(req): Json<SaveConfigRequest>,
 ) -> Response {
     let config_path = rsclaw_config::loader::detect_config_path()
-        .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("rsclaw.json5"));
+        .unwrap_or_else(|| rsclaw_config::loader::base_dir().join(rsclaw_brand::CONFIG_FILE));
 
     // Validate the new config parses before saving.
     let value = match json5::from_str::<serde_json::Value>(&req.raw) {
@@ -6304,8 +6305,9 @@ fn build_provider_models_request(
             .trim_end_matches('}');
         return Err(format!(
             "API key expanded to empty — env var '{var}' is unset or empty in the gateway process. \
-             Either export it before starting the gateway, or replace the placeholder in rsclaw.json5 \
-             with the literal key value."
+             Either export it before starting the gateway, or replace the placeholder in {cfg} \
+             with the literal key value.",
+            cfg = rsclaw_brand::CONFIG_FILE
         ));
     }
 

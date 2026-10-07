@@ -9,7 +9,7 @@ use super::style::*;
 fn gateway_url() -> String {
     let base = rsclaw_config::loader::base_dir();
     // Try to read port from config file.
-    let config_path = base.join("rsclaw.json5");
+    let config_path = base.join(rsclaw_brand::CONFIG_FILE);
     let port = rsclaw_config::loader::load_json5(&config_path)
         .ok()
         .and_then(|c| c.gateway.as_ref()?.port)
@@ -20,7 +20,7 @@ fn gateway_url() -> String {
 /// Resolve auth token from config.
 fn gateway_token() -> String {
     let base = rsclaw_config::loader::base_dir();
-    let config_path = base.join("rsclaw.json5");
+    let config_path = base.join(rsclaw_brand::CONFIG_FILE);
     rsclaw_config::loader::load_json5(&config_path)
         .ok()
         .and_then(|c| {

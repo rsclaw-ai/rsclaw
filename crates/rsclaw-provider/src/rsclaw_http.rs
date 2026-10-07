@@ -31,7 +31,7 @@ const MAX_HOPS: u8 = 5;
 /// Hardcoded default when the caller doesn't pass a configured base.
 /// Mirrors `https://api.rsclaw.ai` — the public gen surface, NOT the
 /// LLM `/v1/agent` mount.
-pub const DEFAULT_GEN_HOST: &str = "https://api.rsclaw.ai";
+pub const DEFAULT_GEN_HOST: &str = rsclaw_brand::API_URL;
 
 /// Resolve the canonical rsclaw gen host root from caller-supplied
 /// config.

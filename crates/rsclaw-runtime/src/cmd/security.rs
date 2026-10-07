@@ -31,7 +31,7 @@ async fn cmd_security_audit(args: rsclaw_cli::SecurityAuditArgs) -> Result<()> {
     let mut fixed = 0usize;
 
     // 1. Config file permissions -- must not be world-readable.
-    for cfg_path in [base.join("rsclaw.json5")] {
+    for cfg_path in [base.join(rsclaw_brand::CONFIG_FILE)] {
         if !cfg_path.exists() {
             continue;
         }
@@ -74,7 +74,7 @@ async fn cmd_security_audit(args: rsclaw_cli::SecurityAuditArgs) -> Result<()> {
     }
 
     // 2. Scan config for plaintext API keys (not ${VAR} references).
-    for cfg_path in [base.join("rsclaw.json5")] {
+    for cfg_path in [base.join(rsclaw_brand::CONFIG_FILE)] {
         if !cfg_path.exists() {
             continue;
         }

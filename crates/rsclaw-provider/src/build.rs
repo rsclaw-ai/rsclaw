@@ -64,10 +64,11 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     Some(s) if s.contains("${") => {
                         let var_name = s.trim_start_matches("${").trim_end_matches('}').to_owned();
                         format!(
-                            "set {var_name} in your shell (then `rsclaw env sync`) \
+                            "set {var_name} in your shell (then `{cli} env sync`) \
                              or edit {}/.env directly",
                             std::env::var("RSCLAW_BASE_DIR")
-                                .unwrap_or_else(|_| "~/.rsclaw".to_owned())
+                                .unwrap_or_else(|_| format!("~/{}", rsclaw_brand::HOME_DIR)),
+                            cli = rsclaw_brand::CLI_NAME
                         )
                     }
                     _ => format!(

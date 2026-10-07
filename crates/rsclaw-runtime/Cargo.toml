@@ -12,6 +12,7 @@ name = "rsclaw_runtime"
 path = "src/lib.rs"
 
 [dependencies]
+rsclaw-brand = { path = "../rsclaw-brand", version = "0.1.0" }
 # Extracted workspace crates
 rsclaw-agent = { path = "../rsclaw-agent", version = "0.1.1" }
 rsclaw-types = { path = "../rsclaw-types", version = "0.1.0" }

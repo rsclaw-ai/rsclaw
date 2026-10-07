@@ -18,7 +18,7 @@ use super::{
 /// `models scan`.
 fn gateway_base() -> String {
     let base = rsclaw_config::loader::base_dir();
-    let port = rsclaw_config::loader::load_json5(&base.join("rsclaw.json5"))
+    let port = rsclaw_config::loader::load_json5(&base.join(rsclaw_brand::CONFIG_FILE))
         .ok()
         .and_then(|c| c.gateway.as_ref()?.port)
         .unwrap_or(18888);
@@ -331,7 +331,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                     "rsclaw models auth v{}",
                     option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
                 ));
-                println!("  Add a provider to rsclaw.json5:");
+                println!("  Add a provider to {}:", rsclaw_brand::CONFIG_FILE);
                 println!();
                 println!("  {}", dim(r#"models: {"#));
                 println!("  {}", dim(r#"  providers: {"#));

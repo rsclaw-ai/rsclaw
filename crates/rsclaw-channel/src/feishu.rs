@@ -304,11 +304,11 @@ fn markdown_to_feishu_post(text: &str) -> serde_json::Value {
 fn build_feishu_card(text: &str, brand: &str) -> serde_json::Value {
     let cleaned = text;
 
-    let title = if brand == "lark" {
+    let title = rsclaw_brand::rebrand(if brand == "lark" {
         "\u{1F980}rsclaw.ai | RsClaw AI Agent Engine"
     } else {
         "\u{1F980}rsclaw.ai | \u{8783}\u{87F9}AI\u{667A}\u{80FD}\u{4F53}\u{5F15}\u{64CE}"
-    };
+    });
     json!({
         "msg_type": "interactive",
         "card": {

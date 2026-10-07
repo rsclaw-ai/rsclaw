@@ -7586,6 +7586,7 @@ dependencies = [
  "reqwest",
  "rsclaw-a2a-types",
  "rsclaw-artifact",
+ "rsclaw-brand",
  "rsclaw-browser",
  "rsclaw-cap",
  "rsclaw-channel",
@@ -7655,6 +7656,7 @@ dependencies = [
  "futures",
  "libc",
  "reqwest",
+ "rsclaw-brand",
  "rsclaw-config",
  "rsclaw-events",
  "rsclaw-i18n",
@@ -7724,6 +7726,7 @@ dependencies = [
  "rand 0.9.2",
  "regex",
  "reqwest",
+ "rsclaw-brand",
  "rsclaw-config",
  "rsclaw-doc",
  "rsclaw-embed",
@@ -7759,6 +7762,7 @@ name = "rsclaw-cli"
 version = "0.1.1"
 dependencies = [
  "clap 4.6.0",
+ "rsclaw-brand",
 ]
 
 [[package]]
@@ -7801,6 +7805,7 @@ dependencies = [
  "libc",
  "regex",
  "reqwest",
+ "rsclaw-brand",
  "serde",
  "serde_json",
  "tempfile",
@@ -7846,6 +7851,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-vision",
+ "rsclaw-brand",
  "rsclaw-platform",
  "serde_json",
  "tokio",
@@ -7878,6 +7884,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "reqwest",
+ "rsclaw-brand",
  "rsclaw-util",
  "serde",
  "serde_json",
@@ -7931,6 +7938,9 @@ dependencies = [
 [[package]]
 name = "rsclaw-i18n"
 version = "0.1.0"
+dependencies = [
+ "rsclaw-brand",
+]
 
 [[package]]
 name = "rsclaw-jobs"
@@ -7943,6 +7953,7 @@ dependencies = [
  "hmac",
  "rand 0.9.2",
  "reqwest",
+ "rsclaw-brand",
  "rsclaw-channel",
  "rsclaw-config",
  "rsclaw-provider",
@@ -8045,6 +8056,7 @@ dependencies = [
  "rayon",
  "redb 4.1.0",
  "regex",
+ "rsclaw-brand",
  "rsclaw-config",
  "rsclaw-memory",
  "rsclaw-store",
@@ -8091,6 +8103,7 @@ dependencies = [
  "json5",
  "rand 0.9.2",
  "reqwest",
+ "rsclaw-brand",
  "rsclaw-browser",
  "rsclaw-channel",
  "rsclaw-computer",
@@ -8131,6 +8144,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "reqwest",
+ "rsclaw-brand",
  "rsclaw-config",
  "rsclaw-embed",
  "rsclaw-i18n",
@@ -8240,6 +8254,7 @@ dependencies = [
  "rsclaw-a2a-types",
  "rsclaw-agent",
  "rsclaw-artifact",
+ "rsclaw-brand",
  "rsclaw-browser",
  "rsclaw-cap",
  "rsclaw-channel",
@@ -8320,6 +8335,7 @@ dependencies = [
  "flate2",
  "futures",
  "reqwest",
+ "rsclaw-brand",
  "rsclaw-config",
  "rsclaw-events",
  "rsclaw-evolution",
@@ -8379,6 +8395,7 @@ dependencies = [
  "futures",
  "indicatif",
  "reqwest",
+ "rsclaw-brand",
  "rsclaw-cli",
  "rsclaw-config",
  "rsclaw-skill",
