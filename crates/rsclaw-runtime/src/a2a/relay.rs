@@ -519,7 +519,28 @@ pub struct RelayHub {
     peer_signal_sessions: std::sync::Mutex<HashMap<String, PeerSignalSession>>,
     consumed_peer_signal_sessions: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     pub metrics: RelayMetrics,
+    /// Spoke-side uplink state (connection to the hub), surfaced by
+    /// `GET /api/v1/a2a/relay/stats` as `uplink`.
+    uplink: std::sync::Mutex<UplinkStatus>,
 }
+
+/// Spoke-side state of the uplink WebSocket to the relay hub.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UplinkStatus {
+    /// True while an authenticated hub WebSocket is open.
+    pub connected: bool,
+    /// Hub currently used / last attempted (credentials and query redacted).
+    pub hub_url: Option<String>,
+    /// This spoke's configured node id.
+    pub node_id: Option<String>,
+    /// Unix milliseconds of the last `connected` transition.
+    pub since: Option<i64>,
+    /// Most recent connect / session error.
+    pub last_error: Option<String>,
+}
+
+/// Max stored uplink error length (bytes); truncated CJK-safely.
+const MAX_UPLINK_ERROR_BYTES: usize = 500;
 
 /// Structured audit event. Emitted via `tracing` with `target =
 /// "a2a.audit"` so operators can pipe to a sink (loki, jq, etc.) with a
@@ -553,6 +574,38 @@ impl RelayHub {
     /// Create an empty relay hub.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Snapshot of the spoke uplink state.
+    pub fn uplink_status(&self) -> UplinkStatus {
+        match self.uplink.lock() {
+            Ok(u) => u.clone(),
+            Err(_) => {
+                warn!("a2a relay uplink status mutex poisoned");
+                UplinkStatus::default()
+            }
+        }
+    }
+
+    /// Record an uplink transition. `connected` flips `since` only when the
+    /// value changes; `error` (when given) replaces `last_error`.
+    fn set_uplink(&self, connected: bool, hub_url: &str, node_id: Option<&str>, error: Option<&str>) {
+        match self.uplink.lock() {
+            Ok(mut u) => {
+                if u.connected != connected || u.since.is_none() {
+                    u.since = Some(chrono::Utc::now().timestamp_millis());
+                }
+                u.connected = connected;
+                u.hub_url = Some(redacted_hub_url(hub_url));
+                if let Some(n) = node_id {
+                    u.node_id = Some(n.to_owned());
+                }
+                if let Some(e) = error {
+                    u.last_error = Some(rsclaw_util::truncate_str(e, MAX_UPLINK_ERROR_BYTES).to_owned());
+                }
+            }
+            Err(_) => warn!("a2a relay uplink status mutex poisoned; state not recorded"),
+        }
     }
 
     fn reserve_peer_signal_session(
@@ -2615,6 +2668,10 @@ pub async fn relay_stats_handler(State(state): State<AppState>) -> Json<serde_js
         },
         "connected_node_ids": nodes,
         "metrics": snapshot,
+        // Spoke-only: this node's connection to its hub. `null` in hub /
+        // disabled mode.
+        "uplink": (state.config.gateway.a2a_relay.mode == A2aRelayModeRuntime::Spoke)
+            .then(|| state.relay_hub.uplink_status()),
     }))
 }
 
@@ -2647,8 +2704,10 @@ pub fn start_spoke_if_configured(state: AppState) {
             let hub_url = &urls[idx];
             let safe_hub_url = redacted_hub_url(hub_url);
             let connect_start = std::time::Instant::now();
+            let node_id = relay.node_id.as_deref();
             match run_spoke_once(state.clone(), &relay, hub_url).await {
                 Ok(()) => {
+                    state.relay_hub.set_uplink(false, hub_url, node_id, None);
                     // Clean disconnect — server-initiated close or
                     // protocol exhaustion. Reset to primary and to fast
                     // backoff so the next outage doesn't compound prior
@@ -2658,6 +2717,9 @@ pub fn start_spoke_if_configured(state: AppState) {
                     info!(hub = %safe_hub_url, "a2a relay spoke session ended cleanly, returning to primary");
                 }
                 Err(e) => {
+                    state
+                        .relay_hub
+                        .set_uplink(false, hub_url, node_id, Some(&format!("{e:#}")));
                     let was_long_lived = connect_start.elapsed() > Duration::from_secs(60);
                     warn!(
                         error = %e,
@@ -2741,6 +2803,7 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
         .await
         .with_context(|| format!("connect relay hub {safe_hub_url}"))?;
     info!(node = %node_id, hub = %safe_hub_url, keypair = signing_key.is_some(), "a2a relay spoke connected");
+    state.relay_hub.set_uplink(true, hub_url, Some(node_id), None);
 
     let (mut write, mut read) = stream.split();
     // Channel item: either a RelayFrame (encoded as JSON Text by the

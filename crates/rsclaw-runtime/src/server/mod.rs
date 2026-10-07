@@ -13,6 +13,14 @@
 //!   GET    /api/v1/agents                   list agents
 //!   POST   /api/v1/agents                   create agent (requires restart)
 //!   GET    /api/v1/agents/:id/status        agent status
+//!   GET    /api/v1/doctor/last              last persisted doctor run
+//!   POST   /api/v1/pairing/:channel/reject  drop a pending pairing request
+//!   GET    /api/v1/owners                   list gateway.owners (local/auth)
+//!   PUT    /api/v1/owners                   replace gateway.owners
+//!   POST   /api/v1/owners                   add one owner {channel, peer}
+//!   DELETE /api/v1/owners/:channel/:peer    remove one owner
+//!   PATCH  /api/v1/memory/docs/:id          pin / unpin a memory doc
+//!   DELETE /api/v1/memory/docs/:id          delete a memory doc
 //!   PATCH  /api/v1/agents/:id              update agent config (requires
 //! restart)   DELETE /api/v1/agents/:id              remove agent (requires
 //! restart)   GET    /api/v1/health                   health check
@@ -419,13 +427,47 @@ struct CreateAgentRequest {
     model: Option<String>,
     default: Option<bool>,
     system: Option<String>,
+    /// Display name (`agents.list[].name`).
+    name: Option<String>,
+    /// Free-form description (`agents.list[].description`).
+    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PatchAgentRequest {
     model: Option<String>,
+    /// `true` makes this the default agent and clears `default` on all others.
     default: Option<bool>,
     system: Option<String>,
+    /// Display name; an empty string removes it.
+    name: Option<String>,
+    /// Description; an empty string removes it.
+    description: Option<String>,
+}
+
+/// Set (non-empty, trimmed) or remove (empty) a string field on an agent
+/// config object.
+fn set_or_clear_agent_text(agent: &mut serde_json::Value, key: &str, value: &str) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        if let Some(obj) = agent.as_object_mut() {
+            obj.remove(key);
+        }
+    } else {
+        agent[key] = serde_json::json!(trimmed);
+    }
+}
+
+/// Clear `default` on every agent in `list` except `keep_id`, so exactly one
+/// agent stays the default.
+fn clear_other_defaults(list: &mut [serde_json::Value], keep_id: &str) {
+    for a in list.iter_mut() {
+        if a["id"].as_str() != Some(keep_id)
+            && let Some(obj) = a.as_object_mut()
+        {
+            obj.remove("default");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +721,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/models/health/reset", post(models_health_reset))
         .route("/doctor", get(run_doctor))
         .route("/doctor/fix", post(run_doctor_fix))
+        .route("/doctor/last", get(doctor_last))
         .route("/channels/wechat/qr-login", post(wechat_qr_start))
         .route("/channels/wechat/qr-status", post(wechat_qr_status))
         .route("/workspace/files", get(list_workspace_files))
@@ -756,7 +799,14 @@ pub fn build_router(state: AppState) -> Router {
         // pin/unpin, importance bump) need shared-state coordination
         // and land in a follow-up.
         .route("/memory/docs", get(memory_list_docs).post(memory_add_doc))
-        .route("/memory/stats", get(memory_stats));
+        .route(
+            "/memory/docs/{id}",
+            patch(memory_patch_doc).delete(memory_delete_doc),
+        )
+        .route("/memory/stats", get(memory_stats))
+        .route("/pairing/{channel}/reject", post(pairing_reject))
+        .route("/owners", get(owners_get).put(owners_put).post(owners_add))
+        .route("/owners/{channel}/{*peer}", delete(owners_remove));
 
     // Mount the knowledge base routes only when the store opened. A KB
     // open failure leaves `knowledge` None; the rest of the API still serves.
@@ -1281,6 +1331,127 @@ mod tests {
         ]);
 
         assert_eq!(reload_failed_scopes(&details), vec!["plugins"]);
+    }
+
+    #[test]
+    fn api_handoff_channel_status_rows_join_registry() {
+        use rsclaw_channel::status::{ChannelState, ChannelStatus};
+        let reg = vec![
+            ChannelStatus {
+                channel: "feishu".into(),
+                account: "default".into(),
+                state: ChannelState::Error,
+                since_ms: 5,
+                last_error: Some("ws down".into()),
+            },
+            ChannelStatus {
+                channel: "telegram".into(),
+                account: "bot2".into(),
+                state: ChannelState::Running,
+                since_ms: 7,
+                last_error: None,
+            },
+            ChannelStatus {
+                channel: "custom".into(),
+                account: "hook1".into(),
+                state: ChannelState::Connected,
+                since_ms: 9,
+                last_error: None,
+            },
+        ];
+        let configured = vec![
+            "feishu".to_owned(),
+            "telegram".to_owned(),
+            "slack".to_owned(),
+            "custom:hook1".to_owned(),
+        ];
+        let rows = channel_status_rows(&configured, &reg);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["state"], "error");
+        assert_eq!(rows[0]["status"], "error");
+        assert_eq!(rows[0]["last_error"], "ws down");
+        assert_eq!(rows[0]["since"], 5);
+        // `running` keeps the legacy "connected" wording.
+        assert_eq!(rows[1]["state"], "running");
+        assert_eq!(rows[1]["status"], "connected");
+        assert_eq!(rows[1]["account"], "bot2");
+        // Configured but never started -> disconnected placeholder.
+        assert_eq!(rows[2]["name"], "slack");
+        assert_eq!(rows[2]["state"], "disconnected");
+        assert!(rows[2]["account"].is_null());
+        assert_eq!(rows[3]["type"], "custom");
+        assert_eq!(rows[3]["name"], "hook1");
+        assert_eq!(rows[3]["state"], "connected");
+    }
+
+    #[test]
+    fn api_handoff_doctor_output_parses_both_streams() {
+        let stdout = "  [ok] config loaded\n  [warn] tools 3/5\n  [fixed] chmod 0600 x\n";
+        let stderr = "  [warn] gateway.auth.token not set (fix: x)\n  [fix-failed] y: boom\n";
+        let checks = parse_doctor_output(stdout, stderr);
+        assert_eq!(checks.len(), 5);
+        let counts = doctor_counts(&checks);
+        assert_eq!(counts, serde_json::json!({"ok": 1, "warn": 2, "error": 1, "fixed": 1}));
+    }
+
+    #[test]
+    fn api_handoff_log_filters_parse() {
+        assert_eq!(log_level_rank("warn"), Some(3));
+        assert_eq!(log_level_rank("Error"), Some(4));
+        assert_eq!(log_level_rank("verbose"), None);
+        assert_eq!(parse_log_since("1767225600"), Some(1_767_225_600_000));
+        assert_eq!(parse_log_since("1767225600123"), Some(1_767_225_600_123));
+        assert_eq!(
+            parse_log_since("2026-01-01T00:00:00Z"),
+            Some(1_767_225_600_000)
+        );
+        assert_eq!(parse_log_since("yesterday"), None);
+        let p = parse_log_line("2026-01-01T00:00:01.500000Z  WARN rsclaw::gw: disk low");
+        assert_eq!(p.level, "WARN");
+        assert_eq!(p.msg, "disk low");
+        assert_eq!(p.ts_ms, Some(1_767_225_601_500));
+        let p = parse_log_line("continuation line");
+        assert_eq!(p.level, "INFO");
+        assert!(p.ts_ms.is_none());
+    }
+
+    #[test]
+    fn api_handoff_owner_entries_validate() {
+        assert_eq!(
+            normalize_owner_entry(" feishu:ou_abc ").unwrap(),
+            "feishu:ou_abc"
+        );
+        assert_eq!(
+            normalize_owner_entry("matrix:@me:example.org").unwrap(),
+            "matrix:@me:example.org"
+        );
+        assert!(normalize_owner_entry("feishu").is_err());
+        assert!(normalize_owner_entry("feishu:").is_err());
+        assert!(normalize_owner_entry(":peer").is_err());
+        assert!(normalize_owner_entry("fei shu:peer").is_err());
+        assert!(normalize_owner_entry("feishu:a b").is_err());
+        let list = normalize_owner_list(["a:1", "b:2", "a:1"]).unwrap();
+        assert_eq!(list, vec!["a:1", "b:2"]);
+    }
+
+    #[test]
+    fn api_handoff_agent_default_is_exclusive() {
+        let mut list = vec![
+            serde_json::json!({"id": "main", "default": true}),
+            serde_json::json!({"id": "ops", "default": false}),
+            serde_json::json!({"id": "dev"}),
+        ];
+        clear_other_defaults(&mut list, "dev");
+        list[2]["default"] = serde_json::json!(true);
+        assert!(list[0].get("default").is_none());
+        assert!(list[1].get("default").is_none());
+        assert_eq!(list[2]["default"], true);
+
+        let mut agent = serde_json::json!({"id": "dev", "name": "Old"});
+        set_or_clear_agent_text(&mut agent, "name", "  New  ");
+        assert_eq!(agent["name"], "New");
+        set_or_clear_agent_text(&mut agent, "name", " ");
+        assert!(agent.get("name").is_none());
     }
 
     #[test]
@@ -2124,15 +2295,26 @@ async fn create_agent(
         if let Some(d) = req.default {
             new_agent["default"] = serde_json::json!(d);
         }
+        if let Some(n) = req.name.as_deref() {
+            set_or_clear_agent_text(&mut new_agent, "name", n);
+        }
+        if let Some(d) = req.description.as_deref() {
+            set_or_clear_agent_text(&mut new_agent, "description", d);
+        }
         if let Some(arr) = val
             .pointer_mut("/agents/list")
             .and_then(|v| v.as_array_mut())
         {
+            if req.default == Some(true) {
+                clear_other_defaults(arr, &id);
+            }
             arr.push(new_agent);
+        } else if val.get("agents").is_some_and(|a| a.is_object()) {
+            val["agents"]["list"] = serde_json::json!([new_agent]);
         } else {
             val["agents"] = serde_json::json!({ "list": [new_agent] });
         }
-        std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+        rsclaw_config::loader::write_file_atomic(&path, &serde_json::to_string_pretty(&val)?)?;
 
         // Seed workspace directory for the new agent (id validated above).
         if let Some(ws) = resolve_workspace(Some(&id))
@@ -2174,6 +2356,12 @@ async fn patch_agent(
             .pointer_mut("/agents/list")
             .and_then(|v| v.as_array_mut())
             .ok_or_else(|| anyhow::anyhow!("not found: agent '{}' not found", id))?;
+        if !list.iter().any(|a| a["id"].as_str() == Some(id.as_str())) {
+            return Err(anyhow::anyhow!("not found: agent '{}' not found", id));
+        }
+        if req.default == Some(true) {
+            clear_other_defaults(list, &id);
+        }
         let agent = list
             .iter_mut()
             .find(|a| a["id"].as_str() == Some(id.as_str()))
@@ -2187,7 +2375,13 @@ async fn patch_agent(
         if let Some(d) = req.default {
             agent["default"] = serde_json::json!(d);
         }
-        std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+        if let Some(n) = req.name.as_deref() {
+            set_or_clear_agent_text(agent, "name", n);
+        }
+        if let Some(d) = req.description.as_deref() {
+            set_or_clear_agent_text(agent, "description", d);
+        }
+        rsclaw_config::loader::write_file_atomic(&path, &serde_json::to_string_pretty(&val)?)?;
         Ok(())
     })();
     match result {
@@ -2471,14 +2665,86 @@ async fn hub_tools() -> impl IntoResponse {
     Json(crate::cmd::tools::tools_catalog())
 }
 
-async fn health(State(_state): State<AppState>) -> impl IntoResponse {
+async fn health(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     // Minimal unauthenticated health payload (R4 review I2).
     // Previously leaked `version` + `port` to anyone reaching the
     // bare `/health` alias — useful for CVE fingerprinting against
     // a public-facing gateway, and the port is redundant since the
     // caller already connected to it. Rich uptime / build info now
     // lives only on the auth-gated `/api/v1/status` endpoint.
+    //
+    // `version` is added only for trusted callers (direct loopback peer or a
+    // valid Bearer token), so local clients can show it before auth without
+    // re-opening the fingerprinting hole for anonymous remote probes.
+    let token = state.live.gateway.read().await.auth_token.clone();
+    if is_loopback(peer) || bearer_matches(&headers, token.as_deref()) {
+        return Json(serde_json::json!({
+            "status": "ok",
+            "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+        }));
+    }
     Json(serde_json::json!({"status": "ok"}))
+}
+
+/// Legacy `status` value for a channel row: the old endpoint always said
+/// `"connected"`; live-but-unconfirmed (`running`) keeps that wording so
+/// older clients counting `status == "connected"` don't regress.
+fn legacy_channel_status(state: rsclaw_channel::status::ChannelState) -> &'static str {
+    use rsclaw_channel::status::ChannelState;
+    match state {
+        ChannelState::Connected | ChannelState::Running => "connected",
+        other => other.as_str(),
+    }
+}
+
+/// Build `/api/v1/status` `channels[]`: one row per running account of each
+/// configured channel (from the status registry), or a single
+/// `disconnected` placeholder when a configured channel has no live account.
+fn channel_status_rows(
+    configured: &[String],
+    registry: &[rsclaw_channel::status::ChannelStatus],
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for name in configured {
+        // Custom channels register as ("custom", <name>).
+        let (kind, account_filter) = match name.strip_prefix("custom:") {
+            Some(custom_name) => ("custom", Some(custom_name)),
+            None => (name.as_str(), None),
+        };
+        let display = account_filter.unwrap_or(kind);
+        let rows: Vec<&rsclaw_channel::status::ChannelStatus> = registry
+            .iter()
+            .filter(|r| r.channel == kind && account_filter.is_none_or(|a| r.account == a))
+            .collect();
+        if rows.is_empty() {
+            out.push(serde_json::json!({
+                "type": kind,
+                "name": display,
+                "status": "disconnected",
+                "account": serde_json::Value::Null,
+                "state": "disconnected",
+                "since": serde_json::Value::Null,
+                "last_error": serde_json::Value::Null,
+            }));
+            continue;
+        }
+        for r in rows {
+            out.push(serde_json::json!({
+                "type": kind,
+                "name": display,
+                "status": legacy_channel_status(r.state),
+                "account": r.account,
+                "state": r.state.as_str(),
+                "since": r.since_ms,
+                "last_error": r.last_error,
+            }));
+        }
+    }
+    out
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
@@ -2490,19 +2756,16 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
 
     let port = state.live.gateway.read().await.port;
 
-    // Collect channel info from channel runtime config.
+    // Configured channels from channel runtime config, joined with the live
+    // connection-state registry fed by the channel run loops.
     let channels: Vec<serde_json::Value> = {
         let ch = state.live.channel.read().await;
         let c = &ch.channels;
-        let mut chs = Vec::new();
+        let mut configured: Vec<String> = Vec::new();
         macro_rules! check_ch {
             ($($name:ident),*) => {
                 $(if c.$name.is_some() {
-                    chs.push(serde_json::json!({
-                        "type": stringify!($name),
-                        "name": stringify!($name),
-                        "status": "connected",
-                    }));
+                    configured.push(stringify!($name).to_owned());
                 })*
             }
         }
@@ -2510,7 +2773,11 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
             telegram, discord, slack, whatsapp, signal, feishu, dingtalk, wecom, wechat, qq, line,
             zalo, matrix
         );
-        chs
+        for custom in c.custom.iter().flatten() {
+            configured.push(format!("custom:{}", custom.name));
+        }
+        drop(ch);
+        channel_status_rows(&configured, &rsclaw_channel::status::snapshot())
     };
 
     // Active session count: sessions with activity in the last 24h.
@@ -2587,6 +2854,7 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         "agents": state.agents.len(),
         "port": port,
         "uptime": uptime,
+        "uptime_secs": uptime_secs,
         "memory": memory,
         "sessions": sessions,
         "channels": channels,
@@ -3976,7 +4244,13 @@ async fn cron_save_and_reload(
 /// GET /api/v1/cron — list all cron jobs.
 async fn cron_list() -> Response {
     match cron_load_jobs().await {
-        Ok(jobs) => Json(serde_json::json!({"jobs": jobs})).into_response(),
+        Ok(mut jobs) => {
+            let now_ms = crate::cron::current_timestamp_ms();
+            for job in &mut jobs {
+                crate::cron::annotate_next_run(job, now_ms);
+            }
+            Json(serde_json::json!({"jobs": jobs})).into_response()
+        }
         Err(e) => cron_load_failed(e),
     }
 }
@@ -6514,39 +6788,124 @@ async fn run_doctor_cmd(fix: bool) -> Response {
         cmd.creation_flags(0x08000000);
     }
 
+    let started_at = chrono::Utc::now().timestamp_millis();
     match cmd.output() {
         Ok(output) => {
+            let finished_at = chrono::Utc::now().timestamp_millis();
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            // Parse output lines into structured results.
-            let mut checks: Vec<serde_json::Value> = Vec::new();
-            static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-                regex::Regex::new(r"\x1b\[[0-9;]*m").expect("ansi escape regex")
+            let checks = parse_doctor_output(&stdout, &stderr);
+            let counts = doctor_counts(&checks);
+            let success = output.status.success();
+            let record = serde_json::json!({
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "fix": fix,
+                "success": success,
+                "counts": counts,
+                "checks": checks,
             });
-            for line in stdout.lines() {
-                let clean = ANSI_RE.replace_all(line, "");
-                let clean = clean.trim();
-                if let Some(msg) = clean.strip_prefix("[ok]") {
-                    checks.push(serde_json::json!({"status": "ok", "message": msg.trim()}));
-                } else if let Some(msg) = clean.strip_prefix("[warn]") {
-                    checks.push(serde_json::json!({"status": "warn", "message": msg.trim()}));
-                } else if let Some(msg) = clean
-                    .strip_prefix("[error]")
-                    .or_else(|| clean.strip_prefix("[err]"))
-                {
-                    checks.push(serde_json::json!({"status": "error", "message": msg.trim()}));
-                } else if let Some(msg) = clean.strip_prefix("[fixed]") {
-                    checks.push(serde_json::json!({"status": "fixed", "message": msg.trim()}));
-                }
-            }
+            persist_doctor_record(&record);
             Json(serde_json::json!({
-                "success": output.status.success(),
+                "success": success,
                 "checks": checks,
                 "raw": stdout,
                 "stderr": stderr,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "counts": counts,
             }))
             .into_response()
         }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Parse `rsclaw doctor` output into `{status, message}` checks. Passing
+/// checks go to stdout; issues (`[warn]`) and failed fixes go to stderr, so
+/// both streams are scanned (stdout first, preserving order within each).
+fn parse_doctor_output(stdout: &str, stderr: &str) -> Vec<serde_json::Value> {
+    static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\x1b\[[0-9;]*m").expect("ansi escape regex")
+    });
+    let mut checks: Vec<serde_json::Value> = Vec::new();
+    for line in stdout.lines().chain(stderr.lines()) {
+        let clean = ANSI_RE.replace_all(line, "");
+        let clean = clean.trim();
+        let (status, msg) = if let Some(msg) = clean.strip_prefix("[ok]") {
+            ("ok", msg)
+        } else if let Some(msg) = clean.strip_prefix("[warn]") {
+            ("warn", msg)
+        } else if let Some(msg) = clean
+            .strip_prefix("[error]")
+            .or_else(|| clean.strip_prefix("[err]"))
+            .or_else(|| clean.strip_prefix("[fix-failed]"))
+        {
+            ("error", msg)
+        } else if let Some(msg) = clean.strip_prefix("[fixed]") {
+            ("fixed", msg)
+        } else {
+            continue;
+        };
+        checks.push(serde_json::json!({"status": status, "message": msg.trim()}));
+    }
+    checks
+}
+
+/// `{ok, warn, error, fixed}` tallies of parsed doctor checks.
+fn doctor_counts(checks: &[serde_json::Value]) -> serde_json::Value {
+    let count = |s: &str| checks.iter().filter(|c| c["status"] == s).count();
+    serde_json::json!({
+        "ok": count("ok"),
+        "warn": count("warn"),
+        "error": count("error"),
+        "fixed": count("fixed"),
+    })
+}
+
+/// Where the last doctor run is persisted (`<base>/doctor-last.json`).
+fn doctor_last_path() -> std::path::PathBuf {
+    rsclaw_config::loader::base_dir().join("doctor-last.json")
+}
+
+/// Atomically persist the last doctor run. Best-effort: a write failure is
+/// logged and the doctor response is still returned.
+fn persist_doctor_record(record: &serde_json::Value) {
+    let path = doctor_last_path();
+    let body = match serde_json::to_string_pretty(record) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "doctor: failed to serialize last-run record");
+            return;
+        }
+    };
+    if let Err(e) = rsclaw_config::loader::write_file_atomic(&path, &body) {
+        warn!(path = %path.display(), error = %e, "doctor: failed to persist last-run record");
+    }
+}
+
+/// GET /api/v1/doctor/last — the persisted result of the last doctor run
+/// (404 when doctor has never run through the API).
+async fn doctor_last() -> Response {
+    let path = doctor_last_path();
+    match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("corrupt doctor record: {e}")})),
+            )
+                .into_response(),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "doctor has not been run yet"})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -6562,13 +6921,111 @@ async fn run_doctor_cmd(fix: bool) -> Response {
 #[derive(Debug, Deserialize)]
 struct LogsQuery {
     limit: Option<usize>,
+    /// Minimum level: `error` | `warn` | `info` | `debug` (`trace` accepted).
+    level: Option<String>,
+    /// Only lines at/after this instant: unix seconds or RFC3339.
+    since: Option<String>,
 }
 
-/// GET /api/v1/logs?limit=50
+/// Severity rank for log-level filtering (higher = more severe).
+fn log_level_rank(level: &str) -> Option<u8> {
+    match level.trim().to_ascii_uppercase().as_str() {
+        "ERROR" => Some(4),
+        "WARN" | "WARNING" => Some(3),
+        "INFO" => Some(2),
+        "DEBUG" => Some(1),
+        "TRACE" => Some(0),
+        _ => None,
+    }
+}
+
+/// Parse a `since` filter: unix seconds (values >= 1e12 are taken as
+/// milliseconds) or an RFC3339 timestamp. Returns unix milliseconds.
+fn parse_log_since(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if let Ok(n) = raw.parse::<i64>() {
+        return Some(if n >= 1_000_000_000_000 { n } else { n.saturating_mul(1000) });
+    }
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// One parsed gateway.log line.
+struct ParsedLogLine<'a> {
+    /// Raw UTC timestamp (`2026-04-03T03:32:17.581318Z`), empty when absent.
+    ts: &'a str,
+    /// Unix milliseconds of `ts`, when it parses.
+    ts_ms: Option<i64>,
+    level: &'static str,
+    msg: &'a str,
+}
+
+/// Parse `"2026-04-03T03:32:17.581318Z  INFO rsclaw::module: message"`.
+/// Lines without a timestamp are reported as INFO with the whole line as msg.
+fn parse_log_line(clean: &str) -> ParsedLogLine<'_> {
+    let mut ts = "";
+    let mut level = "INFO";
+    let mut msg = clean;
+
+    if clean.len() > 30 && clean.as_bytes().get(4) == Some(&b'-') {
+        // Has timestamp
+        if let Some((before_z, rest)) = clean.split_once("Z ") {
+            ts = &clean[..before_z.len() + 1]; // includes 'Z'
+            let rest = rest.trim();
+            // Extract level
+            for lvl in ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"] {
+                if let Some(after_lvl) = rest.strip_prefix(lvl) {
+                    level = lvl;
+                    msg = after_lvl.trim();
+                    // Strip module prefix "rsclaw::xxx:"
+                    if let Some((_, after_colon)) = msg.split_once(": ") {
+                        msg = after_colon;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    let ts_ms = chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.timestamp_millis());
+    ParsedLogLine { ts, ts_ms, level, msg }
+}
+
+/// GET /api/v1/logs?limit=50[&level=warn][&since=<unix secs|RFC3339>]
 /// Read the last N lines from the gateway log file, parse into structured
-/// entries.
+/// entries. With `level` / `since`, the newest `limit` MATCHING entries are
+/// returned; lines without a timestamp never match a `since` filter.
 async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
     let limit = q.limit.unwrap_or(50).min(200);
+    let min_rank = match q.level.as_deref().filter(|l| !l.trim().is_empty()) {
+        None => None,
+        Some(l) => match log_level_rank(l) {
+            Some(r) => Some(r),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid level (error|warn|info|debug)"})),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let since_ms = match q.since.as_deref().filter(|s| !s.trim().is_empty()) {
+        None => None,
+        Some(raw) => match parse_log_since(raw) {
+            Some(ms) => Some(ms),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid since (unix seconds or RFC3339)"})),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let filtered = min_rank.is_some() || since_ms.is_some();
     let log_path = rsclaw_config::loader::log_file();
 
     let content = match std::fs::read_to_string(&log_path) {
@@ -6586,40 +7043,34 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
             .expect("secret redaction regex")
     });
 
-    let lines: Vec<&str> = content.lines().rev().take(limit).collect();
     let mut logs: Vec<serde_json::Value> = Vec::new();
-
-    for line in lines.into_iter().rev() {
+    // Unfiltered: the last `limit` raw lines (legacy behaviour). Filtered:
+    // walk back until `limit` matching entries are collected.
+    for (scanned, line) in content.lines().rev().enumerate() {
+        if !filtered && scanned >= limit {
+            break;
+        }
+        if filtered && logs.len() >= limit {
+            break;
+        }
         let clean = ANSI_RE.replace_all(line, "");
         let clean = clean.trim();
         if clean.is_empty() {
             continue;
         }
 
-        // Parse format: "2026-04-03T03:32:17.581318Z  INFO rsclaw::module: message"
-        let mut ts = "";
-        let mut level = "INFO";
-        let mut msg = clean;
-
-        if clean.len() > 30 && clean.as_bytes().get(4) == Some(&b'-') {
-            // Has timestamp
-            if let Some((before_z, rest)) = clean.split_once("Z ") {
-                ts = &clean[..before_z.len() + 1]; // includes 'Z'
-                let rest = rest.trim();
-                // Extract level
-                for lvl in &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"] {
-                    if let Some(after_lvl) = rest.strip_prefix(lvl) {
-                        level = lvl;
-                        msg = after_lvl.trim();
-                        // Strip module prefix "rsclaw::xxx:"
-                        if let Some((_, after_colon)) = msg.split_once(": ") {
-                            msg = after_colon;
-                        }
-                        break;
-                    }
-                }
-            }
+        let parsed = parse_log_line(clean);
+        if let Some(min) = min_rank
+            && log_level_rank(parsed.level).is_none_or(|r| r < min)
+        {
+            continue;
         }
+        if let Some(since) = since_ms
+            && parsed.ts_ms.is_none_or(|t| t < since)
+        {
+            continue;
+        }
+        let ts = parsed.ts;
 
         // Format timestamp to local HH:MM:SS
         let short_ts = if ts.len() >= 19 {
@@ -6641,11 +7092,12 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
         };
 
         // C2: redact secrets before exposing logs via API
-        let redacted_msg = SECRET_RE.replace_all(msg, "[REDACTED]");
+        let redacted_msg = SECRET_RE.replace_all(parsed.msg, "[REDACTED]");
 
         logs.push(serde_json::json!({
             "ts": short_ts,
-            "level": match level {
+            "ts_ms": parsed.ts_ms,
+            "level": match parsed.level {
                 "ERROR" => "ERROR",
                 "WARN" => "WARN",
                 "DEBUG" => "DEBUG",
@@ -6654,6 +7106,7 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
             "msg": redacted_msg,
         }));
     }
+    logs.reverse();
 
     Json(serde_json::json!({ "logs": logs })).into_response()
 }
@@ -7169,8 +7622,19 @@ struct MemoryListParams {
     scope: Option<String>,
     /// Filter by exact `kind` ("note" | "fact" | "summary" | "session" | ...).
     kind: Option<String>,
+    /// Filter by tier ("core" | "working" | "peripheral").
+    tier: Option<String>,
     /// Max results (defaults to 200, hard cap 1000).
     limit: Option<usize>,
+}
+
+/// Wire name of a memory tier.
+fn mem_tier_str(tier: &rsclaw_agent::memory::MemDocTier) -> &'static str {
+    match tier {
+        rsclaw_agent::memory::MemDocTier::Core => "core",
+        rsclaw_agent::memory::MemDocTier::Working => "working",
+        rsclaw_agent::memory::MemDocTier::Peripheral => "peripheral",
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -7185,8 +7649,14 @@ struct MemoryDocOut {
     tier: String,
     importance: f32,
     pinned: bool,
+    /// Unix SECONDS (legacy field; see `created_at_ms`).
     created_at: i64,
+    /// Unix SECONDS (legacy field; see `accessed_at_ms`).
     accessed_at: i64,
+    /// `created_at` in unix milliseconds.
+    created_at_ms: i64,
+    /// `accessed_at` in unix milliseconds.
+    accessed_at_ms: i64,
     access_count: i64,
     /// Weibull stretched-exponential decay score (0..1). Computed
     /// on read since it depends on `now()`.
@@ -7195,12 +7665,7 @@ struct MemoryDocOut {
 
 impl From<&rsclaw_agent::memory::MemoryDoc> for MemoryDocOut {
     fn from(d: &rsclaw_agent::memory::MemoryDoc) -> Self {
-        let tier = match d.tier {
-            rsclaw_agent::memory::MemDocTier::Core => "core",
-            rsclaw_agent::memory::MemDocTier::Working => "working",
-            rsclaw_agent::memory::MemDocTier::Peripheral => "peripheral",
-        }
-        .to_string();
+        let tier = mem_tier_str(&d.tier).to_string();
         Self {
             id: d.id.clone(),
             scope: d.scope.clone(),
@@ -7214,6 +7679,8 @@ impl From<&rsclaw_agent::memory::MemoryDoc> for MemoryDocOut {
             pinned: d.pinned,
             created_at: d.created_at,
             accessed_at: d.accessed_at,
+            created_at_ms: d.created_at.saturating_mul(1000),
+            accessed_at_ms: d.accessed_at.saturating_mul(1000),
             access_count: d.access_count,
             relevance_score: d.relevance_score(),
         }
@@ -7272,6 +7739,14 @@ async fn memory_list_docs(
         .iter()
         .filter(|d| params.scope.as_ref().is_none_or(|s| &d.scope == s))
         .filter(|d| params.kind.as_ref().is_none_or(|k| &d.kind == k))
+        .filter(|d| {
+            params
+                .tier
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .is_none_or(|t| mem_tier_str(&d.tier).eq_ignore_ascii_case(t))
+        })
         .collect();
 
     let total = filtered.len();
@@ -7476,3 +7951,359 @@ async fn memory_add_doc(
     })
     .into_response()
 }
+
+/// `{pinned}` body for `PATCH /api/v1/memory/docs/{id}`.
+#[derive(Debug, Deserialize)]
+struct MemoryPatchRequest {
+    pinned: Option<bool>,
+}
+
+/// DELETE /api/v1/memory/docs/{id} — permanently remove one memory doc
+/// (redb row in a single write txn, plus the BM25 entry).
+async fn memory_delete_doc(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(mem) = live_memory_store(&state) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "memory store not available"})),
+        )
+            .into_response();
+    };
+    let mut store = mem.lock().await;
+    if store.get_sync(&id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "memory doc not found"})),
+        )
+            .into_response();
+    }
+    match store.delete(&id).await {
+        Ok(()) => Json(serde_json::json!({"id": id, "deleted": true})).into_response(),
+        Err(e) => {
+            warn!(error = %e, id = %id, "memory_delete: store delete failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// PATCH /api/v1/memory/docs/{id} — `{pinned: bool}`; returns the updated doc.
+async fn memory_patch_doc(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryPatchRequest>,
+) -> Response {
+    let Some(pinned) = req.pinned else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "nothing to update (expected `pinned`)"})),
+        )
+            .into_response();
+    };
+    let Some(mem) = live_memory_store(&state) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "memory store not available"})),
+        )
+            .into_response();
+    };
+    let mut store = mem.lock().await;
+    match store.set_pinned(&id, pinned) {
+        Ok(true) => match store.get_sync(&id) {
+            Some(d) => Json(MemoryDocOut::from(d)).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "memory doc not found"})),
+            )
+                .into_response(),
+        },
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "memory doc not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            warn!(error = %e, id = %id, "memory_patch: persist failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pairing reject
+// ---------------------------------------------------------------------------
+
+/// Body for `POST /api/v1/pairing/{channel}/reject`: a code or a peer id.
+#[derive(Debug, Deserialize)]
+struct PairingRejectRequest {
+    code: Option<String>,
+    #[serde(alias = "peerId", alias = "peer_id")]
+    peer: Option<String>,
+}
+
+/// POST /api/v1/pairing/{channel}/reject — drop a pending pairing request
+/// (by `code` or `peer`). The peer is not blocked; a later DM mints a new
+/// code.
+async fn pairing_reject(
+    State(state): State<AppState>,
+    Path(channel): Path<String>,
+    Json(req): Json<PairingRejectRequest>,
+) -> Response {
+    let code = req.code.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let peer = req.peer.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if code.is_none() && peer.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing code or peer"})),
+        )
+            .into_response();
+    }
+    let enforcer = match state.dm_enforcers.read() {
+        Ok(guard) => guard.get(&channel).map(Arc::clone),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal lock error"})),
+            )
+                .into_response();
+        }
+    };
+    let Some(enforcer) = enforcer else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "channel not found"})),
+        )
+            .into_response();
+    };
+    match enforcer.reject_pairing(code, peer).await {
+        Some((code, peer_id)) => Json(serde_json::json!({
+            "rejected": true,
+            "channel": channel,
+            "code": code,
+            "peerId": peer_id,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "pending pairing request not found or expired"})),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Owners (`gateway.owners`)
+// ---------------------------------------------------------------------------
+
+/// Serializes owners read-modify-write cycles on the config file.
+static OWNERS_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Max length of one `channel:peer` owner entry.
+const MAX_OWNER_ENTRY_BYTES: usize = 256;
+
+/// Owner endpoints grant owner-only tools and host commands, so they are
+/// restricted to authenticated callers (a gateway token is configured and
+/// the auth middleware verified it) or a direct loopback peer when the
+/// gateway runs open.
+async fn owners_access_denied(state: &AppState, peer: SocketAddr) -> Option<Response> {
+    let auth_enabled = state.live.gateway.read().await.auth_token.is_some();
+    if headers_are_trusted(auth_enabled, peer) {
+        return None;
+    }
+    warn!(%peer, "owners API refused: open gateway and non-loopback peer");
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "owners API is local-only when no auth token is set"})),
+        )
+            .into_response(),
+    )
+}
+
+/// Validate and normalize one `"<channel>:<peer>"` owner entry.
+fn normalize_owner_entry(raw: &str) -> Result<String, String> {
+    let entry = raw.trim();
+    if entry.len() > MAX_OWNER_ENTRY_BYTES {
+        return Err(format!(
+            "owner entry too long (max {MAX_OWNER_ENTRY_BYTES} bytes)"
+        ));
+    }
+    let Some((channel, peer)) = entry.split_once(':') else {
+        return Err(format!("invalid owner `{entry}`: expected `<channel>:<peer>`"));
+    };
+    if !rsclaw_util::fs_guard::is_safe_slug(channel) {
+        return Err(format!("invalid owner `{entry}`: bad channel name"));
+    }
+    if peer.is_empty() || peer.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("invalid owner `{entry}`: bad peer id"));
+    }
+    Ok(entry.to_owned())
+}
+
+/// Validate, normalize and de-duplicate (order-preserving) an owners list.
+fn normalize_owner_list<'a>(raw: impl IntoIterator<Item = &'a str>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in raw {
+        let e = normalize_owner_entry(r)?;
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    Ok(out)
+}
+
+/// `gateway.owners` from a parsed config JSON value.
+fn owners_from_config(val: &serde_json::Value) -> Vec<String> {
+    val.pointer("/gateway/owners")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read-modify-write `gateway.owners` atomically, then apply the new set to
+/// the live trust registry immediately (hot reload re-applies the same set
+/// from disk).
+async fn update_owners<F>(f: F) -> Result<Vec<String>, Response>
+where
+    F: FnOnce(Vec<String>) -> Result<Vec<String>, (StatusCode, String)>,
+{
+    let _guard = OWNERS_WRITE_LOCK.lock().await;
+    let internal = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response()
+    };
+    let (path, mut val) = rsclaw_config::config_json::load_config_json()
+        .map_err(|e| internal(format!("{e:#}")))?;
+    let current = owners_from_config(&val);
+    let owners = f(current.clone()).map_err(|(status, e)| {
+        (status, Json(serde_json::json!({"error": e}))).into_response()
+    })?;
+    if owners == current {
+        // No-op (e.g. re-adding an existing owner): skip the write so the
+        // config watcher doesn't fire a pointless reload.
+        return Ok(owners);
+    }
+    if !val.get("gateway").is_some_and(|g| g.is_object()) {
+        val["gateway"] = serde_json::json!({});
+    }
+    val["gateway"]["owners"] = serde_json::json!(owners);
+    let body = serde_json::to_string_pretty(&val).map_err(|e| internal(e.to_string()))?;
+    rsclaw_config::loader::write_file_atomic(&path, &body)
+        .map_err(|e| internal(format!("{e:#}")))?;
+    rsclaw_agent::trust::set_explicit_owners(owners.iter().cloned());
+    info!(count = owners.len(), "gateway.owners updated via API");
+    Ok(owners)
+}
+
+/// GET /api/v1/owners — `{"owners": ["channel:peer", ...]}`.
+async fn owners_get(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Some(denied) = owners_access_denied(&state, peer).await {
+        return denied;
+    }
+    match rsclaw_config::config_json::load_config_json() {
+        Ok((_, val)) => Json(serde_json::json!({"owners": owners_from_config(&val)})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// Body for `PUT /api/v1/owners`.
+#[derive(Debug, Deserialize)]
+struct OwnersPutRequest {
+    owners: Vec<String>,
+}
+
+/// PUT /api/v1/owners — replace the whole owners list.
+async fn owners_put(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    Json(req): Json<OwnersPutRequest>,
+) -> Response {
+    if let Some(denied) = owners_access_denied(&state, peer).await {
+        return denied;
+    }
+    match update_owners(|_| {
+        normalize_owner_list(req.owners.iter().map(String::as_str))
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))
+    })
+    .await
+    {
+        Ok(owners) => Json(serde_json::json!({"owners": owners})).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// Body for `POST /api/v1/owners`.
+#[derive(Debug, Deserialize)]
+struct OwnerAddRequest {
+    channel: String,
+    #[serde(alias = "peerId", alias = "peer_id")]
+    peer: String,
+}
+
+/// POST /api/v1/owners — add one `{channel, peer}` owner (idempotent).
+async fn owners_add(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    Json(req): Json<OwnerAddRequest>,
+) -> Response {
+    if let Some(denied) = owners_access_denied(&state, peer).await {
+        return denied;
+    }
+    let entry = format!("{}:{}", req.channel.trim(), req.peer.trim());
+    match update_owners(|mut cur| {
+        cur.push(entry);
+        normalize_owner_list(cur.iter().map(String::as_str))
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))
+    })
+    .await
+    {
+        Ok(owners) => Json(serde_json::json!({"owners": owners})).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// DELETE /api/v1/owners/{channel}/{peer} — remove one owner (404 if absent).
+async fn owners_remove(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer_addr): axum::extract::ConnectInfo<SocketAddr>,
+    Path((channel, peer)): Path<(String, String)>,
+) -> Response {
+    if let Some(denied) = owners_access_denied(&state, peer_addr).await {
+        return denied;
+    }
+    let entry = format!("{}:{}", channel.trim(), peer.trim());
+    let result = update_owners(|cur| {
+        let before = cur.len();
+        let kept: Vec<String> = cur.into_iter().filter(|o| o.trim() != entry).collect();
+        if kept.len() == before {
+            return Err((StatusCode::NOT_FOUND, "owner not found".to_owned()));
+        }
+        Ok(kept)
+    })
+    .await;
+    match result {
+        Ok(owners) => Json(serde_json::json!({"owners": owners})).into_response(),
+        Err(resp) => resp,
+    }
+}
+

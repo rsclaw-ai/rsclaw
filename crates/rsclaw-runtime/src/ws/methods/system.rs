@@ -133,6 +133,7 @@ pub async fn config_get(ctx: MethodCtx) -> MethodResult {
 
 pub async fn cron_list(_ctx: MethodCtx) -> MethodResult {
     let (jobs, _) = crate::cron::load_cron_jobs();
+    let now_ms = crate::cron::current_timestamp_ms();
     let list: Vec<serde_json::Value> = jobs
         .iter()
         .map(|j| {
@@ -149,6 +150,13 @@ pub async fn cron_list(_ctx: MethodCtx) -> MethodResult {
             if let Some(tz) = j.timezone() {
                 v["tz"] = serde_json::json!(tz);
             }
+            if let Some(ref st) = j.state {
+                match serde_json::to_value(st) {
+                    Ok(st) => v["state"] = st,
+                    Err(e) => tracing::warn!(job = %j.id, "cron.list: state serialize failed: {e}"),
+                }
+            }
+            crate::cron::annotate_next_run(&mut v, now_ms);
             v
         })
         .collect();

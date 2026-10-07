@@ -1504,6 +1504,69 @@ async fn run_plugin_preflight(
     Ok(PluginPreflightOutcome { result, should_run })
 }
 
+/// Fill `state.nextRunAtMs` on an enabled job (raw JSON, as served by the
+/// HTTP / WS cron list). A future value the runner already persisted wins
+/// (it accounts for error backoff); otherwise the next fire time is computed
+/// from the schedule in the job's own timezone. Disabled jobs, unparseable
+/// schedules and exhausted one-shots are left untouched.
+pub fn annotate_next_run(job: &mut serde_json::Value, now_ms: u64) {
+    if job.get("enabled").and_then(serde_json::Value::as_bool) != Some(true) {
+        return;
+    }
+    let stored = job
+        .pointer("/state/nextRunAtMs")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|t| *t > now_ms);
+    let next = stored.or_else(|| {
+        let schedule: CronSchedule = serde_json::from_value(job.get("schedule")?.clone()).ok()?;
+        schedule.compute_next_run(now_ms)
+    });
+    let Some(next) = next else {
+        return;
+    };
+    if !job.get("state").is_some_and(serde_json::Value::is_object) {
+        job["state"] = serde_json::json!({});
+    }
+    job["state"]["nextRunAtMs"] = serde_json::json!(next);
+}
+
+#[cfg(test)]
+mod annotate_next_run_tests {
+    use super::annotate_next_run;
+
+    #[test]
+    fn enabled_job_gets_next_run_in_its_timezone() {
+        // 2026-01-01T00:00:00Z. "0 9 * * *" in Asia/Shanghai (UTC+8) fires at
+        // 01:00Z the same day.
+        let now = 1_767_225_600_000u64;
+        let mut job = serde_json::json!({
+            "id": "j1",
+            "enabled": true,
+            "schedule": {"kind": "cron", "expr": "0 9 * * *", "tz": "Asia/Shanghai"},
+        });
+        annotate_next_run(&mut job, now);
+        assert_eq!(job["state"]["nextRunAtMs"], serde_json::json!(now + 3_600_000));
+    }
+
+    #[test]
+    fn stored_future_value_wins_and_disabled_is_untouched() {
+        let now = 1_767_225_600_000u64;
+        let mut job = serde_json::json!({
+            "id": "j2",
+            "enabled": true,
+            "schedule": "*/5 * * * *",
+            "state": {"nextRunAtMs": now + 42, "consecutiveErrors": 2},
+        });
+        annotate_next_run(&mut job, now);
+        assert_eq!(job["state"]["nextRunAtMs"], serde_json::json!(now + 42));
+        assert_eq!(job["state"]["consecutiveErrors"], 2);
+
+        let mut off = serde_json::json!({"id": "j3", "enabled": false, "schedule": "*/5 * * * *"});
+        annotate_next_run(&mut off, now);
+        assert!(off.get("state").is_none());
+    }
+}
+
 #[cfg(test)]
 mod plugin_preflight_tests {
     use super::{PluginPreflight, parse_plugin_preflight};
