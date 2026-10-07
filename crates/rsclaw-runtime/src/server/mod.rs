@@ -381,8 +381,20 @@ pub struct SendMessageResponse {
 #[derive(Debug, Serialize)]
 pub struct AgentStatusResponse {
     pub id: String,
+    /// Effective primary model: the agent's own, else `agents.defaults`.
     pub model: Option<String>,
     pub default: bool,
+    /// Configured display name (`agents.list[].name`); clients fall back to
+    /// a localized label when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Channels this agent is bound to (`None` = all).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolset: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1740,21 +1752,47 @@ async fn delete_session(
 }
 
 async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
+    let default_model = default_primary_model(&state).await;
     let agents: Vec<AgentStatusResponse> = state
         .agents
         .all()
-        .into_iter()
-        .map(|h| AgentStatusResponse {
-            id: h.id.clone(),
-            model: h
-                .config
-                .model
-                .as_ref()
-                .and_then(|m| m.primary_head().map(String::from)),
-            default: h.config.default == Some(true),
-        })
+        .iter()
+        .map(|h| agent_status_of(h, default_model.as_deref()))
         .collect();
     Json(agents)
+}
+
+/// `agents.defaults` primary model, used when an agent has no model of its own.
+async fn default_primary_model(state: &AppState) -> Option<String> {
+    state
+        .live
+        .agents
+        .read()
+        .await
+        .defaults
+        .model
+        .as_ref()
+        .and_then(|m| m.primary_head().map(String::from))
+}
+
+fn agent_status_of(
+    h: &rsclaw_agent::AgentHandle,
+    default_model: Option<&str>,
+) -> AgentStatusResponse {
+    AgentStatusResponse {
+        id: h.id.clone(),
+        model: h
+            .config
+            .model
+            .as_ref()
+            .and_then(|m| m.primary_head().map(String::from))
+            .or_else(|| default_model.map(String::from)),
+        default: h.config.default == Some(true),
+        name: h.config.name.clone().filter(|n| !n.trim().is_empty()),
+        description: h.config.description.clone().filter(|d| !d.trim().is_empty()),
+        channels: h.config.channels.clone(),
+        toolset: h.config.model.as_ref().and_then(|m| m.toolset.clone()),
+    }
 }
 
 /// List active ACP/WS connections with client metadata.
@@ -2043,16 +2081,10 @@ async fn message_broadcast(
 
 async fn agent_status(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match state.agents.get(&id) {
-        Ok(h) => Json(AgentStatusResponse {
-            id: h.id.clone(),
-            model: h
-                .config
-                .model
-                .as_ref()
-                .and_then(|m| m.primary_head().map(String::from)),
-            default: h.config.default == Some(true),
-        })
-        .into_response(),
+        Ok(h) => {
+            let default_model = default_primary_model(&state).await;
+            Json(agent_status_of(&h, default_model.as_deref())).into_response()
+        }
         Err(_) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "not found"})),
