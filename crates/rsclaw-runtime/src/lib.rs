@@ -230,9 +230,9 @@ pub async fn run() -> Result<()> {
         let version = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
         match option_env!("RSCLAW_BUILD_COMMIT") {
             Some(commit) if !commit.is_empty() && commit != "unknown" => {
-                println!("rsclaw v{version} ({commit})")
+                println!("{} v{version} ({commit})", rsclaw_brand::CLI_NAME)
             }
-            _ => println!("rsclaw v{version}"),
+            _ => println!("{} v{version}", rsclaw_brand::CLI_NAME),
         }
         return Ok(());
     }
@@ -389,7 +389,7 @@ async fn cmd_pairing(sub: rsclaw_cli::PairingCommand) -> Result<()> {
                 }
                 _ => {
                     println!("  [!] Gateway not reachable at port {port}");
-                    println!("      Start the gateway first: rsclaw gateway start");
+                    println!("      Start the gateway first: {} gateway start", rsclaw_brand::CLI_NAME);
                 }
             }
         }
