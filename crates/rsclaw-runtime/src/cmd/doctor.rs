@@ -93,6 +93,18 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
         }
     };
 
+    // -- 1b. Brand (shown for OEM builds only) --------------------------------
+    let has_policy = rsclaw_brand::prompt_policy(false).is_some();
+    if rsclaw_brand::ID != "rsclaw" || rsclaw_config::brand_layers::is_active() || has_policy {
+        println!(
+            "  {} brand {} \u{2014} {} locked config key(s){}",
+            dim("[--]"),
+            rsclaw_brand::ID,
+            rsclaw_config::brand_layers::locked_paths().len(),
+            if has_policy { ", distributor policy prompt" } else { "" },
+        );
+    }
+
     // -- 2. State directory ---------------------------------------------------
     let base_dir = config::loader::base_dir();
     if !base_dir.is_dir() {

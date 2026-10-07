@@ -12,6 +12,8 @@ include = ["src/**", "brand/**", "build.rs", "Cargo.toml"]
 
 [build-dependencies]
 toml = "1"
+json5 = "1"
+serde_json = "1"
 
 [dev-dependencies]
 toml = "1"

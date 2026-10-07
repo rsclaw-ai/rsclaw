@@ -43,6 +43,24 @@ static ACTIVE_TOKENS: LazyLock<Vec<(&'static str, String)>> = LazyLock::new(|| {
     tokens
 });
 
+/// Distributor policy prompt for a session language: the language-specific
+/// file first (`prompts/policy.zh.md` / `policy.en.md`), then the generic
+/// `prompts/policy.md`, then the other language. `None` when the brand ships
+/// no policy.
+pub fn prompt_policy(zh: bool) -> Option<&'static str> {
+    let (own, other) = if zh {
+        (PROMPT_POLICY_ZH, PROMPT_POLICY_EN)
+    } else {
+        (PROMPT_POLICY_EN, PROMPT_POLICY_ZH)
+    };
+    own.or(PROMPT_POLICY).or(other)
+}
+
+/// True when the brand directory ships any config layer.
+pub fn has_config_layers() -> bool {
+    CONFIG_DEFAULTS.is_some() || POLICY_LOCKED.is_some()
+}
+
 /// True when this build uses the stock RsClaw text identity.
 pub fn is_default_text() -> bool {
     ACTIVE_TOKENS.is_empty()
@@ -154,6 +172,30 @@ mod tests {
     use super::*;
 
     const DEFAULT_FILE: &str = include_str!("../brand/rsclaw.toml");
+
+    #[test]
+    fn default_brand_ships_no_directory_assets() {
+        assert!(CONFIG_DEFAULTS.is_none() && POLICY_LOCKED.is_none() && DEFAULTS_OVERRIDE.is_none());
+        assert!(PROMPT_POLICY.is_none() && prompt_policy(true).is_none() && prompt_policy(false).is_none());
+        assert!(prompt_template("zh", "IDENTITY.md").is_none());
+        assert!(!has_config_layers());
+    }
+
+    #[test]
+    fn asset_codegen_includes_found_files_only() {
+        let found = |rel: &str| match rel {
+            "policy.locked.json5" => Some("/b/policy.locked.json5".to_owned()),
+            "prompts/zh/IDENTITY.md" => Some("/b/prompts/zh/IDENTITY.md".to_owned()),
+            _ => None,
+        };
+        let code = spec::generate_assets(&found);
+        assert!(code.contains("pub const POLICY_LOCKED: Option<&str> = Some(include_str!(\"/b/policy.locked.json5\"));"));
+        assert!(code.contains("pub const CONFIG_DEFAULTS: Option<&str> = None;"));
+        assert!(code.contains("(\"zh\", \"IDENTITY.md\") => Some(include_str!(\"/b/prompts/zh/IDENTITY.md\")),"));
+        let none = spec::generate_assets(&|_| None);
+        assert!(none.contains("let _ = (lang, file);"));
+        assert!(!none.contains("match (lang, file)"));
+    }
 
     #[test]
     fn default_brand_values_are_unchanged() {

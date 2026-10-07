@@ -15,6 +15,7 @@
 //!   GET    /api/v1/agents/:id/status        agent status
 //!   GET    /api/v1/doctor/last              last persisted doctor run
 //!   POST   /api/v1/pairing/:channel/reject  drop a pending pairing request
+//!   GET    /api/v1/brand                    brand identity + locked config paths
 //!   GET    /api/v1/owners                   list gateway.owners (local/auth)
 //!   PUT    /api/v1/owners                   replace gateway.owners
 //!   POST   /api/v1/owners                   add one owner {channel, peer}
@@ -805,6 +806,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/memory/stats", get(memory_stats))
         .route("/pairing/{channel}/reject", post(pairing_reject))
+        .route("/brand", get(brand_info))
         .route("/owners", get(owners_get).put(owners_put).post(owners_add))
         .route("/owners/{channel}/{*peer}", delete(owners_remove));
 
@@ -5287,8 +5289,15 @@ async fn save_config(
         }
     };
 
-    // H6: validate against schema before writing to disk
-    if let Err(e) = serde_json::from_value::<rsclaw_config::schema::Config>(value) {
+    // Locked brand keys the new file sets differently: written as-is, but
+    // overridden at load time.
+    let locked_ignored = rsclaw_config::brand_layers::locked_conflicts(&value);
+
+    // H6: validate against schema before writing to disk (with the brand
+    // layers applied, as the loader will).
+    if let Err(e) = serde_json::from_value::<rsclaw_config::schema::Config>(
+        rsclaw_config::brand_layers::apply(value),
+    ) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("config schema validation failed: {e}")})),
@@ -5311,9 +5320,29 @@ async fn save_config(
             .into_response();
     }
 
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "saved": true,
         "path": config_path.display().to_string(),
+    });
+    if !locked_ignored.is_empty() {
+        body["lockedIgnored"] = serde_json::json!(locked_ignored);
+    }
+    Json(body).into_response()
+}
+
+/// GET /api/v1/brand -- this build's brand identity and the config paths its
+/// `policy.locked.json5` pins.
+async fn brand_info() -> Response {
+    Json(serde_json::json!({
+        "id": rsclaw_brand::ID,
+        "productName": rsclaw_brand::PRODUCT_NAME,
+        "productNameZh": rsclaw_brand::PRODUCT_NAME_ZH,
+        "assistantName": rsclaw_brand::ASSISTANT_NAME,
+        "cliName": rsclaw_brand::CLI_NAME,
+        "website": rsclaw_brand::WEBSITE,
+        "lockedPaths": rsclaw_config::brand_layers::locked_paths(),
+        "hasPolicyPrompt": rsclaw_brand::prompt_policy(false).is_some(),
+        "hasDefaults": rsclaw_config::brand_layers::has_defaults(),
     }))
     .into_response()
 }

@@ -3,8 +3,9 @@
 //!
 //! - Default brand, no override: the workspace `defaults.toml`, byte for byte.
 //! - Other brands: hosted URLs and data-dir paths follow the brand file.
-//! - `RSCLAW_DEFAULTS_OVERRIDE=<file>` (absolute or workspace-relative):
-//!   merged on top; see `src/defaults_overlay.rs` and docs/branding.md.
+//! - `RSCLAW_DEFAULTS_OVERRIDE=<file>` (absolute or workspace-relative), or
+//!   else the brand directory's `defaults.override.toml`: merged on top; see
+//!   `src/defaults_overlay.rs` and docs/branding.md.
 
 use std::{env, fs, path::PathBuf};
 
@@ -41,6 +42,10 @@ fn main() {
             .unwrap_or_else(|e| panic!("RSCLAW_DEFAULTS_OVERRIDE {}: {e}", path.display()));
         text = apply_override(&text, &overlay)
             .unwrap_or_else(|e| panic!("RSCLAW_DEFAULTS_OVERRIDE {}: {e}", path.display()));
+    } else if let Some(overlay) = rsclaw_brand::DEFAULTS_OVERRIDE {
+        // The brand directory's `defaults.override.toml`.
+        text = apply_override(&text, overlay)
+            .unwrap_or_else(|e| panic!("brand defaults.override.toml: {e}"));
     }
 
     if let Err(e) = text.parse::<toml::Table>() {

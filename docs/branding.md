@@ -143,3 +143,71 @@ _remove = true
 
 Bump `meta.defaults_version` whenever an override changes shipped entries;
 installed copies only refresh on a version change.
+
+## Brand directory
+
+The directory that holds the brand file may also ship optional assets. The
+build picks them up automatically (adding or removing a file triggers a
+rebuild) and validates them: JSON5 files must be objects, TOML must parse,
+Markdown must be non-empty UTF-8. The default brand directory
+(`crates/rsclaw-brand/brand/`) ships none, so stock builds are unchanged.
+
+| File | Effect |
+| --- | --- |
+| `config.defaults.json5` | Default config layer, **under** the user's config file |
+| `policy.locked.json5` | Locked config layer, **over** the user's config file |
+| `defaults.override.toml` | Override for the defaults catalog (used when `RSCLAW_DEFAULTS_OVERRIDE` is unset; see "Defaults catalog") |
+| `prompts/policy.md` | Distributor policy prompt |
+| `prompts/policy.zh.md`, `prompts/policy.en.md` | Language-specific policy prompt (optional) |
+| `prompts/<zh\|en>/<SOUL\|IDENTITY\|AGENTS\|USER\|HEARTBEAT>.md` | Bootstrap workspace templates |
+
+### Config layers
+
+The effective config is `config.defaults.json5 ⊕ user config ⊕
+policy.locked.json5`, merged on the JSON value before schema
+deserialization:
+
+- objects merge key by key, recursively;
+- arrays and scalars replace (so a default `agents.list` is replaced
+  entirely by a user `agents.list`);
+- `${VAR}` placeholders are not expanded inside the layers.
+
+The layers never reach the user's file: config editors read and write only
+what the user wrote. A user value under a locked path is kept in the file
+but has no effect; `PUT /api/v1/config` and the WS `config.set` report such
+paths in `lockedIgnored`. If the layers make a config fail schema
+validation, the load error says so. A unit test
+(`brand_layers::tests::compiled_layers_yield_a_valid_config`) checks that the
+compiled layers validate on top of an empty user config.
+
+### Prompts
+
+Bootstrap templates replace the stock `SOUL.md`, `IDENTITY.md`, ... when a
+new workspace is seeded (per language; the stock template is used for a file
+the brand does not ship). They are written once and stay user-editable.
+
+The policy prompt is not editable by users. It is injected into every
+system prompt (all agents, channels and sub-agents, and the minimal prompt of
+internal sessions) as a block titled `## Distributor policy`
+(`## 发行方规则` when the gateway language is Chinese). It opens the per-client
+suffix, right **after** the shared system prefix, so the prefix used for the
+managed model's prompt cache stays byte-identical across brands and no new
+prefix id is needed. Language choice: the language-specific file, then
+`policy.md`, then the other language.
+
+### Inspecting a build
+
+`GET /api/v1/brand` returns the brand identity and its config layers:
+
+```json
+{
+  "id": "acme", "productName": "Acme Agent", "productNameZh": "…",
+  "assistantName": "Acme Assistant", "cliName": "acme-agent",
+  "website": "acme.example",
+  "lockedPaths": ["tools.exec.safety"],
+  "hasPolicyPrompt": true, "hasDefaults": true
+}
+```
+
+`doctor` prints a brand line (id, number of locked keys, policy prompt) for
+non-default builds.

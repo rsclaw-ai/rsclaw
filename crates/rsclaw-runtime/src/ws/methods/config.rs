@@ -26,16 +26,27 @@ pub async fn config_set(ctx: MethodCtx) -> MethodResult {
         .map_err(|e| ErrorShape::internal(e.to_string()))?;
     crate::cmd::config_json::set_nested_value(&mut val, key, value.clone())
         .map_err(|e| ErrorShape::bad_request(e.to_string()))?;
-    // Same schema gate as HTTP PUT /api/v1/config.
-    if let Err(e) = serde_json::from_value::<rsclaw_config::schema::Config>(val.clone()) {
+    // Same schema gate as HTTP PUT /api/v1/config (brand layers applied).
+    if let Err(e) = serde_json::from_value::<rsclaw_config::schema::Config>(
+        rsclaw_config::brand_layers::apply(val.clone()),
+    ) {
         return Err(ErrorShape::bad_request(format!(
             "config schema validation failed for `{key}`: {e}"
         )));
     }
+    // Locked brand keys this write touches: stored, but overridden at load.
+    let locked_ignored: Vec<String> = rsclaw_config::brand_layers::locked_conflicts(&val)
+        .into_iter()
+        .filter(|p| p == key || p.starts_with(&format!("{key}.")) || key.starts_with(&format!("{p}.")))
+        .collect();
     let json = serde_json::to_string_pretty(&val)
         .map_err(|e| ErrorShape::internal(format!("serialize config: {e}")))?;
     std::fs::write(&path, json).map_err(|e| ErrorShape::internal(e.to_string()))?;
-    Ok(serde_json::json!({"ok": true}))
+    let mut out = serde_json::json!({"ok": true});
+    if !locked_ignored.is_empty() {
+        out["lockedIgnored"] = serde_json::json!(locked_ignored);
+    }
+    Ok(out)
 }
 /// `config.patch` — alias of `config.set`.
 pub async fn config_patch(ctx: MethodCtx) -> MethodResult {

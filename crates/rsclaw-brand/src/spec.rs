@@ -206,3 +206,56 @@ pub fn generate(spec: &BrandSpec) -> String {
     }
     out
 }
+
+/// Optional single-file assets of a brand directory:
+/// `(const name, path relative to the brand directory, doc)`.
+pub const ASSET_FILES: &[(&str, &str, &str)] = &[
+    ("CONFIG_DEFAULTS", "config.defaults.json5", "default config layer, under the user's config"),
+    ("POLICY_LOCKED", "policy.locked.json5", "locked config layer, over the user's config"),
+    ("DEFAULTS_OVERRIDE", "defaults.override.toml", "override merged into the defaults catalog"),
+    ("PROMPT_POLICY", "prompts/policy.md", "distributor policy prompt (any language)"),
+    ("PROMPT_POLICY_ZH", "prompts/policy.zh.md", "distributor policy prompt for Chinese sessions"),
+    ("PROMPT_POLICY_EN", "prompts/policy.en.md", "distributor policy prompt for other sessions"),
+];
+
+/// Languages with bootstrap templates.
+pub const PROMPT_LANGS: &[&str] = &["zh", "en"];
+
+/// Bootstrap workspace files a brand may template (`prompts/<lang>/<file>`).
+pub const PROMPT_FILES: &[&str] = &["SOUL.md", "IDENTITY.md", "AGENTS.md", "USER.md", "HEARTBEAT.md"];
+
+/// Rust source for the brand-directory assets. `found(rel)` returns the
+/// absolute path of an existing asset (relative path as in [`ASSET_FILES`]
+/// or `prompts/<lang>/<file>`), or `None`.
+pub fn generate_assets(found: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    for (name, rel, doc) in ASSET_FILES {
+        let value = match found(rel) {
+            Some(path) => format!("Some(include_str!({path:?}))"),
+            None => "None".to_owned(),
+        };
+        out.push_str(&format!(
+            "/// Brand asset `{rel}`: {doc}.\npub const {name}: Option<&str> = {value};\n"
+        ));
+    }
+    let mut arms = String::new();
+    for lang in PROMPT_LANGS {
+        for file in PROMPT_FILES {
+            if let Some(path) = found(&format!("prompts/{lang}/{file}")) {
+                arms.push_str(&format!(
+                    "        ({lang:?}, {file:?}) => Some(include_str!({path:?})),\n"
+                ));
+            }
+        }
+    }
+    let body = if arms.is_empty() {
+        "    let _ = (lang, file);\n    None\n".to_owned()
+    } else {
+        format!("    match (lang, file) {{\n{arms}        _ => None,\n    }}\n")
+    };
+    out.push_str(&format!(
+        "/// Brand bootstrap template `prompts/<lang>/<file>` (`lang` is `zh` or `en`).\n\
+         pub fn prompt_template(lang: &str, file: &str) -> Option<&'static str> {{\n{body}}}\n"
+    ));
+    out
+}

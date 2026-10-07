@@ -150,6 +150,12 @@ pub fn load_json5(path: &Path) -> Result<Config> {
     // 3. Resolve $include directives recursively.
     resolve_includes(&mut value, base_dir, 0)?;
 
+    // 3a. Brand layers: defaults under the user's file, locked policy over
+    //     it (no-op for the default brand). Keep the user's own value to
+    //     attribute a schema failure to the brand layer if needed.
+    let user_value = super::brand_layers::is_active().then(|| value.clone());
+    let mut value = super::brand_layers::apply(value);
+
     // 3b. Migrate legacy top-level credential fields → accounts.default.*
     //     so the startup code only reads `accounts` (no dual-path).
     migrate_channel_legacy_fields(&mut value);
@@ -160,8 +166,24 @@ pub fn load_json5(path: &Path) -> Result<Config> {
     migrate_channel_env_fallback(&mut value);
 
     // 4. Deserialize into the typed schema.
-    let config: Config = serde_json::from_value(value)
-        .with_context(|| format!("schema error in {}", path.display()))?;
+    let config: Config = match serde_json::from_value(value) {
+        Ok(config) => config,
+        Err(e) => {
+            if let Some(mut own) = user_value {
+                migrate_channel_legacy_fields(&mut own);
+                migrate_channel_env_fallback(&mut own);
+                if serde_json::from_value::<Config>(own).is_ok() {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "schema error in {} caused by the brand config layer \
+                         (config.defaults.json5 / policy.locked.json5)",
+                        path.display()
+                    )));
+                }
+            }
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("schema error in {}", path.display()));
+        }
+    };
 
     Ok(config)
 }

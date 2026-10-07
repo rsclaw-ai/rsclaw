@@ -7642,6 +7642,8 @@ dependencies = [
 name = "rsclaw-brand"
 version = "0.1.0"
 dependencies = [
+ "json5",
+ "serde_json",
  "toml 1.1.0+spec-1.1.0",
 ]
 

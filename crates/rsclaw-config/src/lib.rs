@@ -13,6 +13,7 @@
 //!         → cross-field validate
 //!           → into_runtime (unified RuntimeConfig)
 
+pub mod brand_layers;
 pub mod catalog;
 pub mod env_file;
 pub mod env_resolution;
