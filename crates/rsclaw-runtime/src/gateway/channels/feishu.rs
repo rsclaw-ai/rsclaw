@@ -713,6 +713,8 @@ pub(crate) fn start_feishu_if_configured(
             acct_str(&acct_for_log, "verificationToken").or_else(|| top_verification_token.clone());
         fs_channel.encrypt_key =
             acct_str(&acct_for_log, "encryptKey").or_else(|| top_encrypt_key.clone());
+        let run_status = rsclaw_channel::status::StatusHandle::new("feishu", &acct_for_log);
+        fs_channel.status = Some(run_status.clone());
         let fs = Arc::new(fs_channel);
 
         // The HTTP webhook slot is only filled when webhook verification is
@@ -843,7 +845,7 @@ pub(crate) fn start_feishu_if_configured(
         let shutdown_for_run = shutdown.clone();
         tokio::spawn(async move {
             tokio::select! {
-                res = fs.run() => {
+                res = rsclaw_channel::status::track(run_status, fs.run()) => {
                     if let Err(e) = res {
                         error!("feishu channel error: {e:#}");
                     }

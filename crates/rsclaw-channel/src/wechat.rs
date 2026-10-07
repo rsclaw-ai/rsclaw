@@ -272,6 +272,8 @@ pub struct WeChatPersonalChannel {
             ) + Send
             + Sync,
     >,
+    /// Connection-state reporter for `/api/v1/status` (set by the gateway).
+    status: Option<crate::status::StatusHandle>,
 }
 
 /// Sentinel prefix used in the bail message produced by
@@ -302,12 +304,19 @@ impl WeChatPersonalChannel {
                 .build()
                 .expect("http client"),
             on_message,
+            status: None,
         }
     }
 
     /// Override the ilink API base URL. Used for testing with a mock server.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into().trim_end_matches('/').to_owned();
+        self
+    }
+
+    /// Report long-poll health to the channel status registry.
+    pub fn with_status(mut self, status: crate::status::StatusHandle) -> Self {
+        self.status = Some(status);
         self
     }
 
@@ -797,6 +806,9 @@ impl WeChatPersonalChannel {
         }
 
         info!("WeChat personal long-poll loop started");
+        if let Some(h) = &self.status {
+            h.set(crate::status::ChannelState::Connecting);
+        }
 
         // Long-poll timeouts are routine (held connection vs network jitter),
         // so a single failure is debug-level noise. Consecutive failures are
@@ -808,6 +820,9 @@ impl WeChatPersonalChannel {
         loop {
             match self.get_updates(&updates_buf).await {
                 Ok(resp) => {
+                    if let Some(h) = &self.status {
+                        h.set(crate::status::ChannelState::Connected);
+                    }
                     if consecutive_errs >= CONSECUTIVE_ERR_WARN_THRESHOLD {
                         info!(
                             after_failures = consecutive_errs,
@@ -868,6 +883,16 @@ impl WeChatPersonalChannel {
                 }
                 Err(e) => {
                     consecutive_errs = consecutive_errs.saturating_add(1);
+                    if let Some(h) = &self.status {
+                        // A single failed poll is routine jitter; only a run
+                        // of failures flips the account to `error`.
+                        let msg = format!("{e:#}");
+                        if consecutive_errs >= CONSECUTIVE_ERR_WARN_THRESHOLD {
+                            h.set_with_error(crate::status::ChannelState::Error, &msg);
+                        } else {
+                            h.note_error(&msg);
+                        }
+                    }
                     if consecutive_errs == CONSECUTIVE_ERR_WARN_THRESHOLD
                         || (consecutive_errs > CONSECUTIVE_ERR_WARN_THRESHOLD
                             && consecutive_errs % 10 == 0)

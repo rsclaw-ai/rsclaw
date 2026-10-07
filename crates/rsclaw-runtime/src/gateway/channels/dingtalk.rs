@@ -582,9 +582,10 @@ pub(crate) fn start_dingtalk_if_configured(
         });
 
         let shutdown_for_run = shutdown.clone();
+        let run_status = rsclaw_channel::status::StatusHandle::new("dingtalk", &acct_for_log);
         tokio::spawn(async move {
             tokio::select! {
-                res = dt.run() => {
+                res = rsclaw_channel::status::track(run_status, dt.run()) => {
                     if let Err(e) = res {
                         error!("dingtalk channel error: {e:#}");
                     }

@@ -46,6 +46,7 @@ pub mod qq;
 pub use rsclaw_retry as retry;
 pub mod signal;
 pub mod slack;
+pub mod status;
 pub mod telegram;
 pub mod transcription;
 pub mod wechat;
@@ -194,6 +195,23 @@ impl PairingStore {
     /// Revoke a previously approved peer.
     pub fn revoke(&mut self, peer_id: &str) {
         self.approved.remove(peer_id);
+    }
+
+    /// Drop a pending pairing request matched by `code` (case-insensitive)
+    /// or by `peer_id`. Returns `(code, peer_id)` of the removed request.
+    /// The peer is not blocked: a later DM simply mints a fresh code.
+    pub fn reject(&mut self, code: Option<&str>, peer_id: Option<&str>) -> Option<(String, String)> {
+        self.pending
+            .retain(|e| e.created_at.elapsed() < PAIRING_TTL);
+        let code_upper = code.map(str::to_uppercase);
+        let pos = self.pending.iter().position(|e| {
+            code_upper
+                .as_deref()
+                .is_some_and(|c| e.code.to_uppercase() == c)
+                || peer_id.is_some_and(|p| e.peer_id == p)
+        })?;
+        let entry = self.pending.remove(pos);
+        Some((entry.code, entry.peer_id))
     }
 
     /// List pending pairing requests (not yet approved). Returns (code,
@@ -363,6 +381,17 @@ impl DmPolicyEnforcer {
                 warn!(channel = %self.channel_name, peer_id, error = %e, "failed to delete pairing from store");
             }
         }
+    }
+
+    /// Drop a pending pairing request by code or peer id. Returns the removed
+    /// `(code, peer_id)`. Pending requests are in-memory only, so nothing is
+    /// persisted.
+    pub async fn reject_pairing(
+        &self,
+        code: Option<&str>,
+        peer_id: Option<&str>,
+    ) -> Option<(String, String)> {
+        self.pairing.lock().await.reject(code, peer_id)
     }
 
     /// List pending pairing requests for this channel.
@@ -1073,6 +1102,27 @@ fn extract_pptx_text(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reject_pairing_drops_pending_by_code_or_peer() {
+        let enforcer = DmPolicyEnforcer::new(DmPolicy::Pairing, vec![]);
+        let code = match enforcer.check("user_1").await {
+            PolicyResult::SendPairingCode(c) => c,
+            other => panic!("expected code, got {other:?}"),
+        };
+        assert!(matches!(enforcer.check("user_2").await, PolicyResult::SendPairingCode(_)));
+
+        let removed = enforcer
+            .reject_pairing(Some(&code.to_lowercase()), None)
+            .await;
+        assert_eq!(removed, Some((code.clone(), "user_1".to_owned())));
+        // A rejected code can no longer be approved.
+        assert!(enforcer.approve_pairing(&code).await.is_none());
+
+        assert!(enforcer.reject_pairing(None, Some("user_2")).await.is_some());
+        assert!(enforcer.list_pending().await.is_empty());
+        assert!(enforcer.reject_pairing(None, Some("nobody")).await.is_none());
+    }
 
     #[tokio::test]
     async fn pairing_policy_generates_code() {

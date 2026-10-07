@@ -586,9 +586,10 @@ pub(crate) fn start_slack_if_configured(
             tracing::warn!("failed to register channel: {e}");
         }
         let shutdown_for_run = shutdown.clone();
+        let run_status = rsclaw_channel::status::StatusHandle::new("slack", &acct_for_log);
         tokio::spawn(async move {
             tokio::select! {
-                res = sl.run() => {
+                res = rsclaw_channel::status::track(run_status, sl.run()) => {
                     if let Err(e) = res {
                         error!("slack channel: {e:#}");
                     }

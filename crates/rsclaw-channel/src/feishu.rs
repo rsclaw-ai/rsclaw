@@ -171,6 +171,8 @@ pub struct FeishuChannel {
     /// Seconds to wait between WS reconnect attempts (config:
     /// feishu.reconnectDelaySecs).
     pub ws_reconnect_delay_secs: u64,
+    /// Connection-state reporter for `/api/v1/status` (set by the gateway).
+    pub status: Option<crate::status::StatusHandle>,
     /// Callback: (sender_open_id, text, chat_id, is_group, images, files).
     #[allow(clippy::type_complexity)]
     on_message: Arc<
@@ -487,7 +489,18 @@ impl FeishuChannel {
             name_lookup_disabled: std::sync::atomic::AtomicBool::new(false),
             download_timeout_secs: 600, // overridden by startup from config
             ws_reconnect_delay_secs: 5,
+            status: None,
             on_message,
+        }
+    }
+
+    /// Report a WS connection-state change to the status registry, if wired.
+    fn report_state(&self, state: crate::status::ChannelState, err: Option<&str>) {
+        if let Some(h) = &self.status {
+            match err {
+                Some(e) => h.set_with_error(state, e),
+                None => h.set(state),
+            }
         }
     }
 
@@ -842,6 +855,7 @@ impl FeishuChannel {
         let (mut write, mut read) = ws_stream.split();
 
         info!("feishu: WebSocket connected");
+        self.report_state(crate::status::ChannelState::Connected, None);
 
         // 3. Read events with idle timeout (detect half-open connections).
         // Feishu sends pings every ~30s; if we hear nothing for 90s, reconnect.
@@ -2319,6 +2333,9 @@ impl Channel for FeishuChannel {
             // wechat long-poll loop (warn at 5, then every 10th).
             let mut consecutive_errs: u32 = 0;
             loop {
+                if consecutive_errs < 5 {
+                    self.report_state(crate::status::ChannelState::Connecting, None);
+                }
                 match self.ws_connect_loop().await {
                     Ok(_) => {
                         if consecutive_errs >= 5 {
@@ -2326,9 +2343,19 @@ impl Channel for FeishuChannel {
                         }
                         consecutive_errs = 0;
                         info!("feishu: WS connection ended, reconnecting...");
+                        self.report_state(crate::status::ChannelState::Connecting, None);
                     }
                     Err(e) => {
                         consecutive_errs = consecutive_errs.saturating_add(1);
+                        // Same escalation contract as the log levels below:
+                        // isolated failures are routine reconnects, five in
+                        // a row is an outage.
+                        let state = if consecutive_errs >= 5 {
+                            crate::status::ChannelState::Error
+                        } else {
+                            crate::status::ChannelState::Connecting
+                        };
+                        self.report_state(state, Some(&format!("{e:#}")));
                         if consecutive_errs == 5
                             || (consecutive_errs > 5 && consecutive_errs % 10 == 0)
                         {

@@ -540,6 +540,7 @@ pub(crate) fn start_signal_if_configured(
         // sends.
         let shutdown_for_signal = shutdown.clone();
         let cancel_token = manager.register_cancel_token(&proxy_name);
+        let run_status = rsclaw_channel::status::StatusHandle::new("signal", &acct_name);
         tokio::spawn(async move {
             match SignalChannel::spawn(phone, sig_cli_path, on_message).await {
                 Ok(ch) => {
@@ -573,7 +574,7 @@ pub(crate) fn start_signal_if_configured(
                     });
                     info!(account = %acct_for_log, "signal channel started");
                     tokio::select! {
-                        res = ch.run() => {
+                        res = rsclaw_channel::status::track(run_status, ch.run()) => {
                             if let Err(e) = res {
                                 error!("signal channel: {e:#}");
                             }
@@ -586,7 +587,13 @@ pub(crate) fn start_signal_if_configured(
                         }
                     }
                 }
-                Err(e) => warn!("signal-cli not available: {e:#}"),
+                Err(e) => {
+                    run_status.set_with_error(
+                        rsclaw_channel::status::ChannelState::Error,
+                        &format!("signal-cli not available: {e:#}"),
+                    );
+                    warn!("signal-cli not available: {e:#}");
+                }
             }
         });
     } // end for sig_accounts

@@ -522,9 +522,10 @@ pub(crate) fn start_wecom_if_configured(
         }
 
         let shutdown_for_run = shutdown.clone();
+        let run_status = rsclaw_channel::status::StatusHandle::new("wecom", &acct_for_log);
         tokio::spawn(async move {
             tokio::select! {
-                res = wecom.run() => {
+                res = rsclaw_channel::status::track(run_status, wecom.run()) => {
                     if let Err(e) = res {
                         error!("wecom channel: {e:#}");
                     }

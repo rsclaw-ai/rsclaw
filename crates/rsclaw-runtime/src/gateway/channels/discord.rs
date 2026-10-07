@@ -582,9 +582,10 @@ pub(crate) fn start_discord_if_configured(
             tracing::warn!("failed to register channel: {e}");
         }
         let shutdown_for_run = shutdown.clone();
+        let run_status = rsclaw_channel::status::StatusHandle::new("discord", &acct_for_log);
         tokio::spawn(async move {
             tokio::select! {
-                res = dc.run() => {
+                res = rsclaw_channel::status::track(run_status, dc.run()) => {
                     if let Err(e) = res {
                         error!("discord channel: {e:#}");
                     }

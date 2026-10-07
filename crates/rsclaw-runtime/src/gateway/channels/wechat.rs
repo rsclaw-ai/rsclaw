@@ -528,8 +528,10 @@ pub(crate) fn start_wechat_personal_if_configured(
             },
         );
 
+        let run_status = rsclaw_channel::status::StatusHandle::new("wechat", &acct_name);
         let wc = Arc::new({
-            let ch = rsclaw_channel::wechat::WeChatPersonalChannel::new(token, on_message);
+            let ch = rsclaw_channel::wechat::WeChatPersonalChannel::new(token, on_message)
+                .with_status(run_status.clone());
             if let Some(url) = wechat_base_url {
                 ch.with_base_url(url)
             } else {
@@ -609,7 +611,7 @@ pub(crate) fn start_wechat_personal_if_configured(
         let shutdown_for_poll = shutdown.clone();
         tokio::spawn(async move {
             tokio::select! {
-                res = wc.run() => {
+                res = rsclaw_channel::status::track(run_status, wc.run()) => {
                     if let Err(e) = res {
                         error!("wechat channel error: {e:#}");
                     }

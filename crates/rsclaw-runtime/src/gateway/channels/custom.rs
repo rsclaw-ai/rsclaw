@@ -549,9 +549,10 @@ fn start_custom_webhook(
         tracing::warn!("failed to register channel: {e}");
     }
     let shutdown_for_run = shutdown.clone();
+    let run_status = rsclaw_channel::status::StatusHandle::new("custom", &ch_name);
     tokio::spawn(async move {
         tokio::select! {
-            res = ch.run() => {
+            res = rsclaw_channel::status::track(run_status, ch.run()) => {
                 if let Err(e) = res {
                     error!("custom webhook channel error: {e:#}");
                 }
@@ -1017,9 +1018,10 @@ fn start_custom_websocket(
         tracing::warn!("failed to register channel: {e}");
     }
     let shutdown_for_run = shutdown.clone();
+    let run_status = rsclaw_channel::status::StatusHandle::new("custom", &ch_name);
     tokio::spawn(async move {
         tokio::select! {
-            res = ch.run() => {
+            res = rsclaw_channel::status::track(run_status, ch.run()) => {
                 if let Err(e) = res {
                     error!("custom WS channel error: {e:#}");
                 }

@@ -489,9 +489,10 @@ pub(crate) fn start_whatsapp_if_configured(
             tracing::warn!("failed to register channel: {e}");
         }
         let shutdown_for_run = shutdown.clone();
+        let run_status = rsclaw_channel::status::StatusHandle::new("whatsapp", &acct_for_log);
         tokio::spawn(async move {
             tokio::select! {
-                res = wa.run() => {
+                res = rsclaw_channel::status::track(run_status, wa.run()) => {
                     if let Err(e) = res {
                         error!("whatsapp channel: {e:#}");
                     }
