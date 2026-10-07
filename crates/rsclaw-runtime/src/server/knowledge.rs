@@ -19,7 +19,11 @@ use axum::{
     routing::{get, post},
 };
 use futures::{Stream, StreamExt as _};
-use rsclaw_kb::{KnowledgeError, KnowledgeService, model::KbCollection, service::DocInfo};
+use rsclaw_kb::{
+    KnowledgeError, KnowledgeService,
+    model::KbCollection,
+    service::{CollectionCounts, DocInfo},
+};
 use serde::{Deserialize, Serialize};
 
 /// Routes nested under `/api/v1/knowledge`. State is the `KnowledgeService`
@@ -99,7 +103,7 @@ struct CollectionDto {
     embed_model: Option<String>,
     /// P2 will populate from the resolved embedder; 0 until then.
     embed_dim: u32,
-    /// P2 will populate by counting docs/chunks tagged to this collection.
+    /// Active docs/chunks/bytes tagged to this collection.
     doc_count: u64,
     chunk_count: u64,
     bytes: u64,
@@ -111,6 +115,17 @@ fn ms_to_rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|d| d.to_rfc3339())
         .unwrap_or_default()
+}
+
+impl CollectionDto {
+    fn with_counts(mut self, counts: Option<&CollectionCounts>) -> Self {
+        if let Some(c) = counts {
+            self.doc_count = c.doc_count as u64;
+            self.chunk_count = c.chunk_count as u64;
+            self.bytes = c.bytes;
+        }
+        self
+    }
 }
 
 impl From<KbCollection> for CollectionDto {
@@ -150,7 +165,15 @@ struct PatchCollectionReq {
 async fn list_collections(State(svc): State<Arc<KnowledgeService>>) -> Response {
     match svc.list_collections() {
         Ok(cols) => {
-            let dtos: Vec<CollectionDto> = cols.into_iter().map(Into::into).collect();
+            // Counts are cosmetic; a failure here must not hide the list.
+            let counts = svc.collection_counts().unwrap_or_default();
+            let dtos: Vec<CollectionDto> = cols
+                .into_iter()
+                .map(|c| {
+                    let n = counts.get(&c.id).copied();
+                    CollectionDto::from(c).with_counts(n.as_ref())
+                })
+                .collect();
             Json(serde_json::json!({ "collections": dtos })).into_response()
         }
         Err(e) => err_response(e),
@@ -187,7 +210,11 @@ async fn get_collection(
     Path(id): Path<String>,
 ) -> Response {
     match svc.get_collection(&id) {
-        Ok(c) => Json(CollectionDto::from(c)).into_response(),
+        Ok(c) => {
+            let counts = svc.collection_counts().unwrap_or_default();
+            let n = counts.get(&c.id).copied();
+            Json(CollectionDto::from(c).with_counts(n.as_ref())).into_response()
+        }
         Err(e) => err_response(e),
     }
 }
@@ -1208,6 +1235,16 @@ mod http_tests {
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0]["status"], "ready");
 
+        // collection totals reflect the tagged doc
+        let (st, body) = send(&app, "GET", "/collections", None).await;
+        assert_eq!(st, StatusCode::OK);
+        let col = &body["collections"][0];
+        assert_eq!(col["docCount"], 1);
+        assert!(col["chunkCount"].as_u64().unwrap() > 0);
+        assert!(col["bytes"].as_u64().unwrap() > 0);
+        let (_, body) = send(&app, "GET", &format!("/collections/{cid}"), None).await;
+        assert_eq!(body["docCount"], 1);
+
         // content
         let resp = app
             .clone()
@@ -1281,11 +1318,15 @@ mod http_tests {
         }
         // Bad scheme / not-a-url.
         assert_eq!(
-            validate_public_http_url("ftp://example.com").await.unwrap_err(),
+            validate_public_http_url("ftp://example.com")
+                .await
+                .unwrap_err(),
             "invalid_url"
         );
         assert_eq!(
-            validate_public_http_url("file:///etc/passwd").await.unwrap_err(),
+            validate_public_http_url("file:///etc/passwd")
+                .await
+                .unwrap_err(),
             "invalid_url"
         );
         assert_eq!(

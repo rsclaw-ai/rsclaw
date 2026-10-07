@@ -102,6 +102,14 @@ pub struct KbStats {
     pub bytes: u64,
 }
 
+/// Per-collection document totals (active docs only).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionCounts {
+    pub doc_count: usize,
+    pub chunk_count: usize,
+    pub bytes: u64,
+}
+
 /// An embedder the user can select for a collection.
 pub struct EmbedderInfo {
     pub id: String,
@@ -687,6 +695,30 @@ impl KnowledgeService {
             chunk_count,
             bytes,
         })
+    }
+
+    /// Active doc / chunk / byte totals keyed by collection id. Collections
+    /// with no documents are absent from the map.
+    pub fn collection_counts(&self) -> KResult<HashMap<String, CollectionCounts>> {
+        let rtx = self.store.begin_read()?;
+        let chunks = self.chunk_counts(&rtx)?;
+        let mut out: HashMap<String, CollectionCounts> = HashMap::new();
+        for d in self.all_active_docs(&rtx)? {
+            let Some(cid) = d
+                .tags
+                .iter()
+                .find_map(|t| t.strip_prefix(COLLECTION_TAG_PREFIX))
+            else {
+                continue;
+            };
+            let e = out.entry(cid.to_owned()).or_default();
+            e.doc_count += 1;
+            e.chunk_count += chunks.get(&d.id).copied().unwrap_or(0);
+            e.bytes += std::fs::metadata(self.paths.root.join(&d.markdown_path))
+                .map(|m| m.len())
+                .unwrap_or(0);
+        }
+        Ok(out)
     }
 
     /// Run one compactor tick + HNSW snapshot dump. The CLI `kb compact`
