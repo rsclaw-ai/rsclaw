@@ -1410,6 +1410,10 @@ mod tests {
         assert_eq!(p.level, "WARN");
         assert_eq!(p.msg, "disk low");
         assert_eq!(p.ts_ms, Some(1_767_225_601_500));
+        let p = parse_log_line("2026-01-01T08:00:01.500000+08:00  ERROR rsclaw_channel::feishu: boom");
+        assert_eq!(p.level, "ERROR");
+        assert_eq!(p.msg, "boom");
+        assert_eq!(p.ts_ms, Some(1_767_225_601_500));
         let p = parse_log_line("continuation line");
         assert_eq!(p.level, "INFO");
         assert!(p.ts_ms.is_none());
@@ -6953,7 +6957,8 @@ fn parse_log_since(raw: &str) -> Option<i64> {
 
 /// One parsed gateway.log line.
 struct ParsedLogLine<'a> {
-    /// Raw UTC timestamp (`2026-04-03T03:32:17.581318Z`), empty when absent.
+    /// Raw RFC 3339 timestamp (`2026-04-03T03:32:17.581318Z` or with a
+    /// `+08:00` offset), empty when absent.
     ts: &'a str,
     /// Unix milliseconds of `ts`, when it parses.
     ts_ms: Option<i64>,
@@ -6961,35 +6966,34 @@ struct ParsedLogLine<'a> {
     msg: &'a str,
 }
 
-/// Parse `"2026-04-03T03:32:17.581318Z  INFO rsclaw::module: message"`.
-/// Lines without a timestamp are reported as INFO with the whole line as msg.
+/// Parse `"<rfc3339>  INFO rsclaw::module: message"`; the timestamp may be
+/// UTC (`Z`) or carry a local offset. Lines without a timestamp are
+/// reported as INFO with the whole line as msg.
 fn parse_log_line(clean: &str) -> ParsedLogLine<'_> {
     let mut ts = "";
+    let mut ts_ms = None;
     let mut level = "INFO";
     let mut msg = clean;
 
-    if clean.len() > 30 && clean.as_bytes().get(4) == Some(&b'-') {
-        // Has timestamp
-        if let Some((before_z, rest)) = clean.split_once("Z ") {
-            ts = &clean[..before_z.len() + 1]; // includes 'Z'
-            let rest = rest.trim();
-            // Extract level
-            for lvl in ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"] {
-                if let Some(after_lvl) = rest.strip_prefix(lvl) {
-                    level = lvl;
-                    msg = after_lvl.trim();
-                    // Strip module prefix "rsclaw::xxx:"
-                    if let Some((_, after_colon)) = msg.split_once(": ") {
-                        msg = after_colon;
-                    }
-                    break;
+    if let Some((head, rest)) = clean.split_once(char::is_whitespace)
+        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(head)
+    {
+        ts = head;
+        ts_ms = Some(dt.timestamp_millis());
+        let rest = rest.trim_start();
+        msg = rest;
+        for lvl in ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"] {
+            if let Some(after_lvl) = rest.strip_prefix(lvl) {
+                level = lvl;
+                msg = after_lvl.trim();
+                // Strip module prefix "rsclaw::xxx:"
+                if let Some((_, after_colon)) = msg.split_once(": ") {
+                    msg = after_colon;
                 }
+                break;
             }
         }
     }
-    let ts_ms = chrono::DateTime::parse_from_rfc3339(ts)
-        .ok()
-        .map(|dt| dt.timestamp_millis());
     ParsedLogLine { ts, ts_ms, level, msg }
 }
 

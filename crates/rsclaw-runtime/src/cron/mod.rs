@@ -1507,10 +1507,14 @@ async fn run_plugin_preflight(
 /// Fill `state.nextRunAtMs` on an enabled job (raw JSON, as served by the
 /// HTTP / WS cron list). A future value the runner already persisted wins
 /// (it accounts for error backoff); otherwise the next fire time is computed
-/// from the schedule in the job's own timezone. Disabled jobs, unparseable
-/// schedules and exhausted one-shots are left untouched.
+/// from the schedule in the job's own timezone. Disabled jobs lose any stale
+/// persisted value; unparseable schedules and exhausted one-shots are left
+/// untouched.
 pub fn annotate_next_run(job: &mut serde_json::Value, now_ms: u64) {
     if job.get("enabled").and_then(serde_json::Value::as_bool) != Some(true) {
+        if let Some(state) = job.get_mut("state").and_then(serde_json::Value::as_object_mut) {
+            state.remove("nextRunAtMs");
+        }
         return;
     }
     let stored = job
