@@ -20,8 +20,9 @@ async fn env_sync(args: EnvSyncArgs) -> Result<()> {
     let base_dir = loader::base_dir();
     let env_path = base_dir.join(".env");
 
-    let config_path = loader::detect_config_path()
-        .ok_or_else(|| anyhow::anyhow!("no rsclaw config file found"))?;
+    let config_path = loader::detect_config_path().ok_or_else(|| {
+        anyhow::anyhow!(rsclaw_brand::rebrand("no rsclaw config file found").into_owned())
+    })?;
     let raw = std::fs::read_to_string(&config_path)?;
     let needed = env_resolution::scan_var_refs(&raw);
 
@@ -108,8 +109,9 @@ async fn env_list() -> Result<()> {
     let base_dir = loader::base_dir();
     let env_path = base_dir.join(".env");
 
-    let config_path = loader::detect_config_path()
-        .ok_or_else(|| anyhow::anyhow!("no rsclaw config file found"))?;
+    let config_path = loader::detect_config_path().ok_or_else(|| {
+        anyhow::anyhow!(rsclaw_brand::rebrand("no rsclaw config file found").into_owned())
+    })?;
     let raw = std::fs::read_to_string(&config_path)?;
     let needed = env_resolution::scan_var_refs(&raw);
 

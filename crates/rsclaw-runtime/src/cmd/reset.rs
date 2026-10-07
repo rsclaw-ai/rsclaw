@@ -57,9 +57,7 @@ fn ensure_gateway_stopped() -> Result<()> {
     if let Some(pid) = pid
         && rsclaw_platform::process_is_rsclaw(pid)
     {
-        anyhow::bail!(
-            "the gateway is running (pid {pid}); stop it first with `rsclaw gateway stop`"
-        );
+        brand_bail!("the gateway is running (pid {pid}); stop it first with `rsclaw gateway stop`");
     }
     Ok(())
 }

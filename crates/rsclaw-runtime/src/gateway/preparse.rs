@@ -379,7 +379,8 @@ pub(crate) async fn try_preparse_locally_with_account(
     // /version
     if lower == "/version" {
         return Some(txt(format!(
-            "rsclaw v{}",
+            "{} v{}",
+            rsclaw_brand::CLI_NAME,
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         )));
     }

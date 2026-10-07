@@ -4,13 +4,13 @@ use rsclaw_cli::CompletionArgs;
 pub async fn cmd_completion(args: CompletionArgs) -> Result<()> {
     let shell = args.shell.to_lowercase();
 
-    let script = match shell.as_str() {
+    let script = brand_script(match shell.as_str() {
         "bash" => generate_bash(),
         "zsh" => generate_zsh(),
         "fish" => generate_fish(),
         "powershell" | "pwsh" => generate_powershell(),
         other => anyhow::bail!("unsupported shell: {other} (use bash, zsh, fish, or powershell)"),
-    };
+    });
 
     if args.install {
         install_completion(&shell, &script)?;
@@ -19,6 +19,16 @@ pub async fn cmd_completion(args: CompletionArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The scripts are written for the `rsclaw` command; retarget every mention
+/// (command name, `_rsclaw` function, comments) to this build's CLI name.
+fn brand_script(script: String) -> String {
+    if rsclaw_brand::CLI_NAME == "rsclaw" {
+        script
+    } else {
+        script.replace("rsclaw", rsclaw_brand::CLI_NAME)
+    }
 }
 
 fn generate_bash() -> String {
@@ -167,7 +177,7 @@ fn install_completion(shell: &str, script: &str) -> Result<()> {
         "fish" => {
             let dir = home.join(".config/fish/completions");
             std::fs::create_dir_all(&dir)?;
-            let p = dir.join("rsclaw.fish");
+            let p = dir.join(format!("{}.fish", rsclaw_brand::CLI_NAME));
             std::fs::write(&p, script)?;
             println!("installed completions to {}", p.display());
             return Ok(());
@@ -191,9 +201,10 @@ fn install_completion(shell: &str, script: &str) -> Result<()> {
             if let Some(parent) = std::path::Path::new(&profile).parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let eval_line = format!("\n# rsclaw completions\n{script}\n");
+            let cli = rsclaw_brand::CLI_NAME;
+            let eval_line = format!("\n# {cli} completions\n{script}\n");
             let existing = std::fs::read_to_string(&profile).unwrap_or_default();
-            if existing.contains("rsclaw") {
+            if existing.contains(cli) {
                 println!("completions already installed in {profile}");
             } else {
                 use std::io::Write;
@@ -207,9 +218,10 @@ fn install_completion(shell: &str, script: &str) -> Result<()> {
     };
 
     // For bash/zsh, append an eval line.
-    let eval_line = format!("\neval \"$(rsclaw completion {shell})\"\n");
+    let cli = rsclaw_brand::CLI_NAME;
+    let eval_line = format!("\neval \"$({cli} completion {shell})\"\n");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    if existing.contains("rsclaw completion") {
+    if existing.contains(&format!("{cli} completion")) {
         println!("completions already installed in {}", path.display());
     } else {
         use std::io::Write;

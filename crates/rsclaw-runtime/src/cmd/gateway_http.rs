@@ -212,5 +212,8 @@ pub async fn get_bytes(path: &str) -> Result<Vec<u8>> {
 /// Format a "gateway down" hint suitable for CLI error output. Used by
 /// HTTP-only subcommands that can't fall back to a direct file open.
 pub fn down_hint() -> String {
-    "gateway is not reachable on loopback. start it with: rsclaw gateway start".to_string()
+    rsclaw_brand::rebrand(
+        "gateway is not reachable on loopback. start it with: rsclaw gateway start",
+    )
+    .into_owned()
 }

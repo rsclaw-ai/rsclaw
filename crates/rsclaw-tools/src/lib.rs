@@ -9,59 +9,64 @@ use rsclaw_cli::ToolsCommand;
 // the tools install/manifest layer is reproduced.
 // ---------------------------------------------------------------------------
 
+// Printed lines follow the build's brand (see `rsclaw_brand::brand_line`);
+// these shadow the std print macros for the rest of this crate.
+macro_rules! println {
+    () => { ::std::println!() };
+    ($fmt:tt $($rest:tt)*) => {{
+        let line = ::std::format!($fmt $($rest)*);
+        ::std::println!("{}", ::rsclaw_brand::brand_line($fmt, &line))
+    }};
+}
+#[allow(unused_macros)]
+macro_rules! eprintln {
+    () => { ::std::eprintln!() };
+    ($fmt:tt $($rest:tt)*) => {{
+        let line = ::std::format!($fmt $($rest)*);
+        ::std::eprintln!("{}", ::rsclaw_brand::brand_line($fmt, &line))
+    }};
+}
+
 fn use_color() -> bool {
     std::env::var("NO_COLOR").is_err()
 }
 
-fn green(s: &str) -> String {
+/// Wrap `s` in an ANSI style; styled text is CLI prose and follows the brand.
+fn paint(code: &str, s: &str) -> String {
+    let s = rsclaw_brand::rebrand(s);
     if use_color() {
-        format!("\x1b[32m{s}\x1b[0m")
+        format!("\x1b[{code}m{s}\x1b[0m")
     } else {
-        s.to_owned()
+        s.into_owned()
     }
+}
+
+fn green(s: &str) -> String {
+    paint("32", s)
 }
 
 fn yellow(s: &str) -> String {
-    if use_color() {
-        format!("\x1b[33m{s}\x1b[0m")
-    } else {
-        s.to_owned()
-    }
+    paint("33", s)
 }
 
 fn red(s: &str) -> String {
-    if use_color() {
-        format!("\x1b[31m{s}\x1b[0m")
-    } else {
-        s.to_owned()
-    }
+    paint("31", s)
 }
 
 fn bold(s: &str) -> String {
-    if use_color() {
-        format!("\x1b[1m{s}\x1b[0m")
-    } else {
-        s.to_owned()
-    }
+    paint("1", s)
 }
 
 fn dim(s: &str) -> String {
-    if use_color() {
-        format!("\x1b[2m{s}\x1b[0m")
-    } else {
-        s.to_owned()
-    }
+    paint("2", s)
 }
 
 fn cyan(s: &str) -> String {
-    if use_color() {
-        format!("\x1b[36m{s}\x1b[0m")
-    } else {
-        s.to_owned()
-    }
+    paint("36", s)
 }
 
 fn banner(title: &str) {
+    let title = &*rsclaw_brand::rebrand(title);
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
     let c = use_color();
@@ -70,6 +75,21 @@ fn banner(title: &str) {
     let d = if c { "\x1b[2m" } else { "" }; // dim
     let n = if c { "\x1b[0m" } else { "" }; // reset
 
+    if !rsclaw_brand::is_default_text() {
+        // Other brands get a plain title instead of the RSCLAW word mark.
+        println!();
+        println!(
+            "    {b}{}{n}  {d}-- {title} --{n}",
+            rsclaw_brand::PRODUCT_NAME
+        );
+        println!();
+        println!("    {d}>{n} engine:   {title}");
+        println!("    {d}>{n} platform: {arch} on {os}");
+        println!();
+        println!("    {d}{}{n}", "-".repeat(56));
+        println!();
+        return;
+    }
     println!(
         r#"
     {r}.       .{n}
@@ -92,14 +112,17 @@ fn banner(title: &str) {
 }
 
 fn ok(msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!("  {} {msg}", green("[ok]"));
 }
 
 fn warn_msg(msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!("  {} {msg}", yellow("[warn]"));
 }
 
 fn err_msg(msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!("  {} {msg}", red("[error]"));
 }
 
@@ -1029,8 +1052,9 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
                 Ok(s) => bail!("{}: npm install exited with {s}", def.name),
                 Err(e) => {
                     bail!(
-                        "{}: npm not found ({e}). Install node first: rsclaw tools install node",
-                        def.name
+                        "{}: npm not found ({e}). Install node first: {} tools install node",
+                        def.name,
+                        rsclaw_brand::CLI_NAME
                     );
                 }
             }

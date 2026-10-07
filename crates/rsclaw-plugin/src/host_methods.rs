@@ -184,9 +184,11 @@ impl HostMethodRegistry {
             tracing::info!("JS plugin: auto-starting browser session");
             let browser_path = rsclaw_platform::detect_chrome()
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No supported Chromium browser found; install Chrome for Testing with: rsclaw tools install chrome"
-                    )
+                    anyhow::anyhow!(concat!(
+                        "No supported Chromium browser found; install Chrome for Testing with: ",
+                        rsclaw_brand::brand_cli_name!(),
+                        " tools install chrome"
+                    ))
                 })
                 .map_err(|e| anyhow::anyhow!("failed to obtain browser executable: {e:#}"))?;
             let session = BrowserSession::start(&browser_path, true, Some(PROFILE))

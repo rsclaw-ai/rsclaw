@@ -40,7 +40,8 @@ pub async fn cmd_debug(sub: DebugCommand) -> Result<()> {
 async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
     // 1. Load config. `load_quiet` skips banner/log noise so this is safe to pipe
     //    through `jq`.
-    let config = config::load_quiet().context("failed to load rsclaw config")?;
+    let config = config::load_quiet()
+        .with_context(|| rsclaw_brand::rebrand("failed to load rsclaw config").into_owned())?;
 
     // 2. Resolve the target agent id. Priority: explicit --agent -> first entry
     //    flagged default=true -> "main".

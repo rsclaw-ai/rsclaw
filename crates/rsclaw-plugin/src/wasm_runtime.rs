@@ -2082,7 +2082,12 @@ fn media_command(bin: &std::ffi::OsStr, local_only: bool) -> tokio::process::Com
 /// Extract 16 kHz mono WAV audio from `input` into a fresh artifact path.
 pub(crate) async fn media_extract_audio(input: &str, local_only: bool) -> Result<String, String> {
     let Some(ffmpeg_bin) = rsclaw_platform::detect_ffmpeg() else {
-        return Err("ffmpeg not found. Run: rsclaw tools install ffmpeg".to_string());
+        return Err(concat!(
+            "ffmpeg not found. Run: ",
+            rsclaw_brand::brand_cli_name!(),
+            " tools install ffmpeg"
+        )
+        .to_string());
     };
     let out_path = allocate_dl_paths("audio.wav", 1)?
         .pop()
@@ -2190,7 +2195,12 @@ pub(crate) async fn media_extract_keyframes(
     local_only: bool,
 ) -> Result<Vec<String>, String> {
     let Some(ffmpeg_bin) = rsclaw_platform::detect_ffmpeg() else {
-        return Err("ffmpeg not found. Run: rsclaw tools install ffmpeg".to_string());
+        return Err(concat!(
+            "ffmpeg not found. Run: ",
+            rsclaw_brand::brand_cli_name!(),
+            " tools install ffmpeg"
+        )
+        .to_string());
     };
     let count = count.clamp(1, 20);
     let duration_secs = probe_media_duration(&ffmpeg_bin, input, local_only)
@@ -2452,9 +2462,11 @@ impl HostState {
             tracing::info!("WASM plugin: auto-starting browser session");
             let browser_path = rsclaw_platform::detect_chrome()
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No supported Chromium browser found; install Chrome for Testing with: rsclaw tools install chrome"
-                    )
+                    anyhow::anyhow!(concat!(
+                        "No supported Chromium browser found; install Chrome for Testing with: ",
+                        rsclaw_brand::brand_cli_name!(),
+                        " tools install chrome"
+                    ))
                 })
                 .map_err(|e| format!("failed to obtain browser executable: {e:#}"))?;
             // All plugins share one Chrome profile so that auth state

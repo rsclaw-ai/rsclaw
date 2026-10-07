@@ -13,6 +13,14 @@ const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") {
 // Issue -- a detected problem with an optional auto-fix
 // ---------------------------------------------------------------------------
 
+/// Issue messages are CLI prose written with the default brand's words.
+fn branded(msg: String) -> String {
+    match rsclaw_brand::rebrand(&msg) {
+        std::borrow::Cow::Owned(s) => s,
+        std::borrow::Cow::Borrowed(_) => msg,
+    }
+}
+
 struct Issue {
     message: String,
     /// A short description of what --fix will do.
@@ -24,7 +32,7 @@ struct Issue {
 impl Issue {
     fn warn(msg: impl Into<String>) -> Self {
         Self {
-            message: msg.into(),
+            message: branded(msg.into()),
             fix_hint: None,
             fix_fn: None,
         }
@@ -36,7 +44,7 @@ impl Issue {
         f: impl FnOnce() -> Result<String> + 'static,
     ) -> Self {
         Self {
-            message: msg.into(),
+            message: branded(msg.into()),
             fix_hint: Some(hint),
             fix_fn: Some(Box::new(f)),
         }

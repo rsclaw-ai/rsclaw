@@ -202,7 +202,7 @@ async fn plugins_install(spec: &str) -> Result<()> {
                 "plugin `{spec}` is in the hub allowlist but has no download URL — \
                  the hub manifest may be stale"
             ),
-            None => bail!(
+            None => brand_bail!(
                 "`{spec}` is not a local path, URL, or known hub plugin slug. \
                  Browse available plugins with `rsclaw plugins marketplace`."
             ),
@@ -473,8 +473,11 @@ fn plugins_set_enabled(name: &str, enabled: bool) -> Result<()> {
         bail!("plugin `{name}` not found. Install it first.");
     }
 
-    let (path, mut val) = load_config_json()
-        .map_err(|_| anyhow::anyhow!("No config file found. Run `rsclaw onboard` first."))?;
+    let (path, mut val) = load_config_json().map_err(|_| {
+        anyhow::anyhow!(
+            rsclaw_brand::rebrand("No config file found. Run `rsclaw onboard` first.").into_owned()
+        )
+    })?;
 
     // Ensure plugins.entries.<name>.enabled exists
     {

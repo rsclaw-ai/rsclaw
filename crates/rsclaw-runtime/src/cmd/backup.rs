@@ -26,7 +26,7 @@ async fn cmd_backup_create(args: rsclaw_cli::BackupCreateArgs) -> Result<()> {
     let base = rsclaw_config::loader::base_dir();
 
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let archive_name = format!("rsclaw-backup-{timestamp}.tar.gz");
+    let archive_name = format!("{}-backup-{timestamp}.tar.gz", rsclaw_brand::CLI_NAME);
     let archive_path = std::env::current_dir()?.join(&archive_name);
     let checksum_path = archive_path.with_extension("").with_extension("sha256");
 

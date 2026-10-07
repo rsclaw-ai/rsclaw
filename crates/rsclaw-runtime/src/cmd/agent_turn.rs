@@ -92,7 +92,7 @@ pub async fn cmd_agent_turn(args: AgentTurnArgs) -> Result<()> {
             anyhow::bail!("gateway returned {status}: {body}");
         }
         Err(e) => {
-            anyhow::bail!(
+            brand_bail!(
                 "gateway not reachable at port {port}: {e}\nstart it with: rsclaw gateway start"
             );
         }

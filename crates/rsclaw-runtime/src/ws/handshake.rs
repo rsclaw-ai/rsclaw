@@ -197,10 +197,11 @@ pub async fn root_or_ws_handler(
 pub async fn root_handler() -> impl IntoResponse {
     axum::response::Html(format!(
         "<html><body>\
-        <h2>rsclaw gateway {}</h2>\
+        <h2>{} gateway {}</h2>\
         <p>WebSocket endpoint. Connect with a compatible client.</p>\
         <p><a href=\"/api/v1/health\">Health</a></p>\
         </body></html>",
+        rsclaw_brand::CLI_NAME,
         option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
     ))
 }

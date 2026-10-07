@@ -608,7 +608,12 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "skill_list".to_owned(),
-        description: "List installed local skills with pagination. Use query first to filter by skill name/description, then use limit/offset for more results. Do not use shell to run `rsclaw skills list`; this tool is the authoritative installed-skill listing.".to_owned(),
+        description: concat!(
+            "List installed local skills with pagination. Use query first to filter by skill name/description, then use limit/offset for more results. Do not use shell to run `",
+            rsclaw_brand::brand_cli_name!(),
+            " skills list`; this tool is the authoritative installed-skill listing."
+        )
+        .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {

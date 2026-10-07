@@ -29,9 +29,13 @@ use runtime::{IntoRuntime, RuntimeConfig};
 ///
 /// Panics-free: all errors are returned as `Err`.
 pub fn load() -> Result<RuntimeConfig> {
-    let path = detect_config_path().with_context(
-        || "no config file found. Run `rsclaw setup` to create one, or set RSCLAW_CONFIG_PATH.",
-    )?;
+    let path = detect_config_path().with_context(|| {
+        concat!(
+            "no config file found. Run `",
+            rsclaw_brand::brand_cli_name!(),
+            " setup` to create one, or set RSCLAW_CONFIG_PATH."
+        )
+    })?;
 
     tracing::info!(path = %path.display(), "loading config");
 
@@ -40,9 +44,13 @@ pub fn load() -> Result<RuntimeConfig> {
 
 /// Like `load()` but without INFO-level log (for CLI status commands).
 pub fn load_quiet() -> Result<RuntimeConfig> {
-    let path = detect_config_path().with_context(
-        || "no config file found. Run `rsclaw setup` to create one, or set RSCLAW_CONFIG_PATH.",
-    )?;
+    let path = detect_config_path().with_context(|| {
+        concat!(
+            "no config file found. Run `",
+            rsclaw_brand::brand_cli_name!(),
+            " setup` to create one, or set RSCLAW_CONFIG_PATH."
+        )
+    })?;
 
     load_from_path(&path)
 }

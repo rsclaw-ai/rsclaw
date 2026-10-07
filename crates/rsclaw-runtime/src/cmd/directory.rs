@@ -37,7 +37,7 @@ pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
                     println!("handle: {handle}");
                 }
                 _ => {
-                    anyhow::bail!(
+                    brand_bail!(
                         "gateway not reachable at port {port}; start it with: rsclaw gateway start"
                     );
                 }
@@ -83,7 +83,7 @@ pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
                         }
                     }
                     _ => {
-                        anyhow::bail!(
+                        brand_bail!(
                             "gateway not reachable at port {port}; start it with: rsclaw gateway start"
                         );
                     }
@@ -119,7 +119,7 @@ pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
                         }
                     }
                     _ => {
-                        anyhow::bail!(
+                        brand_bail!(
                             "gateway not reachable at port {port}; start it with: rsclaw gateway start"
                         );
                     }
@@ -150,7 +150,7 @@ pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
                         }
                     }
                     _ => {
-                        anyhow::bail!(
+                        brand_bail!(
                             "gateway not reachable at port {port}; start it with: rsclaw gateway start"
                         );
                     }
