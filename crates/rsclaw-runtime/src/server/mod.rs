@@ -7074,26 +7074,12 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
         {
             continue;
         }
-        let ts = parsed.ts;
-
-        // Format timestamp to local HH:MM:SS
-        let short_ts = if ts.len() >= 19 {
-            // Parse UTC timestamp and convert to local time.
-            chrono::NaiveDateTime::parse_from_str(&ts[..19], "%Y-%m-%dT%H:%M:%S")
-                .ok()
-                .map(|naive| {
-                    let utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                        naive,
-                        chrono::Utc,
-                    );
-                    utc.with_timezone(&chrono::Local)
-                        .format("%H:%M:%S")
-                        .to_string()
-                })
-                .unwrap_or_else(|| ts[11..19].to_owned())
-        } else {
-            ts.to_owned()
-        };
+        // Local HH:MM:SS for display; ts_ms carries the exact instant.
+        let short_ts = parsed
+            .ts_ms
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|utc| utc.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+            .unwrap_or_default();
 
         // C2: redact secrets before exposing logs via API
         let redacted_msg = SECRET_RE.replace_all(parsed.msg, "[REDACTED]");
