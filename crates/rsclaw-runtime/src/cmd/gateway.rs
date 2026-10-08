@@ -61,6 +61,14 @@ pub fn spawn_gateway_bg_pub() -> Result<std::process::Child> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
         const DETACHED_PROCESS: u32 = 0x00000008;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        // CreateProcess inherits every inheritable handle, including the
+        // caller's stdio pipes this `start` process was given. The daemon
+        // would then hold the caller's pipe open and anyone reading
+        // `gateway start` output (the desktop app, `| Out-String`) would
+        // block until the gateway exits. Our own std handles are not needed
+        // by the child (it gets the log file / NUL above), so stop them from
+        // being inherited.
+        clear_std_handle_inheritance();
     }
     #[cfg(unix)]
     {
@@ -76,6 +84,27 @@ pub fn spawn_gateway_bg_pub() -> Result<std::process::Child> {
     }
 
     Ok(cmd.spawn()?)
+}
+
+/// Mark this process's stdin/stdout/stderr handles non-inheritable so a
+/// detached child does not keep the caller's pipes open.
+#[cfg(windows)]
+fn clear_std_handle_inheritance() {
+    use winapi::um::{
+        handleapi::{INVALID_HANDLE_VALUE, SetHandleInformation},
+        processenv::GetStdHandle,
+        winbase::{HANDLE_FLAG_INHERIT, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+    };
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle/SetHandleInformation only read/modify handle
+        // flags of this process; null or invalid handles are skipped.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
