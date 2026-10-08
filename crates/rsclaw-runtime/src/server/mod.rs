@@ -79,6 +79,7 @@ use tracing::{info, warn};
 use crate::{cmd::config_json::load_config_json, gateway::LiveConfig, ws::types::EventFrame};
 
 mod knowledge;
+mod wechat_accounts;
 pub(crate) mod sessions_api;
 
 const MAX_LOCAL_MEDIA_BYTES: u64 = 10 * 1024 * 1024;
@@ -6697,7 +6698,13 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
 /// Start WeChat QR login, returns qrcode URL and session token.
 /// Uses the silent variant: the HTTP caller (web UI) renders the QR itself
 /// from `qrcode_url`, so terminal rendering would only be noise.
-async fn wechat_qr_start() -> Response {
+async fn wechat_qr_start(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Some(denied) = wechat_login_access_denied(&state, peer).await {
+        return denied;
+    }
     let client = reqwest::Client::new();
     match rsclaw_channel::wechat::WeChatPersonalChannel::start_qr_login_silent(&client).await {
         Ok((qrcode_url, qrcode_token)) => Json(serde_json::json!({
@@ -6721,17 +6728,44 @@ struct QrStatusRequest {
 /// POST /api/v1/channels/wechat/qr-status
 /// One long-poll (up to ~35s) of the WeChat QR login. `status` is
 /// `waiting`, `scanned` (confirm on the phone), `expired` (start a new
-/// login) or `ok` (with `bot_token` + `bot_id`).
-async fn wechat_qr_status(Json(req): Json<QrStatusRequest>) -> Response {
+/// login) or `ok` (with `bot_token` + `bot_id`). On `ok` the bot is written
+/// into `channels.wechat.accounts` and `account: {id, label, created}` says
+/// whether it was added or an existing account was renewed (`account: null`
+/// plus `bind_error` when the config could not be written).
+async fn wechat_qr_status(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    Json(req): Json<QrStatusRequest>,
+) -> Response {
     use rsclaw_channel::wechat::{QrLoginState, WeChatPersonalChannel};
+    if let Some(denied) = wechat_login_access_denied(&state, peer).await {
+        return denied;
+    }
     let client = reqwest::Client::new();
-    match WeChatPersonalChannel::poll_qr_state(&client, &req.qrcode_token).await {
-        Ok(QrLoginState::Confirmed { bot_token, bot_id }) => Json(serde_json::json!({
-            "status": "ok",
-            "bot_token": bot_token,
-            "bot_id": bot_id,
-        }))
-        .into_response(),
+    match WeChatPersonalChannel::poll_qr_state_unsaved(&client, &req.qrcode_token).await {
+        Ok(QrLoginState::Confirmed { bot_token, bot_id }) => {
+            let mut body = serde_json::json!({
+                "status": "ok",
+                "bot_token": bot_token,
+                "bot_id": bot_id,
+            });
+            match bind_wechat_account(&bot_id, &bot_token).await {
+                Ok(b) => {
+                    info!(account = %b.id, created = b.created, "wechat QR login bound to config");
+                    body["account"] = serde_json::json!({
+                        "id": b.id,
+                        "label": b.label,
+                        "created": b.created,
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "wechat QR login: could not write account");
+                    body["account"] = serde_json::Value::Null;
+                    body["bind_error"] = serde_json::json!(format!("{e:#}"));
+                }
+            }
+            Json(body).into_response()
+        }
         Ok(QrLoginState::Waiting) => Json(serde_json::json!({"status": "waiting"})).into_response(),
         Ok(QrLoginState::Scanned) => Json(serde_json::json!({"status": "scanned"})).into_response(),
         Ok(QrLoginState::Expired) => Json(serde_json::json!({"status": "expired"})).into_response(),
@@ -6741,6 +6775,42 @@ async fn wechat_qr_status(Json(req): Json<QrStatusRequest>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Write a confirmed bot into `channels.wechat.accounts`. The config watcher
+/// then restarts the channel listeners, so the bot comes online without a
+/// gateway restart.
+async fn bind_wechat_account(
+    bot_id: &str,
+    bot_token: &str,
+) -> anyhow::Result<wechat_accounts::WechatBinding> {
+    let _guard = CONFIG_RMW_LOCK.lock().await;
+    let path = rsclaw_config::loader::detect_config_path()
+        .ok_or_else(|| anyhow::anyhow!("no config file found"))?;
+    let (bot_id, bot_token) = (bot_id.to_owned(), bot_token.to_owned());
+    let (binding, _changed) = tokio::task::spawn_blocking(move || {
+        wechat_accounts::bind_wechat_account_at(&path, &bot_id, &bot_token)
+    })
+    .await??;
+    Ok(binding)
+}
+
+/// WeChat login writes channel credentials into the config, so it follows
+/// the owners API trust model: an authenticated caller, or loopback when the
+/// gateway runs without a token.
+async fn wechat_login_access_denied(state: &AppState, peer: SocketAddr) -> Option<Response> {
+    let auth_enabled = state.live.gateway.read().await.auth_token.is_some();
+    if headers_are_trusted(auth_enabled, peer) {
+        return None;
+    }
+    warn!(%peer, "wechat login refused: open gateway and non-loopback peer");
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "WeChat login is local-only when no auth token is set"})),
+        )
+            .into_response(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -8091,8 +8161,10 @@ async fn pairing_reject(
 // Owners (`gateway.owners`)
 // ---------------------------------------------------------------------------
 
-/// Serializes owners read-modify-write cycles on the config file.
-static OWNERS_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Serializes read-modify-write cycles on the config file done by API
+/// handlers (owners, WeChat account binding), so concurrent writers never
+/// drop each other's change.
+pub(crate) static CONFIG_RMW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Max length of one `channel:peer` owner entry.
 const MAX_OWNER_ENTRY_BYTES: usize = 256;
@@ -8167,7 +8239,7 @@ async fn update_owners<F>(f: F) -> Result<Vec<String>, Response>
 where
     F: FnOnce(Vec<String>) -> Result<Vec<String>, (StatusCode, String)>,
 {
-    let _guard = OWNERS_WRITE_LOCK.lock().await;
+    let _guard = CONFIG_RMW_LOCK.lock().await;
     let internal = |e: String| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
