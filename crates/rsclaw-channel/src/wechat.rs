@@ -108,6 +108,29 @@ struct QrCodeResponse {
     qrcode_img_content: Option<String>,
 }
 
+/// Non-confirmed QR login states by upstream status string.
+fn qr_pending_state(status: Option<&str>) -> QrLoginState {
+    match status {
+        Some("expired") => QrLoginState::Expired,
+        // ilink spells it "scaned"; accept the correct spelling too.
+        Some("scaned") | Some("scanned") => QrLoginState::Scanned,
+        _ => QrLoginState::Waiting,
+    }
+}
+
+/// Progress of a WeChat QR login (see [`WeChatPersonalChannel::poll_qr_state`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QrLoginState {
+    /// Not scanned yet.
+    Waiting,
+    /// Scanned; waiting for the user to confirm on the phone.
+    Scanned,
+    /// Confirmed; the bot token has been saved.
+    Confirmed { bot_token: String, bot_id: String },
+    /// The QR code expired; start a new login.
+    Expired,
+}
+
 #[derive(Debug, Deserialize)]
 struct QrStatusResponse {
     status: Option<String>,
@@ -439,21 +462,36 @@ impl WeChatPersonalChannel {
     /// - Ok(None) if still waiting/scanned
     /// - Err if expired or failed
     pub async fn poll_qr_status(client: &Client, qrcode: &str) -> Result<Option<(String, String)>> {
+        match Self::poll_qr_state(client, qrcode).await? {
+            QrLoginState::Confirmed { bot_token, bot_id } => Ok(Some((bot_token, bot_id))),
+            QrLoginState::Expired => bail!("QR code expired"),
+            QrLoginState::Waiting | QrLoginState::Scanned => Ok(None),
+        }
+    }
+
+    /// One long-poll of the QR login state (the upstream holds the request
+    /// up to ~35s). A long-poll timeout reports [`QrLoginState::Waiting`]
+    /// so callers can simply poll again. On confirmation the bot token is
+    /// saved, as with [`Self::poll_qr_status`].
+    pub async fn poll_qr_state(client: &Client, qrcode: &str) -> Result<QrLoginState> {
         let url = format!(
             "{}/ilink/bot/get_qrcode_status?qrcode={}",
             ILINK_BASE_URL, qrcode
         );
-        let resp: QrStatusResponse = client
+        let sent = client
             .post(&url)
             .header("Content-Type", "application/json")
             .body("{}")
             .timeout(Duration::from_millis(LONG_POLL_TIMEOUT_MS))
             .send()
-            .await?
-            .json()
-            .await?;
+            .await;
+        let resp: QrStatusResponse = match sent {
+            Ok(r) => r.json().await?,
+            Err(e) if e.is_timeout() => return Ok(QrLoginState::Waiting),
+            Err(e) => return Err(e.into()),
+        };
 
-        match resp.status.as_deref() {
+        Ok(match resp.status.as_deref() {
             Some("confirmed") => {
                 let token = resp.bot_token.context("no bot_token after confirmed")?;
                 let bot_id = resp
@@ -469,11 +507,13 @@ impl WeChatPersonalChannel {
                     }),
                 )?;
 
-                Ok(Some((token, bot_id)))
+                QrLoginState::Confirmed {
+                    bot_token: token,
+                    bot_id,
+                }
             }
-            Some("expired") => bail!("QR code expired"),
-            _ => Ok(None), // waiting or scanned
-        }
+            other => qr_pending_state(other),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2495,5 +2535,19 @@ mod tests {
         ch.send_text("user_abc", "Hello from rsclaw test")
             .await
             .expect("send_text failed");
+    }
+}
+
+#[cfg(test)]
+mod qr_state_tests {
+    use super::{QrLoginState, qr_pending_state};
+
+    #[test]
+    fn maps_upstream_qr_statuses() {
+        assert_eq!(qr_pending_state(Some("wait")), QrLoginState::Waiting);
+        assert_eq!(qr_pending_state(None), QrLoginState::Waiting);
+        assert_eq!(qr_pending_state(Some("scaned")), QrLoginState::Scanned);
+        assert_eq!(qr_pending_state(Some("scanned")), QrLoginState::Scanned);
+        assert_eq!(qr_pending_state(Some("expired")), QrLoginState::Expired);
     }
 }
