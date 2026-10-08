@@ -1270,10 +1270,17 @@ impl TaskQueueWorker {
                     );
                     last_send_ok = true;
                 } else {
+                    // Chat channels never show reasoning; local surfaces
+                    // (desktop, ws, …) render it themselves.
+                    let text = if rsclaw_agent::trust::is_local_channel(&channel_name) {
+                        reply.text.clone()
+                    } else {
+                        rsclaw_provider::openai::strip_think_tags_pub(&reply.text)
+                    };
                     let out = OutboundMessage {
                         target_id: target.clone(),
                         is_group,
-                        text: reply.text.clone(),
+                        text,
                         reply_to: if turn == 1 { reply_to.clone() } else { None },
                         images: reply.images.clone(),
                         files: reply.files.clone(),

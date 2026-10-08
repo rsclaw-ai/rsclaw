@@ -1572,6 +1572,16 @@ pub fn strip_think_tags_pub(text: &str) -> String {
 /// Strip `<think>...</think>` tags from content (qwen3.5, QwQ, etc.).
 fn strip_think_tags(text: &str) -> String {
     let mut result = text.to_owned();
+    // A `</think>` with no `<think>` before it: the chat template opened the
+    // block inside the generation prompt (thinking forced open), so the model
+    // output starts mid-reasoning. Everything up to the close tag is reasoning.
+    if let Some(close) = result.find("</think>")
+        && !result[..close].contains("<think>")
+    {
+        result = result[close + "</think>".len()..]
+            .trim_start_matches(['\n', '\r'])
+            .to_owned();
+    }
     // Remove complete <think>...</think> blocks.
     // Search for </think> strictly AFTER each <think> to avoid matching a lone
     // </think> that appears earlier in the string (stream-chunk residual).
@@ -2277,6 +2287,23 @@ fn parse_completions_fallback(v: &Value) -> Option<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn strip_think_tags_handles_forced_open_and_pairs() {
+        // Forced-open: the template put `<think>` in the generation prompt.
+        assert_eq!(
+            super::strip_think_tags("reasoning line\n</think>\n\nanswer"),
+            "answer"
+        );
+        // Paired block before the answer.
+        assert_eq!(super::strip_think_tags("<think>r</think>answer"), "answer");
+        // Two blocks.
+        assert_eq!(super::strip_think_tags("<think>a</think>x<think>b</think>y"), "xy");
+        // Unclosed open at the end is cut.
+        assert_eq!(super::strip_think_tags("answer<think>partial"), "answer");
+        // No tags: unchanged.
+        assert_eq!(super::strip_think_tags("plain\n\n\ntext"), "plain\n\n\ntext");
+    }
+
     use super::{
         super::{LlmRequest, Message, MessageContent, Role},
         *,

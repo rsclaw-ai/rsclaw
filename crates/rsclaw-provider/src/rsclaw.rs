@@ -5717,6 +5717,30 @@ data: {"type":"block_stop","index":0}
     }
 
     #[test]
+    fn turn_options_carry_explicit_thinking_off() {
+        let mut req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("你是啥模型？".into()),
+                rsclaw_hidden: None,
+            }],
+            2,
+            Some("k"),
+        );
+        // Thinking explicitly off (budget 0) must reach the worker as false.
+        req.thinking_budget = Some(0);
+        let off = serde_json::to_value(TurnOptions::from_request(&req, false)).unwrap();
+        assert_eq!(off["enable_thinking"], false);
+        req.thinking_budget = Some(4096);
+        let on = serde_json::to_value(TurnOptions::from_request(&req, false)).unwrap();
+        assert_eq!(on["enable_thinking"], true);
+        // Not configured: omitted, the worker default applies.
+        req.thinking_budget = None;
+        let unset = serde_json::to_value(TurnOptions::from_request(&req, false)).unwrap();
+        assert!(unset.get("enable_thinking").is_none());
+    }
+
+    #[test]
     fn create_session_resp_parses_replay_shape_without_prefix_id() {
         // Protocol §2.2 replay response carries session_id but NOT
         // prefix_id. Without #[serde(default)] this fails with

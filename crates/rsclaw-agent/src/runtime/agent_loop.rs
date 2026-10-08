@@ -680,37 +680,28 @@ impl AgentRuntime {
             //   [tail] …      — turn_scratchpad  (per-iteration tools)
             let mut messages = self.build_request_messages(ctx, &mut turn_scratchpad);
 
-            // Resolve thinking budget from agent config or defaults.
+            // Resolve thinking budget: the agent's own model, then
+            // `agents.defaults.model`, then `agents.defaults.thinking`.
             let thinking_budget = {
                 let agent_thinking = self
                     .handle
                     .config
                     .model
                     .as_ref()
-                    .and_then(|m| m.thinking.as_ref())
-                    .cloned();
-                // Clone the live default so we don't hold the lock across the
-                // closure / `.and_then` chain below.
-                let default_thinking = self.live.agents.read().await.defaults.thinking.clone();
-                let tc = agent_thinking.or(default_thinking);
-                tc.and_then(|t| {
-                    // Explicit budget_tokens takes precedence.
-                    if let Some(budget) = t.budget_tokens {
-                        return Some(budget);
-                    }
-                    // Then try level mapping.
-                    if let Some(ref level) = t.level {
-                        let b = level.budget_tokens();
-                        if b > 0 {
-                            return Some(b);
-                        }
-                    }
-                    // Then fall back to enabled bool (medium budget as default).
-                    if t.enabled == Some(true) {
-                        return Some(10240);
-                    }
-                    None
-                })
+                    .and_then(|m| m.thinking.clone());
+                // Clone the live defaults so we don't hold the lock.
+                let (default_model_thinking, default_thinking) = {
+                    let agents = self.live.agents.read().await;
+                    (
+                        agents.defaults.model.as_ref().and_then(|m| m.thinking.clone()),
+                        agents.defaults.thinking.clone(),
+                    )
+                };
+                super::resolve_thinking_budget(
+                    agent_thinking.as_ref(),
+                    default_model_thinking.as_ref(),
+                    default_thinking.as_ref(),
+                )
             };
 
             let msg_count = messages.len();
@@ -894,7 +885,7 @@ impl AgentRuntime {
                     .or(agents_live.defaults.temperature)
                     .map(Some)
                     .unwrap_or_else(|| {
-                        if thinking_budget.is_some() {
+                        if thinking_budget.unwrap_or(0) > 0 {
                             None
                         } else if tools.is_empty() {
                             Some(0.7)
@@ -1868,7 +1859,8 @@ impl AgentRuntime {
             if intermediate_enabled
                 && !is_streaming_channel
                 && !tool_calls.is_empty()
-                && let Some(intermediate_text) = intermediate_notification_text(&text_buf)
+                && let Some(intermediate_text) =
+                    intermediate_notification_text(&strip_think_for_channel(&text_buf))
             {
                 if let Some(ref ntx) = self.notification_tx {
                     let notif_target = if !ctx.chat_id.is_empty() {
@@ -1879,7 +1871,7 @@ impl AgentRuntime {
                     let _ = ntx.send(rsclaw_channel::OutboundMessage {
                         target_id: notif_target,
                         is_group: false,
-                        text: intermediate_text.to_owned(),
+                        text: intermediate_text.clone(),
                         reply_to: None,
                         images: vec![],
                         files: vec![],
