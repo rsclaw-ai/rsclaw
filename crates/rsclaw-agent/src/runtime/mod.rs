@@ -2802,12 +2802,47 @@ pub(crate) async fn persist_agent_to_config(
     Ok(())
 }
 
-fn intermediate_notification_text(text: &str) -> Option<&str> {
+fn intermediate_notification_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed)
+        Some(trimmed.to_owned())
+    }
+}
+
+/// Text bound for a chat channel: reasoning (`<think>…</think>`, including a
+/// block the template opened in the prompt) never leaves the gateway.
+pub(crate) fn strip_think_for_channel(text: &str) -> String {
+    rsclaw_provider::openai::strip_think_tags_pub(text)
+}
+
+/// Thinking budget for a turn from the first configured source: the agent's
+/// own model, then `agents.defaults.model`, then `agents.defaults.thinking`.
+///
+/// `Some(0)` means "explicitly off" (providers send `enable_thinking: false`);
+/// `None` means "not configured" (the provider's default applies).
+pub(crate) fn resolve_thinking_budget(
+    agent_model: Option<&rsclaw_config::schema::ThinkingConfig>,
+    defaults_model: Option<&rsclaw_config::schema::ThinkingConfig>,
+    defaults: Option<&rsclaw_config::schema::ThinkingConfig>,
+) -> Option<u32> {
+    use rsclaw_config::schema::ThinkingLevel;
+    let t = agent_model.or(defaults_model).or(defaults)?;
+    if let Some(budget) = t.budget_tokens {
+        return Some(budget);
+    }
+    match t.level {
+        Some(ThinkingLevel::Off) => return Some(0),
+        // Let the model decide.
+        Some(ThinkingLevel::Adaptive) => {}
+        Some(ref level) => return Some(level.budget_tokens()),
+        None => {}
+    }
+    match t.enabled {
+        Some(true) => Some(10240),
+        Some(false) => Some(0),
+        None => None,
     }
 }
 

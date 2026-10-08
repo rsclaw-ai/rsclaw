@@ -418,7 +418,7 @@ fn intermediate_notification_text_rejects_whitespace_only_text() {
 fn intermediate_notification_text_preserves_real_text_without_mutating_source() {
     let source = "\n正在查看屏幕。\n";
     assert_eq!(
-        intermediate_notification_text(source),
+        intermediate_notification_text(source).as_deref(),
         Some("正在查看屏幕。")
     );
     assert_eq!(source, "\n正在查看屏幕。\n");
@@ -962,3 +962,46 @@ fn search_query_mode_scores_and_paginates() {
     assert!(names.contains(&"publish_video"));
     assert!(names.contains(&"edit_video"));
 }
+
+#[test]
+fn channel_text_never_carries_reasoning() {
+    // Paired block (thinking enabled; the runtime wraps reasoning in tags).
+    assert_eq!(
+        strip_think_for_channel("<think>user asks X</think>\n\n你好").trim(),
+        "你好"
+    );
+    // Template opened the block in the prompt: output starts mid-reasoning.
+    assert_eq!(
+        strip_think_for_channel("The user is asking.\nLet me answer.\n</think>\n\n在的"),
+        "在的"
+    );
+    // Plain answer is untouched.
+    assert_eq!(strip_think_for_channel("在的，东升"), "在的，东升");
+    // Intermediate notifications go through the same filter.
+    assert_eq!(
+        intermediate_notification_text(&strip_think_for_channel("<think>plan</think>\n正在查看")),
+        Some("正在查看".to_owned())
+    );
+}
+
+#[test]
+fn thinking_budget_falls_back_to_defaults_model() {
+    use rsclaw_config::schema::{ThinkingConfig, ThinkingLevel};
+    let off = ThinkingConfig { enabled: Some(false), level: Some(ThinkingLevel::Off), budget_tokens: Some(0) };
+    let on = ThinkingConfig { enabled: Some(true), level: None, budget_tokens: None };
+    // The production shape: agent has no model of its own, thinking is
+    // configured under agents.defaults.model.
+    assert_eq!(resolve_thinking_budget(None, Some(&off), None), Some(0));
+    // Agent's own model wins over the defaults.
+    assert_eq!(resolve_thinking_budget(Some(&on), Some(&off), None), Some(10240));
+    // agents.defaults.thinking is the last resort.
+    assert_eq!(resolve_thinking_budget(None, None, Some(&on)), Some(10240));
+    // Explicitly off without a budget still disables (instead of "unset").
+    let off_flag = ThinkingConfig { enabled: Some(false), level: None, budget_tokens: None };
+    assert_eq!(resolve_thinking_budget(None, Some(&off_flag), None), Some(0));
+    let off_level = ThinkingConfig { enabled: None, level: Some(ThinkingLevel::Off), budget_tokens: None };
+    assert_eq!(resolve_thinking_budget(None, Some(&off_level), None), Some(0));
+    // Nothing configured leaves the provider default.
+    assert_eq!(resolve_thinking_budget(None, None, None), None);
+}
+
