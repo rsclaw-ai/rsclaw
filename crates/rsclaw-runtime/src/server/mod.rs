@@ -6719,22 +6719,22 @@ struct QrStatusRequest {
 }
 
 /// POST /api/v1/channels/wechat/qr-status
-/// Poll WeChat QR scan status. Returns bot_token + bot_id when scanned.
+/// One long-poll (up to ~35s) of the WeChat QR login. `status` is
+/// `waiting`, `scanned` (confirm on the phone), `expired` (start a new
+/// login) or `ok` (with `bot_token` + `bot_id`).
 async fn wechat_qr_status(Json(req): Json<QrStatusRequest>) -> Response {
+    use rsclaw_channel::wechat::{QrLoginState, WeChatPersonalChannel};
     let client = reqwest::Client::new();
-    match rsclaw_channel::wechat::WeChatPersonalChannel::poll_qr_status(&client, &req.qrcode_token)
-        .await
-    {
-        Ok(Some((bot_token, bot_id))) => Json(serde_json::json!({
+    match WeChatPersonalChannel::poll_qr_state(&client, &req.qrcode_token).await {
+        Ok(QrLoginState::Confirmed { bot_token, bot_id }) => Json(serde_json::json!({
             "status": "ok",
             "bot_token": bot_token,
             "bot_id": bot_id,
         }))
         .into_response(),
-        Ok(None) => Json(serde_json::json!({
-            "status": "waiting",
-        }))
-        .into_response(),
+        Ok(QrLoginState::Waiting) => Json(serde_json::json!({"status": "waiting"})).into_response(),
+        Ok(QrLoginState::Scanned) => Json(serde_json::json!({"status": "scanned"})).into_response(),
+        Ok(QrLoginState::Expired) => Json(serde_json::json!({"status": "expired"})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
