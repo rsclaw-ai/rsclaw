@@ -691,6 +691,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         ] {
             let _ = std::fs::create_dir_all(base.join(dir));
         }
+        crate::bundled_plugins::install_all(&base.join("plugins"));
         let defaults_path = base.join("defaults.toml");
         if !defaults_path.exists() {
             let _ = std::fs::write(&defaults_path, &builtin_defaults());
@@ -817,6 +818,13 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         let path = base.join(dir);
         std::fs::create_dir_all(&path)?;
         step("+", &format!("{}", path.display()));
+    }
+    for (name, outcome) in crate::bundled_plugins::install_all(&base.join("plugins")) {
+        if let crate::bundled_plugins::Outcome::Installed { version }
+        | crate::bundled_plugins::Outcome::Upgraded { to: version, .. } = outcome
+        {
+            step("+", &format!("plugin {name} v{version}"));
+        }
     }
 
     // Import data from OpenClaw when user chose Import mode.

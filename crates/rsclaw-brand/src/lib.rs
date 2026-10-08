@@ -12,6 +12,18 @@ use std::sync::LazyLock;
 
 include!(concat!(env!("OUT_DIR"), "/brand.rs"));
 
+pub mod plugin_digest;
+
+/// A plugin shipped with this brand. The install package carries its files;
+/// [`BUNDLED_PLUGINS`] records what they must hash to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundledPlugin {
+    pub name: &'static str,
+    pub version: &'static str,
+    /// `sha256:<hex>` from [`plugin_digest::tree_digest`].
+    pub digest: &'static str,
+}
+
 /// Default-brand tokens that user-facing text templates are written with,
 /// paired with this build's value. Longer tokens come first so the scan in
 /// [`rebrand`] prefers them.
@@ -192,6 +204,50 @@ mod tests {
         assert!(PROMPT_POLICY.is_none() && prompt_policy(true).is_none() && prompt_policy(false).is_none());
         assert!(prompt_template("zh", "IDENTITY.md").is_none());
         assert!(!has_config_layers());
+        assert!(BUNDLED_PLUGINS.is_empty());
+    }
+
+    #[test]
+    fn bundled_plugin_codegen_lists_each_plugin() {
+        let code = spec::generate_bundled_plugins(&[(
+            "court".to_owned(),
+            "0.2.0".to_owned(),
+            "sha256:ab".to_owned(),
+        )]);
+        assert!(code.contains(
+            "BundledPlugin { name: \"court\", version: \"0.2.0\", digest: \"sha256:ab\" }"
+        ));
+        assert!(spec::generate_bundled_plugins(&[]).contains("&[\n];"));
+    }
+
+    #[test]
+    fn tree_digest_tracks_content_names_and_ignores_markers() {
+        let dir = std::env::temp_dir().join(format!("rsclaw-brand-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).expect("mkdir");
+        std::fs::write(dir.join("plugin.json5"), "{name:'x'}").expect("write");
+        std::fs::write(dir.join("sub/a.wasm"), b"\0asm").expect("write");
+        let base = plugin_digest::tree_digest(&dir).expect("digest");
+        assert!(base.starts_with("sha256:") && base.len() == 7 + 64);
+
+        std::fs::write(dir.join(".rsclaw-bundled.json"), "{}").expect("write");
+        std::fs::write(dir.join(".DS_Store"), "x").expect("write");
+        assert_eq!(plugin_digest::tree_digest(&dir).expect("digest"), base);
+
+        std::fs::write(dir.join("sub/a.wasm"), b"\0asn").expect("write");
+        assert_ne!(plugin_digest::tree_digest(&dir).expect("digest"), base);
+        std::fs::write(dir.join("sub/a.wasm"), b"\0asm").expect("write");
+        std::fs::rename(dir.join("sub/a.wasm"), dir.join("sub/b.wasm")).expect("rename");
+        assert_ne!(plugin_digest::tree_digest(&dir).expect("digest"), base);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn version_ordering_is_numeric() {
+        use std::cmp::Ordering::*;
+        assert_eq!(plugin_digest::version_cmp("0.10.0", "0.9.3"), Greater);
+        assert_eq!(plugin_digest::version_cmp("1.2", "1.2.0"), Equal);
+        assert_eq!(plugin_digest::version_cmp("v0.2.0", "0.2.1"), Less);
     }
 
     #[test]

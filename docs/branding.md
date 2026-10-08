@@ -162,6 +162,7 @@ Markdown must be non-empty UTF-8. The default brand directory
 | `prompts/policy.md` | Distributor policy prompt |
 | `prompts/policy.zh.md`, `prompts/policy.en.md` | Language-specific policy prompt (optional) |
 | `prompts/<zh\|en>/<SOUL\|IDENTITY\|AGENTS\|USER\|HEARTBEAT>.md` | Bootstrap workspace templates |
+| `plugins/<name>/` | Plugin bundled with the brand (see "Bundled plugins") |
 
 ### Config layers
 
@@ -213,3 +214,52 @@ prefix id is needed. Language choice: the language-specific file, then
 
 `doctor` prints a brand line (id, number of locked keys, policy prompt) for
 non-default builds.
+
+## Bundled plugins
+
+A brand can ship plugins with its install package. Each lives in
+`plugins/<name>/` next to the brand file, laid out exactly like an installed
+plugin: a `plugin.json5` whose `name` equals the directory and that declares
+a `version`, plus its entry (`.wasm` for WASM plugins). The build records
+each plugin's name, version and a content digest (`sha256` over every file)
+in `rsclaw_brand::BUNDLED_PLUGINS`; the plugin files are **not** compiled into
+the binary.
+
+Packaging puts the files next to the engine, where the engine looks for them
+in this order:
+
+1. `$RSCLAW_BUNDLED_PLUGINS_DIR`;
+2. `<engine dir>/../Resources/plugins` (macOS app bundle, engine in
+   `Contents/Helpers`);
+3. `<engine dir>/../plugins` (desktop packages with the engine in `bin/`);
+4. `<engine dir>/plugins`.
+
+On `setup` and on every gateway start, each bundled plugin is checked and
+installed into `$base_dir/plugins/<name>/`:
+
+- files whose digest differs from the recorded one are **refused** (a
+  tampered package does not install);
+- missing, or installed at an older version → installed / upgraded,
+  atomically (staged copy, then swapped in);
+- same version but edited or without the install marker → reinstalled;
+- installed at a newer version → kept (never downgraded).
+
+The installed copy carries `.rsclaw-bundled.json`. A bundled plugin cannot be
+uninstalled with `plugins uninstall` (it would come back on the next start).
+To keep it enabled, lock it in `policy.locked.json5`:
+
+```json5
+{ plugins: { entries: { "<name>": { enabled: true } } } }
+```
+
+`plugins enable` / `plugins disable` then refuse to toggle it.
+
+Trust model: a bundled plugin is part of the distributor's package, so it
+skips the hub allowlist that gates network installs. Everything enforced at
+run time still applies: the WASM sandbox, per-call time limits, host
+capability checks, the `host.cli` allowlist and upload-directory checks.
+
+Plugin tools reach the model through the plugin catalog and
+`plugin_search` / `plugin_invoke`, not through the builtin tool list, so a
+bundled plugin does not change the cached shared prefix.
+

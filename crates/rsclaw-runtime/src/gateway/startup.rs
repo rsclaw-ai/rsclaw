@@ -410,6 +410,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // 7. Load all plugins (JS + WASM) and register built-in memory slot.
     let plugins_dir = base_dir.join("plugins");
+    // Brand-bundled plugins first, so a fresh or upgraded install loads them
+    // on this start (no-op for builds that bundle none).
+    crate::bundled_plugins::install_all(&plugins_dir);
     let wasm_browser: Arc<tokio::sync::Mutex<Option<rsclaw_browser::BrowserSession>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     // Resolve default vision model for the host-vlm interface (plugin

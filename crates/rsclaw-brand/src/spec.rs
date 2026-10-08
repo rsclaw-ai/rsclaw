@@ -285,3 +285,25 @@ pub fn generate_assets(found: &dyn Fn(&str) -> Option<String>) -> String {
     ));
     out
 }
+
+/// A plugin bundled with the brand: `(name, version, digest)`, digest as
+/// produced by `plugin_digest::tree_digest`.
+pub type BundledPluginSpec = (String, String, String);
+
+/// Rust source for `BUNDLED_PLUGINS` (empty for a brand without
+/// `plugins/`).
+pub fn generate_bundled_plugins(plugins: &[BundledPluginSpec]) -> String {
+    let mut items = String::new();
+    for (name, version, digest) in plugins {
+        items.push_str(&format!(
+            "    BundledPlugin {{ name: {name:?}, version: {version:?}, digest: {digest:?} }},\n"
+        ));
+    }
+    format!(
+        "/// Plugins bundled with this brand (`plugins/<name>/` in the brand directory).\n\
+         /// Install packages ship the files; the engine verifies `digest` before\n\
+         /// installing them.\n\
+         pub const BUNDLED_PLUGINS: &[BundledPlugin] = &[\n{items}];\n"
+    )
+}
+

@@ -7644,6 +7644,7 @@ version = "0.1.0"
 dependencies = [
  "json5",
  "serde_json",
+ "sha2",
  "toml 1.1.0+spec-1.1.0",
 ]
 

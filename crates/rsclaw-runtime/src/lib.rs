@@ -83,6 +83,7 @@
 // The 7 root-knot modules (composition root + RPC handlers).
 // ---------------------------------------------------------------------------
 pub mod a2a;
+pub mod bundled_plugins;
 pub mod cmd;
 pub mod cron;
 pub mod gateway;

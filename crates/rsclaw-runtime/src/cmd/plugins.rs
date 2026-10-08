@@ -111,6 +111,12 @@ fn plugins_list() -> Result<()> {
     );
     for p in &plugins {
         let version = p.version.as_deref().unwrap_or("-");
+        let version = if crate::bundled_plugins::is_bundled(&p.name) {
+            format!("{version}*")
+        } else {
+            version.to_owned()
+        };
+        let version = version.as_str();
         let desc = p.description.as_deref().unwrap_or("-");
         println!(
             "  {:<24} {:<10} {:<8} {}",
@@ -467,6 +473,13 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 // ---------------------------------------------------------------------------
 
 fn plugins_set_enabled(name: &str, enabled: bool) -> Result<()> {
+    let locked = format!("plugins.entries.{name}.enabled");
+    if rsclaw_config::brand_layers::locked_paths()
+        .iter()
+        .any(|p| *p == locked || locked.starts_with(&format!("{p}.")))
+    {
+        bail!("plugin `{name}` is managed by the distributor of this build and cannot be toggled");
+    }
     // Verify the plugin is installed
     let plugin_dir = plugins_dir().join(name);
     if !plugin_dir.exists() {
@@ -649,6 +662,12 @@ fn plugins_inspect(name: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn plugins_uninstall(name: &str) -> Result<()> {
+    if crate::bundled_plugins::is_bundled(name) {
+        bail!(
+            "plugin `{name}` ships with this build and is reinstalled on every start; \
+             it cannot be uninstalled"
+        );
+    }
     let plugin_dir = plugins_dir().join(name);
     if !plugin_dir.exists() {
         bail!("plugin `{name}` not found in {}", plugins_dir().display());
