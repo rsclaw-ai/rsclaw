@@ -3756,7 +3756,14 @@ pub(crate) async fn apply_reload_scopes(
             vec![rsclaw_config::schema::AgentEntry {
                 id: "main".to_owned(),
                 default: Some(true),
-                name: Some("Main Agent".to_owned()),
+                name: Some(
+                    rsclaw_brand::default_agent_name(
+                        rsclaw_i18n::resolve_lang(
+                            fresh_config.gateway.language.as_deref().unwrap_or(""),
+                        ) == "zh",
+                    )
+                    .to_owned(),
+                ),
                 workspace: defaults.workspace.clone(),
                 model: defaults.model.clone(),
                 flash_model: None,

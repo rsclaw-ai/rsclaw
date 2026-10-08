@@ -921,7 +921,13 @@ impl AgentRegistry {
                 daemon: false,
                 description: None,
                 default: Some(true),
-                name: Some("Main Agent".to_owned()),
+                name: Some(
+                    rsclaw_brand::default_agent_name(
+                        rsclaw_i18n::resolve_lang(cfg.gateway.language.as_deref().unwrap_or(""))
+                            == "zh",
+                    )
+                    .to_owned(),
+                ),
                 workspace,
                 model,
                 flash_model: None,

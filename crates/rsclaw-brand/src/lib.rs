@@ -66,6 +66,19 @@ pub fn is_default_text() -> bool {
     ACTIVE_TOKENS.is_empty()
 }
 
+/// Display name of the implicit `main` agent created when the config lists
+/// no agents: `Main Agent` in the default brand, the brand's assistant name
+/// (Chinese when `zh`) otherwise.
+pub fn default_agent_name(zh: bool) -> &'static str {
+    if ID == "rsclaw" {
+        "Main Agent"
+    } else if zh {
+        ASSISTANT_NAME_ZH
+    } else {
+        ASSISTANT_NAME
+    }
+}
+
 /// Rewrite a user-facing text template authored with the default brand
 /// (`RsClaw`, `Crab AI Assistant`, `螃蟹AI助手`, `~/.rsclaw`, `rsclaw.json5`,
 /// `rsclaw.ai`, `🦀`, and `rsclaw <subcommand>` invocations) into this
