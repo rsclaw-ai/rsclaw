@@ -125,7 +125,8 @@ pub enum QrLoginState {
     Waiting,
     /// Scanned; waiting for the user to confirm on the phone.
     Scanned,
-    /// Confirmed; the bot token has been saved.
+    /// Confirmed; the bot token has been saved (unless polled with
+    /// [`WeChatPersonalChannel::poll_qr_state_unsaved`]).
     Confirmed { bot_token: String, bot_id: String },
     /// The QR code expired; start a new login.
     Expired,
@@ -474,6 +475,21 @@ impl WeChatPersonalChannel {
     /// so callers can simply poll again. On confirmation the bot token is
     /// saved, as with [`Self::poll_qr_status`].
     pub async fn poll_qr_state(client: &Client, qrcode: &str) -> Result<QrLoginState> {
+        Self::poll_qr_state_inner(client, qrcode, true).await
+    }
+
+    /// Like [`Self::poll_qr_state`] but does not save the token on
+    /// confirmation: the caller binds it itself (the HTTP login writes it
+    /// into `channels.wechat.accounts` in one atomic config update).
+    pub async fn poll_qr_state_unsaved(client: &Client, qrcode: &str) -> Result<QrLoginState> {
+        Self::poll_qr_state_inner(client, qrcode, false).await
+    }
+
+    async fn poll_qr_state_inner(
+        client: &Client,
+        qrcode: &str,
+        save: bool,
+    ) -> Result<QrLoginState> {
         let url = format!(
             "{}/ilink/bot/get_qrcode_status?qrcode={}",
             ILINK_BASE_URL, qrcode
@@ -498,14 +514,16 @@ impl WeChatPersonalChannel {
                     .ilink_bot_id
                     .context("no ilink_bot_id after confirmed")?;
 
-                crate::auth::save_token(
-                    "wechat",
-                    &json!({
-                        "bot_token": token,
-                        "ilink_bot_id": bot_id,
-                        "ilink_user_id": resp.ilink_user_id,
-                    }),
-                )?;
+                if save {
+                    crate::auth::save_token(
+                        "wechat",
+                        &json!({
+                            "bot_token": token,
+                            "ilink_bot_id": bot_id,
+                            "ilink_user_id": resp.ilink_user_id,
+                        }),
+                    )?;
+                }
 
                 QrLoginState::Confirmed {
                     bot_token: token,
