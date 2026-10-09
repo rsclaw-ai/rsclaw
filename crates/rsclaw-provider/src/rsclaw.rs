@@ -620,6 +620,11 @@ impl LlmProvider for RsclawProvider {
             // entire turn. Fold trailing System text back into the
             // preceding User delta so the model still gets the context.
             normalize_trailing_system(&mut req.messages);
+            if !self.prefix_id.is_empty() {
+                if let Some(user_system) = req.user_system.clone() {
+                    carry_user_system_in_first_user(&mut req.messages, &user_system);
+                }
+            }
 
             let split = split_request(&req, &self.prefix_id, self.constrain_tool_calls)?;
 
@@ -2718,6 +2723,45 @@ fn normalize_trailing_system(messages: &mut Vec<Message>) {
         },
         _ => {
             // Tool / empty — nothing to fold into. Drop silently.
+        }
+    }
+}
+
+/// Registry-path sessions fork the worker's registered base KV, and the
+/// deployed server/worker pair renders nothing from the per-session
+/// `user_system` there: the server only forwards `prefix_id`,
+/// `user_tools`, `dynamic_prefix` and `options`, and the worker's static
+/// path ignores `dynamic_prefix`. Persona, response language, distributor
+/// policy and plugin/skill listings were therefore lost. The conversation
+/// itself does reach the worker, so prepend the segment to the first user
+/// message. The head message survives in-place compaction (head
+/// sanctuary) and is rebuilt identically on replay, so the session keeps
+/// seeing it.
+const SESSION_INSTRUCTIONS_OPEN: &str = "<session-instructions>\n";
+const SESSION_INSTRUCTIONS_CLOSE: &str = "\n</session-instructions>\n\n";
+
+fn carry_user_system_in_first_user(messages: &mut [Message], user_system: &str) {
+    let user_system = user_system.trim();
+    if user_system.is_empty() {
+        return;
+    }
+    let Some(first) = messages.iter_mut().find(|m| matches!(m.role, Role::User)) else {
+        return;
+    };
+    let block = format!("{SESSION_INSTRUCTIONS_OPEN}{user_system}{SESSION_INSTRUCTIONS_CLOSE}");
+    match &mut first.content {
+        MessageContent::Text(t) => {
+            if t.starts_with(SESSION_INSTRUCTIONS_OPEN) {
+                return;
+            }
+            t.insert_str(0, &block);
+        }
+        MessageContent::Parts(parts) => {
+            if matches!(parts.first(), Some(ContentPart::Text { text }) if text.starts_with(SESSION_INSTRUCTIONS_OPEN))
+            {
+                return;
+            }
+            parts.insert(0, ContentPart::Text { text: block });
         }
     }
 }
@@ -5507,6 +5551,64 @@ data: {"type":"block_stop","index":0}
         assert!(
             suffix.is_empty(),
             "Parts whose only Text was empty must not leak; got {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn user_system_rides_on_the_first_user_message() {
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+            rsclaw_hidden: None,
+        };
+        let mut msgs = vec![
+            m(Role::User, "first"),
+            m(Role::Assistant, "ok"),
+            m(Role::User, "second"),
+        ];
+        carry_user_system_in_first_user(&mut msgs, "Persona: lvsi\n");
+        let MessageContent::Text(t) = &msgs[0].content else {
+            panic!("expected Text content")
+        };
+        assert_eq!(
+            t,
+            "<session-instructions>\nPersona: lvsi\n</session-instructions>\n\nfirst"
+        );
+        let MessageContent::Text(t) = &msgs[2].content else {
+            panic!("expected Text content")
+        };
+        assert_eq!(t, "second");
+
+        // Applying twice (e.g. a retried request) must not stack blocks.
+        carry_user_system_in_first_user(&mut msgs, "Persona: lvsi");
+        let MessageContent::Text(t) = &msgs[0].content else {
+            panic!("expected Text content")
+        };
+        assert_eq!(t.matches("<session-instructions>").count(), 1);
+
+        // Blank segment is a no-op.
+        let mut msgs = vec![m(Role::User, "hi")];
+        carry_user_system_in_first_user(&mut msgs, "  ");
+        let MessageContent::Text(t) = &msgs[0].content else {
+            panic!("expected Text content")
+        };
+        assert_eq!(t, "hi");
+    }
+
+    #[test]
+    fn user_system_leads_multipart_first_user_message() {
+        let mut msgs = vec![Message {
+            role: Role::User,
+            content: MessageContent::Parts(vec![ContentPart::Text { text: "look".into() }]),
+            rsclaw_hidden: None,
+        }];
+        carry_user_system_in_first_user(&mut msgs, "Persona: lvsi");
+        let MessageContent::Parts(parts) = &msgs[0].content else {
+            panic!("expected Parts content")
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(
+            matches!(&parts[0], ContentPart::Text { text } if text.contains("Persona: lvsi"))
         );
     }
 
