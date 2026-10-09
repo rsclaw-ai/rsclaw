@@ -2792,9 +2792,14 @@ impl AgentRuntime {
                             // token-saving tradeoff. The per-turn aggregate guard
                             // (cap_turn_input_to_budget) still bounds a pathologically
                             // huge SKILL.md, so this can't blow the context unbounded.
+                            // `plugin_describe` is the same kind of spec: one tool's
+                            // input schema, which the model must match field by field.
                             let v = if matches!(
                                 tool_name.as_str(),
-                                "read_artifact" | "read_session_archive" | "skill_use"
+                                "read_artifact"
+                                    | "read_session_archive"
+                                    | "skill_use"
+                                    | "plugin_describe"
                             ) {
                                 v
                             } else {
@@ -3264,7 +3269,9 @@ impl AgentRuntime {
                         // @fly-ai/flyai-cli` on line 60 — past the 3000-char
                         // cut — so the agent saw only `runtime: node` in
                         // frontmatter and made up `node index.js` instead).
-                        "skill_use" => limits.and_then(|l| l.default).unwrap_or(60_000),
+                        "skill_use" | "plugin_describe" => {
+                            limits.and_then(|l| l.default).unwrap_or(60_000)
+                        }
                         // Recovery tools page their own output against the
                         // artifact read budget and advance a server-side
                         // cursor. Cutting a page here loses the tail for good
