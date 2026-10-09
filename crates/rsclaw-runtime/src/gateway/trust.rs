@@ -20,6 +20,14 @@ pub fn refresh_from_config(config: &RuntimeConfig) {
         .unwrap_or_default();
     rsclaw_agent::trust::set_explicit_owners(owners);
 
+    rsclaw_util::net::set_trusted_redirect_sites(
+        config
+            .raw
+            .gateway
+            .as_ref()
+            .and_then(|g| g.trusted_redirect_sites.clone()),
+    );
+
     let mut lists: HashMap<String, HashSet<String>> = HashMap::new();
     if let Some(channels) = config.raw.channels.as_ref() {
         match serde_json::to_value(channels) {
