@@ -213,9 +213,19 @@ fn site_of(host: &str) -> &str {
     }
 }
 
+/// Registrable domains operated as one fleet. A credentialed hop between two
+/// of them is not a leak: `api.rsclaw.ai` permanently redirects to the
+/// serving domain. Any other cross-site hop is still refused.
+const TRUSTED_FLEET_SITES: &[&str] = &["rsclaw.ai", "duoduoyun.work"];
+
+fn trusted_fleet_hop(a: &str, b: &str) -> bool {
+    TRUSTED_FLEET_SITES.contains(&a) && TRUSTED_FLEET_SITES.contains(&b)
+}
+
 /// Whether a credentialed request may follow a redirect from `from` to
-/// `to`: same host or same registrable domain (LB -> backend pool), and
-/// never an https -> http downgrade.
+/// `to`: same host or same registrable domain (LB -> backend pool), or a
+/// hop between the trusted fleet domains over https; never an https -> http
+/// downgrade.
 pub(crate) fn redirect_allowed(from: &str, to: &str) -> bool {
     let (Ok(from), Ok(to)) = (Url::parse(from), Url::parse(to)) else {
         return false;
@@ -229,7 +239,9 @@ pub(crate) fn redirect_allowed(from: &str, to: &str) -> bool {
     match (from.host_str(), to.host_str()) {
         (Some(a), Some(b)) => {
             let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
-            a == b || site_of(&a) == site_of(&b)
+            a == b
+                || site_of(&a) == site_of(&b)
+                || (to.scheme() == "https" && trusted_fleet_hop(site_of(&a), site_of(&b)))
         }
         _ => false,
     }
@@ -341,6 +353,19 @@ mod tests {
         assert!(!redirect_allowed(
             "http://127.0.0.1:8080/start",
             "http://10.0.0.1:8080/final"
+        ));
+        // The public domain permanently redirects to the serving domain.
+        assert!(redirect_allowed(
+            "https://api.rsclaw.ai/v1/agent/sessions",
+            "https://api.duoduoyun.work:8443/v1/agent/sessions"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.rsclaw.ai/v1/agent/sessions",
+            "http://api.duoduoyun.work/v1/agent/sessions"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.duoduoyun.work:8443/v1",
+            "https://duoduoyun.work.evil.example/v1"
         ));
     }
 
