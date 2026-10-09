@@ -2446,13 +2446,30 @@ fn format_artifact_read(val: &serde_json::Value) -> String {
         meta.push("truncated=true".to_owned());
     }
     let mut out = content.trim_end().to_owned();
+    // query: mode answers with ranked `matches` instead of `content`.
+    if let Some(matches) = val.get("matches").and_then(|v| v.as_array()) {
+        if matches.is_empty() {
+            out.push_str("(no matching sections)");
+        }
+        for m in matches {
+            let text = m.get("text").and_then(|v| v.as_str()).unwrap_or("").trim_end();
+            let from = m.get("from_line").and_then(|v| v.as_u64()).unwrap_or(0);
+            let to = m.get("to_line").and_then(|v| v.as_u64()).unwrap_or(0);
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&format!("--- lines {from}-{to} ---\n{text}"));
+        }
+    }
     if !out.is_empty() {
         out.push_str("\n\n");
     }
     out.push_str(&format!("[read_artifact {}]", meta.join(" ")));
-    if let Some(next) = val.get("next").and_then(|v| v.as_str()) {
-        out.push_str("\n");
-        out.push_str(next);
+    for key in ["note", "next"] {
+        if let Some(text) = val.get(key).and_then(|v| v.as_str()) {
+            out.push_str("\n");
+            out.push_str(text);
+        }
     }
     out
 }
@@ -2948,6 +2965,32 @@ mod format_artifact_read_tests {
             "returned_chars": 0, "content": "", "byte_size": 9000, "char_count": 8800});
         let s = format_tool_result(&v);
         assert!(s.contains("total_lines=420") && s.contains("byte_size=9000"), "{s}");
+    }
+
+    #[test]
+    fn query_matches_are_rendered() {
+        let val = serde_json::json!({
+            "tool_result_id": "tr_1",
+            "mode": "query:required fields",
+            "total_lines": 177,
+            "matches": [
+                {"from_line": 40, "to_line": 52, "score": 0.81, "text": "\"required\": [\"court_name\"]"}
+            ],
+            "note": "Top semantically-relevant sections.",
+        });
+        let out = super::format_artifact_read(&val);
+        assert!(out.contains("--- lines 40-52 ---"), "{out}");
+        assert!(out.contains("court_name"), "{out}");
+        assert!(out.contains("Top semantically-relevant sections."), "{out}");
+
+        let empty = serde_json::json!({
+            "tool_result_id": "tr_1",
+            "mode": "query:x",
+            "matches": [],
+            "note": "Artifact is empty.",
+        });
+        let out = super::format_artifact_read(&empty);
+        assert!(out.starts_with("(no matching sections)"), "{out}");
     }
 
     #[test]
