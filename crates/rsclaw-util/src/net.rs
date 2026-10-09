@@ -16,6 +16,7 @@
 //! no-op; the pre-flight check still rejects literal/private targets.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -270,6 +271,48 @@ pub async fn read_body_truncated(
     Ok((out, false))
 }
 
+/// Registrable domains trusted as one model-serving fleet when no
+/// `gateway.trustedRedirectSites` is configured: the public API domain
+/// permanently redirects to the serving domain.
+pub const DEFAULT_TRUSTED_REDIRECT_SITES: &[&str] = &["rsclaw.ai", "duoduoyun.work"];
+
+static TRUSTED_REDIRECT_SITES: RwLock<Option<Vec<String>>> = RwLock::new(None);
+
+/// Replace the trusted redirect sites (`gateway.trustedRedirectSites`).
+/// `None` restores [`DEFAULT_TRUSTED_REDIRECT_SITES`]; an explicit list,
+/// even an empty one, replaces the defaults. Entries are registrable
+/// domains (`example.com`); a leading `*.` or `.` is ignored.
+pub fn set_trusted_redirect_sites(sites: Option<Vec<String>>) {
+    let normalized = sites.map(|list| {
+        list.iter()
+            .map(|s| {
+                s.trim()
+                    .trim_start_matches("*.")
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase()
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+    });
+    if let Ok(mut slot) = TRUSTED_REDIRECT_SITES.write() {
+        *slot = normalized;
+    }
+}
+
+/// Whether a credentialed https redirect between two registrable domains
+/// stays inside the trusted fleet (both ends trusted).
+pub fn is_trusted_redirect_hop(from_site: &str, to_site: &str) -> bool {
+    let trusted = |site: &str, list: &[String]| list.iter().any(|t| t == site);
+    let (a, b) = (from_site.to_ascii_lowercase(), to_site.to_ascii_lowercase());
+    match TRUSTED_REDIRECT_SITES.read().ok().and_then(|g| g.clone()) {
+        Some(list) => trusted(&a, &list) && trusted(&b, &list),
+        None => {
+            DEFAULT_TRUSTED_REDIRECT_SITES.contains(&a.as_str())
+                && DEFAULT_TRUSTED_REDIRECT_SITES.contains(&b.as_str())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +355,22 @@ mod tests {
         ] {
             assert!(resolve_public(u).await.is_err(), "{u} should be rejected");
         }
+    }
+
+    #[test]
+    fn trusted_redirect_sites_default_and_override() {
+        set_trusted_redirect_sites(None);
+        assert!(is_trusted_redirect_hop("rsclaw.ai", "duoduoyun.work"));
+        assert!(!is_trusted_redirect_hop("rsclaw.ai", "evil.com"));
+
+        set_trusted_redirect_sites(Some(vec![" *.Example.com ".into(), ".cdn.net".into()]));
+        assert!(is_trusted_redirect_hop("example.com", "cdn.net"));
+        assert!(!is_trusted_redirect_hop("rsclaw.ai", "duoduoyun.work"));
+
+        set_trusted_redirect_sites(Some(vec![]));
+        assert!(!is_trusted_redirect_hop("rsclaw.ai", "duoduoyun.work"));
+
+        set_trusted_redirect_sites(None);
+        assert!(is_trusted_redirect_hop("duoduoyun.work", "rsclaw.ai"));
     }
 }

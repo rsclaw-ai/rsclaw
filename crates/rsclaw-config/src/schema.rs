@@ -95,6 +95,13 @@ pub struct MetaConfig {
 #[serde(rename_all = "camelCase")]
 pub struct GatewayConfig {
     pub port: Option<u16>,
+    /// Registrable domains between which credentialed https redirects of
+    /// the model fleet may be followed (e.g. a public API domain that
+    /// permanently redirects to the serving domain). Unset uses the
+    /// built-in fleet domains; a list replaces them. Other cross-site
+    /// redirects and https->http downgrades are always refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_redirect_sites: Option<Vec<String>>,
     pub mode: Option<GatewayMode>,
     pub bind: Option<BindMode>,
     /// Custom bind address (IP string like "192.168.0.169"). Used when bind is

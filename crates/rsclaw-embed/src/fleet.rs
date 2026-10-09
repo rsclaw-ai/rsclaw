@@ -120,15 +120,6 @@ fn site_of(host: &str) -> &str {
     }
 }
 
-/// Registrable domains operated as one fleet. A credentialed hop between two
-/// of them is not a leak: `api.rsclaw.ai` permanently redirects to the
-/// serving domain. Any other cross-site hop is still refused.
-const TRUSTED_FLEET_SITES: &[&str] = &["rsclaw.ai", "duoduoyun.work"];
-
-fn trusted_fleet_hop(a: &str, b: &str) -> bool {
-    TRUSTED_FLEET_SITES.contains(&a) && TRUSTED_FLEET_SITES.contains(&b)
-}
-
 /// Whether a credentialed request may follow a redirect from `from` to `to`:
 /// same host or same registrable domain (LB -> backend pool), and never an
 /// https -> http downgrade. Same rule as
@@ -149,7 +140,8 @@ fn redirect_allowed(from: &str, to: &str) -> bool {
         (Some(a), Some(b)) => {
             a == b
                 || site_of(&a) == site_of(&b)
-                || (ts == "https" && trusted_fleet_hop(site_of(&a), site_of(&b)))
+                || (ts == "https"
+                    && rsclaw_util::net::is_trusted_redirect_hop(site_of(&a), site_of(&b)))
         }
         _ => false,
     }
