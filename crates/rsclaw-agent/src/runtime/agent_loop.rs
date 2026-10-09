@@ -3265,6 +3265,12 @@ impl AgentRuntime {
                         // cut — so the agent saw only `runtime: node` in
                         // frontmatter and made up `node index.js` instead).
                         "skill_use" => limits.and_then(|l| l.default).unwrap_or(60_000),
+                        // Recovery tools page their own output against the
+                        // artifact read budget and advance a server-side
+                        // cursor. Cutting a page here loses the tail for good
+                        // (the cursor has already moved past it), and the model
+                        // then loops re-reading an artifact it can never see.
+                        "read_artifact" | "read_session_archive" => usize::MAX,
                         "read_file" | "read" => limits.and_then(|l| l.default).unwrap_or(3000),
                         _ => limits.and_then(|l| l.default).unwrap_or(3000),
                     };

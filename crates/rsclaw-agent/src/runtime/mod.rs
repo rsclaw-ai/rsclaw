@@ -2418,6 +2418,45 @@ fn squash_large_strings(val: &serde_json::Value, max_chars: usize) -> serde_json
     }
 }
 
+/// Render a `read_artifact` result: the page content followed by a one-line
+/// status (position, end-of-artifact, sizes) and the tool's `next` hint.
+fn format_artifact_read(val: &serde_json::Value) -> String {
+    let content = val.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let mut meta: Vec<String> = Vec::new();
+    for key in [
+        "mode",
+        "from_line",
+        "to_line",
+        "total_lines",
+        "returned_lines",
+        "selected_lines",
+        "char_count",
+        "byte_size",
+    ] {
+        match val.get(key) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => meta.push(format!("{key}={s}")),
+            Some(serde_json::Value::Number(n)) => meta.push(format!("{key}={n}")),
+            _ => {}
+        }
+    }
+    if val.get("at_end").and_then(|v| v.as_bool()) == Some(true) {
+        meta.push("at_end=true".to_owned());
+    }
+    if val.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
+        meta.push("truncated=true".to_owned());
+    }
+    let mut out = content.trim_end().to_owned();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&format!("[read_artifact {}]", meta.join(" ")));
+    if let Some(next) = val.get("next").and_then(|v| v.as_str()) {
+        out.push_str("\n");
+        out.push_str(next);
+    }
+    out
+}
+
 fn format_tool_result(val: &serde_json::Value) -> String {
     // exec tool: { exit_code, stdout, stderr }
     if val.get("stdout").is_some() || val.get("stderr").is_some() {
@@ -2448,6 +2487,44 @@ fn format_tool_result(val: &serde_json::Value) -> String {
         } else {
             out
         }
+    }
+    // read_artifact: { tool_result_id, mode, content, total_lines, … }. Keep
+    // the paging metadata — without `at_end` / `next` / the line counts the
+    // model cannot tell how far it has read and starts guessing line ranges
+    // (a `stat` call, whose content is empty, came back as an empty string).
+    else if val.get("tool_result_id").is_some() && val.get("mode").is_some() {
+        format_artifact_read(val)
+    }
+    // list_dir: { path, count, entries: [{ name, path, is_dir, size }] }. One
+    // line per entry instead of pretty JSON (which repeated every absolute
+    // path and pushed a 70-entry listing past the inline budget into an
+    // artifact the model then had to page through).
+    else if let (Some(root), Some(entries)) = (
+        val.get("path").and_then(|v| v.as_str()),
+        val.get("entries").and_then(|v| v.as_array()),
+    ) {
+        let mut out = format!("[{root}] {} entries", entries.len());
+        if let Some(count) = val.get("count").and_then(|v| v.as_u64())
+            && count as usize != entries.len()
+        {
+            out.push_str(&format!(" (of {count})"));
+        }
+        for e in entries {
+            let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            if e.get("is_dir").and_then(|v| v.as_bool()) == Some(true) {
+                out.push_str(&format!("\n{name}/"));
+            } else if let Some(size) = e.get("size").and_then(|v| v.as_u64()) {
+                out.push_str(&format!("\n{name}  {size}B"));
+            } else {
+                out.push_str(&format!("\n{name}"));
+            }
+        }
+        for key in ["truncated_note", "note", "hint"] {
+            if let Some(v) = val.get(key).filter(|v| !v.is_null()) {
+                out.push_str(&format!("\n[{key}: {}]", v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())));
+            }
+        }
+        out
     }
     // read tool: { content, path }
     else if let Some(content) = val.get("content").and_then(|v| v.as_str()) {
@@ -2852,3 +2929,38 @@ pub(crate) fn resolve_thinking_budget(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod format_artifact_read_tests {
+    use super::format_tool_result;
+
+    #[test]
+    fn list_dir_renders_one_line_per_entry() {
+        let v = serde_json::json!({"path": "/w", "count": 2, "entries": [
+            {"name": "a.py", "path": "/w/a.py", "is_dir": false, "size": 12},
+            {"name": "docs", "path": "/w/docs", "is_dir": true, "size": 0}]});
+        assert_eq!(format_tool_result(&v), "[/w] 2 entries\na.py  12B\ndocs/");
+    }
+
+    #[test]
+    fn stat_is_not_rendered_empty() {
+        let v = serde_json::json!({"tool_result_id": "tr_1", "mode": "stat", "total_lines": 420,
+            "returned_chars": 0, "content": "", "byte_size": 9000, "char_count": 8800});
+        let s = format_tool_result(&v);
+        assert!(s.contains("total_lines=420") && s.contains("byte_size=9000"), "{s}");
+    }
+
+    #[test]
+    fn page_keeps_position_and_next_hint() {
+        let v = serde_json::json!({"tool_result_id": "tr_1", "mode": "next", "total_lines": 420,
+            "returned_lines": 100, "from_line": 1, "to_line": 100, "content": "a\nb",
+            "next": "Call read_artifact again (no mode) to continue from line 101"});
+        let s = format_tool_result(&v);
+        assert!(s.starts_with("a\nb"), "{s}");
+        assert!(s.contains("from_line=1") && s.contains("to_line=100"), "{s}");
+        assert!(s.contains("continue from line 101"), "{s}");
+        let end = serde_json::json!({"tool_result_id": "tr_1", "mode": "next", "total_lines": 3,
+            "at_end": true, "content": "x"});
+        assert!(format_tool_result(&end).contains("at_end=true"));
+    }
+}
