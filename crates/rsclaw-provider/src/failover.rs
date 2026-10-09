@@ -300,6 +300,7 @@ impl FailoverManager {
                         // 10s network hiccup.
                         if matches!(kind, ErrorKind::Transient | ErrorKind::Unknown)
                             && transient_attempts < transient_retry_max
+                            && !is_capacity_exhausted(&e)
                         {
                             let delay = backoff_delay(transient_attempts, &self.retry);
                             warn!(
@@ -456,6 +457,15 @@ fn is_rate_limit(e: &anyhow::Error) -> bool {
 fn is_auth_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string().to_lowercase();
     msg.contains("401") || msg.contains("unauthorized") || msg.contains("invalid api key")
+}
+
+/// The backend already queued the request for its whole budget without
+/// finding a worker (rsclaw: 504 "queued > Ns waiting for a worker"). An
+/// identical retry would queue again for the same budget, so a single
+/// message could hang for many minutes; advance the chain instead.
+fn is_capacity_exhausted(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}");
+    s.contains("waiting for a worker")
 }
 
 #[cfg(test)]
@@ -619,5 +629,14 @@ mod tests {
         assert_eq!(mgr.hit_count("deepseek", "default"), 1);
         assert!(mgr.cooldowns.contains_key(&cooldown_key("kimi", "default")));
         assert_eq!(mgr.hit_count("kimi", "default"), 1);
+    }
+
+    #[test]
+    fn queue_timeout_without_worker_is_not_retried_in_place() {
+        let e = anyhow::anyhow!(
+            "rsclaw open session failed 504 Gateway Timeout: {{\"error\":{{\"code\":\"backend_error\",\"detail\":\"queued > 120s waiting for a worker on rsclaw/2026.8.28\"}}}}"
+        );
+        assert!(super::is_capacity_exhausted(&e));
+        assert!(!super::is_capacity_exhausted(&anyhow::anyhow!("connection reset by peer")));
     }
 }
