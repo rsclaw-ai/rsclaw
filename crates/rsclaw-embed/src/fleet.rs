@@ -120,6 +120,15 @@ fn site_of(host: &str) -> &str {
     }
 }
 
+/// Registrable domains operated as one fleet. A credentialed hop between two
+/// of them is not a leak: `api.rsclaw.ai` permanently redirects to the
+/// serving domain. Any other cross-site hop is still refused.
+const TRUSTED_FLEET_SITES: &[&str] = &["rsclaw.ai", "duoduoyun.work"];
+
+fn trusted_fleet_hop(a: &str, b: &str) -> bool {
+    TRUSTED_FLEET_SITES.contains(&a) && TRUSTED_FLEET_SITES.contains(&b)
+}
+
 /// Whether a credentialed request may follow a redirect from `from` to `to`:
 /// same host or same registrable domain (LB -> backend pool), and never an
 /// https -> http downgrade. Same rule as
@@ -137,7 +146,11 @@ fn redirect_allowed(from: &str, to: &str) -> bool {
         return false;
     }
     match (host_of(from), host_of(to)) {
-        (Some(a), Some(b)) => a == b || site_of(&a) == site_of(&b),
+        (Some(a), Some(b)) => {
+            a == b
+                || site_of(&a) == site_of(&b)
+                || (ts == "https" && trusted_fleet_hop(site_of(&a), site_of(&b)))
+        }
         _ => false,
     }
 }
@@ -510,6 +523,19 @@ mod tests {
         ));
         assert!(redirect_allowed("http://10.0.0.1:8442/a", "http://10.0.0.1:8443/a"));
         assert!(!redirect_allowed("http://10.0.0.1/a", "http://10.0.0.2/a"));
+        // Trusted fleet domains: the public domain 308s to the serving one.
+        assert!(redirect_allowed(
+            "https://api.rsclaw.ai/v1/agent/sessions",
+            "https://api.duoduoyun.work:8443/v1/agent/sessions"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.rsclaw.ai/v1/agent/sessions",
+            "http://api.duoduoyun.work/v1/agent/sessions"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.rsclaw.ai/v1/x",
+            "https://duoduoyun.work.evil.com/x"
+        ));
     }
 
     #[test]
