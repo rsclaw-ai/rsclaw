@@ -730,9 +730,9 @@ pub fn build_user_system(
 
 /// The brand's distributor policy as a system-prompt block, or `None`.
 ///
-/// It opens the user suffix, i.e. sits right after the shared prefix: the
-/// shared (kvCache) prefix stays byte-identical for every brand, and the
-/// block is stable per build so it caches with the rest of the suffix.
+/// It closes the user suffix, right before the conversation: the shared
+/// (kvCache) prefix stays byte-identical for every brand, and the block is
+/// stable per build.
 pub(crate) fn distributor_policy_block(policy: Option<&str>, zh: bool) -> Option<String> {
     let body = policy?.trim();
     if body.is_empty() {
@@ -755,10 +755,6 @@ pub(crate) fn build_user_system_with_policy(
     zh: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
-
-    if let Some(block) = distributor_policy_block(policy, zh) {
-        parts.push(block);
-    }
 
     if let Some(lang) = config.gateway.as_ref().and_then(|g| g.language.as_deref()) {
         parts.push(format!(
@@ -998,6 +994,16 @@ pub(crate) fn build_user_system_with_policy(
         parts.push(ws_segment);
     }
 
+    // The distributor policy closes the suffix, right before the
+    // conversation: placed at the top (after the long shared prefix and tool
+    // list) models ignored it, e.g. a branded build kept introducing itself
+    // as the engine. Still outside the shared prefix, so kvCache is
+    // unaffected; it is stable per build and only re-hydrates with the
+    // daily-rolling workspace tail above it.
+    if let Some(block) = distributor_policy_block(policy, zh) {
+        parts.push(block);
+    }
+
     parts.join("\n\n")
 }
 
@@ -1193,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn distributor_policy_opens_the_user_suffix() {
+    fn distributor_policy_closes_the_user_suffix() {
         let ws = WorkspaceContext::default();
         let skills = SkillRegistry::new();
         let config = rsclaw_config::schema::Config::default();
@@ -1209,8 +1215,8 @@ mod tests {
             false,
         );
         assert!(
-            suffix.starts_with("## Distributor policy\n\nNever quote prices."),
-            "policy must open the suffix: {suffix}"
+            suffix.ends_with("## Distributor policy\n\nNever quote prices."),
+            "policy must close the suffix: {suffix}"
         );
         // Full prompt layout: the shared prefix stays first and untouched.
         let prefix = build_shared_system_prefix();
