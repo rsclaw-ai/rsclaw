@@ -17,6 +17,39 @@ use serde_json::{Value, json};
 
 use super::runtime::{AgentRuntime, RunContext};
 
+/// Reject a `read_artifact` mode the tool does not understand. An unknown or
+/// incomplete mode (`grep` with no pattern, `query` with no question) used to
+/// fall through to cursor paging, silently advancing past content the model
+/// never asked for; it now gets an error that spells out the valid forms.
+pub(crate) fn validate_read_mode(mode: &str) -> Result<()> {
+    const PLAIN: &[&str] = &["", "next", "full", "reset", "stat"];
+    const PREFIXED: &[&str] = &["query:", "grep:", "lines:", "head:", "tail:"];
+    if PLAIN.contains(&mode) {
+        return Ok(());
+    }
+    if let Some(prefix) = PREFIXED.iter().find(|p| mode.starts_with(**p)) {
+        if mode[prefix.len()..].trim().is_empty() {
+            return Err(anyhow!(
+                "read_artifact: mode `{mode}` is missing its argument — write it as `{prefix}...` \
+                 (e.g. `query:which files are config files`, `grep:\\.toml`, `lines:1-80`, \
+                 `head:50`), or omit mode to read the next chunk"
+            ));
+        }
+        return Ok(());
+    }
+    let bare = mode.trim_end_matches(':');
+    if PREFIXED.iter().any(|p| p.trim_end_matches(':') == bare) {
+        return Err(anyhow!(
+            "read_artifact: mode `{mode}` needs an argument after a colon, e.g. `{bare}:...`; \
+             omit mode to read the next chunk"
+        ));
+    }
+    Err(anyhow!(
+        "read_artifact: unknown mode `{mode}`. Valid: omit (next chunk), reset, stat, \
+         query:QUESTION, grep:PATTERN, lines:A-B, head:N, tail:N"
+    ))
+}
+
 /// Apply `mode` to `full` text and return the selected slice.
 ///
 /// Factored out from the tool handler so unit tests can hit the parser
@@ -285,6 +318,7 @@ impl AgentRuntime {
         // No mode = cursor mode (return the next unread chunk). The model
         // never has to compute line ranges; calling again always advances.
         let mode = args["mode"].as_str().unwrap_or("").trim();
+        validate_read_mode(mode)?;
         let store = default_store();
         let full = store.read(&ctx.session_key, &id).map_err(|e| {
             anyhow!(
@@ -632,6 +666,17 @@ mod tests {
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn read_mode_validation_rejects_incomplete_modes() {
+        for ok in ["", "next", "full", "reset", "stat", "query:who", "grep:toml", "lines:1-5", "head:3", "tail:2"] {
+            assert!(validate_read_mode(ok).is_ok(), "{ok} should be accepted");
+        }
+        for bad in ["grep", "query", "grep:", "query: ", "lines", "summary", "page:2"] {
+            let err = validate_read_mode(bad).expect_err(bad).to_string();
+            assert!(err.contains("read_artifact"), "{bad}: {err}");
+        }
     }
 
     #[test]
