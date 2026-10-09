@@ -1021,6 +1021,7 @@ impl RsclawProvider {
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             options: Some(split.options.clone()),
         };
         // 180s caps the worst-case prefix-decode time for a fresh
@@ -1098,6 +1099,7 @@ impl RsclawProvider {
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             history,
             options: Some(split.options.clone()),
         };
@@ -1641,6 +1643,15 @@ struct CreateSessionReq<'a> {
     /// the prior byte shape.
     #[serde(skip_serializing_if = "str::is_empty")]
     user_system: &'a str,
+    /// The same registry-path segment under the field name the worker's
+    /// static (registered-prefix) create/replay path reads. Workers since
+    /// the v1.9 rename only consult `user_suffix` there, so sending
+    /// `user_system` alone silently dropped the persona, workspace instructions
+    /// and plugin/skill listings. Sent alongside `user_system` (identical
+    /// content) so both old and new workers overlay it; empty on the
+    /// dynamic path.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    user_suffix: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
 }
@@ -1667,6 +1678,15 @@ struct ReplayReq<'a> {
     /// `CreateSessionReq::user_system`.
     #[serde(skip_serializing_if = "str::is_empty")]
     user_system: &'a str,
+    /// The same registry-path segment under the field name the worker's
+    /// static (registered-prefix) create/replay path reads. Workers since
+    /// the v1.9 rename only consult `user_suffix` there, so sending
+    /// `user_system` alone silently dropped the persona, workspace instructions
+    /// and plugin/skill listings. Sent alongside `user_system` (identical
+    /// content) so both old and new workers overlay it; empty on the
+    /// dynamic path.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    user_suffix: &'a str,
     history: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
@@ -4571,6 +4591,7 @@ data: {"type":"block_stop","index":0}
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -4590,9 +4611,9 @@ data: {"type":"block_stop","index":0}
             v.get("rsclaw_version").is_none(),
             "rsclaw_version is the pre-rename name; never send"
         );
-        assert!(
-            v.get("user_suffix").is_none(),
-            "user_suffix is the legacy name; never send (top-level or otherwise)"
+        assert_eq!(
+            v["user_suffix"], "<suf>",
+            "registry path also sends the segment as user_suffix, the field the worker's static path reads"
         );
         // Registry path lifts the per-session system segment to the top
         // level (dynamic_prefix is omitted, so it has nowhere else to go).
@@ -4646,6 +4667,7 @@ data: {"type":"block_stop","index":0}
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -4695,6 +4717,7 @@ data: {"type":"block_stop","index":0}
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -4751,6 +4774,7 @@ data: {"type":"block_stop","index":0}
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
