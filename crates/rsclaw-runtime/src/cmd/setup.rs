@@ -700,7 +700,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         let workspace = base.join("workspace");
         let _ = rsclaw_agent::bootstrap::seed_workspace_with_lang(
             &workspace,
-            brand_default_language().as_deref(),
+            initial_language().as_deref(),
         );
         // Seed tool prompts + embedded knowledge trees (web_browser
         // site-rules + computer_use app-rules). Previously skipped on
@@ -1629,7 +1629,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     }
 
     let workspace = base.join("workspace");
-    let _ = agent::seed_workspace_with_lang(&workspace, brand_default_language().as_deref());
+    let _ = agent::seed_workspace_with_lang(&workspace, initial_language().as_deref());
 
     // Summary
     header(&rsclaw_i18n::t("cli_onboard_complete", lang));
@@ -3943,6 +3943,48 @@ mod account_helper_tests {
 /// `gateway.language` from the brand's default config layer, so
 /// non-interactive setup seeds workspace templates in the brand's language.
 /// `None` for the default brand (English templates, as before).
+/// Language for a fresh install's workspace templates: the brand default
+/// when the brand sets one, else Chinese on a Chinese-language system.
+/// Without the fallback a Chinese desktop install got the English
+/// templates and the assistant introduced itself by its English name.
+fn initial_language() -> Option<String> {
+    brand_default_language().or_else(|| system_prefers_chinese().then(|| "Chinese".to_owned()))
+}
+
+/// Whether the user's preferred UI language is Chinese.
+fn system_prefers_chinese() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // GUI-launched processes carry no LANG; the first AppleLanguages
+        // entry is the language the user picked, e.g. `"zh-Hans-CN"`.
+        if let Ok(out) = std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleLanguages"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(first) = text
+                .split([',', '(', ')', '\n'])
+                .map(|s| s.trim().trim_matches('"'))
+                .find(|s| !s.is_empty())
+            {
+                return first.to_ascii_lowercase().starts_with("zh");
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Primary language id 0x04 is Chinese (any region or script).
+        let lang = unsafe { winapi::um::winnls::GetUserDefaultUILanguage() };
+        return lang & 0x3ff == 0x04;
+    }
+    #[allow(unreachable_code)]
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|v| !v.is_empty() && v != "C" && v != "POSIX")
+        .is_some_and(|v| v.to_ascii_lowercase().starts_with("zh"))
+}
+
 fn brand_default_language() -> Option<String> {
     rsclaw_config::brand_layers::apply(serde_json::json!({}))
         .pointer("/gateway/language")
