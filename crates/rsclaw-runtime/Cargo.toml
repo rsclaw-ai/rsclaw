@@ -178,7 +178,7 @@ openclaw-migrate = ["rsclaw-migrate/openclaw-migrate"]
 tray = ["dep:tray-icon", "dep:muda"]
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["handleapi", "processenv", "processthreadsapi", "winbase", "winnt"] }
+winapi = { version = "0.3", features = ["handleapi", "processenv", "processthreadsapi", "winbase", "winnls", "winnt"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
