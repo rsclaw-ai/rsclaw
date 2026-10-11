@@ -889,57 +889,72 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         live_reload.apply(new_owned.clone()).await;
 
                         // Channel edits (typically a desktop/CLI QR login
-                        // writing a new `channels.<ch>.accounts` entry) are
-                        // applied right away with the same scoped reload as
-                        // `rsclaw gateway reload --scope channels`: it only
-                        // (re)starts channel listeners and never cancels agent
-                        // turns, and leaving it as an offer meant a freshly
-                        // scanned bot stayed silent. It also syncs the live
-                        // snapshot so later saves don't re-report the section.
-                        // Still under the reload mutex, as the helper expects.
-                        let channels_applied = if impact
-                            .sections()
-                            .iter()
-                            .any(|s| s == "config.channels")
-                        {
+                        // writing a new `channels.<ch>.accounts` entry) and
+                        // provider edits (a key or baseUrl set with
+                        // `config set`) are applied right away with the same
+                        // scoped reload as `rsclaw gateway reload --scope …`.
+                        // Neither cancels agent turns: channels only (re)start
+                        // listeners and providers only swap the registry.
+                        // Leaving them as an offer meant a freshly scanned bot
+                        // stayed silent and a newly set key kept failing with
+                        // 401 until a restart. It also syncs the live snapshot
+                        // so later saves don't re-report the sections. Still
+                        // under the reload mutex, as the helper expects.
+                        let sections = impact.sections();
+                        let touches = |name: &str| sections.iter().any(|s| s == name);
+                        let mut auto_scopes: Vec<&'static str> = Vec::new();
+                        if touches("config.channels") {
+                            auto_scopes.push("channels");
+                        }
+                        if touches("config.models") || touches("config.auth") {
+                            auto_scopes.push("providers");
+                        }
+                        let auto_applied = if auto_scopes.is_empty() {
+                            false
+                        } else {
                             match bridge_app_state.get() {
                                 Some(state) => {
                                     let details = crate::server::apply_reload_scopes(
                                         state,
-                                        &["channels"],
+                                        &auto_scopes,
                                         new_owned,
                                     )
                                     .await;
                                     info!(
+                                        scopes = ?auto_scopes,
                                         details = %serde_json::Value::Object(details),
-                                        "config change: channels reloaded automatically"
+                                        "config change: reloaded automatically"
                                     );
                                     true
                                 }
                                 None => {
                                     warn!(
-                                        "config change touches channels before the server \
-                                         is up; offering a reload instead"
+                                        scopes = ?auto_scopes,
+                                        "config change arrived before the server is up; \
+                                         offering a reload instead"
                                     );
                                     false
                                 }
                             }
+                        };
+                        let auto_sections: &[&str] = if auto_applied {
+                            &["config.channels", "config.models", "config.auth"]
                         } else {
-                            false
+                            &[]
                         };
                         drop(guard);
-                        if channels_applied {
+                        if auto_applied {
                             clear_auto_applied_reload_offer(
                                 &bridge_pending,
                                 &bridge_tx,
                                 &bridge_cleared_tx,
                             );
                         }
-                        // Sections the automatic channel reload already took
-                        // care of are not part of any banner below.
+                        // Sections the automatic reload already took care of
+                        // are not part of any banner below.
                         let not_auto_applied = |list: Vec<String>| -> Vec<String> {
                             list.into_iter()
-                                .filter(|s| !(channels_applied && s == "config.channels"))
+                                .filter(|s| !auto_sections.iter().any(|a| *a == s.as_str()))
                                 .collect()
                         };
 
@@ -974,8 +989,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             // provider/skill/plugin registries) — a scoped
                             // in-process reload rebuilds them in about a
                             // second, no cold boot and no dropped listener.
-                            // Offered rather than auto-applied (channels
-                            // aside, see above): re-spawning an agent cancels
+                            // Offered rather than auto-applied (channels and
+                            // providers aside, see above): re-spawning an agent cancels
                             // its in-flight turns, and saving a config file
                             // should not silently kill the conversation the
                             // user is in the middle of.
@@ -986,10 +1001,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                                 let sections = not_auto_applied(sections);
                                 let scopes: Vec<String> = scopes
                                     .into_iter()
-                                    .filter(|s| !(channels_applied && s == "channels"))
+                                    .filter(|s| !(auto_applied && auto_scopes.iter().any(|a| *a == s.as_str())))
                                     .collect();
                                 if scopes.is_empty() {
-                                    info!("config change applied via automatic channel reload");
+                                    info!("config change applied via automatic reload");
                                     continue;
                                 }
                                 info!(
