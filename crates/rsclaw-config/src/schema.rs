@@ -1048,12 +1048,34 @@ impl ThinkingLevel {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThinkingConfig {
     pub enabled: Option<bool>,
     pub level: Option<ThinkingLevel>,
     pub budget_tokens: Option<u32>,
+}
+
+// `rsclaw setup` and the settings panel write the budget as `budget`, so
+// that spelling is read too. It wins over `budgetTokens` when a file has
+// both: the panel edits `budget`, which makes it the newer choice.
+impl<'de> Deserialize<'de> for ThinkingConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            enabled: Option<bool>,
+            level: Option<ThinkingLevel>,
+            budget_tokens: Option<u32>,
+            budget: Option<u32>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            enabled: raw.enabled,
+            level: raw.level,
+            budget_tokens: raw.budget.or(raw.budget_tokens),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2967,4 +2989,38 @@ pub struct WebConfig {
     pub port: Option<u16>,
     pub bind: Option<String>,
     pub tls_enabled: Option<bool>,
+}
+
+#[cfg(test)]
+mod thinking_config_tests {
+    use super::*;
+
+    fn budget(src: &str) -> Option<u32> {
+        json5::from_str::<ThinkingConfig>(src)
+            .expect("thinking config")
+            .budget_tokens
+    }
+
+    #[test]
+    fn budget_is_read_under_both_spellings() {
+        // What `rsclaw setup` and the settings panel write.
+        assert_eq!(budget("{ budget: 0 }"), Some(0));
+        assert_eq!(budget("{ budget: 4096 }"), Some(4096));
+        assert_eq!(budget("{ budgetTokens: 0 }"), Some(0));
+        assert_eq!(budget("{ enabled: true }"), None);
+        // The panel edits `budget`, so it carries the newer choice.
+        assert_eq!(budget("{ budgetTokens: 0, budget: 16384 }"), Some(16384));
+    }
+
+    #[test]
+    fn setup_template_budget_reaches_agent_defaults() {
+        let cfg: Config = json5::from_str("{ agents: { defaults: { thinking: { budget: 0 } } } }")
+            .expect("config");
+        let thinking = cfg
+            .agents
+            .and_then(|a| a.defaults)
+            .and_then(|d| d.thinking)
+            .expect("thinking");
+        assert_eq!(thinking.budget_tokens, Some(0));
+    }
 }
