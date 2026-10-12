@@ -1971,6 +1971,12 @@ struct TurnOptions {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
+    /// Cap on reasoning tokens for the turn: the worker closes the
+    /// reasoning block once they are spent and goes on to the answer.
+    /// Sent only with thinking on; a worker that predates it ignores it
+    /// and thinks without a cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_budget_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1993,6 +1999,7 @@ impl TurnOptions {
             temperature: req.temperature,
             top_p: None,
             enable_thinking: req.thinking_budget.map(|b| b > 0),
+            thinking_budget_tokens: req.thinking_budget.filter(|b| *b > 0),
             stop: None,
             idle_ttl_secs: None,
             constrain_tool_calls: (constrain_tool_calls && !req.tools.is_empty()).then_some(true),
@@ -5670,6 +5677,7 @@ data: {"type":"block_stop","index":0}
             temperature: Some(0.6),
             top_p: Some(0.95),
             enable_thinking: None,
+            thinking_budget_tokens: None,
             stop: None,
             idle_ttl_secs: None,
             constrain_tool_calls: None,
@@ -5699,6 +5707,7 @@ data: {"type":"block_stop","index":0}
             temperature: None,
             top_p: None,
             enable_thinking: None,
+            thinking_budget_tokens: None,
             stop: None,
             idle_ttl_secs: None,
             constrain_tool_calls: None,
@@ -5755,13 +5764,17 @@ data: {"type":"block_stop","index":0}
         req.thinking_budget = Some(0);
         let off = serde_json::to_value(TurnOptions::from_request(&req, false)).unwrap();
         assert_eq!(off["enable_thinking"], false);
+        assert!(off.get("thinking_budget_tokens").is_none());
+        // On: the budget travels with the switch so the worker can cap it.
         req.thinking_budget = Some(4096);
         let on = serde_json::to_value(TurnOptions::from_request(&req, false)).unwrap();
         assert_eq!(on["enable_thinking"], true);
+        assert_eq!(on["thinking_budget_tokens"], 4096);
         // Not configured: omitted, the worker default applies.
         req.thinking_budget = None;
         let unset = serde_json::to_value(TurnOptions::from_request(&req, false)).unwrap();
         assert!(unset.get("enable_thinking").is_none());
+        assert!(unset.get("thinking_budget_tokens").is_none());
     }
 
     #[test]
