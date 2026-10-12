@@ -3118,11 +3118,10 @@ function TauriConfigPageInner() {
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "深度思考" : "Deep Thinking"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.thinking.budget</div>
               </div>
-              <select style={{ ...fSelect, minWidth: 200 }} value={String(getVal("agents.defaults.thinking.budget", 0))} onChange={(e) => updateConfig("agents.defaults.thinking.budget", parseInt(e.target.value))}>
+              {/* The budget caps each reasoning block. Small caps were measured to slow replies without improving them, so there is one setting; any stored positive value shows as on. */}
+              <select style={{ ...fSelect, minWidth: 200 }} value={getVal("agents.defaults.thinking.budget", 0) > 0 ? "8192" : "0"} onChange={(e) => updateConfig("agents.defaults.thinking.budget", parseInt(e.target.value))}>
                 <option value="0">{zh ? "禁用" : "Disabled"}</option>
-                <option value="4096">{zh ? "轻度 (4K tokens)" : "Light (4K tokens)"}</option>
-                <option value="16384">{zh ? "中度 (16K tokens)" : "Medium (16K tokens)"}</option>
-                <option value="32768">{zh ? "深度 (32K tokens)" : "Deep (32K tokens)"}</option>
+                <option value="8192">{zh ? "开启（每次思考上限 8K tokens）" : "On (up to 8K tokens per reasoning block)"}</option>
               </select>
             </div>
           </div>
