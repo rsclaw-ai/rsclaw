@@ -1130,6 +1130,7 @@ impl AgentRuntime {
             };
             let mut text_buf = String::new();
             let mut reasoning_buf = String::new();
+            let mut inline_think = InlineThink::default();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
             // Signed reasoning blocks (Anthropic thinking / redacted_thinking)
             // not yet followed by a tool call, and those anchored to the id
@@ -1197,13 +1198,9 @@ impl AgentRuntime {
                             continue;
                         }
                         // Close <think> tag when transitioning from reasoning to text.
-                        if thinking_budget.unwrap_or(0) > 0
-                            && !reasoning_buf.is_empty()
-                            && !text_buf.ends_with("</think>")
-                        {
-                            text_buf.push_str("</think>");
-                            delta_buf.push_str("</think>");
-                        }
+                        let tag = inline_think.close();
+                        text_buf.push_str(tag);
+                        delta_buf.push_str(tag);
                         text_buf.push_str(&delta);
                         // Update live status text preview (first ~200 chars).
                         if text_buf.len() <= 250 {
@@ -1244,11 +1241,9 @@ impl AgentRuntime {
                         reasoning_buf.push_str(&delta);
                         // Only emit <think> tags when thinking is explicitly enabled.
                         if thinking_budget.unwrap_or(0) > 0 {
-                            if reasoning_buf.len() == delta.len() {
-                                // First chunk — open tag.
-                                text_buf.push_str("<think>");
-                                delta_buf.push_str("<think>");
-                            }
+                            let tag = inline_think.before_reasoning();
+                            text_buf.push_str(tag);
+                            delta_buf.push_str(tag);
                             text_buf.push_str(&delta);
                             delta_buf.push_str(&delta);
                         }
@@ -1371,13 +1366,9 @@ impl AgentRuntime {
             }
 
             // Close unclosed <think> tag if stream ended during reasoning.
-            if thinking_budget.unwrap_or(0) > 0
-                && !reasoning_buf.is_empty()
-                && !text_buf.ends_with("</think>")
-            {
-                text_buf.push_str("</think>");
-                delta_buf.push_str("</think>");
-            }
+            let tag = inline_think.close();
+            text_buf.push_str(tag);
+            delta_buf.push_str(tag);
 
             // Flush any remaining buffered delta.
             if !delta_buf.is_empty() {
@@ -3471,4 +3462,76 @@ fn is_workspace_mutating_tool(name: &str) -> bool {
         name,
         "write_file" | "write" | "edit_file" | "edit" | "shell" | "execute_command" | "exec"
     )
+}
+
+/// The `<think>` tag written around reasoning that is shown inline in the
+/// reply text. Each run of reasoning chunks gets one opening and one closing
+/// tag, however many text chunks follow it.
+#[derive(Default)]
+struct InlineThink {
+    open: bool,
+}
+
+impl InlineThink {
+    /// Tag to write before a reasoning chunk.
+    fn before_reasoning(&mut self) -> &'static str {
+        if std::mem::replace(&mut self.open, true) {
+            ""
+        } else {
+            "<think>"
+        }
+    }
+
+    /// Tag to write before a text chunk, and when the stream ends.
+    fn close(&mut self) -> &'static str {
+        if std::mem::replace(&mut self.open, false) {
+            "</think>"
+        } else {
+            ""
+        }
+    }
+}
+
+#[cfg(test)]
+mod inline_think_tests {
+    use super::InlineThink;
+
+    /// Renders a stream of `(is_reasoning, chunk)` the way the agent loop does.
+    fn render(chunks: &[(bool, &str)]) -> String {
+        let mut think = InlineThink::default();
+        let mut out = String::new();
+        for (is_reasoning, chunk) in chunks {
+            out.push_str(if *is_reasoning {
+                think.before_reasoning()
+            } else {
+                think.close()
+            });
+            out.push_str(chunk);
+        }
+        out.push_str(think.close());
+        out
+    }
+
+    #[test]
+    fn reasoning_is_closed_once_before_the_answer() {
+        // Every text chunk after the first used to get its own `</think>`.
+        let got = render(&[(true, "a"), (true, "b"), (false, "1"), (false, "2")]);
+        assert_eq!(got, "<think>ab</think>12");
+    }
+
+    #[test]
+    fn text_alone_gets_no_tags() {
+        assert_eq!(render(&[(false, "1"), (false, "2")]), "12");
+    }
+
+    #[test]
+    fn reasoning_left_open_is_closed_at_the_end() {
+        assert_eq!(render(&[(true, "a")]), "<think>a</think>");
+    }
+
+    #[test]
+    fn a_second_reasoning_run_gets_its_own_tags() {
+        let got = render(&[(true, "a"), (false, "1"), (true, "b"), (false, "2")]);
+        assert_eq!(got, "<think>a</think>1<think>b</think>2");
+    }
 }
