@@ -212,14 +212,15 @@ const SANDBOX_SAFE_PATHS: &[&str] = &[
 
 /// Split a shell command into path-candidate words for the exec sandbox:
 /// whitespace, quotes, redirections, pipes, separators and `=` (so
-/// `--out=/etc/x` and `2>/etc/x` are both seen).
+/// `--out=/etc/x` and `2>/etc/x` are both seen). A lone `/` is dropped: in a
+/// script it is division or prose (`# a / b`), not the root directory.
 fn sandbox_path_tokens(command: &str) -> Vec<String> {
     command
         .split(|c: char| {
             c.is_whitespace()
                 || matches!(c, '\'' | '"' | '`' | '=' | ';' | '|' | '&' | '(' | ')' | '<' | '>' | ',')
         })
-        .filter(|t| !t.is_empty())
+        .filter(|t| !t.is_empty() && !t.chars().all(|c| c == '/' || c == '\\'))
         .map(str::to_owned)
         .collect()
 }
@@ -369,6 +370,13 @@ mod sandbox_tests {
         assert!(home_reference("cd; ls").is_some());
         assert!(home_reference("ls -la src && cargo build").is_none());
         assert!(home_reference("cd src && ls").is_none());
+    }
+
+    #[test]
+    fn exec_sandbox_tokens_skip_a_lone_slash() {
+        let t = sandbox_path_tokens("python3 -c \"x = a / b  # textboxes / other parts\"");
+        assert!(!t.iter().any(|w| w == "/"), "{t:?}");
+        assert!(sandbox_path_tokens("ls /etc").contains(&"/etc".to_owned()));
     }
 
     #[test]

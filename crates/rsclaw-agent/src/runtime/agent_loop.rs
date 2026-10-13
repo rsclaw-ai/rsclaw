@@ -288,6 +288,10 @@ impl AgentRuntime {
         let mut last_tool_name_only = String::new();
         let mut same_name_streak: usize = 0;
         const MAX_SAME_NAME_STREAK: usize = 10;
+        // Shell runs a different command each time and is how document work
+        // gets done (read this file, convert that one, write the result), so
+        // it gets a longer run before the depletion starts.
+        const MAX_SAME_NAME_STREAK_SHELL: usize = 30;
         // Absolute hard ceiling on loop iterations, independent of the
         // progress-aware stagnation budget. The budget treats every call that
         // returns new output as "free", so a productive-looking loop (paging,
@@ -2230,9 +2234,14 @@ impl AgentRuntime {
                 // same_call_streak (args differ) and the stagnation budget (each
                 // result is "new"), so deplete the budget hard past the
                 // threshold to force the wrap-up prompt instead of spinning.
+                let name_limit = if matches!(tool_name.as_str(), "shell" | "execute_command" | "exec") {
+                    MAX_SAME_NAME_STREAK_SHELL
+                } else {
+                    MAX_SAME_NAME_STREAK
+                };
                 if tool_name == last_tool_name_only {
                     same_name_streak += 1;
-                    if same_name_streak > MAX_SAME_NAME_STREAK {
+                    if same_name_streak > name_limit {
                         budget -= 4;
                         ctx.turn_metrics.stagnation_budget = budget;
                         warn!(
@@ -2253,7 +2262,7 @@ impl AgentRuntime {
                 // web_browser, agent…) re-raises the budget every iteration and
                 // the same-name depletion above never bites; only the hard
                 // iteration ceiling would stop the spin.
-                if same_name_streak <= MAX_SAME_NAME_STREAK
+                if same_name_streak <= name_limit
                     && matches!(
                         tool_name.as_str(),
                         "web_browser"
