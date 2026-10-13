@@ -555,6 +555,10 @@ pub struct AgentDefaults {
     /// (browser/shell/cap): 100. Budget depletes on stagnation/errors, not on
     /// productive iterations. Set to 0 to use built-in defaults.
     pub max_iterations: Option<u32>,
+    /// Hard ceiling on loop steps in one turn, whatever the stagnation
+    /// budget says (default 80). Raise it for agents whose work is many
+    /// short tool steps, such as reading a case folder.
+    pub max_steps: Option<u32>,
     /// Send intermediate text to user during multi-step tool calls. Default:
     /// true.
     pub intermediate_output: Option<bool>,

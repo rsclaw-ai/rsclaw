@@ -296,8 +296,19 @@ impl AgentRuntime {
         // progress-aware stagnation budget. The budget treats every call that
         // returns new output as "free", so a productive-looking loop (paging,
         // re-routing search) can spin unbounded — this is the universal
-        // backstop. Set well above any legitimate multi-tool turn.
-        const HARD_MAX_ITERATIONS: usize = 80;
+        // backstop. Set well above any legitimate multi-tool turn;
+        // `agents.defaults.maxSteps` overrides it.
+        const DEFAULT_HARD_MAX_ITERATIONS: usize = 80;
+        let hard_max_iterations: usize = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .max_steps
+            .map(|v| v as usize)
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_HARD_MAX_ITERATIONS);
         // Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
         // Identical-failing-call ledger: hash(tool_name + canonical args) →
@@ -357,7 +368,7 @@ impl AgentRuntime {
             // paging / re-routing). A turn that legitimately needs >80 tool
             // iterations is itself pathological; stop and hand back what we have.
             // (Daemon agents are exempt — they loop forever by design.)
-            if !daemon_mode && iteration > HARD_MAX_ITERATIONS {
+            if !daemon_mode && iteration > hard_max_iterations {
                 warn!(
                     session = %ctx.session_key,
                     iterations = iteration,
@@ -478,7 +489,7 @@ impl AgentRuntime {
             }
             // Close to the hard ceiling, start the wrap-up so the turn ends on
             // an answer from what the model has, not on the ceiling notice.
-            if !daemon_mode && !wrapup_injected && iteration + 8 >= HARD_MAX_ITERATIONS {
+            if !daemon_mode && !wrapup_injected && iteration + 8 >= hard_max_iterations {
                 budget = budget.min(0);
             }
             // Stagnation budget check: when budget depletes, inject a wrap-up

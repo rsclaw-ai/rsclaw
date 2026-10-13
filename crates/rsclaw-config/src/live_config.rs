@@ -445,6 +445,7 @@ fn strip_live_fields(v: &mut serde_json::Value) {
                     "intermediateOutput",
                     "kvCacheMode",
                     "maxIterations",
+                    "maxSteps",
                     "stripThinkTags",
                     "thinking",
                 ] {
