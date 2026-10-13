@@ -476,6 +476,11 @@ impl AgentRuntime {
                     outcome: crate::registry::ReplyOutcome::Ok,
                 });
             }
+            // Close to the hard ceiling, start the wrap-up so the turn ends on
+            // an answer from what the model has, not on the ceiling notice.
+            if !daemon_mode && !wrapup_injected && iteration + 8 >= HARD_MAX_ITERATIONS {
+                budget = budget.min(0);
+            }
             // Stagnation budget check: when budget depletes, inject a wrap-up
             // prompt (soft limit). If the LLM still calls tools after that,
             // hard-stop with contextual message. (Daemon agents are exempt — a
