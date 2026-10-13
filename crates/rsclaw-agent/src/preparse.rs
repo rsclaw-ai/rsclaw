@@ -592,3 +592,55 @@ fn load_safety_rules() -> (Vec<Regex>, Vec<Regex>, Vec<Regex>) {
         compile(&defs.exec_safety.allow),
     )
 }
+
+#[cfg(test)]
+mod safety_rule_tests {
+    use regex::Regex;
+
+    /// The shipped deny rules, compiled the way `load_safety_rules` does.
+    fn shipped_deny() -> Vec<Regex> {
+        let raw = include_str!("../../../defaults.toml");
+        let v: toml::Value = toml::from_str(raw).expect("defaults.toml");
+        v["exec_safety"]["deny"]
+            .as_array()
+            .expect("deny")
+            .iter()
+            .filter_map(|p| p.as_str())
+            .map(|p| Regex::new(&format!("(?i){p}")).expect("valid rule"))
+            .collect()
+    }
+
+    fn denied(cmd: &str) -> bool {
+        shipped_deny().iter().any(|re| re.is_match(cmd))
+    }
+
+    #[test]
+    fn ordinary_dev_redirects_are_allowed() {
+        for cmd in [
+            "ls -la ~/x 2>/dev/null | head",
+            "find . -name '*.pdf' 2>/dev/null",
+            "echo hi > /dev/stderr",
+            "make >/dev/null 2>&1",
+            "echo x | tee /dev/null",
+            "dd if=/dev/zero of=/dev/null bs=1m count=10",
+        ] {
+            assert!(!denied(cmd), "falsely blocked: {cmd}");
+        }
+    }
+
+    #[test]
+    fn device_writes_are_still_blocked() {
+        for cmd in [
+            "echo x > /dev/sda",
+            "cat img > /dev/disk2",
+            "cat img >/dev/rdisk3",
+            "echo x | tee /dev/nvme0n1",
+            "echo x | tee -a /dev/sdb",
+            "dd if=img.iso of=/dev/sdb bs=4m",
+            "dd if=x of=/dev/disk4",
+            "echo 1 > /dev/mem",
+        ] {
+            assert!(denied(cmd), "not blocked: {cmd}");
+        }
+    }
+}

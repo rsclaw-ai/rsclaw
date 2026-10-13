@@ -692,6 +692,16 @@ fn merge_defaults_toml(user_raw: &str, builtin_raw: &str) -> Option<String> {
     (merged != user_raw).then_some(merged)
 }
 
+/// `[exec_safety]` rules earlier releases shipped and later replaced with
+/// narrower ones. The deny/confirm union below would otherwise carry them
+/// forward forever, so an upgrade drops exactly these strings.
+const RETIRED_EXEC_SAFETY_RULES: [&str; 3] = [
+    // Matched `2>/dev/null`; replaced by device-only patterns (2026.10.13).
+    r">\s*/dev/",
+    r"tee\s+/dev/",
+    r"\bdd\b\s+if=.*of=/dev/",
+];
+
 /// Named-entry tables whose user-added entries / keys survive an upgrade.
 const KEYWISE_MERGED_TABLES: [&str; 3] = ["skill_registries", "direct_apis", "video_providers"];
 
@@ -720,6 +730,12 @@ fn preserve_user_policy_tables(merged: &str, user_raw: &str) -> Option<String> {
                         && match (dst.get_mut(key).and_then(Item::as_array_mut), user_val.as_array()) {
                             (Some(dst_arr), Some(user_arr)) => {
                                 for v in user_arr.iter() {
+                                    if v
+                                        .as_str()
+                                        .is_some_and(|r| RETIRED_EXEC_SAFETY_RULES.contains(&r))
+                                    {
+                                        continue;
+                                    }
                                     let exists = dst_arr
                                         .iter()
                                         .any(|d| d.as_str().is_some() && d.as_str() == v.as_str());
@@ -1244,6 +1260,33 @@ label = "Feishu / Lark"
         assert!(merged.contains("name = \"mycorp\""));
         assert!(merged.contains("MyCorp Internal"));
         assert!(merged.contains("https://llm.mycorp.internal/v1"));
+    }
+
+    #[test]
+    fn merge_defaults_drops_retired_exec_safety_rules() {
+        let user = r#"
+[meta]
+defaults_version = "2026.9.30"
+
+[exec_safety]
+deny = [">\\s*/dev/", "tee\\s+/dev/", "user-rule"]
+"#;
+        let builtin = r#"
+[meta]
+defaults_version = "2026.10.13"
+
+[exec_safety]
+deny = ["new-shipped"]
+"#;
+        let merged = merge_defaults_toml(user, builtin).expect("upgrade");
+        let v: toml::Value = toml::from_str(&merged).expect("valid toml");
+        let deny: Vec<&str> = v["exec_safety"]["deny"]
+            .as_array()
+            .expect("deny")
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert_eq!(deny, vec!["new-shipped", "user-rule"]);
     }
 
     #[test]

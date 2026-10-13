@@ -6,7 +6,7 @@
 # any entries you added yourself; the previous file is saved as defaults.toml.bak.*.
 
 [meta]
-defaults_version = "2026.9.30"
+defaults_version = "2026.10.13"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Providers
@@ -742,7 +742,7 @@ deny = [
   "rd\\s+/s\\s+/q\\s+[A-Z]:\\\\",
   "del\\s+/f\\s+/s\\s+/q\\s+[A-Z]:\\\\",
   "\\bmkfs\\b",
-  "\\bdd\\b\\s+if=.*of=/dev/",
+  "\\bdd\\b\\s+if=.*of=/dev/(?:[sh]d[a-z]|nvme|r?disk[0-9]|x?vd[a-z]|mmcblk|md[0-9]|dm-|mapper/|loop[0-9]|sg[0-9]|k?mem\\b|port\\b|fb[0-9])",
   "\\bformat\\b\\s+[A-Z]:",
   "\\bdiskpart\\b",
   ":\\(\\)\\s*\\{",
@@ -769,7 +769,9 @@ deny = [
   "launchctl\\s+unload",
   "csrutil\\s+disable",
   "reg\\s+delete\\s+HKLM",
-  ">\\s*/dev/",
+  # Writes to disk / memory devices only: `2>/dev/null`, `>/dev/stderr`
+  # and the like are ordinary redirects, not device writes.
+  ">\\s*/dev/(?:[sh]d[a-z]|nvme|r?disk[0-9]|x?vd[a-z]|mmcblk|md[0-9]|dm-|mapper/|loop[0-9]|sg[0-9]|k?mem\\b|port\\b|fb[0-9])",
   ">\\s*/etc/",
   ">\\s*/usr/",
   ">\\s*/bin/",
@@ -778,7 +780,7 @@ deny = [
   ">\\s*~/.profile",
   ">\\s*~/.ssh/",
   "tee\\s+/etc/",
-  "tee\\s+/dev/",
+  "tee\\s+(?:-a\\s+)?/dev/(?:[sh]d[a-z]|nvme|r?disk[0-9]|x?vd[a-z]|mmcblk|md[0-9]|dm-|mapper/|loop[0-9]|sg[0-9]|k?mem\\b|port\\b|fb[0-9])",
   # Block reading sensitive files
   "cat.*~/.ssh/",
   "cat.*/\\.ssh/",
