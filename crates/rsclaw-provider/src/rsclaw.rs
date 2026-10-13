@@ -3096,6 +3096,10 @@ async fn parse_sse_chunk(
                     }
                     BlockKind::ToolCall => {
                         b.buf.push_str(delta);
+                        // A long tool input (a whole script, a document)
+                        // can take minutes; an empty delta tells the
+                        // caller's idle watchdog the stream is alive.
+                        events.push(Ok(StreamEvent::TextDelta(String::new())));
                     }
                 }
             }
@@ -3574,6 +3578,22 @@ data: {"type":"block_stop","index":0}
         assert_eq!(id, "call_42");
         assert_eq!(name, "read_file");
         assert_eq!(input.get("path").and_then(Value::as_str), Some("x.rs"));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_tool_call_input_keeps_the_stream_alive() {
+        // Each input shard yields an empty TextDelta, so the agent loop's
+        // idle watchdog sees progress while a long tool input streams.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let start = br#"data: {"type":"block_start","index":0,"block":{"type":"tool_call","id":"c","name":"shell"}}
+"#;
+        parse_sse_test(Ok(bytes::Bytes::copy_from_slice(start)), &buf, &rem, &state).await;
+        let shard = br#"data: {"type":"block_delta","index":0,"delta":"{\"command\":\"python3"}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(shard)), &buf, &rem, &state).await;
+        assert!(matches!(evs.as_slice(), [Ok(StreamEvent::TextDelta(t))] if t.is_empty()));
     }
 
     #[tokio::test]
