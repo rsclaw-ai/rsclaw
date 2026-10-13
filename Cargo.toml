@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.10.1"
+version = "2026.10.13"
 edition = "2024"
 rust-version = "1.91"
 description = "AI Agent Engine Compatible with OpenClaw"
