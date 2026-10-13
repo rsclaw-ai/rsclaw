@@ -126,6 +126,25 @@ pub fn rule_key(pattern: &str) -> String {
     format!("rule:{pattern}")
 }
 
+/// `path` with symlinks resolved. A path that doesn't exist yet keeps its
+/// missing tail on top of its deepest existing ancestor.
+fn real_path(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            return tail.iter().rev().fold(real, |p, part| p.join(part));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// Grant key for a directory.
 pub fn path_key(dir: &Path) -> String {
     format!("path:{}", dir.display())
@@ -177,11 +196,14 @@ impl ApprovalBroker {
         self.granted(session, &rule_key(rule))
     }
 
-    /// Whether `path` lies under a directory granted for `session`.
+    /// Whether `path` lies under a directory granted for `session`. Both
+    /// sides are compared as real paths, so a grant for `/tmp` covers
+    /// `/private/tmp/x` on macOS.
     pub fn path_granted(&self, session: &str, path: &Path) -> bool {
+        let path = real_path(path);
         let covers = |key: &String| {
             key.strip_prefix("path:")
-                .is_some_and(|dir| path.starts_with(Path::new(dir)))
+                .is_some_and(|dir| path.starts_with(real_path(Path::new(dir))))
         };
         self.always.lock().map(|a| a.iter().any(covers)).unwrap_or(false)
             || self
@@ -427,6 +449,20 @@ mod tests {
             .await;
         assert_eq!(d, Decision::TimedOut);
         assert!(b.pending(None).is_empty());
+    }
+
+    #[test]
+    fn path_grants_compare_real_paths() {
+        let dir = std::env::temp_dir().join(format!("rsclaw-real-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let b = ApprovalBroker::new(None);
+        b.always.lock().unwrap().insert(path_key(&dir.join("link")));
+        assert!(b.path_granted("s", &std::fs::canonicalize(dir.join("real")).unwrap().join("x.txt")));
+        assert!(b.path_granted("s", &dir.join("link/new/file")));
+        assert!(!b.path_granted("s", &dir.join("other")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
