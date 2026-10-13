@@ -385,8 +385,13 @@ impl AgentRuntime {
         let provider_raw = args["provider"].as_str().unwrap_or("");
         // Normalize: "auto-detect", "auto", "default" -> empty (trigger auto-detect
         // logic)
-        let provider = match provider_raw {
+        let provider_name = provider_raw.trim().to_ascii_lowercase();
+        let provider = match provider_name.as_str() {
             "auto-detect" | "auto" | "default" | "none" => "",
+            // Common spellings of the key-free providers.
+            "duckduckgo" | "ddg" | "duck" => "duckduckgo-free",
+            "baidu" => "baidu-free",
+            "sogou" => "sogou-free",
             other => other,
         };
 
@@ -415,6 +420,27 @@ impl AgentRuntime {
             ws_cfg.and_then(|c| c.serper_api_key.as_ref()),
             "SERPER_API_KEY",
         );
+        // A keyed provider without its key, or a name we don't know, falls
+        // back to the free providers instead of failing the call: models
+        // pick a provider by name and then retry the same dead end.
+        const KNOWN_PROVIDERS: &[&str] = &[
+            "serper",
+            "google",
+            "brave",
+            "bing",
+            "duckduckgo-free",
+            "bing-free",
+            "baidu-free",
+            "sogou-free",
+        ];
+        let provider = match provider {
+            "bing" if bing_key.is_none() => "bing-free",
+            "google" if google_key.is_none() || google_cx.is_none() => "",
+            "brave" if brave_key.is_none() => "",
+            "serper" if serper_key.is_none() => "",
+            p if !p.is_empty() && !KNOWN_PROVIDERS.contains(&p) => "",
+            p => p,
+        };
 
         // Auto-detect provider priority:
         //   explicit arg > config default
