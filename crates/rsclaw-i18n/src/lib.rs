@@ -2490,6 +2490,13 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ja" => "{iterations}ステップ実行したが進捗なし（最後: {tool}）。会話を続けると別の方法を試します。",
     );
 
+    msg!("agent_output_degenerated",
+        "en" => "The model's output broke down (it kept repeating the same characters), so this step was stopped. Please send the request again; splitting it into smaller steps helps.",
+        "zh" => "模型输出异常（反复输出同样的字符），已中止这一步。请重新发送请求，拆成更小的步骤会更稳定。",
+        "cn" => "模型输出异常（反复输出同样的字符），已中止这一步。请重新发送请求，拆成更小的步骤会更稳定。",
+        "ja" => "モデルの出力が異常になった（同じ文字を繰り返した）ため、このステップを停止しました。もう一度送信してください。小さなステップに分けると安定します。",
+    );
+
     msg!("agent_loop_detected",
         "en" => "Detected repeated identical operation without progress. Trying a different approach.",
         "zh" => "检测到重复执行相同操作但没有进展，尝试换一种方式处理。",

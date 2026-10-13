@@ -328,6 +328,8 @@ impl AgentRuntime {
         let mut wrapup_injected = false;
         // Responses after the wrap-up prompt whose tool calls were refused.
         let mut wrapup_refusals = 0usize;
+        // Responses cut off because the model fell into repeating itself.
+        let mut degenerate_retries = 0usize;
         // DAEMON: consecutive "tried to end with no tool call" re-injects. Reset
         // whenever the model actually makes a tool call. If it keeps refusing
         // (some models won't honor the loop), we stop re-injecting after a cap
@@ -1174,6 +1176,8 @@ impl AgentRuntime {
             let delta_flush_chars = if is_local_ui { 40 } else { 80 };
             let mut delta_buf = String::new();
             let mut last_delta_flush = std::time::Instant::now();
+            let mut degenerate_checked_at = 0usize;
+            let mut degenerated = false;
 
             loop {
                 // Idle watchdog: bound each await on the next stream event so a
@@ -1209,6 +1213,22 @@ impl AgentRuntime {
                         text_buf.push_str(tag);
                         delta_buf.push_str(tag);
                         text_buf.push_str(&delta);
+                        // A model can fall into emitting one short piece over
+                        // and over until max_tokens (minutes of '////').
+                        // Stop reading as soon as that shows.
+                        if text_buf.len() >= degenerate_checked_at + 256 {
+                            degenerate_checked_at = text_buf.len();
+                            if degenerate_tail(&text_buf) {
+                                warn!(
+                                    session = %ctx.session_key,
+                                    text_len = text_buf.len(),
+                                    "agent_loop: model output degenerated into repetition, cutting the response"
+                                );
+                                degenerated = true;
+                                delta_buf.clear();
+                                break;
+                            }
+                        }
                         // Update live status text preview (first ~200 chars).
                         if text_buf.len() <= 250 {
                             if let Ok(mut status) = self.live_status.try_write() {
@@ -1597,6 +1617,25 @@ impl AgentRuntime {
                 text_len = text_buf.len(),
                 "agent_loop: stream finished"
             );
+            if degenerated {
+                // The server drops the cut-off reply too, so nothing of it is
+                // kept; ask once for the work to go on.
+                text_buf.clear();
+                tool_calls.clear();
+                degenerate_retries += 1;
+                if degenerate_retries <= 1 && !daemon_mode {
+                    turn_scratchpad.push(Message {
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "[system] Your last reply degenerated into one short piece repeated over and over, and was discarded. \
+                             Continue the task. Write long documents to a file with a tool instead of into the reply.".to_owned(),
+                        ),
+                        rsclaw_hidden: None,
+                    });
+                    continue;
+                }
+                text_buf = rsclaw_i18n::t("agent_output_degenerated", rsclaw_i18n::default_lang()).to_owned();
+            }
             if tool_calls.is_empty() {
                 // DAEMON agents must never end their turn by "concluding". A
                 // monitor like agent_wechat is a `while(true)` poll loop; some
@@ -3641,5 +3680,31 @@ mod tool_target_tests {
         assert_eq!(tool_target("not json"), None);
         let long = "字".repeat(300);
         assert_eq!(tool_target(&format!(r#"{{"url":"{long}"}}"#)).unwrap().chars().count(), 201);
+    }
+}
+
+/// Whether the end of `text` is one piece of 1–8 characters repeated for
+/// at least 600 characters: a model stuck in a loop, not prose.
+fn degenerate_tail(text: &str) -> bool {
+    const SPAN: usize = 600;
+    let tail: Vec<char> = text.chars().rev().take(SPAN).collect();
+    if tail.len() < SPAN {
+        return false;
+    }
+    (1..=8).any(|period| (period..tail.len()).all(|i| tail[i] == tail[i - period]))
+}
+
+#[cfg(test)]
+mod degenerate_tail_tests {
+    use super::degenerate_tail;
+
+    #[test]
+    fn flags_a_repeated_short_piece_only() {
+        assert!(degenerate_tail(&format!("答辩状正文{}", "/".repeat(700))));
+        assert!(degenerate_tail(&"的的的的".repeat(200)));
+        assert!(degenerate_tail(&"ab12".repeat(200)));
+        assert!(!degenerate_tail(&"/".repeat(500)));
+        let prose = "原告主张的事实与客观情况不符，答辩人收取的服务费具有合同依据。".repeat(30);
+        assert!(!degenerate_tail(&prose));
     }
 }
