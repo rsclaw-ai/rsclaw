@@ -2787,14 +2787,14 @@ pub struct KbRerankConfig {
     pub enabled: Option<bool>,
 }
 
-/// OCR endpoint config (`kb.ocr`). Speaks the rsclaw-native `/v1/ocr`
-/// shape (`{model, image, stream:false}` → `{content, …}`).
+/// OCR endpoint config (`kb.ocr`). Speaks the rsclaw-native
+/// `/v1/agent/ocr` shape (`{model, image, stream:false}` → `{content, …}`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KbOcrConfig {
     /// API root, e.g. `https://api.rsclaw.ai/v1`. May be empty when
     /// `model` is a `rsclaw-*` name (then defaults to the fleet API).
-    /// `/ocr` is appended at request time.
+    /// `/agent/ocr` is appended at request time.
     #[serde(default)]
     pub base_url: String,
     /// Model name (e.g. `rsclaw-ocr-v1`). Drives both the request body
