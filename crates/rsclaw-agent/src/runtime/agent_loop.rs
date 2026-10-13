@@ -326,6 +326,8 @@ impl AgentRuntime {
         let mut last_result_hash: Option<String> = None;
         let mut last_tool_name = String::new();
         let mut wrapup_injected = false;
+        // Responses after the wrap-up prompt whose tool calls were refused.
+        let mut wrapup_refusals = 0usize;
         // DAEMON: consecutive "tried to end with no tool call" re-injects. Reset
         // whenever the model actually makes a tool call. If it keeps refusing
         // (some models won't honor the loop), we stop re-injecting after a cap
@@ -498,8 +500,9 @@ impl AgentRuntime {
                 });
                 wrapup_injected = true;
                 // Give the LLM one more chance to produce a final answer.
-            } else if !daemon_mode && budget <= 0 && wrapup_injected {
-                // Hard stop: LLM called another tool despite the wrap-up prompt.
+            } else if !daemon_mode && wrapup_injected && wrapup_refusals >= 2 {
+                // Hard stop: the model kept calling tools after the wrap-up
+                // prompt and two refusals.
                 warn!(
                     session = %ctx.session_key,
                     iterations = iteration,
@@ -2002,8 +2005,33 @@ impl AgentRuntime {
             }
             let mut to_dispatch: Vec<PendingDispatch> = Vec::new();
 
+            // After the wrap-up prompt, tools are closed: refuse the calls so
+            // the model answers from what it has instead of working on.
+            let tools_closed = wrapup_injected && !daemon_mode;
+            if tools_closed {
+                wrapup_refusals += 1;
+            }
+
             // ---- Phase 1: serial preflight ----
             for (tool_id, tool_name, tool_input) in tool_calls {
+                if tools_closed {
+                    turn_scratchpad.push(Message {
+                        role: Role::Tool,
+                        content: MessageContent::Parts(vec![
+                            rsclaw_provider::ContentPart::ToolResult {
+                                tool_use_id: tool_id.clone(),
+                                content: json!({
+                                    "error": "REFUSED: tools are closed for this turn. Write your final answer now from what you already have, and say what is still missing.",
+                                    "retryable": false,
+                                })
+                                .to_string(),
+                                is_error: Some(true),
+                            },
+                        ]),
+                        rsclaw_hidden: None,
+                    });
+                    continue;
+                }
                 // Skip tools with parse errors — do not execute, return error directly.
                 // This prevents infinite retry loops when model output gets truncated.
                 if let Some(parse_error) = tool_input.get("_parse_error").and_then(|v| v.as_str()) {
