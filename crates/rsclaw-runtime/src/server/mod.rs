@@ -1184,7 +1184,19 @@ async fn send_message(
                         if !event.tool_log.is_empty() {
                             stop["rsclaw_tool_log"] = serde_json::json!(event.tool_log);
                         }
-                        return Some(format!("data: {stop}\n\ndata: [DONE]\n\n"));
+                        // A turn the loop stops early carries its closing
+                        // text on the done event itself.
+                        let tail = if event.delta.is_empty() {
+                            String::new()
+                        } else {
+                            let chunk = serde_json::json!({
+                                "id": cid, "object": "chat.completion.chunk",
+                                "created": now, "model": "rsclaw",
+                                "choices": [{"index":0,"delta":{"content":event.delta},"finish_reason":null}]
+                            });
+                            format!("data: {chunk}\n\n")
+                        };
+                        return Some(format!("{tail}data: {stop}\n\ndata: [DONE]\n\n"));
                     }
                     if event.delta.is_empty() { return None; }
                     let chunk = serde_json::json!({
@@ -5845,7 +5857,19 @@ async fn openai_chat_completions(
                         if !event.tool_log.is_empty() {
                             stop["rsclaw_tool_log"] = serde_json::json!(event.tool_log);
                         }
-                        return Some(format!("data: {stop}\n\ndata: [DONE]\n\n"));
+                        // A turn the loop stops early carries its closing
+                        // text on the done event itself.
+                        let tail = if event.delta.is_empty() {
+                            String::new()
+                        } else {
+                            let chunk = serde_json::json!({
+                                "id": cid, "object": "chat.completion.chunk",
+                                "created": now, "model": model_str,
+                                "choices": [{"index":0,"delta":{"content":event.delta},"finish_reason":null}]
+                            });
+                            format!("data: {chunk}\n\n")
+                        };
+                        return Some(format!("{tail}data: {stop}\n\ndata: [DONE]\n\n"));
                     }
                     if event.delta.is_empty() { return None; }
                     if let Ok(mut acc) = reply_acc.lock() {

@@ -215,11 +215,11 @@ function ChevronSvg({ open, className }: { open: boolean; className?: string }) 
   );
 }
 
-/** Extract first `$ ...` command line for header preview. */
+/** Extract the first `$ command` or `> target` line for header preview. */
 function extractCmdPreview(output: string): string {
-  const line = output.split("\n").find((l) => /^\$\s/.test(l));
+  const line = output.split("\n").find((l) => /^[$>]\s/.test(l));
   if (!line) return "";
-  return line.replace(/^\$\s*/, "").slice(0, 72);
+  return line.replace(/^[$>]\s*/, "").slice(0, 72);
 }
 
 /** Expand/collapse single tool output block. */

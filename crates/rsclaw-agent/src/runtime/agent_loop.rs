@@ -2153,6 +2153,35 @@ impl AgentRuntime {
                         ctx.turn_metrics.same_call_streak_max.max(same_call_streak);
                     // Daemon agents poll the same tool forever by design — don't
                     // treat a repeated identical call as a stagnation break.
+                    if !daemon_mode && same_call_streak >= MAX_SAME_CALL_STREAK && !wrapup_injected {
+                        // First time: refuse the call and drain the budget so
+                        // the next iteration asks for a final answer. The
+                        // model then hands back what it has instead of the
+                        // turn ending with nothing.
+                        warn!(
+                            tool = %tool_name,
+                            streak = same_call_streak,
+                            "agent_loop: identical tool call repeated, asking for a final answer"
+                        );
+                        budget = 0;
+                        ctx.turn_metrics.stagnation_budget = budget;
+                        turn_scratchpad.push(Message {
+                            role: Role::Tool,
+                            content: MessageContent::Parts(vec![
+                                rsclaw_provider::ContentPart::ToolResult {
+                                    tool_use_id: tool_id.clone(),
+                                    content: json!({
+                                        "error": "REFUSED: this exact call was already made several times with the same result.",
+                                        "retryable": false,
+                                    })
+                                    .to_string(),
+                                    is_error: Some(true),
+                                },
+                            ]),
+                            rsclaw_hidden: None,
+                        });
+                        continue;
+                    }
                     if !daemon_mode && same_call_streak >= MAX_SAME_CALL_STREAK {
                         warn!(
                             tool = %tool_name,
@@ -2546,7 +2575,12 @@ impl AgentRuntime {
                                     })
                                     .unwrap_or(preview)
                             } else {
-                                preview
+                                // Other tools: a `> target` line (file, URL,
+                                // query) so the card says what was touched.
+                                match tool_target(&tool_input_str) {
+                                    Some(target) => format!("> {target}\n{preview}"),
+                                    None => preview,
+                                }
                             };
                             let marker =
                                 format!("<rstool name=\"{tool_name}\">{display_out}</rstool>");
@@ -3533,5 +3567,42 @@ mod inline_think_tests {
     fn a_second_reasoning_run_gets_its_own_tags() {
         let got = render(&[(true, "a"), (false, "1"), (true, "b"), (false, "2")]);
         assert_eq!(got, "<think>a</think>1<think>b</think>2");
+    }
+}
+
+/// The argument a tool card names as its target: the first string among the
+/// usual path / URL / query keys, on one line and capped in length.
+fn tool_target(args_json: &str) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "path", "file_path", "file", "url", "query", "q", "dir", "directory", "pattern", "app",
+    ];
+    let args: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    let value = KEYS
+        .iter()
+        .find_map(|k| args.get(*k).and_then(|v| v.as_str()))?
+        .trim();
+    let line = value.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut target: String = line.chars().take(200).collect();
+    if line.chars().count() > 200 {
+        target.push('…');
+    }
+    Some(target)
+}
+
+#[cfg(test)]
+mod tool_target_tests {
+    use super::tool_target;
+
+    #[test]
+    fn names_the_path_url_or_query() {
+        assert_eq!(tool_target(r#"{"path":"/a/起诉状.pdf"}"#).as_deref(), Some("/a/起诉状.pdf"));
+        assert_eq!(tool_target(r#"{"query":"诉讼时效 司法解释\n"}"#).as_deref(), Some("诉讼时效 司法解释"));
+        assert_eq!(tool_target(r#"{"action":"list"}"#), None);
+        assert_eq!(tool_target("not json"), None);
+        let long = "字".repeat(300);
+        assert_eq!(tool_target(&format!(r#"{{"url":"{long}"}}"#)).unwrap().chars().count(), 201);
     }
 }
