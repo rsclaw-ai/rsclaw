@@ -732,6 +732,8 @@ pub fn build_router(state: AppState) -> Router {
             get(read_workspace_file).put(write_workspace_file),
         )
         .route("/stream", get(stream_sse))
+        .route("/approvals", get(approvals_list))
+        .route("/approvals/{id}", post(approvals_respond))
         .route(
             "/a2a",
             // axum's stock Json<T> body limit is 2 MiB which 413s any
@@ -1193,12 +1195,36 @@ async fn send_message(
                     Some(format!("data: {chunk}\n\n"))
                 }
             })
-            .scan(false, |done, line| {
-                if *done { return std::future::ready(None); }
-                if line.contains("[DONE]") { *done = true; }
-                std::future::ready(Some(Ok::<_, Infallible>(line)))
+            // End right after [DONE]: the broadcast never closes, so don't wait
+            // for another event before finishing the response.
+            .flat_map(|line| {
+                let last = line.contains("[DONE]");
+                futures::stream::iter(std::iter::once(Some(line)).chain(last.then_some(None)))
             })
+            .take_while(|line| std::future::ready(line.is_some()))
+            .filter_map(|line| std::future::ready(line.map(Ok::<_, Infallible>)))
             .take_until(Box::pin(async move { shutdown_for_stream.notified().await }));
+
+        // Heartbeat comments while the turn is silent: a model can think, or a
+        // tool can run, for minutes without emitting a delta, and clients and
+        // proxies drop an idle stream. The pings stop when the stream ends.
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ended_approvals_tx, ended_approvals_rx) = tokio::sync::oneshot::channel::<()>();
+        let stream = stream.chain(futures::stream::once(async move {
+            let _ = ended_tx.send(());
+            let _ = ended_approvals_tx.send(());
+            Ok::<_, Infallible>(String::new())
+        }));
+        let pings = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval_at(
+            tokio::time::Instant::now() + SSE_KEEPALIVE,
+            SSE_KEEPALIVE,
+        ))
+        .map(|_| Ok::<_, Infallible>(": keep-alive\n\n".to_owned()))
+        .take_until(ended_rx);
+        let approvals = approval_frames(Some(session_key.clone()))
+            .map(|v| Ok::<_, Infallible>(format!("data: {v}\n\n")))
+            .take_until(ended_approvals_rx);
+        let stream = futures::stream::select(futures::stream::select(stream, pings), approvals);
 
         let mut hdrs = axum::http::HeaderMap::new();
         hdrs.insert(
@@ -2898,6 +2924,9 @@ async fn config_reload(State(_state): State<AppState>) -> impl IntoResponse {
             .into_response(),
     }
 }
+
+/// Interval between SSE heartbeat comments on streamed agent turns.
+const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
 
 /// Scope names accepted by `POST /api/v1/reload`.
 pub const KNOWN_RELOAD_SCOPES: [&str; 7] = [
@@ -5830,11 +5859,14 @@ async fn openai_chat_completions(
                     Some(format!("data: {chunk}\n\n"))
                 }
             })
-            .scan(false, |done, line| {
-                if *done { return std::future::ready(None); }
-                if line.contains("[DONE]") { *done = true; }
-                std::future::ready(Some(Ok::<_, Infallible>(line)))
+            // End right after [DONE]: the broadcast never closes, so don't wait
+            // for another event before finishing the response.
+            .flat_map(|line| {
+                let last = line.contains("[DONE]");
+                futures::stream::iter(std::iter::once(Some(line)).chain(last.then_some(None)))
             })
+            .take_while(|line| std::future::ready(line.is_some()))
+            .filter_map(|line| std::future::ready(line.map(Ok::<_, Infallible>)))
             .take_until(Box::pin(async move { shutdown_for_stream.notified().await }));
 
         let mut response_headers = axum::http::HeaderMap::new();
@@ -6266,12 +6298,100 @@ async fn zalo_webhook(
     StatusCode::OK.into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct ApprovalsQuery {
+    session_id: Option<String>,
+}
+
+/// GET /api/v1/approvals?session_id= — requests still waiting for the user,
+/// so a client that (re)connects mid-turn can show them.
+async fn approvals_list(Query(q): Query<ApprovalsQuery>) -> Response {
+    let list = rsclaw_agent::approvals::broker().pending(q.session_id.as_deref());
+    Json(serde_json::json!({ "approvals": list })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovalAnswer {
+    /// `allow` or `deny`.
+    decision: String,
+    #[serde(default = "default_approval_scope")]
+    scope: rsclaw_agent::approvals::Scope,
+}
+
+fn default_approval_scope() -> rsclaw_agent::approvals::Scope {
+    rsclaw_agent::approvals::Scope::Once
+}
+
+/// POST /api/v1/approvals/{id} — the user's answer; resumes the waiting
+/// tool call.
+async fn approvals_respond(
+    Path(id): Path<String>,
+    Json(answer): Json<ApprovalAnswer>,
+) -> Response {
+    let allow = match answer.decision.as_str() {
+        "allow" => true,
+        "deny" => false,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("decision must be allow or deny, got {other}")})),
+            )
+                .into_response();
+        }
+    };
+    match rsclaw_agent::approvals::broker().respond(&id, allow, answer.scope) {
+        Ok(_) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) if e.contains("not found") => {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// SSE `data:` payloads that announce an approval request or its answer for
+/// `session` (`None` = every session), merged into the session streams.
+fn approval_frames(
+    session: Option<String>,
+) -> impl Stream<Item = serde_json::Value> + Send + 'static {
+    let requests = tokio_stream::wrappers::BroadcastStream::new(
+        rsclaw_agent::approvals::broker().subscribe(),
+    )
+    .filter_map({
+        let session = session.clone();
+        move |msg| {
+            let session = session.clone();
+            async move {
+                let req = msg.ok()?;
+                if session.as_ref().is_some_and(|s| *s != req.session_key) {
+                    return None;
+                }
+                Some(serde_json::json!({"type": "approval_request", "request": req}))
+            }
+        }
+    });
+    let resolved = tokio_stream::wrappers::BroadcastStream::new(
+        rsclaw_agent::approvals::broker().subscribe_resolved(),
+    )
+    .filter_map(move |msg| {
+        let session = session.clone();
+        async move {
+            let done = msg.ok()?;
+            if session.as_ref().is_some_and(|s| *s != done.session_key) {
+                return None;
+            }
+            Some(serde_json::json!({"type": "approval_resolved", "id": done.id, "allow": done.allow}))
+        }
+    });
+    futures::stream::select(requests, resolved)
+}
+
 async fn stream_sse(
     State(state): State<AppState>,
     Query(params): Query<StreamParams>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.event_bus.subscribe();
     let session_filter = params.session_id;
+    let approval_session = session_filter.clone();
     let shutdown_for_stream = state.shutdown.clone();
 
     let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
@@ -6292,6 +6412,9 @@ async fn stream_sse(
         .take_until(Box::pin(
             async move { shutdown_for_stream.notified().await },
         ));
+    let approvals = approval_frames(approval_session)
+        .map(|v| Ok::<_, Infallible>(Event::default().data(v.to_string())));
+    let stream = futures::stream::select(stream, approvals);
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()

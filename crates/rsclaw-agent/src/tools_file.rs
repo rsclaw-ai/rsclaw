@@ -272,6 +272,88 @@ fn home_reference(command: &str) -> Option<String> {
     None
 }
 
+/// Safety rules no approval can lift: their damage can't be undone
+/// (wiping disks, writing raw devices, fork bombs, deleting `/` or `~`).
+const NEVER_APPROVABLE: &[&str] = &[
+    r"\bmkfs\b",
+    r"\bdiskpart\b",
+    r":\(\)\s*\{",
+    r"%0\|%0",
+    r"\bformat\b\s+[A-Z]:",
+    r"rd\s+/s\s+/q\s+[A-Z]:\\",
+    r"del\s+/f\s+/s\s+/q\s+[A-Z]:\\",
+    r"rm\s+-rf\s+[/~]",
+];
+
+fn never_approvable(pattern: &str) -> bool {
+    NEVER_APPROVABLE.contains(&pattern) || pattern.starts_with(r"\bdd\b")
+}
+
+/// Channels whose client can show an approval prompt (the desktop and
+/// mobile apps). IM bots and cron turns keep refusing.
+fn interactive_channel(channel: &str) -> bool {
+    matches!(channel, "api" | "desktop" | "ws" | "webchat" | "web")
+}
+
+/// Ask the user to approve what the exec safety layer would refuse.
+/// `Ok(())` means approved; otherwise the error tells the model what
+/// happened and not to work around it.
+async fn ask_approval(
+    ctx: &super::runtime::RunContext,
+    kind: crate::approvals::ApprovalKind,
+    command: &str,
+    target: &str,
+    risk: crate::approvals::Risk,
+    blocked: &str,
+) -> Result<()> {
+    use crate::approvals::{APPROVAL_WAIT, Decision, broker};
+    if !interactive_channel(&ctx.channel) {
+        bail!("{blocked}");
+    }
+    match broker()
+        .request(&ctx.session_key, &ctx.agent_id, kind, command, target, risk, APPROVAL_WAIT)
+        .await
+    {
+        Decision::Allow(_) => Ok(()),
+        Decision::Deny => bail!(
+            "{blocked}. The user was asked and declined. Do not retry this or try to work around it; tell the user what you could not do."
+        ),
+        Decision::TimedOut => bail!(
+            "{blocked}. The user was asked but did not answer in time. Do not retry; tell the user this step needs their approval."
+        ),
+        Decision::NoClient => bail!("{blocked}"),
+    }
+}
+
+/// Whether `path` is under a directory approved for this session or earlier
+/// in this call.
+fn path_approved(session: &str, approved: &[std::path::PathBuf], path: &std::path::Path) -> bool {
+    approved.iter().any(|d| path.starts_with(d))
+        || crate::approvals::broker().path_granted(session, path)
+}
+
+/// The directory an approval for `path` covers: the path itself when it is a
+/// directory, else its parent.
+fn grant_dir(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().map_or_else(|| path.to_path_buf(), std::path::Path::to_path_buf)
+    }
+}
+
+/// The location a [`home_reference`] points at: `~/x` under the home
+/// directory, every other marker the home directory itself.
+fn home_reference_target(reason: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(std::path::PathBuf::from)?;
+    let Some(rest) = reason.strip_prefix('~') else {
+        return Some(home);
+    };
+    let rest = rest.trim_start_matches(['/', '\\']);
+    Some(if rest.is_empty() { home } else { home.join(rest) })
+}
+
 #[cfg(test)]
 mod sandbox_tests {
     use super::{has_drive_prefix, home_reference, sandbox_path_tokens};
@@ -1260,17 +1342,39 @@ impl super::runtime::AgentRuntime {
         let safety_enabled = self.exec_safety_enabled();
 
         if safety_enabled {
+            // A matched rule asks the user (when a client can show the
+            // prompt) instead of refusing outright; each approved rule is
+            // skipped on the next pass so every rule the command hits gets
+            // its own answer.
             let preparse = crate::preparse::PreParseEngine::load_with_safety(true);
-            match preparse.check_exec_safety(command) {
-                crate::preparse::SafetyCheck::Allow => {}
-                crate::preparse::SafetyCheck::Deny(reason) => {
-                    bail!("[blocked] {reason}");
-                }
-                crate::preparse::SafetyCheck::Confirm(reason) => {
+            let mut approved_rules: std::collections::HashSet<String> = Default::default();
+            loop {
+                let violation = preparse.violation_skipping(command, &|pattern| {
+                    approved_rules.contains(pattern)
+                        || crate::approvals::broker().rule_granted(&ctx.session_key, pattern)
+                });
+                let Some(violation) = violation else { break };
+                let pattern = violation.pattern().to_owned();
+                if never_approvable(&pattern) {
                     bail!(
-                        "[needs confirmation] {reason}. Command: {command}. Do not retry on your own — ask the user to explicitly approve this command, and re-run it only after they confirm."
+                        "[blocked] command blocked by safety rule: {pattern}. This operation is never allowed."
                     );
                 }
+                let (risk, blocked) = match violation {
+                    crate::preparse::Violation::Deny(_) => (
+                        crate::approvals::Risk::High,
+                        format!("[blocked] command blocked by safety rule: {pattern}"),
+                    ),
+                    crate::preparse::Violation::Confirm(_) => (
+                        crate::approvals::Risk::Normal,
+                        format!(
+                            "[needs confirmation] dangerous command requires confirmation: {pattern}. Command: {command}"
+                        ),
+                    ),
+                };
+                ask_approval(ctx, crate::approvals::ApprovalKind::Command, command, &pattern, risk, &blocked)
+                    .await?;
+                approved_rules.insert(pattern);
             }
         }
 
@@ -1334,11 +1438,31 @@ impl super::runtime::AgentRuntime {
             } else {
                 workspace.clone()
             };
+            // Directories the user approved during this call.
+            let mut approved_dirs: Vec<std::path::PathBuf> = Vec::new();
             if let Some(reason) = home_reference(command) {
-                bail!(
-                    "[sandbox] access denied: `{reason}` refers to a location outside the workspace `{}`. Use paths under the workspace, or ask the user to relax `tools.exec.safety` if outside access is intended.",
-                    ws_canon.display()
-                );
+                let target = home_reference_target(&reason);
+                let inside = target.as_ref().is_some_and(|t| t.starts_with(&ws_canon));
+                if !inside {
+                    let blocked = format!(
+                        "[sandbox] access denied: `{reason}` refers to a location outside the workspace `{}`. Use paths under the workspace, or ask the user to relax `tools.exec.safety` if outside access is intended.",
+                        ws_canon.display()
+                    );
+                    let Some(target) = target else { bail!("{blocked}") };
+                    let dir = grant_dir(&target);
+                    if !path_approved(&ctx.session_key, &approved_dirs, &target) {
+                        ask_approval(
+                            ctx,
+                            crate::approvals::ApprovalKind::Path,
+                            command,
+                            &dir.display().to_string(),
+                            crate::approvals::Risk::Normal,
+                            &blocked,
+                        )
+                        .await?;
+                        approved_dirs.push(dir);
+                    }
+                }
             }
             for token in sandbox_path_tokens(command) {
                 let token = token.as_str();
@@ -1361,10 +1485,34 @@ impl super::runtime::AgentRuntime {
                         resolved.clone()
                     };
                     if !canon.starts_with(&ws_canon) {
-                        bail!(
+                        // Text that only looks like a path (`'</w:p>'` in a
+                        // Python one-liner yields `/w:p`): nothing there and
+                        // nothing to create it in.
+                        if !canon.exists()
+                            && canon
+                                .parent()
+                                .is_none_or(|p| p.parent().is_none() || !p.exists())
+                        {
+                            continue;
+                        }
+                        if path_approved(&ctx.session_key, &approved_dirs, &canon) {
+                            continue;
+                        }
+                        let blocked = format!(
                             "[sandbox] access denied: `{token}` is outside the workspace `{}`. Use paths under the workspace, or ask the user to relax `tools.exec.safety` if outside access is intended.",
                             ws_canon.display()
                         );
+                        let dir = grant_dir(&canon);
+                        ask_approval(
+                            ctx,
+                            crate::approvals::ApprovalKind::Path,
+                            command,
+                            &dir.display().to_string(),
+                            crate::approvals::Risk::Normal,
+                            &blocked,
+                        )
+                        .await?;
+                        approved_dirs.push(dir);
                     }
                 }
             }

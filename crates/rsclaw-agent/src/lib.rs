@@ -21,6 +21,7 @@ pub use rsclaw_platform::install_hints;
 pub mod loop_detection;
 pub mod model_resolution;
 pub use rsclaw_memory as memory;
+pub mod approvals;
 pub mod args_sanitizer;
 pub mod memory_extractor;
 pub mod platform;

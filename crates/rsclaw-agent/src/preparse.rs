@@ -400,6 +400,30 @@ impl PreParseEngine {
         self.check_safety(cmd)
     }
 
+    /// The first deny (then confirm) rule `cmd` matches, ignoring rules for
+    /// which `skip(pattern)` is true (already approved). `None` when the
+    /// command is allowed. Patterns are reported without the `(?i)` prefix
+    /// added at compile time.
+    pub fn violation_skipping(&self, cmd: &str, skip: &dyn Fn(&str) -> bool) -> Option<Violation> {
+        if !self.safety_enabled || self.allow_patterns.iter().any(|p| p.is_match(cmd)) {
+            return None;
+        }
+        let source = |re: &Regex| re.as_str().trim_start_matches("(?i)").to_owned();
+        for re in &self.deny_patterns {
+            let pat = source(re);
+            if re.is_match(cmd) && !skip(&pat) {
+                return Some(Violation::Deny(pat));
+            }
+        }
+        for re in &self.confirm_patterns {
+            let pat = source(re);
+            if re.is_match(cmd) && !skip(&pat) {
+                return Some(Violation::Confirm(pat));
+            }
+        }
+        None
+    }
+
     fn check_safety(&self, cmd: &str) -> SafetyCheck {
         // Allow overrides deny
         for pat in &self.allow_patterns {
@@ -433,6 +457,20 @@ pub enum SafetyCheck {
     Allow,
     Deny(String),
     Confirm(String),
+}
+
+/// A safety rule a command matched, with the rule's source pattern.
+pub enum Violation {
+    Deny(String),
+    Confirm(String),
+}
+
+impl Violation {
+    pub fn pattern(&self) -> &str {
+        match self {
+            Violation::Deny(p) | Violation::Confirm(p) => p,
+        }
+    }
 }
 
 // --- Helper functions ---
