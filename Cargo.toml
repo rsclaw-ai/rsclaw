@@ -237,8 +237,10 @@ opt-level = "s"
 lto = "fat"
 strip = "symbols"
 codegen-units = 1
-# Drop unwind tables — we don't rely on panic=unwind in release.
-panic = "abort"
+# Keep panic=unwind (the default): the gateway is long-lived and third-party
+# parsers (pdf-extract and others) panic on unusual input. Tool code catches
+# those with catch_unwind, and a panic in a tokio task only ends that task;
+# with abort either one would take the whole gateway down.
 # Overflow/debug assertions off for smaller asserts
 debug-assertions = false
 overflow-checks = false
