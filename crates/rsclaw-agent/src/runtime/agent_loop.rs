@@ -1391,6 +1391,20 @@ impl AgentRuntime {
                             );
                         }
                     }
+                    // The fleet worker ends a reply that fell into a loop
+                    // with `degenerate_output:` and drops the session (the
+                    // provider replays it next call): same recovery as our
+                    // own check above.
+                    StreamEvent::Error(e) if e.contains("degenerate_output") => {
+                        warn!(
+                            session = %ctx.session_key,
+                            error = %e,
+                            "agent_loop: worker cut a degenerate response"
+                        );
+                        degenerated = true;
+                        delta_buf.clear();
+                        break;
+                    }
                     StreamEvent::Error(e) => {
                         return Err(anyhow!("LLM stream error: {e}"));
                     }
