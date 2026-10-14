@@ -261,11 +261,27 @@ fn create_excel(args: &Value, path: &Path) -> Result<Value> {
 // Word (.docx)
 // ---------------------------------------------------------------------------
 
+/// `content` without a leading heading that repeats `title`: models pass the
+/// title and also open the content with `# <title>`, which printed it twice.
+fn skip_repeated_title<'a>(content: &'a str, title: &str) -> &'a str {
+    let title = title.trim();
+    if title.is_empty() {
+        return content;
+    }
+    let trimmed = content.trim_start();
+    let (first, rest) = trimmed.split_once('\n').unwrap_or((trimmed, ""));
+    if first.trim_start_matches('#').trim() == title {
+        rest
+    } else {
+        content
+    }
+}
+
 fn create_word(args: &Value, path: &Path) -> Result<Value> {
     use docx_rs::*;
 
     let title = args["title"].as_str().unwrap_or("");
-    let content = args["content"].as_str().unwrap_or("");
+    let content = skip_repeated_title(args["content"].as_str().unwrap_or(""), title);
 
     if content.is_empty() && title.is_empty() {
         return Ok(json!({
@@ -1502,5 +1518,18 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod skip_repeated_title_tests {
+    use super::skip_repeated_title;
+
+    #[test]
+    fn drops_only_a_heading_that_repeats_the_title() {
+        assert_eq!(skip_repeated_title("# 民事答辩状\n\n答辩人：甲", "民事答辩状"), "\n答辩人：甲");
+        assert_eq!(skip_repeated_title("民事答辩状\n答辩人：甲", "民事答辩状"), "答辩人：甲");
+        assert_eq!(skip_repeated_title("# 答辩请求\n一、", "民事答辩状"), "# 答辩请求\n一、");
+        assert_eq!(skip_repeated_title("# 民事答辩状", ""), "# 民事答辩状");
     }
 }
