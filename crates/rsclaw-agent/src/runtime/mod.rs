@@ -1547,8 +1547,14 @@ impl AgentRuntime {
     /// (HTML, search results, screenshots) is never concatenated into the
     /// conversation. Returns the extracted text; error means caller should fall
     /// back to plain truncation.
-    /// Per-turn aggregate input guard. Caps the total ToolResult payload in
-    /// `scratchpad` to `budget` tokens by trimming the largest results first.
+    /// Per-iteration input guard. Caps the ToolResult payload added since the
+    /// model's last reply (the tail of `scratchpad` after its last assistant
+    /// message) to `budget` tokens by trimming the largest results first.
+    /// Earlier results already passed this guard; growth across a long turn
+    /// is the pre-flight check's job. Counting the whole turn here starved
+    /// long turns: past ~100 steps every new result, a `read_artifact` page
+    /// included, was cut to the floor under a fresh handle, and the model
+    /// paged handle after handle without ever seeing the content.
     ///
     /// Each trimmed result keeps (or, when it has none yet, is given) a
     /// `read_artifact` handle so the model can page into the full content —
@@ -1570,9 +1576,13 @@ impl AgentRuntime {
 
         use super::context_mgr::estimate_tokens;
 
-        // Index every ToolResult part with its current token cost.
+        // Index this iteration's ToolResult parts with their token cost.
+        let start = scratchpad
+            .iter()
+            .rposition(|m| m.role == Role::Assistant)
+            .map_or(0, |i| i + 1);
         let mut idx: Vec<(usize, usize, usize)> = Vec::new();
-        for (mi, msg) in scratchpad.iter().enumerate() {
+        for (mi, msg) in scratchpad.iter().enumerate().skip(start) {
             if let MessageContent::Parts(parts) = &msg.content {
                 for (pi, part) in parts.iter().enumerate() {
                     if let ContentPart::ToolResult { content, .. } = part {
