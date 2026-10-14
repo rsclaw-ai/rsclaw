@@ -353,6 +353,9 @@ impl AgentRuntime {
         // Per-result char cap applied to older tool results when a
         // ContextExceeded retry finds nothing to compact.
         const CONTEXT_RETRY_TOOL_RESULT_CHARS: usize = 1_000;
+        // Headroom kept under the context limit once the estimate is
+        // calibrated: the next turn's new input plus a full reply.
+        const PREFLIGHT_RESERVE_TOKENS: usize = 12_288;
         // Set once pre-flight compaction proves to be a no-op this turn, so it
         // isn't re-attempted (and re-billed) on every iteration.
         let mut preflight_compaction_stalled = false;
@@ -757,6 +760,11 @@ impl AgentRuntime {
                     + msg_count * 10
             };
             let approx_tokens = component_est.max(body_est);
+            // The estimate runs low on CJK text and tool output (about 1.5x
+            // against the fleet worker's count); scale it by what the
+            // provider reported for this session's earlier calls.
+            let calibrated_tokens = token_scale(&ctx.session_key)
+                .map_or(approx_tokens, |s| (approx_tokens as f32 * s) as usize);
             self.handle.update_session_tokens(
                 &ctx.session_key,
                 crate::registry::SessionTokens {
@@ -775,8 +783,8 @@ impl AgentRuntime {
             // scratchpad, invalidating the provider's prompt-prefix cache for
             // the rest of the turn. With buckets the bytes only change when a
             // threshold is crossed.
-            if approx_tokens > 0 && context_tokens > 0 {
-                let usage_pct = (approx_tokens * 100) / context_tokens;
+            if calibrated_tokens > 0 && context_tokens > 0 {
+                let usage_pct = (calibrated_tokens * 100) / context_tokens;
                 let usage_hint: Option<&str> = if usage_pct >= 90 {
                     Some(
                         "[Context usage: over 90% — CRITICAL. \
@@ -933,10 +941,41 @@ impl AgentRuntime {
                 .get(&ctx.session_key)
                 .map(|msgs| msgs.iter().map(crate::context_mgr::msg_tokens).sum())
                 .unwrap_or(0);
-            let total_est = overhead + session_tokens;
-            // Use 80% of context limit as threshold to account for token estimation
-            // inaccuracy (estimate is ~char/3.5, actual tokenization may differ by 10-15%).
-            if !preflight_compaction_stalled && total_est > (context_limit * 80 / 100) {
+            // This turn's tool calls and results count too: a long turn
+            // (reading a case folder) grows the context there, not in the
+            // stored session.
+            let turn_tokens: usize = turn_scratchpad.iter().map(msg_tokens).sum();
+            let scale = token_scale(&ctx.session_key);
+            let total_est = scale.map_or(overhead + session_tokens + turn_tokens, |s| {
+                ((overhead + session_tokens + turn_tokens) as f32 * s) as usize
+            });
+            // Calibrated against the provider's real count: compact once the
+            // next input and reply would no longer fit. Uncalibrated: keep a
+            // 20% margin for the estimate's error.
+            let preflight_threshold = if scale.is_some() {
+                context_limit.saturating_sub(PREFLIGHT_RESERVE_TOKENS)
+            } else {
+                context_limit * 80 / 100
+            };
+            if total_est > preflight_threshold && preflight_compaction_stalled {
+                // The stored session has nothing left to fold; shrink this
+                // turn's older tool results instead (handles stay readable).
+                let shrunk = crate::context_mgr::shrink_oldest_tool_results(
+                    &mut turn_scratchpad,
+                    CONTEXT_RETRY_TOOL_RESULT_CHARS,
+                );
+                if shrunk > 0 {
+                    warn!(
+                        session = %ctx.session_key,
+                        total_est,
+                        preflight_threshold,
+                        shrunk,
+                        "pre-flight: near the context limit, shrank older tool results of this turn"
+                    );
+                    messages = self.build_request_messages(ctx, &mut turn_scratchpad);
+                }
+            }
+            if !preflight_compaction_stalled && total_est > preflight_threshold {
                 warn!(
                     session = %ctx.session_key,
                     total_est,
@@ -1388,6 +1427,7 @@ impl AgentRuntime {
                     StreamEvent::Done { usage } => {
                         // Update context total with real usage from LLM if available.
                         if let Some(ref u) = usage {
+                            record_token_scale(&ctx.session_key, u.input, approx_tokens);
                             let real_tokens = (u.input + u.output) as usize;
                             if let Ok(mut map) = self.handle.session_tokens.write() {
                                 if let Some(st) = map.get_mut(&ctx.session_key) {
@@ -3736,5 +3776,53 @@ mod degenerate_tail_tests {
         assert!(!degenerate_tail(&"/".repeat(500)));
         let prose = "原告主张的事实与客观情况不符，答辩人收取的服务费具有合同依据。".repeat(30);
         assert!(!degenerate_tail(&prose));
+    }
+}
+
+/// Per-session ratio of the provider's real prompt size to our estimate.
+fn token_scales() -> &'static std::sync::Mutex<std::collections::HashMap<String, f32>> {
+    static SCALES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, f32>>> =
+        std::sync::OnceLock::new();
+    SCALES.get_or_init(Default::default)
+}
+
+/// How much to scale this session's token estimate, once a call has
+/// reported its real prompt size.
+fn token_scale(session: &str) -> Option<f32> {
+    token_scales().lock().ok()?.get(session).copied()
+}
+
+/// Learn from a call's reported prompt size (`real`) against our estimate
+/// of the same request. Only ever scales up (1.0 to 3.0): some providers
+/// leave cached tokens out of the count, and a low count must not make us
+/// compact later than the plain estimate would.
+fn record_token_scale(session: &str, real: u64, estimated: usize) {
+    if real < 2_000 || estimated < 1_000 {
+        return;
+    }
+    let ratio = (real as f32 / estimated as f32).clamp(1.0, 3.0);
+    if let Ok(mut map) = token_scales().lock() {
+        let next = map.get(session).map_or(ratio, |old| (old + ratio) / 2.0);
+        map.insert(session.to_owned(), next);
+    }
+}
+
+#[cfg(test)]
+mod token_scale_tests {
+    use super::{record_token_scale, token_scale};
+
+    #[test]
+    fn scales_up_from_real_counts_only() {
+        assert_eq!(token_scale("ts-a"), None);
+        record_token_scale("ts-a", 72_000, 48_000);
+        assert_eq!(token_scale("ts-a"), Some(1.5));
+        record_token_scale("ts-a", 60_000, 60_000);
+        assert_eq!(token_scale("ts-a"), Some(1.25));
+        // A provider that leaves cached tokens out never scales us down.
+        record_token_scale("ts-b", 3_000, 50_000);
+        assert_eq!(token_scale("ts-b"), Some(1.0));
+        // Tiny calls teach nothing.
+        record_token_scale("ts-c", 500, 400);
+        assert_eq!(token_scale("ts-c"), None);
     }
 }
