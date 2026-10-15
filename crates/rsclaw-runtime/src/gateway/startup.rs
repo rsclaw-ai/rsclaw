@@ -30,26 +30,9 @@ use crate::{
     server::{AppState, serve},
 };
 
-// ---------------------------------------------------------------------------
-// Sync-only channel allow-list
-// ---------------------------------------------------------------------------
-
-/// Channels whose responses arrive back at the caller through a non-
-/// notification transport — currently the HTTP `/api/v1/message`
-/// endpoint, which uses a `oneshot::reply_tx` on the `AgentMessage`
-/// plus an optional SSE byte stream.
-///
-/// The agent runtime still fans the assistant reply out onto the
-/// notification bus for observers (UI, telemetry), so this list
-/// suppresses the otherwise-misleading `WARN: no channel sender
-/// registered` log for those known-by-design absences. Future
-/// sync-only entry points (stdio MCP, in-process embeds, etc.)
-/// should be added here.
-const SYNC_ONLY_CHANNELS: &[&str] = &["api"];
-
-fn is_sync_only_channel(name: &str) -> bool {
-    SYNC_ONLY_CHANNELS.contains(&name)
-}
+// Sync-only channels (HTTP /api/v1/message) have no notification sender by
+// design; see `rsclaw_channel::SYNC_ONLY_CHANNELS`.
+use rsclaw_channel::is_sync_only_channel;
 
 // ---------------------------------------------------------------------------
 // Gateway entry point

@@ -98,6 +98,18 @@ pub mod outbound_kind {
 // existing `crate::OutboundMessage` paths keep resolving.
 pub use rsclaw_types::OutboundMessage;
 
+/// Channels whose replies go back to the caller through their own transport
+/// (the HTTP `/api/v1/message` reply and its SSE stream), with no sender on
+/// the notification bus: an outbound message sent to one of them reaches
+/// nobody. Future sync-only entry points (stdio MCP, in-process embeds)
+/// belong here too.
+pub const SYNC_ONLY_CHANNELS: &[&str] = &["api"];
+
+/// Whether `name` is a [`SYNC_ONLY_CHANNELS`] channel.
+pub fn is_sync_only_channel(name: &str) -> bool {
+    SYNC_ONLY_CHANNELS.contains(&name)
+}
+
 // ---------------------------------------------------------------------------
 // Channel trait
 // ---------------------------------------------------------------------------

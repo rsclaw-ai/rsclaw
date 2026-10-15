@@ -835,6 +835,16 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         image_data_uri: String,
     ) -> HostTrapResult<Result<String, String>> {
         tracing::info!(target: "wasm_plugin_notify", "{message}");
+        // A sync-only chat (the HTTP API the desktop app uses) has no sender
+        // on the bus: say so, so the plugin can return the image with its
+        // result and it reaches the user with the reply.
+        if self
+            .notify_ctx
+            .as_ref()
+            .is_some_and(|ctx| rsclaw_channel::is_sync_only_channel(&ctx.channel))
+        {
+            return Ok(Ok("sync_only".to_string()));
+        }
         if let Some(ctx) = &self.notify_ctx {
             match ctx.tx.send(rsclaw_channel::OutboundMessage {
                 target_id: ctx.target_id.clone(),
