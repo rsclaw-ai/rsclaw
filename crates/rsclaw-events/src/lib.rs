@@ -225,8 +225,9 @@ pub struct AgentEvent {
     /// local_path_or_url). Non-empty only on the final `done = true` event.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<(String, String, String)>,
-    /// Image attachments (base64 data URIs or local paths).
-    /// Non-empty only on the final `done = true` event.
+    /// Image attachments (base64 data URIs or local paths). The turn's
+    /// images come on the final `done = true` event; a plugin can also push
+    /// one mid-turn (a login QR code), on an event with `done = false`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
     /// Tool call log for this turn: (name, args_json, output_text).

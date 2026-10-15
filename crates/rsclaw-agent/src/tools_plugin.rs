@@ -1006,6 +1006,7 @@ impl AgentRuntime {
                     session_key: ctx.session_key.clone(),
                     is_group: false,
                     account: ctx.account.clone(),
+                    event_bus: self.event_bus.clone(),
                 }
             });
             return wp

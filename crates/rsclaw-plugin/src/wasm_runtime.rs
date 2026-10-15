@@ -191,6 +191,30 @@ pub struct WasmNotifyCtx {
     /// it a multi-account feishu setup sends with an arbitrary app's token and
     /// Feishu rejects open_id targets with 99992361 "open_id cross app".
     pub account: Option<String>,
+    /// The agent's event bus. A sync-only chat (the HTTP API the desktop app
+    /// uses) has no notification sender, so plugin messages for it are
+    /// streamed into the running reply here instead.
+    pub event_bus: Option<tokio::sync::broadcast::Sender<rsclaw_events::AgentEvent>>,
+}
+
+impl WasmNotifyCtx {
+    /// Streams `text` (and `images`) into the reply of a sync-only chat.
+    /// `None` when this chat is not sync-only or nobody is listening.
+    fn stream_to_sync_chat(&self, text: &str, images: Vec<String>) -> Option<&'static str> {
+        if !rsclaw_channel::is_sync_only_channel(&self.channel) {
+            return None;
+        }
+        let bus = self.event_bus.as_ref()?;
+        bus.send(rsclaw_events::AgentEvent {
+            session_id: self.session_key.clone(),
+            agent_id: self.agent_id.clone(),
+            delta: format!("\n\n{text}\n\n"),
+            images,
+            ..Default::default()
+        })
+        .ok()
+        .map(|_| "dispatched")
+    }
 }
 
 /// State passed into the wasmtime `Store`, available to host functions.
@@ -812,6 +836,13 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
 
     async fn notify(&mut self, message: String) -> HostTrapResult<Result<String, String>> {
         tracing::info!(target: "wasm_plugin_notify", "{message}");
+        if let Some(sent) = self
+            .notify_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.stream_to_sync_chat(&message, vec![]))
+        {
+            return Ok(Ok(sent.to_string()));
+        }
         if let Some(ctx) = &self.notify_ctx {
             let _ = ctx.tx.send(rsclaw_channel::OutboundMessage {
                 target_id: ctx.target_id.clone(),
@@ -835,9 +866,17 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         image_data_uri: String,
     ) -> HostTrapResult<Result<String, String>> {
         tracing::info!(target: "wasm_plugin_notify", "{message}");
-        // A sync-only chat (the HTTP API the desktop app uses) has no sender
-        // on the bus: say so, so the plugin can return the image with its
+        // A sync-only chat (the HTTP API the desktop app uses) has no
+        // notification sender: stream the image into the running reply, or,
+        // with no listener, say so, so the plugin returns the image with its
         // result and it reaches the user with the reply.
+        if let Some(sent) = self
+            .notify_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.stream_to_sync_chat(&message, vec![image_data_uri.clone()]))
+        {
+            return Ok(Ok(sent.to_string()));
+        }
         if self
             .notify_ctx
             .as_ref()

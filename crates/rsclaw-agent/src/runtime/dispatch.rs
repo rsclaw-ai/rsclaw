@@ -192,6 +192,7 @@ impl AgentRuntime {
                     session_key: ctx.session_key.clone(),
                     is_group: false,
                     account: ctx.account.clone(),
+                    event_bus: self.event_bus.clone(),
                 }
             });
             return wp.call_tool_with_ctx(plugin_tool, args, notify_ctx).await;
@@ -606,6 +607,7 @@ impl AgentRuntime {
                         session_key: ctx.session_key.clone(),
                         is_group: false,
                         account: ctx.account.clone(),
+                        event_bus: self.event_bus.clone(),
                     }
                 });
                 return wp.call_tool_with_ctx(tool_name, args, notify_ctx).await;

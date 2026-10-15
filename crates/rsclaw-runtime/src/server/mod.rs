@@ -1198,12 +1198,17 @@ async fn send_message(
                         };
                         return Some(format!("{tail}data: {stop}\n\ndata: [DONE]\n\n"));
                     }
-                    if event.delta.is_empty() { return None; }
-                    let chunk = serde_json::json!({
+                    if event.delta.is_empty() && event.images.is_empty() { return None; }
+                    let mut chunk = serde_json::json!({
                         "id": cid, "object": "chat.completion.chunk",
                         "created": now, "model": "rsclaw",
                         "choices": [{"index":0,"delta":{"content":event.delta},"finish_reason":null}]
                     });
+                    // Images pushed mid-turn (a plugin's login QR code) show
+                    // now, not only with the final chunk.
+                    if !event.images.is_empty() {
+                        chunk["rsclaw_images"] = serde_json::json!(event.images);
+                    }
                     Some(format!("data: {chunk}\n\n"))
                 }
             })

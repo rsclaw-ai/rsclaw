@@ -1739,6 +1739,7 @@ async fn try_plugin_slash(
                 session_key: session_key.to_owned(),
                 is_group: false,
                 account: account.map(str::to_owned),
+                event_bus: None,
             });
             return Some(
                 match plugin
