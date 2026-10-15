@@ -1204,15 +1204,19 @@ $g.Dispose();$b.Dispose()"#
         return Some(txt(task_help_text(rsclaw_i18n::default_lang())));
     }
     // /model — show current model; /models — list providers; /model <name> — switch
-    if lower == "/model" || lower == "/models" {
-        // Single source of truth shared with the agent-queue __MODELS__ path.
-        return Some(txt(handle.format_models()));
-    }
-    if lower.starts_with("/model ") {
-        let model = t.get(7..).unwrap_or("").trim();
-        return Some(txt(format!(
-            "Model switched to: {model} (runtime only, use configure to persist)"
-        )));
+    if lower == "/model" || lower == "/models" || lower.starts_with("/model ") {
+        // The turn runs under this exact key, so the switch must use it too.
+        let session_key = session_key
+            .map(str::to_owned)
+            .unwrap_or_else(|| preparse_session_key(handle, channel, peer_id, account));
+        let reply = match t.get(7..).map(str::trim) {
+            Some(model) if lower.starts_with("/model ") => {
+                rsclaw_agent::model_switch::switch_session_model(handle, &session_key, model)
+            }
+            // Single source of truth shared with the agent-queue __MODELS__ path.
+            _ => handle.format_models_for(&session_key),
+        };
+        return Some(txt(reply));
     }
     // /plugin — session-scoped plugin activation control. See plugin_help_text.
     if lower == "/plugin" || lower.starts_with("/plugin ") {

@@ -81,6 +81,9 @@ pub struct AgentHandle {
     /// shared prefix KV cache stays intact across overrides.
     pub plugin_overrides:
         Arc<std::sync::RwLock<HashMap<String, HashMap<String, crate::runtime::PluginOverride>>>>,
+    /// Per-session model switches from `/model <name>`:
+    /// `session_key → provider/model`. Runtime only; see `model_switch`.
+    pub model_overrides: Arc<std::sync::RwLock<HashMap<String, String>>>,
     /// Loaded WASM plugins shared with queue-bypassing slash handlers.
     pub wasm_plugins: Arc<std::sync::RwLock<Arc<Vec<rsclaw_plugin::WasmPlugin>>>>,
     /// Outbound notification sender shared with queue-bypassing slash handlers.
@@ -510,6 +513,32 @@ impl AgentHandle {
     /// gateway fast-preparse path and the agent-queue `__MODELS__` template,
     /// so the two can never drift (they previously rendered "default" vs the
     /// resolved name independently).
+    /// The model `/model` switched `session_key` to, if any.
+    pub fn session_model(&self, session_key: &str) -> Option<String> {
+        self.model_overrides.read().ok()?.get(session_key).cloned()
+    }
+
+    /// Switches `session_key` to `model`, or back to the configured model.
+    pub fn set_session_model(&self, session_key: &str, model: Option<String>) {
+        if let Ok(mut g) = self.model_overrides.write() {
+            match model {
+                Some(m) => g.insert(session_key.to_owned(), m),
+                None => g.remove(session_key),
+            };
+        }
+    }
+
+    /// `format_models`, leading with the model `session_key` was switched to.
+    pub fn format_models_for(&self, session_key: &str) -> String {
+        match self.session_model(session_key) {
+            Some(m) => format!(
+                "This chat: {m} (/model default to switch back)\n{}",
+                self.format_models().replacen("Current model:", "Default model:", 1)
+            ),
+            None => self.format_models(),
+        }
+    }
+
     pub fn format_models(&self) -> String {
         let mut lines = vec![format!("Current model: {}", self.effective_model)];
         lines.push(String::new());
@@ -998,6 +1027,7 @@ impl AgentRegistry {
                     cancel_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     lifetime: tokio_util::sync::CancellationToken::new(),
                     plugin_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    model_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     wasm_plugins: Arc::new(std::sync::RwLock::new(Arc::new(Vec::new()))),
                     notification_tx: Arc::new(std::sync::RwLock::new(None)),
                     cold_enabled: Arc::new(std::sync::RwLock::new(HashMap::new())),

@@ -631,14 +631,10 @@ impl AgentRuntime {
                         )
                     }
                     "__UPTIME__" => format_duration(self.started_at.elapsed()),
-                    "__MODELS__" => self.handle.format_models(),
+                    "__MODELS__" => self.handle.format_models_for(session_key),
                     s if s.starts_with("__MODEL_SET__:") => {
                         let model = s.strip_prefix("__MODEL_SET__:").unwrap_or("");
-                        // Runtime-only model switch (doesn't persist to config)
-                        // Update the agent handle's model config
-                        format!(
-                            "Model switched to: {model} (runtime only, use configure to persist)"
-                        )
+                        crate::model_switch::switch_session_model(&self.handle, session_key, model)
                     }
                     "__CLEAR__" => {
                         // Use LLM to generate a quality summary before clearing.
@@ -1740,8 +1736,13 @@ impl AgentRuntime {
         // Cron is intentionally excluded from this fast path: cron-fired
         // agentTurns carry real user instructions and need primary-tier
         // reasoning.
+        // `/model <name>` switches one session; it replaces the whole
+        // primary chain for that session.
+        let switched_model = if is_internal { None } else { self.switched_model(session_key) };
         let model = if is_internal {
             self.resolve_flash_model_name()
+        } else if let Some(m) = &switched_model {
+            m.clone()
         } else {
             agent_cfg
                 .model
@@ -1763,7 +1764,7 @@ impl AgentRuntime {
         // is an internal flash call — both cases preserve the legacy
         // single-model + global-fallback behaviour. The chain falls back
         // through the standard layered config: per-agent > defaults.
-        let primary_chain_tail: Vec<String> = if is_internal {
+        let primary_chain_tail: Vec<String> = if is_internal || switched_model.is_some() {
             Vec::new()
         } else {
             let chain = agent_cfg

@@ -20,6 +20,7 @@ pub mod goal;
 pub use rsclaw_platform::install_hints;
 pub mod loop_detection;
 pub mod model_resolution;
+pub mod model_switch;
 pub use rsclaw_memory as memory;
 pub mod approvals;
 pub mod args_sanitizer;

@@ -1921,6 +1921,18 @@ impl AgentRuntime {
 
     /// If the key has an alias, returns the canonical (old) key so all data
     /// stays under one key. Otherwise returns the key unchanged.
+    /// The model `/model` switched this session to. The gateway records the
+    /// switch under the key it saw, which may be an alias of the canonical
+    /// key the turn runs under.
+    pub(crate) fn switched_model(&self, session_key: &str) -> Option<String> {
+        self.handle.session_model(session_key).or_else(|| {
+            self.session_aliases
+                .iter()
+                .filter(|(_, canonical)| canonical.as_str() == session_key)
+                .find_map(|(alias, _)| self.handle.session_model(alias))
+        })
+    }
+
     fn resolve_session_key<'a>(&'a self, session_key: &'a str) -> &'a str {
         if let Some(canonical) = self.session_aliases.get(session_key) {
             canonical.as_str()

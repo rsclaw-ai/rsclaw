@@ -491,6 +491,10 @@ impl AgentSpawner {
 
         let wiring = self.wiring_snapshot();
         let template = self.registry.default_agent().ok();
+        // A hot reload rebuilds the handle; `/model` switches survive it.
+        let model_overrides = inherit
+            .map(|old| Arc::clone(&old.model_overrides))
+            .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(HashMap::new())));
         let (wasm_plugins, notification_tx, skills, js_plugins, plugin_overrides, cold_enabled) =
             match inherit {
                 Some(old) => (
@@ -545,6 +549,7 @@ impl AgentSpawner {
             cancel_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
             lifetime: tokio_util::sync::CancellationToken::new(),
             plugin_overrides,
+            model_overrides,
             wasm_plugins,
             notification_tx,
             cold_enabled,
