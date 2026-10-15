@@ -2,6 +2,7 @@
 
 pub mod fs_guard;
 pub mod net;
+pub mod ocr_page;
 pub mod session_text;
 
 /// Estimate token count for mixed-language text.

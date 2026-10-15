@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Result, anyhow};
 pub use rsclaw_kb::OcrClient;
+use futures::StreamExt as _;
 use serde_json::{Value, json};
 
 /// Server-side failures in a row, and the unix second until which the OCR
@@ -39,7 +40,10 @@ fn now_secs() -> u64 {
 /// unreachable) rather than the image's.
 fn is_server_failure(error: &str) -> bool {
     let e = error.to_ascii_lowercase();
-    e.contains("server error") || e.contains("error sending request") || e.contains("timed out")
+    e.contains("server error")
+        || e.contains("error sending request")
+        || e.contains("timed out")
+        || e.contains("busy")
 }
 
 impl super::runtime::AgentRuntime {
@@ -73,13 +77,20 @@ impl super::runtime::AgentRuntime {
             }));
         };
 
+        let lang = args["lang"].as_str().map(str::to_owned);
+        let prompt = args["prompt"].as_str().map(str::to_owned);
+        let max_tokens = match parse_max_tokens(&args) {
+            Ok(max_tokens) => max_tokens,
+            Err(message) => return Ok(json!({ "error": message })),
+        };
+
         // Resolve the image to something the endpoint accepts: URLs and
         // data URIs pass through; a local path is read and base64-wrapped.
-        let payload = if image.starts_with("http://")
+        let reading = if image.starts_with("http://")
             || image.starts_with("https://")
             || image.starts_with("data:")
         {
-            image.to_owned()
+            Reading::Whole(image.to_owned())
         } else {
             // Scope-checked: the bytes are uploaded to the OCR endpoint, so
             // non-owners must not be able to point this at host files.
@@ -102,35 +113,142 @@ impl super::runtime::AgentRuntime {
                 }
             };
             let mime = rsclaw_kb::canonicalize::detect_mime(&bytes, Some(image));
-            // A page rendered at high DPI can pass the endpoint's 16 MB body
-            // limit; OCR reads a 2400px long edge fine.
-            let (bytes, mime) = tokio::task::spawn_blocking(move || {
-                rsclaw_util::downscale_image_for_vision(&bytes, &mime, 4 * 1024 * 1024, 2400, 90)
-                    .unwrap_or((bytes, mime))
-            })
-            .await
-            .map_err(|e| anyhow!("ocr: task join failed: {e}"))?;
-            use base64::Engine as _;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            format!("data:{mime};base64,{b64}")
+            // A custom prompt may ask for coordinates, which only mean
+            // something on the image as given.
+            let plan_page = prompt.is_none();
+            tokio::task::spawn_blocking(move || plan_reading(bytes, mime, plan_page))
+                .await
+                .map_err(|e| anyhow!("ocr: task join failed: {e}"))?
         };
 
-        let lang = args["lang"].as_str().map(str::to_owned);
-        let prompt = args["prompt"].as_str().map(str::to_owned);
-        let max_tokens = match parse_max_tokens(&args) {
-            Ok(max_tokens) => max_tokens,
-            Err(message) => return Ok(json!({ "error": message })),
+        let request = OcrRequest { client, prompt, max_tokens, lang };
+        let (text, note) = match reading {
+            Reading::Whole(payload) => (request.read(payload).await.map(|r| r.text), None),
+            Reading::Strips(parts) => {
+                let count = parts.len();
+                let reads: Vec<_> = futures::stream::iter(parts.into_iter().map(|p| request.read(p)))
+                    .buffered(STRIPS_IN_FLIGHT)
+                    .collect()
+                    .await;
+                let text = reads
+                    .into_iter()
+                    .map(|r| r.map(|r| r.text))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|t| t.join("\n"));
+                let note = (count > 1).then(|| format!("Read in {count} strips, top to bottom."));
+                (text, note)
+            }
+            Reading::Rotations([turned_90, turned_270]) => {
+                let payloads = [turned_90.0, turned_90.1, turned_270.0, turned_270.1];
+                let reads: Vec<_> = futures::stream::iter(payloads.into_iter().map(|p| request.read(p)))
+                    .buffered(STRIPS_IN_FLIGHT)
+                    .collect()
+                    .await;
+                let [whole_90, top_90, whole_270, top_270]: [_; 4] =
+                    reads.try_into().unwrap_or_else(|_| unreachable!("four reads"));
+                let (text, degrees) = match (whole_90, whole_270) {
+                    (Ok(a), Ok(b)) => match (top_90, top_270) {
+                        (Ok(ta), Ok(tb)) => pick_consistent(a, ta, b, tb),
+                        _ => pick_upright(a, b),
+                    },
+                    (Ok(a), Err(_)) => (a.text, 90),
+                    (Err(_), Ok(b)) => (b.text, 270),
+                    (Err(e), Err(_)) => return Ok(failure(e)),
+                };
+                let note = format!("The page was sideways; read after turning it {degrees}° clockwise.");
+                (Ok(text), Some(note))
+            }
         };
+
+        match text {
+            Ok(t) => {
+                OCR_SERVER_FAILURES.store(0, Ordering::Relaxed);
+                let mut out = if t.trim().is_empty() {
+                    json!({ "text": "", "note": "OCR returned no text (blank or non-text image)." })
+                } else {
+                    json!({ "text": t.trim() })
+                };
+                if let (Some(note), false) = (note, t.trim().is_empty()) {
+                    out["note"] = json!(note);
+                }
+                Ok(out)
+            }
+            Err(e) => Ok(failure(e)),
+        }
+    }
+}
+
+/// OCR requests one page may have in flight: each fleet OCR node reads one
+/// image at a time, so one page must not take most of the pool.
+const STRIPS_IN_FLIGHT: usize = 3;
+
+/// What to send for one page.
+enum Reading {
+    Whole(String),
+    /// Strips of a tall page, top to bottom.
+    Strips(Vec<String>),
+    /// A sideways page turned 90° and 270° clockwise, each as (whole page,
+    /// top part).
+    Rotations([(String, String); 2]),
+}
+
+fn data_uri(mime: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("data:{mime};base64,{b64}")
+}
+
+/// Blocking: decodes the page to decide how to read it.
+fn plan_reading(bytes: Vec<u8>, mime: String, plan_page: bool) -> Reading {
+    use rsclaw_util::ocr_page::{OcrPlan, plan_ocr_page};
+    let plan = if plan_page { plan_ocr_page(&bytes) } else { OcrPlan::Whole };
+    match plan {
+        OcrPlan::Strips(parts) => {
+            Reading::Strips(parts.iter().map(|p| data_uri("image/jpeg", p)).collect())
+        }
+        OcrPlan::Rotations(turns) => Reading::Rotations(
+            turns.map(|t| (data_uri("image/jpeg", &t.whole), data_uri("image/jpeg", &t.top))),
+        ),
+        OcrPlan::Whole => {
+            // A page rendered at high DPI can pass the endpoint's 16 MB
+            // body limit; OCR reads a 2400px long edge fine.
+            let (bytes, mime) =
+                rsclaw_util::downscale_image_for_vision(&bytes, &mime, 4 * 1024 * 1024, 2400, 90)
+                    .unwrap_or((bytes, mime));
+            Reading::Whole(data_uri(&mime, &bytes))
+        }
+    }
+}
+
+struct OcrRequest {
+    client: std::sync::Arc<OcrClient>,
+    prompt: Option<String>,
+    max_tokens: Option<u32>,
+    lang: Option<String>,
+}
+
+/// One image's text, and how long the endpoint took to produce it.
+struct OcrRead {
+    text: String,
+    secs: f64,
+}
+
+impl OcrRequest {
+    /// One image to text. A busy or failing endpoint gets a few backed-off
+    /// retries first.
+    async fn read(&self, payload: String) -> std::result::Result<OcrRead, String> {
         let _slot = ocr_slots()
             .acquire()
             .await
-            .map_err(|e| anyhow!("ocr: slot closed: {e}"))?;
+            .map_err(|e| format!("ocr: slot closed: {e}"))?;
+        let client = self.client.clone();
+        let (prompt, max_tokens, lang) = (self.prompt.clone(), self.max_tokens, self.lang.clone());
         // OCR transport is sync (block_in_place); run it off the async
-        // worker so we don't stall the runtime thread on a slow page. A busy
-        // or failing endpoint gets a few backed-off retries first.
-        let text = tokio::task::spawn_blocking(move || {
+        // worker so we don't stall the runtime thread on a slow page.
+        tokio::task::spawn_blocking(move || {
             let mut attempt = 0;
             loop {
+                let started = std::time::Instant::now();
                 let result = client.ocr_with_options(
                     &payload,
                     prompt.as_deref(),
@@ -148,37 +266,110 @@ impl super::runtime::AgentRuntime {
                         ));
                         attempt += 1;
                     }
-                    other => break other,
+                    other => {
+                        break other
+                            .map(|text| OcrRead { text, secs: started.elapsed().as_secs_f64() })
+                            .map_err(|e| format!("ocr request failed: {e:#}"));
+                    }
                 }
             }
         })
         .await
-        .map_err(|e| anyhow!("ocr: task join failed: {e}"))?;
+        .map_err(|e| format!("ocr: task join failed: {e}"))?
+    }
+}
 
-        match text {
-            Ok(t) => {
-                OCR_SERVER_FAILURES.store(0, Ordering::Relaxed);
-                if t.trim().is_empty() {
-                    Ok(json!({ "text": "", "note": "OCR returned no text (blank or non-text image)." }))
-                } else {
-                    Ok(json!({ "text": t.trim() }))
-                }
-            }
-            Err(e) => {
-                let error = format!("ocr request failed: {e:#}");
-                if is_server_failure(&error)
-                    && OCR_SERVER_FAILURES.fetch_add(1, Ordering::Relaxed) + 1 >= OCR_FAILURES_TO_TRIP
-                {
-                    OCR_SERVER_FAILURES.store(0, Ordering::Relaxed);
-                    OCR_DOWN_UNTIL.store(now_secs() + OCR_DOWN_SECS, Ordering::Relaxed);
-                }
-                Ok(json!({
-                    "error": error,
-                    "hint": "Endpoint may be down or the image unreadable. Retry once; if it persists tell the user."
-                }))
-            }
+/// The tool result for a failed read; trips the breaker after several
+/// server-side failures in a row.
+fn failure(error: String) -> Value {
+    if is_server_failure(&error)
+        && OCR_SERVER_FAILURES.fetch_add(1, Ordering::Relaxed) + 1 >= OCR_FAILURES_TO_TRIP
+    {
+        OCR_SERVER_FAILURES.store(0, Ordering::Relaxed);
+        OCR_DOWN_UNTIL.store(now_secs() + OCR_DOWN_SECS, Ordering::Relaxed);
+    }
+    json!({
+        "error": error,
+        "hint": "Endpoint may be down or the image unreadable. Retry once; if it persists tell the user."
+    })
+}
+
+/// Share of a reading's phrases that repeat an earlier one. Read at the
+/// wrong angle, the model tends to loop on one phrase.
+fn repeated_phrase_share(text: &str) -> f64 {
+    let mut seen = std::collections::HashSet::new();
+    let (mut phrases, mut repeats) = (0usize, 0usize);
+    for phrase in text
+        .split(|c: char| matches!(c, '；' | '、' | '，' | '。' | ';' | ',' | '\n'))
+        .map(str::trim)
+        .filter(|p| p.chars().count() >= 3)
+    {
+        phrases += 1;
+        if !seen.insert(phrase) {
+            repeats += 1;
         }
     }
+    if phrases == 0 { 0.0 } else { repeats as f64 / phrases as f64 }
+}
+
+/// Character pairs (CJK and digits) of a reading, to compare readings.
+fn char_pairs(text: &str) -> std::collections::HashSet<(char, char)> {
+    let chars: Vec<char> = text
+        .chars()
+        .filter(|c| c.is_ascii_digit() || ('\u{4E00}'..='\u{9FFF}').contains(c))
+        .collect();
+    chars.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// How much of the shorter reading the other one also contains.
+fn agreement(a: &str, b: &str) -> f64 {
+    let (a, b) = (char_pairs(a), char_pairs(b));
+    let smaller = a.len().min(b.len());
+    if smaller == 0 { 0.0 } else { a.intersection(&b).count() as f64 / smaller as f64 }
+}
+
+/// Of a sideways page turned 90° and 270°, the way that is upright: read
+/// the right way up, the whole page and its top part say the same thing;
+/// the wrong way up, the model invents text that changes with the crop.
+/// (The invented text can be fluent, fast and loop-free, so it is the
+/// disagreement that gives it away.)
+fn pick_consistent(
+    whole_90: OcrRead,
+    top_90: OcrRead,
+    whole_270: OcrRead,
+    top_270: OcrRead,
+) -> (String, u16) {
+    let (a, b) = (agreement(&whole_90.text, &top_90.text), agreement(&whole_270.text, &top_270.text));
+    tracing::info!(agree_90 = a, agree_270 = b, "ocr: sideways page");
+    if (a - b).abs() < 0.1 {
+        return pick_upright(whole_90, whole_270);
+    }
+    if a > b { (whole_90.text, 90) } else { (whole_270.text, 270) }
+}
+
+/// Of the readings of a page turned 90° and 270°, the one read upright:
+/// the one that loops less, else the clearly faster one, else the shorter.
+/// The wrong way up the model generates far more (a loop the endpoint
+/// trims, or invented text), which shows as time more than as length.
+fn pick_upright(turned_90: OcrRead, turned_270: OcrRead) -> (String, u16) {
+    let (a, b) = (repeated_phrase_share(&turned_90.text), repeated_phrase_share(&turned_270.text));
+    let (fast, slow) = (turned_90.secs.min(turned_270.secs), turned_90.secs.max(turned_270.secs));
+    let first = if (a - b).abs() > 0.05 {
+        a < b
+    } else if slow > fast * 1.5 {
+        turned_90.secs < turned_270.secs
+    } else {
+        turned_90.text.chars().count() <= turned_270.text.chars().count()
+    };
+    tracing::info!(
+        repeats_90 = a,
+        repeats_270 = b,
+        secs_90 = turned_90.secs,
+        secs_270 = turned_270.secs,
+        chose = if first { 90 } else { 270 },
+        "ocr: sideways page, readings agree alike"
+    );
+    if first { (turned_90.text, 90) } else { (turned_270.text, 270) }
 }
 
 fn parse_max_tokens(args: &Value) -> std::result::Result<Option<u32>, &'static str> {
@@ -201,6 +392,33 @@ mod tests {
         assert!(!is_server_failure(
             "ocr request failed: HTTP status client error (413 Request Entity Too Large) for url (x)"
         ));
+    }
+
+    #[test]
+    fn ocr_keeps_the_reading_that_does_not_loop() {
+        let upright = "名称 武汉恒远建筑装饰工程有限公司\n经营范围 建筑工程劳务分包；建筑设备租赁；钢管扣件租赁；模板脚手架安装及租赁。";
+        let looping = "名称 武汉德坤建筑装饰工程有限公司\n经营范围 土石方工程、园林绿化工程、土石方工程、园林绿化工程、土石方工程、园林绿化工程、土石方工程";
+        assert!(repeated_phrase_share(looping) > 0.4);
+        assert!(repeated_phrase_share(upright) < 0.05);
+        let read = |text: &str, secs| OcrRead { text: text.into(), secs };
+        assert_eq!(pick_upright(read(looping, 9.0), read(upright, 9.0)), (upright.to_string(), 270));
+        assert_eq!(pick_upright(read(upright, 9.0), read(looping, 9.0)), (upright.to_string(), 90));
+        // A trimmed loop leaves no repeats but took far longer.
+        let invented = "名称 武汉市硚口区汉正街1号\n法定代表人 李明远";
+        assert_eq!(pick_upright(read(invented, 29.5), read(upright, 8.4)), (upright.to_string(), 270));
+    }
+
+    #[test]
+    fn ocr_keeps_the_way_up_whose_readings_agree() {
+        let read = |text: &str| OcrRead { text: text.into(), secs: 8.0 };
+        let whole = "统一社会信用代码 91420112MA4L12345X\n名称 武汉恒远建筑装饰工程有限公司\n法定代表人 李明远";
+        let top = "统一社会信用代码 91420112MA4L12345X\n名称 武汉恒远建筑装饰工程有限公司";
+        let invented = "统一社会信用代码 91420112MA4L12345X\n名称 武汉市硚口区汉正街汉正中路1号";
+        let invented_top = "注册号 420112\n名称 武汉恒坤商贸有限公司\n住所 重庆市南岸区";
+        assert!(agreement(whole, top) > 0.9);
+        assert!(agreement(invented, invented_top) < 0.5);
+        let (text, degrees) = pick_consistent(read(invented), read(invented_top), read(whole), read(top));
+        assert_eq!((text.as_str(), degrees), (whole, 270));
     }
 
     #[test]
