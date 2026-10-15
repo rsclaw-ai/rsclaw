@@ -1253,17 +1253,19 @@ fn read_doc(path: &Path) -> Result<Value> {
     match ext.as_str() {
         "xlsx" | "xls" => read_excel(path),
         "docx" => read_docx(path),
+        "doc" => read_legacy_doc(path),
         "pdf" => read_pdf(path),
         other => Err(anyhow!(
-            "read_doc: unsupported format '.{other}'. Supported: xlsx, docx, pdf"
+            "read_doc: unsupported format '.{other}'. Supported: xlsx, xls, docx, doc, pdf"
         )),
     }
 }
 
 fn read_excel(path: &Path) -> Result<Value> {
-    use calamine::{Data, Reader, Xlsx, open_workbook};
+    use calamine::{Data, Reader, open_workbook_auto};
 
-    let mut wb: Xlsx<_> = open_workbook(path)
+    // Auto-detect so legacy .xls opens too (the Xlsx reader rejects it).
+    let mut wb = open_workbook_auto(path)
         .map_err(|e| anyhow!("read_doc: cannot open '{}': {e}", path.display()))?;
 
     let sheet_names: Vec<String> = wb.sheet_names().to_vec();
@@ -1303,6 +1305,89 @@ fn read_excel(path: &Path) -> Result<Value> {
         "format": "xlsx",
         "sheets": sheets_out,
     }))
+}
+
+/// Text of a legacy binary Word file (.doc). There is no pure-Rust reader,
+/// so use what the system has: macOS textutil, antiword or catdoc, Word
+/// itself on Windows, else LibreOffice converting to .docx.
+fn read_legacy_doc(path: &Path) -> Result<Value> {
+    use std::process::Command;
+
+    let done = |text: String, via: &str| {
+        json!({
+            "path": path.display().to_string(),
+            "format": "doc",
+            "text": text,
+            "length": text.len(),
+            "via": via,
+        })
+    };
+    let readers: &[(&str, &[&str])] = &[
+        ("textutil", &["-convert", "txt", "-stdout"]),
+        ("antiword", &["-w", "0"]),
+        ("catdoc", &[]),
+    ];
+    for (bin, args) in readers {
+        if let Ok(out) = Command::new(bin).args(*args).arg(path).output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !text.is_empty() {
+                return Ok(done(text, bin));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Word, when installed, reads its own format; read-only, no prompts.
+        let script = format!(
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $w=New-Object -ComObject Word.Application; \
+             $w.Visible=$false; $d=$w.Documents.Open('{}', $false, $true); $d.Content.Text; \
+             $d.Close(0); $w.Quit()",
+            path.display().to_string().replace('\'', "''")
+        );
+        if let Ok(out) = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !text.is_empty() {
+                return Ok(done(text, "word"));
+            }
+        }
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "rsclaw-doc-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    for bin in ["soffice", "libreoffice"] {
+        let converted = Command::new(bin)
+            .args(["--headless", "--convert-to", "docx", "--outdir"])
+            .arg(&dir)
+            .arg(path)
+            .output();
+        if converted.is_ok_and(|o| o.status.success()) {
+            let docx = dir.join(path.with_extension("docx").file_name().unwrap_or_default());
+            let read = read_docx(&docx);
+            let _ = std::fs::remove_dir_all(&dir);
+            if let Ok(mut v) = read {
+                v["path"] = json!(path.display().to_string());
+                v["format"] = json!("doc");
+                v["via"] = json!(bin);
+                return Ok(v);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Err(anyhow!(
+        "read_doc: cannot read the legacy Word file '{}': no converter on this machine \
+         (textutil, antiword, catdoc, Word or LibreOffice). Ask the user for a .docx or PDF copy.",
+        path.display()
+    ))
 }
 
 fn read_docx(path: &Path) -> Result<Value> {
@@ -1531,5 +1616,28 @@ mod skip_repeated_title_tests {
         assert_eq!(skip_repeated_title("民事答辩状\n答辩人：甲", "民事答辩状"), "答辩人：甲");
         assert_eq!(skip_repeated_title("# 答辩请求\n一、", "民事答辩状"), "# 答辩请求\n一、");
         assert_eq!(skip_repeated_title("# 民事答辩状", ""), "# 民事答辩状");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod legacy_doc_tests {
+    #[test]
+    fn reads_a_legacy_word_file() {
+        let dir = std::env::temp_dir().join(format!("rsclaw-doc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("note.txt");
+        std::fs::write(&txt, "证据目录\n证据一：中标结果公告").unwrap();
+        let doc = dir.join("note.doc");
+        let made = std::process::Command::new("textutil")
+            .args(["-convert", "doc", "-output"])
+            .arg(&doc)
+            .arg(&txt)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let v = super::read_legacy_doc(&doc).unwrap();
+        assert_eq!(v["format"], "doc");
+        assert!(v["text"].as_str().unwrap().contains("中标结果公告"), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
