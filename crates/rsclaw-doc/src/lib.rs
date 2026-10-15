@@ -1307,6 +1307,40 @@ fn read_excel(path: &Path) -> Result<Value> {
     }))
 }
 
+/// Plain text of a legacy Office file (.doc, .xls) for `read_file`, which
+/// otherwise rejects them as non-UTF-8. Spreadsheet rows come back one per
+/// line, cells separated by tabs, under a `# <sheet>` heading.
+pub fn legacy_office_text(path: &Path) -> Result<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let v = match ext.as_str() {
+        "doc" => read_legacy_doc(path)?,
+        "xls" => read_excel(path)?,
+        other => return Err(anyhow!("legacy_office_text: not a legacy Office file: .{other}")),
+    };
+    if let Some(text) = v["text"].as_str() {
+        return Ok(text.to_owned());
+    }
+    let mut out = String::new();
+    for sheet in v["sheets"].as_array().into_iter().flatten() {
+        out.push_str(&format!("# {}\n", sheet["name"].as_str().unwrap_or("")));
+        for row in sheet["rows"].as_array().into_iter().flatten() {
+            let cells: Vec<&str> = row
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| c.as_str().unwrap_or(""))
+                .collect();
+            out.push_str(&cells.join("\t"));
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 /// Text of a legacy binary Word file (.doc). There is no pure-Rust reader,
 /// so use what the system has: macOS textutil, antiword or catdoc, Word
 /// itself on Windows, else LibreOffice converting to .docx.

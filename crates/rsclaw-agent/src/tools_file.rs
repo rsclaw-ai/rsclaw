@@ -1075,6 +1075,16 @@ impl super::runtime::AgentRuntime {
             };
             return Ok(json!({"content": content, "path": path}));
         }
+        if lower.ends_with(".doc") || lower.ends_with(".xls") {
+            // Legacy binary Office: converted through what the system has
+            // (textutil, antiword, Word, LibreOffice...), off the async thread.
+            let file = full.clone();
+            let text = tokio::task::spawn_blocking(move || crate::doc::legacy_office_text(&file))
+                .await
+                .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?
+                .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
+            return Ok(json!({"content": text, "path": path}));
+        }
         if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
             let bytes = read_regular_file_capped(&full, MAX_LOCAL_BINARY_READ_BYTES)
                 .await
@@ -1097,9 +1107,22 @@ impl super::runtime::AgentRuntime {
                     "read `{path}`: {e}. For very large files use search_content, or shell `head`/`tail`/`sed -n` to read a slice."
                 )
             })?;
-        let content = String::from_utf8(bytes).map_err(|e| {
-            anyhow!("read `{}`: file is not valid UTF-8 text: {e}", full.display())
-        })?;
+        let content = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            // Chinese text files are often GBK; GB18030 is its superset.
+            // Binary data can decode too, but it carries NUL bytes.
+            Err(e) => match encoding_rs::GB18030
+                .decode_without_bom_handling_and_without_replacement(e.as_bytes())
+                .filter(|text| !text.contains('\0'))
+            {
+                Some(text) => text.into_owned(),
+                None => anyhow::bail!(
+                    "read `{}`: file is not valid UTF-8 text: {}",
+                    full.display(),
+                    e.utf8_error()
+                ),
+            },
+        };
 
         // Pagination: 1-indexed `offset` line + `limit` lines (default 2000).
         // Cheap path: when neither is set AND the file is small, skip the
@@ -1955,4 +1978,21 @@ async fn run_ripgrep(
         "engine": "ripgrep",
         "results": results,
     }))
+}
+
+#[cfg(test)]
+mod gbk_read_tests {
+    #[test]
+    fn gbk_text_decodes_and_binary_does_not() {
+        let (gbk, _, _) = encoding_rs::GBK.encode("民事起诉状 原告武汉恒远");
+        let text = encoding_rs::GB18030
+            .decode_without_bom_handling_and_without_replacement(&gbk)
+            .filter(|t| !t.contains('\0'));
+        assert_eq!(text.as_deref(), Some("民事起诉状 原告武汉恒远"));
+        let binary = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d];
+        let decoded = encoding_rs::GB18030
+            .decode_without_bom_handling_and_without_replacement(&binary)
+            .filter(|t| !t.contains('\0'));
+        assert!(decoded.is_none());
+    }
 }
