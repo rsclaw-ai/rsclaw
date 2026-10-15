@@ -570,12 +570,12 @@ impl rsclaw::plugin::host_browser::Host for HostState {
     }
 
     async fn browser_click(&mut self, ref_str: String) -> HostTrapResult<Result<String, String>> {
-        Ok(self.browser_action("click", json!({"ref": ref_str})).await)
+        Ok(self.click_following_new_tab("click", json!({"ref": ref_str})).await)
     }
 
     async fn browser_click_at(&mut self, x: u32, y: u32) -> HostTrapResult<Result<String, String>> {
         Ok(self
-            .browser_action("click_at", json!({"x": x, "y": y}))
+            .click_following_new_tab("click_at", json!({"x": x, "y": y}))
             .await)
     }
 
@@ -680,15 +680,17 @@ impl rsclaw::plugin::host_browser::Host for HostState {
             Some(t) => t,
             None => return Ok(Err("list_tabs returned no tabs array".to_string())),
         };
-        let last = match tabs.last() {
+        // Chrome lists the most recently active tab first, and a tab a page
+        // just opened is the active one.
+        let latest = match tabs.first() {
             Some(t) => t,
             None => return Ok(Err("no tabs to switch to".to_string())),
         };
-        let tid = match last.get("id").and_then(|t| t.as_str()) {
+        let tid = match latest.get("id").and_then(|t| t.as_str()) {
             Some(s) => s,
-            None => return Ok(Err("last tab has no id".to_string())),
+            None => return Ok(Err("latest tab has no id".to_string())),
         };
-        let url = last.get("url").and_then(|u| u.as_str()).unwrap_or("?");
+        let url = latest.get("url").and_then(|u| u.as_str()).unwrap_or("?");
         match session
             .execute("switch_tab", &json!({"target_id": tid}))
             .await
@@ -2503,6 +2505,59 @@ impl HostState {
 
     /// Execute a browser action by locking the shared browser session.
     /// Auto-starts a browser if no session exists.
+    /// Clicks, then moves onto any tab the click opened (`window.open`,
+    /// `target=_blank`), as a person's browser would. Without this the
+    /// session stays on the old page and every later call reads a page the
+    /// user has left.
+    async fn click_following_new_tab(&mut self, action: &str, args: Value) -> Result<String, String> {
+        let before = self.page_tab_ids().await;
+        let clicked = self.browser_action(action, args).await?;
+        let Some(before) = before else {
+            return Ok(clicked);
+        };
+        // The new tab shows up a moment after the click's handler runs.
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut guard = self.browser.lock().await;
+            let Some(session) = guard.as_mut() else {
+                break;
+            };
+            let Ok(listed) = session.execute("list_tabs", &json!({})).await else {
+                break;
+            };
+            let opened = listed["tabs"].as_array().and_then(|tabs| {
+                tabs.iter().find(|t| {
+                    t["id"].as_str().is_some_and(|id| !before.contains(id))
+                        && !t["url"].as_str().unwrap_or("").starts_with("devtools:")
+                })
+            });
+            if let Some(tab) = opened {
+                let id = tab["id"].as_str().unwrap_or_default().to_string();
+                let url = tab["url"].as_str().unwrap_or("?").to_string();
+                return match session.execute("switch_tab", &json!({"target_id": id})).await {
+                    Ok(_) => Ok(format!("{clicked}\nthe click opened a new tab; now on it: {url}")),
+                    Err(e) => Ok(format!(
+                        "{clicked}\nthe click opened a new tab ({url}) but switching to it failed: {e:#}"
+                    )),
+                };
+            }
+        }
+        Ok(clicked)
+    }
+
+    /// Ids of the open page tabs, or `None` before the browser has started.
+    async fn page_tab_ids(&mut self) -> Option<std::collections::HashSet<String>> {
+        let mut guard = self.browser.lock().await;
+        let listed = guard.as_mut()?.execute("list_tabs", &json!({})).await.ok()?;
+        Some(
+            listed["tabs"]
+                .as_array()?
+                .iter()
+                .filter_map(|t| t["id"].as_str().map(str::to_string))
+                .collect(),
+        )
+    }
+
     async fn browser_action(&mut self, action: &str, args: Value) -> Result<String, String> {
         let mut guard = self.browser.lock().await;
 
