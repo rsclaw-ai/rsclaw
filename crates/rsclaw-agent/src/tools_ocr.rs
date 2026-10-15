@@ -20,12 +20,13 @@ const OCR_DOWN_SECS: u64 = 120;
 /// Back-off before each retry of a busy or failing endpoint.
 const OCR_RETRY_DELAYS_MS: [u64; 3] = [500, 1_000, 2_000];
 
-/// One OCR request at a time. The fleet gateway currently sends every OCR
-/// request to the same node, which takes one image at a time and answers
-/// any overlap with 502 `backend_overload`. Raise once it balances.
+/// OCR requests in flight at once. Each fleet OCR node takes one image at a
+/// time and the gateway spreads requests over ten of them by load, so stay
+/// a little under the node count; a rare collision still gets a 502
+/// `backend_overload`, which the retries below absorb.
 fn ocr_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(1))
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(8))
 }
 
 fn now_secs() -> u64 {
