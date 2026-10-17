@@ -380,14 +380,21 @@ fn create_word(args: &Value, path: &Path) -> Result<Value> {
                     docx = docx.add_paragraph(p);
                 }
             } else {
-                // Regular paragraph with line spacing.
+                // Regular paragraph with line spacing. A single newline is a
+                // line break: Word ignores newlines inside text, which ran a
+                // brief's party lines ("答辩人…" / "住所地…" / "法定代表人…")
+                // and its signature block together.
+                let mut run = Run::new()
+                    .size(font_size)
+                    .fonts(RunFonts::new().east_asia(default_font));
+                for (i, line) in block.lines().enumerate() {
+                    if i > 0 {
+                        run = run.add_break(BreakType::TextWrapping);
+                    }
+                    run = run.add_text(line.trim_end());
+                }
                 let p = Paragraph::new()
-                    .add_run(
-                        Run::new()
-                            .add_text(block)
-                            .size(font_size)
-                            .fonts(RunFonts::new().east_asia(default_font)),
-                    )
+                    .add_run(run)
                     .line_spacing(LineSpacing::new().line(360)); // 1.5x line spacing
                 docx = docx.add_paragraph(p);
             }
@@ -1553,6 +1560,27 @@ mod tests {
         );
 
         println!("DOCX output: {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn create_word_keeps_single_line_breaks() {
+        let dir = std::env::temp_dir().join("rsclaw_doc_linebreak_test");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("brief.docx");
+        let args = json!({
+            "action": "create_word",
+            "path": path.to_str().expect("path"),
+            "content": "答辩人：武汉安和置业有限公司\n住所地：武汉市汉阳区江城大道88号\n法定代表人：周宁\n\n此致\n武汉市汉阳区人民法院",
+        });
+        handle(&args, &path).await.expect("create_word");
+        let file = std::fs::File::open(&path).expect("open docx");
+        let mut zip = zip::ZipArchive::new(file).expect("zip");
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("word/document.xml").expect("document.xml"), &mut xml)
+            .expect("read xml");
+        // Three party lines → two breaks; "此致" / court → one more.
+        assert_eq!(xml.matches("<w:br").count(), 3, "{xml}");
+        assert!(!xml.contains("有限公司住所地"), "lines ran together: {xml}");
     }
 
     #[tokio::test]
