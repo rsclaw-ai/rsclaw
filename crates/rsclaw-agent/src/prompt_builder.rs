@@ -840,6 +840,16 @@ pub(crate) fn build_user_system_with_policy(
         ws = ws_ctx.workspace_dir.display(),
         home = rsclaw_brand::HOME_DIR
     ));
+    // Stated outright: without it a model guesses a stock username
+    // ("ls /Users/kevin/Desktop/…") for "the folder on my desktop".
+    if let Some(user_home) = dirs_next::home_dir() {
+        parts.push(format!(
+            "The user's home directory is `{h}` (their desktop: `{desktop}`). Use these \
+             paths or `~`; never guess a username.",
+            h = user_home.display(),
+            desktop = user_home.join("Desktop").display(),
+        ));
+    }
 
     // KV-cache ordering rationale: append blocks from most-stable to most-volatile
     // so the worker-side prefix match runs as deep as possible before hitting a
