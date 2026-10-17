@@ -1682,6 +1682,24 @@ impl AgentRuntime {
                 }
             }
 
+            // Same for `[tool_use NAME({json})]`, the form the rsclaw worker
+            // renders tool calls in replayed history (a model echoes it after
+            // a context-overflow replay).
+            if tool_calls.is_empty() && text_buf.contains("[tool_use ") {
+                let rescued = crate::tool_call_repair::rescue_bracket_tool_calls(&text_buf, &tools);
+                for (id, name, input) in rescued {
+                    tracing::warn!(
+                        tool = %name,
+                        rescued_from_text = true,
+                        "agent_loop: rescued tool call from [tool_use] text — server returned no native tool_calls"
+                    );
+                    tool_calls.push((id, name, input));
+                }
+                if !tool_calls.is_empty() {
+                    text_buf.clear();
+                }
+            }
+
             // If no tool calls, we have the final assistant reply.
             tracing::info!(
                 session = %ctx.session_key,

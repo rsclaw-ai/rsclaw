@@ -594,9 +594,63 @@ pub fn rescue_tool_calls_from_text(text: &str, tools: &[ToolDef]) -> Vec<(String
     out
 }
 
+/// Recovers tool calls written as text in the `[tool_use NAME({json})]`
+/// form. The rsclaw worker renders tool calls in replayed history that way,
+/// and a model that has just seen dozens of them can answer with one as
+/// text instead of a real call; delivered as the reply, the user gets the
+/// raw command. Only names in `tools` with complete JSON arguments count.
+pub fn rescue_bracket_tool_calls(text: &str, tools: &[ToolDef]) -> Vec<(String, String, Value)> {
+    const OPEN: &str = "[tool_use ";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(OPEN) {
+        let after = &rest[at + OPEN.len()..];
+        let name_len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'))
+            .unwrap_or(after.len());
+        let name = &after[..name_len];
+        let Some(json_part) = after[name_len..].strip_prefix('(') else {
+            rest = after;
+            continue;
+        };
+        let mut stream = serde_json::Deserializer::from_str(json_part).into_iter::<Value>();
+        match stream.next() {
+            Some(Ok(args @ Value::Object(_)))
+                if json_part[stream.byte_offset()..].starts_with(")]")
+                    && tools.iter().any(|t| t.name == name) =>
+            {
+                out.push((format!("rescued_{name}_{}", out.len()), name.to_owned(), args));
+                rest = &json_part[stream.byte_offset() + 2..];
+            }
+            _ => rest = after,
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescue_bracket_tool_call_written_as_text() {
+        let tools = vec![ToolDef {
+            name: "shell".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let text = "[tool_use shell({\"command\":\"cd /a && python3 << 'PYEOF'\\nprint('x)]')\\nPYEOF\\n\"})]";
+        let calls = rescue_bracket_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "shell");
+        assert!(calls[0].2["command"].as_str().unwrap().contains("print('x)]')"));
+        // Unknown tools, truncated JSON and prose mentions are left alone.
+        assert!(rescue_bracket_tool_calls("[tool_use rm_rf({\"a\":1})]", &tools).is_empty());
+        assert!(rescue_bracket_tool_calls("[tool_use shell({\"command\":\"ls", &tools).is_empty());
+        assert!(rescue_bracket_tool_calls("the [tool_use shell] format", &tools).is_empty());
+        let two = "[tool_use shell({\"command\":\"a\"})]\n[tool_use shell({\"command\":\"b\"})]";
+        assert_eq!(rescue_bracket_tool_calls(two, &tools).len(), 2);
+    }
 
     fn ask_user_tool() -> ToolDef {
         ToolDef {
