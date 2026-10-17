@@ -3783,12 +3783,16 @@ mod tool_target_tests {
 /// Whether the end of `text` is one piece of 1–8 characters repeated for
 /// at least 600 characters: a model stuck in a loop, not prose.
 fn degenerate_tail(text: &str) -> bool {
+    // A 1-8 char piece filling the last 600 chars ("////…"), or a phrase of
+    // 9-24 chars repeated 60 times in a row ("edit_word, edit_word, …" ran
+    // to 30k chars). A sentence said a few dozen times is left alone.
     const SPAN: usize = 600;
-    let tail: Vec<char> = text.chars().rev().take(SPAN).collect();
-    if tail.len() < SPAN {
-        return false;
-    }
-    (1..=8).any(|period| (period..tail.len()).all(|i| tail[i] == tail[i - period]))
+    const PHRASE_REPEATS: usize = 60;
+    let tail: Vec<char> = text.chars().rev().take(24 * PHRASE_REPEATS).collect();
+    let repeats = |period: usize, span: usize| {
+        tail.len() >= span && (period..span).all(|i| tail[i] == tail[i - period])
+    };
+    (1..=8).any(|p| repeats(p, SPAN)) || (9..=24).any(|p| repeats(p, p * PHRASE_REPEATS))
 }
 
 #[cfg(test)]
@@ -3803,6 +3807,14 @@ mod degenerate_tail_tests {
         assert!(!degenerate_tail(&"/".repeat(500)));
         let prose = "原告主张的事实与客观情况不符，答辩人收取的服务费具有合同依据。".repeat(30);
         assert!(!degenerate_tail(&prose));
+    }
+
+    #[test]
+    fn flags_a_looping_phrase() {
+        assert!(degenerate_tail(&format!("agent, anycli, {}", "edit_word, ".repeat(200))));
+        assert!(!degenerate_tail(&"edit_word, ".repeat(40)));
+        let list: String = (1..300).map(|i| format!("{i}. 第{i}项\n")).collect();
+        assert!(!degenerate_tail(&list));
     }
 }
 
