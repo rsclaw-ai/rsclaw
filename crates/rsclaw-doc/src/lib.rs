@@ -277,6 +277,32 @@ fn skip_repeated_title<'a>(content: &'a str, title: &str) -> &'a str {
     }
 }
 
+/// `text` split into (span, bold) by markdown `**` pairs. An unpaired
+/// `**` is dropped rather than printed.
+fn inline_spans(text: &str) -> Vec<(String, bool)> {
+    let parts: Vec<&str> = text.split("**").collect();
+    let paired = parts.len() % 2 == 1;
+    let mut spans: Vec<(String, bool)> = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        // With an odd marker count the last marker has no partner: its
+        // text stays plain.
+        let bold = i % 2 == 1 && (paired || i + 1 < parts.len());
+        if part.is_empty() {
+            continue;
+        }
+        match spans.last_mut() {
+            Some((prev, prev_bold)) if *prev_bold == bold => prev.push_str(part),
+            _ => spans.push(((*part).to_owned(), bold)),
+        }
+    }
+    spans
+}
+
+/// `text` without markdown `**` markers (for headings, bold anyway).
+fn strip_bold_markers(text: &str) -> String {
+    text.replace("**", "")
+}
+
 /// Whether CJK characters make up most of the letters in `text`.
 fn is_mostly_cjk(text: &str) -> bool {
     let (mut cjk, mut latin) = (0usize, 0usize);
@@ -315,7 +341,13 @@ fn chinese_document(title: &str, content: &str) -> docx_rs::Docx {
             .add_run(Run::new().add_text(text).bold().size(BODY_SIZE).fonts(fonts(font)))
             .line_spacing(body_spacing().before(120))
     };
-    let body = |text: &str| Run::new().add_text(text).size(BODY_SIZE).fonts(fonts(BODY_FONT));
+    // Markdown **bold** inside a line becomes real bold.
+    let body_line = |text: &str| {
+        inline_spans(text).into_iter().fold(Paragraph::new(), |p, (span, bold)| {
+            let run = Run::new().add_text(span).size(BODY_SIZE).fonts(fonts(BODY_FONT));
+            p.add_run(if bold { run.bold() } else { run })
+        })
+    };
 
     let mut docx = Docx::new()
         .page_size(11906, 16838)
@@ -340,23 +372,24 @@ fn chinese_document(title: &str, content: &str) -> docx_rs::Docx {
         }
         if let Some(text) = block.strip_prefix("# ") {
             // The first heading of an untitled document is its title.
-            docx = docx.add_paragraph(if has_title { heading(text.trim(), "黑体") } else { title_paragraph(text.trim()) });
+            let text = strip_bold_markers(text.trim());
+            docx = docx.add_paragraph(if has_title { heading(&text, "黑体") } else { title_paragraph(&text) });
             has_title = true;
             continue;
         }
         if let Some(text) = block.strip_prefix("## ") {
-            docx = docx.add_paragraph(heading(text.trim(), "黑体"));
+            docx = docx.add_paragraph(heading(&strip_bold_markers(text.trim()), "黑体"));
             continue;
         }
         if let Some(text) = block.strip_prefix("### ") {
-            docx = docx.add_paragraph(heading(text.trim(), "楷体"));
+            docx = docx.add_paragraph(heading(&strip_bold_markers(text.trim()), "楷体"));
             continue;
         }
         for line in block.lines().map(str::trim).filter(|l| !l.is_empty()) {
             let bullet = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "));
             let mut p = match bullet {
-                Some(item) => Paragraph::new().add_run(body(&format!("• {item}"))),
-                None => Paragraph::new().add_run(body(line)),
+                Some(item) => body_line(&format!("• {item}")),
+                None => body_line(line),
             }
             .line_spacing(body_spacing());
             if line == "此致" {
@@ -406,7 +439,7 @@ fn plain_document(title: &str, content: &str) -> docx_rs::Docx {
             continue;
         }
         if block.starts_with("### ") {
-            let text = &block[4..];
+            let text = &strip_bold_markers(&block[4..]);
             docx = docx.add_paragraph(
                 Paragraph::new()
                     .add_run(
@@ -419,7 +452,7 @@ fn plain_document(title: &str, content: &str) -> docx_rs::Docx {
                     .style("Heading3"),
             );
         } else if block.starts_with("## ") {
-            let text = &block[3..];
+            let text = &strip_bold_markers(&block[3..]);
             docx = docx.add_paragraph(
                 Paragraph::new()
                     .add_run(
@@ -432,7 +465,7 @@ fn plain_document(title: &str, content: &str) -> docx_rs::Docx {
                     .style("Heading2"),
             );
         } else if block.starts_with("# ") {
-            let text = &block[2..];
+            let text = &strip_bold_markers(&block[2..]);
             docx = docx.add_paragraph(
                 Paragraph::new()
                     .add_run(
@@ -459,7 +492,7 @@ fn plain_document(title: &str, content: &str) -> docx_rs::Docx {
                         .trim_start_matches("* ");
                     let p = Paragraph::new().add_run(
                         Run::new()
-                            .add_text(format!("  \u{2022}  {text}"))
+                            .add_text(format!("  \u{2022}  {}", strip_bold_markers(text)))
                             .size(font_size)
                             .fonts(RunFonts::new().east_asia(default_font)),
                     );
@@ -470,18 +503,20 @@ fn plain_document(title: &str, content: &str) -> docx_rs::Docx {
                 // line break: Word ignores newlines inside text, which ran a
                 // brief's party lines ("答辩人…" / "住所地…" / "法定代表人…")
                 // and its signature block together.
-                let mut run = Run::new()
-                    .size(font_size)
-                    .fonts(RunFonts::new().east_asia(default_font));
+                let mut p = Paragraph::new();
                 for (i, line) in block.lines().enumerate() {
                     if i > 0 {
-                        run = run.add_break(BreakType::TextWrapping);
+                        p = p.add_run(Run::new().add_break(BreakType::TextWrapping));
                     }
-                    run = run.add_text(line.trim_end());
+                    for (span, bold) in inline_spans(line.trim_end()) {
+                        let run = Run::new()
+                            .add_text(span)
+                            .size(font_size)
+                            .fonts(RunFonts::new().east_asia(default_font));
+                        p = p.add_run(if bold { run.bold() } else { run });
+                    }
                 }
-                let p = Paragraph::new()
-                    .add_run(run)
-                    .line_spacing(LineSpacing::new().line(360)); // 1.5x line spacing
+                let p = p.line_spacing(LineSpacing::new().line(360)); // 1.5x line spacing
                 docx = docx.add_paragraph(p);
             }
         }
@@ -1695,6 +1730,34 @@ mod tests {
         // Signature and date on the right; the court flush left.
         assert_eq!(xml.matches(r#"w:jc w:val="right""#).count(), 2, "{xml}");
         assert!(xml.contains(r#"w:top="2098""#), "official margins missing: {xml}");
+    }
+
+    #[test]
+    fn inline_spans_turn_markdown_bold_into_bold() {
+        assert_eq!(
+            inline_spans("**被答辩人（原告）：陈东**，男"),
+            vec![("被答辩人（原告）：陈东".to_owned(), true), ("，男".to_owned(), false)]
+        );
+        assert_eq!(inline_spans("plain"), vec![("plain".to_owned(), false)]);
+        // An unpaired marker is dropped, its text stays plain.
+        assert_eq!(inline_spans("a **b"), vec![("a b".to_owned(), false)]);
+    }
+
+    #[tokio::test]
+    async fn create_word_prints_no_markdown_markers() {
+        let dir = std::env::temp_dir().join("rsclaw_doc_bold_test");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        for (name, content) in [
+            ("zh.docx", "## **一、答辩请求**\n\n**答辩人（被告）：武汉安和置业有限公司**\n住所地：武汉"),
+            ("en.docx", "## **Claims**\n\nThe **defendant** denies it."),
+        ] {
+            let path = dir.join(name);
+            let args = json!({"action": "create_word", "path": path.to_str().expect("path"), "content": content});
+            handle(&args, &path).await.expect("create_word");
+            let xml = document_xml(&path);
+            assert!(!xml.contains("**"), "{name}: markers printed: {xml}");
+            assert!(xml.contains("<w:b />") || xml.contains("<w:b/>"), "{name}: no bold run: {xml}");
+        }
     }
 
     #[tokio::test]
