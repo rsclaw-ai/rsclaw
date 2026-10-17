@@ -729,6 +729,37 @@ impl super::runtime::AgentRuntime {
         resolve_write_path(path, &roots)
     }
 
+    /// `resolve_writable_path`, but a target outside the write roots is
+    /// allowed for the owner when its directory was approved this session,
+    /// or when the user approves it now (interactive channels), the same
+    /// rule shell commands follow. Before, a desktop folder the user had
+    /// granted could be read by `ls` but not written (or even opened) by
+    /// write_file / edit_file / doc. Non-owners stay confined.
+    pub(crate) async fn resolve_writable_path_approved(
+        &self,
+        ctx: &RunContext,
+        path: &str,
+    ) -> Result<std::path::PathBuf> {
+        let blocked = match self.resolve_writable_path(ctx, path) {
+            Ok(full) => return Ok(full),
+            Err(e) if ctx.turn_ctx.trust.is_owner() => e.to_string(),
+            Err(e) => return Err(e),
+        };
+        let target = rsclaw_util::canonicalize_external_path(path.trim(), &self.default_workspace());
+        if !path_approved(&ctx.session_key, &[], &target) {
+            ask_approval(
+                ctx,
+                crate::approvals::ApprovalKind::Path,
+                &format!("write {}", target.display()),
+                &grant_dir(&target).display().to_string(),
+                crate::approvals::Risk::Normal,
+                &blocked,
+            )
+            .await?;
+        }
+        Ok(target)
+    }
+
     /// List files and directories in a path (structured alternative to `exec
     /// ls`). Uses [`safe_walk`] so a huge or pathological tree (symlink
     /// loops, deeply nested `node_modules`) cannot wedge the worker.
@@ -1257,7 +1288,7 @@ impl super::runtime::AgentRuntime {
         }
         // Confinement: the target must resolve inside the workspace (or an
         // owner write root); then the sensitive-name / content checks.
-        let full = self.resolve_writable_path(ctx, &path)?;
+        let full = self.resolve_writable_path_approved(ctx, &path).await?;
         if self.exec_safety_enabled() || !ctx.turn_ctx.trust.is_owner() {
             check_write_safety(&path, &full, &content)?;
         }
@@ -1795,7 +1826,7 @@ impl super::runtime::AgentRuntime {
 
         // Resolve and vet the target BEFORE reading it, so an edit cannot be
         // used to probe files outside the write scope.
-        let full = self.resolve_writable_path(ctx, path)?;
+        let full = self.resolve_writable_path_approved(ctx, path).await?;
         let safety_enabled = self.exec_safety_enabled() || !ctx.turn_ctx.trust.is_owner();
         if safety_enabled {
             check_write_safety(path, &full, "")?;

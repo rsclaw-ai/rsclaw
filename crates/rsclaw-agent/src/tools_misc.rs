@@ -603,10 +603,19 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
             .as_str()
             .ok_or_else(|| anyhow!("doc: `path` required"))?;
 
-        // `doc` creates and edits files and is reachable by non-owners, so
-        // the target is confined like write_file (workspace, plus owner
-        // write roots) and vetted against the sensitive-name list.
-        let full = self.resolve_writable_path(ctx, path_str)?;
+        // read_doc only reads: it goes through the read scope like
+        // read_file, not the write confinement (which refused to open a
+        // draft in a desktop folder the user had granted).
+        if args["action"].as_str() == Some("read_doc") {
+            let full = self.resolve_readable_path(ctx, path_str)?;
+            return super::doc::handle(&args, &full).await;
+        }
+
+        // The other actions create and edit files and are reachable by
+        // non-owners, so the target is confined like write_file (workspace,
+        // owner write roots, or a directory the owner approved) and vetted
+        // against the sensitive-name list.
+        let full = self.resolve_writable_path_approved(ctx, path_str).await?;
         if self.exec_safety_enabled() || !ctx.turn_ctx.trust.is_owner() {
             super::security::check_write_safety(path_str, &full, "")?;
         }
