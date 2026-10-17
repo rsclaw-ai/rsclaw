@@ -1300,6 +1300,11 @@ impl RsclawProvider {
             anyhow::bail!("rsclaw {path}: empty prompt after flattening req.messages");
         }
 
+        let max_tokens = if path == "/fastshot" {
+            fastshot_max_tokens(req.max_tokens, &prompt)
+        } else {
+            req.max_tokens
+        };
         let mut body = serde_json::Map::new();
         body.insert("prompt".to_owned(), Value::String(prompt));
         // /vision wants a single complete result — the caller (e.g. vlm_parse)
@@ -1311,7 +1316,7 @@ impl RsclawProvider {
         // /oneshot where token-by-token delivery still matters.
         let use_stream = path != "/vision";
         body.insert("stream".to_owned(), Value::Bool(use_stream));
-        if let Some(mt) = req.max_tokens {
+        if let Some(mt) = max_tokens {
             body.insert("max_tokens".to_owned(), Value::from(mt));
         }
         // Bind the model id to the endpoint per the fleet's model-slot
@@ -2367,6 +2372,41 @@ fn split_request<'a>(
         dynamic_user_tools,
         options: TurnOptions::from_request(req, constrain_tool_calls),
     })
+}
+
+/// Total context of the fleet's `/fastshot` lane (`--rsclaw-fastshot-ctx`).
+/// Prompt plus `max_tokens` must fit, or the worker fails the call
+/// (`fastshot_ctx_exceeded`) — which every heartbeat did while it asked
+/// for the generic 8192.
+const FASTSHOT_CTX_TOKENS: u32 = 8192;
+
+/// `max_tokens` for a `/fastshot` call: what was asked, but never more
+/// than the lane has left after a generous estimate of the prompt (CJK
+/// counted as a token per character).
+fn fastshot_max_tokens(requested: Option<u32>, prompt: &str) -> Option<u32> {
+    let (cjk, other) = prompt.chars().fold((0u32, 0u32), |(c, o), ch| {
+        if ch as u32 >= 0x2E80 { (c + 1, o) } else { (c, o + 1) }
+    });
+    let prompt_tokens = cjk + other / 3;
+    let room = FASTSHOT_CTX_TOKENS.saturating_sub(prompt_tokens + prompt_tokens / 4 + 256).max(512);
+    Some(requested.map_or(room, |r| r.min(room)))
+}
+
+#[cfg(test)]
+mod fastshot_budget_tests {
+    use super::*;
+
+    #[test]
+    fn fastshot_max_tokens_fits_the_lane() {
+        // The heartbeat: a ~1.3k-token prompt asking for 8192.
+        let prompt = "检查待办".repeat(330);
+        let mt = fastshot_max_tokens(Some(8192), &prompt).unwrap();
+        assert!(mt + 1320 <= FASTSHOT_CTX_TOKENS, "{mt}");
+        assert!(mt > 4000, "{mt}");
+        // A small request is left alone; a huge prompt still gets 512.
+        assert_eq!(fastshot_max_tokens(Some(300), "hi"), Some(300));
+        assert_eq!(fastshot_max_tokens(None, &"字".repeat(9000)), Some(512));
+    }
 }
 
 /// Returns the history slice to send to `/sessions/replay`: every
