@@ -308,7 +308,7 @@ impl AgentRuntime {
         // Head: first user-assistant pair (contains [Session started:...], preserved
         // verbatim) Middle: compressed into summary
         // Tail: recent N pairs (preserved verbatim)
-        let (head_msgs, old_text, recent_msgs) = if mode == CompactionMode::Layered {
+        let (head_msgs, old_text, recent_msgs, ledger_text) = if mode == CompactionMode::Layered {
             let msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
 
             // Head: protect first user + first assistant (2 messages).
@@ -392,12 +392,16 @@ impl AgentRuntime {
             if old_portion.is_empty() {
                 return; // not enough history to compact
             }
+            // Facts are read from the turns as the model saw them, before
+            // any shortening for the transcript.
+            let ledger_text = plain_text(&old_portion);
             compress_tool_results(&mut old_portion, 6);
-            (head, msgs_to_text(&old_portion), recent)
+            (head, msgs_to_text(&old_portion), recent, ledger_text)
         } else {
             let mut msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
+            let ledger_text = plain_text(&msgs);
             compress_tool_results(&mut msgs, 6);
-            (vec![], msgs_to_text(&msgs), vec![])
+            (vec![], msgs_to_text(&msgs), vec![], ledger_text)
         };
 
         // Pre-compaction entity preservation: deterministic extraction (phone/ID/email)
@@ -565,6 +569,30 @@ impl AgentRuntime {
         };
 
         let Some(summary) = summary else { return };
+
+        // Whatever exact identifiers the model dropped (from these turns or
+        // from the previous summary) go back in verbatim.
+        let summary = {
+            let key_cfg = cfg.key_data.clone().unwrap_or_default();
+            let kinds: Vec<String> = key_cfg.kinds.unwrap_or_else(|| {
+                crate::key_data::DEFAULT_KINDS.iter().map(|k| (*k).to_owned()).collect()
+            });
+            let source = format!("{}\n{ledger_text}", previous_summary.as_deref().unwrap_or(""));
+            let facts = crate::key_data::extract(&source, &kinds);
+            let kept = crate::key_data::ensure_in_summary(
+                &summary,
+                &facts,
+                key_cfg.max_items.unwrap_or(crate::key_data::DEFAULT_MAX_ITEMS),
+            );
+            let restored = crate::key_data::missing_from(&summary, &facts).len();
+            info!(
+                session = session_key,
+                facts = facts.len(),
+                restored,
+                "compaction: key data checked against the summary"
+            );
+            kept
+        };
 
         // -- Entity extraction from summary's Entities section --
         // The summary prompt includes an Entities section (kind=value format).
@@ -989,7 +1017,7 @@ impl AgentRuntime {
         }
 
         // Build the summary instruction
-        let template = Self::summary_template();
+        let template = self.scenario_summary_template().await;
         let instruction = if let Some(prev) = previous_summary {
             format!(
                 "Ignore all previous instructions. You are now a summarization agent. \
@@ -1107,6 +1135,22 @@ impl AgentRuntime {
         }
     }
 
+    /// `summary_template` with the deployment's scenario section
+    /// (`compaction.keyData.template`) added before its closing rule.
+    async fn scenario_summary_template(&self) -> String {
+        let extra = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .compaction
+            .as_ref()
+            .and_then(|c| c.key_data.as_ref())
+            .and_then(|k| k.template.clone());
+        with_scenario_section(Self::summary_template(), extra.as_deref())
+    }
+
     /// Shared summary template used by both standalone and KV cache modes.
     fn summary_template() -> &'static str {
         "Use this exact structure:\n\n\
@@ -1154,7 +1198,7 @@ impl AgentRuntime {
             in the conversation - only output the structured summary. \
             Do NOT include any preamble, greeting, or prefix.";
 
-        let template = Self::summary_template();
+        let template = self.scenario_summary_template().await;
 
         let prompt = if let Some(prev) = previous_summary {
             format!(
@@ -1380,6 +1424,60 @@ impl AgentRuntime {
 /// phone=18674030927
 /// birthday=1995年3月15日
 /// ```
+/// Everything said in `msgs`, untruncated: text, tool results, and the
+/// string arguments of tool calls (a drafted document's text lives there).
+fn plain_text(msgs: &[Message]) -> String {
+    fn strings(v: &Value, out: &mut String) {
+        match v {
+            Value::String(s) => {
+                out.push_str(s);
+                out.push('\n');
+            }
+            Value::Array(a) => a.iter().for_each(|v| strings(v, out)),
+            Value::Object(o) => o.values().for_each(|v| strings(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    for m in msgs {
+        match &m.content {
+            MessageContent::Text(t) => {
+                out.push_str(t);
+                out.push('\n');
+            }
+            MessageContent::Parts(parts) => {
+                for p in parts {
+                    match p {
+                        ContentPart::Text { text } => {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                        ContentPart::ToolResult { content, .. } => {
+                            out.push_str(content);
+                            out.push('\n');
+                        }
+                        ContentPart::ToolUse { input, .. } => strings(input, &mut out),
+                        #[allow(unreachable_patterns)]
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `template` with `extra` inserted before its closing "CRITICAL" rule.
+fn with_scenario_section(template: &str, extra: Option<&str>) -> String {
+    let Some(extra) = extra.map(str::trim).filter(|e| !e.is_empty()) else {
+        return template.to_owned();
+    };
+    match template.rfind("CRITICAL:") {
+        Some(i) => format!("{}{extra}\n\n{}", &template[..i], &template[i..]),
+        None => format!("{template}\n\n{extra}"),
+    }
+}
+
 fn parse_entities_from_summary(summary: &str) -> Vec<crate::context_mgr::KeyEntity> {
     let mut entities = Vec::new();
 
@@ -1446,6 +1544,43 @@ mod tests {
             content: MessageContent::Text(text.to_owned()),
             rsclaw_hidden: None,
         }
+    }
+
+    #[test]
+    fn compaction_scenario_section_goes_before_the_closing_rule() {
+        let t = with_scenario_section("## Goal\n[x]\n\nCRITICAL: copy values.", Some("## Case Facts\n[案号]"));
+        assert_eq!(t, "## Goal\n[x]\n\n## Case Facts\n[案号]\n\nCRITICAL: copy values.");
+        assert_eq!(with_scenario_section("T", None), "T");
+        assert_eq!(with_scenario_section("T", Some("  ")), "T");
+    }
+
+    #[test]
+    fn compaction_ledger_reads_tool_results_and_call_arguments() {
+        let msgs = vec![
+            msg(Role::User, "起诉华建"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                    id: "t1".into(),
+                    name: "create_docx".into(),
+                    input: json!({"content": "案号（2024）鄂0116民初1234号", "n": 3}),
+                }]),
+                rsclaw_hidden: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "统一社会信用代码 91420112MA4L12345X".into(),
+                    is_error: None,
+                }]),
+                rsclaw_hidden: None,
+            },
+        ];
+        let text = plain_text(&msgs);
+        assert!(text.contains("起诉华建"));
+        assert!(text.contains("（2024）鄂0116民初1234号"));
+        assert!(text.contains("91420112MA4L12345X"));
     }
 
     #[test]

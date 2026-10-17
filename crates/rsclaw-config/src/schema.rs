@@ -1171,6 +1171,25 @@ pub struct CompactionConfig {
     /// Higher values preserve more tool call/result detail but require a
     /// compact model with sufficient context window. Default: 16000 tokens.
     pub max_transcript_tokens: Option<usize>,
+    /// What a summary must carry verbatim for this deployment's work.
+    pub key_data: Option<KeyDataConfig>,
+}
+
+/// Facts compaction keeps verbatim. Rule-extracted from the compacted
+/// turns; any the summary drops are appended to it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyDataConfig {
+    /// Kinds to keep, in priority order: phone, landline, id_card, email,
+    /// credit_code, case_no, amount, date, org, legal_rep. Default: phone,
+    /// id_card, email, credit_code, case_no.
+    pub kinds: Option<Vec<String>>,
+    /// Most facts appended to one summary (default 60).
+    pub max_items: Option<usize>,
+    /// Extra summary section(s) for the scenario, e.g. a "## Case Facts"
+    /// section listing what a lawyer's summary must hold. Added to the
+    /// summary template before its closing rule.
+    pub template: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

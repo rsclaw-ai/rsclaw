@@ -3075,6 +3075,13 @@ impl AgentRuntime {
                 // streaming subscribers see per-tool cards in real time; this
                 // block only builds `tool_log` for the final AgentReply
                 // (rendered by non-streaming channels like Feishu/WeChat).
+                // The facts this result showed outlive the turn (its tool
+                // results don't).
+                self.record_key_data(
+                    &ctx.session_key,
+                    &format!("{tool_input_str}\n{result_text}"),
+                )
+                .await;
                 {
                     let args_str = tool_input_str;
                     let out_str = if result_text.len() > 4000 {

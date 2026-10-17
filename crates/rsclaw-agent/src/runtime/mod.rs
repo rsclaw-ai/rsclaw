@@ -1921,6 +1921,76 @@ impl AgentRuntime {
 
     /// If the key has an alias, returns the canonical (old) key so all data
     /// stays under one key. Otherwise returns the key unchanged.
+    /// Key-data kinds and ledger size for this deployment
+    /// (`compaction.keyData`).
+    pub(crate) async fn key_data_settings(&self) -> (Vec<String>, usize) {
+        let cfg = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .compaction
+            .as_ref()
+            .and_then(|c| c.key_data.clone())
+            .unwrap_or_default();
+        let kinds = cfg.kinds.unwrap_or_else(|| {
+            crate::key_data::DEFAULT_KINDS.iter().map(|k| (*k).to_owned()).collect()
+        });
+        (kinds, cfg.max_items.unwrap_or(crate::key_data::DEFAULT_MAX_ITEMS))
+    }
+
+    /// Adds the facts in one tool call (its arguments and the result the
+    /// model saw) to the session's ledger, which outlives the turn.
+    pub(crate) async fn record_key_data(&self, session_key: &str, text: &str) {
+        let (kinds, max_items) = self.key_data_settings().await;
+        let found = crate::key_data::extract(text, &kinds);
+        if found.is_empty() {
+            return;
+        }
+        let key = crate::key_data::ledger_kv_key(session_key);
+        let ledger = self
+            .store
+            .db
+            .kv_get(&key)
+            .ok()
+            .flatten()
+            .map(|raw| crate::key_data::from_json(&raw))
+            .unwrap_or_default();
+        let ledger = crate::key_data::merge(ledger, found, max_items);
+        if let Err(e) = self.store.db.kv_set(&key, &crate::key_data::to_json(&ledger)) {
+            warn!("key data ledger write failed for {session_key}: {e:#}");
+        }
+    }
+
+    /// What a session carries from turn to turn outside its history: the
+    /// working plan and the key-data ledger, for the per-turn recall
+    /// channel. `None` when there is neither.
+    pub(crate) fn session_carryover(&self, session_key: &str) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(plan) = self.load_todo_rendered(session_key) {
+            parts.push(format!("[Current plan]\n{plan}"));
+        }
+        if let Some(facts) = self.load_key_data_rendered(session_key) {
+            parts.push(format!(
+                "[Key facts from earlier tool results in this session, verbatim]\n{facts}"
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
+    /// The session's ledger for the per-turn context, or `None` when empty.
+    pub(crate) fn load_key_data_rendered(&self, session_key: &str) -> Option<String> {
+        let raw = self
+            .store
+            .db
+            .kv_get(&crate::key_data::ledger_kv_key(session_key))
+            .ok()
+            .flatten()?;
+        let ledger = crate::key_data::from_json(&raw);
+        (!ledger.is_empty()).then(|| crate::key_data::render(&ledger))
+    }
+
     /// The model `/model` switched this session to. The gateway records the
     /// switch under the key it saw, which may be an alias of the canonical
     /// key the turn runs under.

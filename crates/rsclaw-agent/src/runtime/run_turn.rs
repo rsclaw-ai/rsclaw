@@ -1810,24 +1810,24 @@ impl AgentRuntime {
         } else {
             None
         };
-        // Keep the session's working plan (todo tool) visible every turn.
-        // It rides the turn-local recall channel, so it never dirties the
-        // KV prefix and survives the original tool result being sketched
-        // out of the transcript.
+        // Keep the session's working plan (todo tool) and the facts earlier
+        // turns' tool results showed visible every turn. They ride the
+        // turn-local recall channel, so they never dirty the KV prefix and
+        // survive the original tool results being dropped at turn end.
         let auto_recall_bundle = if model_provider == "rsclaw" || recall_external {
-            match (auto_recall_bundle, self.load_todo_rendered(session_key)) {
+            match (auto_recall_bundle, self.session_carryover(session_key)) {
                 (bundle, None) => bundle,
-                (Some(mut bundle), Some(plan)) => {
-                    bundle.context.push_str("\n\n[Current plan]\n");
-                    bundle.context.push_str(&plan);
+                (Some(mut bundle), Some(carryover)) => {
+                    bundle.context.push_str("\n\n");
+                    bundle.context.push_str(&carryover);
                     bundle.metadata.hash = {
                         use sha2::{Digest, Sha256};
                         format!("sha256:{:x}", Sha256::digest(bundle.context.as_bytes()))
                     };
                     Some(bundle)
                 }
-                (None, Some(plan)) => {
-                    let context = format!("[Current plan]\n{plan}");
+                (None, Some(carryover)) => {
+                    let context = carryover;
                     let hash = {
                         use sha2::{Digest, Sha256};
                         format!("sha256:{:x}", Sha256::digest(context.as_bytes()))
@@ -2982,6 +2982,13 @@ impl AgentRuntime {
             .kv_delete(&crate::tools_misc::todo_kv_key(session_key))
         {
             warn!("todo kv cleanup failed for {session_key}: {e:#}");
+        }
+        if let Err(e) = self
+            .store
+            .db
+            .kv_delete(&crate::key_data::ledger_kv_key(session_key))
+        {
+            warn!("key data kv cleanup failed for {session_key}: {e:#}");
         }
     }
 }
