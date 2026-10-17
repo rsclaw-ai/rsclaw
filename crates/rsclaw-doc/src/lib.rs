@@ -277,22 +277,108 @@ fn skip_repeated_title<'a>(content: &'a str, title: &str) -> &'a str {
     }
 }
 
-fn create_word(args: &Value, path: &Path) -> Result<Value> {
-    use docx_rs::*;
-
-    let title = args["title"].as_str().unwrap_or("");
-    let content = skip_repeated_title(args["content"].as_str().unwrap_or(""), title);
-
-    if content.is_empty() && title.is_empty() {
-        return Ok(json!({
-            "error": "create_word requires 'content' parameter. Please provide the text content to write into the document.",
-            "hint": "Retry with: {\"action\": \"create_word\", \"path\": \"file.docx\", \"content\": \"your text here\"}"
-        }));
+/// Whether CJK characters make up most of the letters in `text`.
+fn is_mostly_cjk(text: &str) -> bool {
+    let (mut cjk, mut latin) = (0usize, 0usize);
+    for c in text.chars() {
+        if ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c) {
+            cjk += 1;
+        } else if c.is_ascii_alphabetic() {
+            latin += 1;
+        }
     }
+    cjk > 0 && cjk * 2 >= latin
+}
 
+/// A document laid out the way Chinese legal and official papers are:
+/// A4 with official-document margins, a centred 宋体 title, 黑体 / 楷体
+/// headings, 仿宋 body text indented two characters at a fixed line
+/// height, every line its own paragraph (so each party line of a brief is
+/// indented), and the closing "此致" indented, the court flush left and the
+/// signature and date on the right.
+fn chinese_document(title: &str, content: &str) -> docx_rs::Docx {
+    use docx_rs::*;
+    const LATIN: &str = "Times New Roman";
+    const BODY_FONT: &str = "仿宋";
+    const BODY_SIZE: usize = 28; // 14pt (四号), half-points
+    const TWO_CHARS: i32 = 560; // two 14pt characters, twips
+    let fonts = |east_asia: &str| RunFonts::new().east_asia(east_asia).ascii(LATIN).hi_ansi(LATIN);
+    let body_spacing = || LineSpacing::new().line(520).line_rule(LineSpacingType::Exact); // 26pt
+    let title_paragraph = |text: &str| {
+        Paragraph::new()
+            .add_run(Run::new().add_text(text).bold().size(44).fonts(fonts("宋体")))
+            .align(AlignmentType::Center)
+            .line_spacing(LineSpacing::new().after(240))
+    };
+    let heading = |text: &str, font: &str| {
+        Paragraph::new()
+            .add_run(Run::new().add_text(text).bold().size(BODY_SIZE).fonts(fonts(font)))
+            .line_spacing(body_spacing().before(120))
+    };
+    let body = |text: &str| Run::new().add_text(text).size(BODY_SIZE).fonts(fonts(BODY_FONT));
+
+    let mut docx = Docx::new()
+        .page_size(11906, 16838)
+        .page_margin(PageMargin::new().top(2098).bottom(1984).left(1588).right(1474));
+    let mut has_title = !title.trim().is_empty();
+    if has_title {
+        docx = docx.add_paragraph(title_paragraph(title.trim()));
+    }
+    // After "此致": the next line is the court (flush left), the rest is the
+    // signature block (right-aligned).
+    #[derive(PartialEq)]
+    enum Closing {
+        No,
+        Court,
+        Signature,
+    }
+    let mut closing = Closing::No;
+    for block in content.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        if let Some(text) = block.strip_prefix("# ") {
+            // The first heading of an untitled document is its title.
+            docx = docx.add_paragraph(if has_title { heading(text.trim(), "黑体") } else { title_paragraph(text.trim()) });
+            has_title = true;
+            continue;
+        }
+        if let Some(text) = block.strip_prefix("## ") {
+            docx = docx.add_paragraph(heading(text.trim(), "黑体"));
+            continue;
+        }
+        if let Some(text) = block.strip_prefix("### ") {
+            docx = docx.add_paragraph(heading(text.trim(), "楷体"));
+            continue;
+        }
+        for line in block.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let bullet = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "));
+            let mut p = match bullet {
+                Some(item) => Paragraph::new().add_run(body(&format!("• {item}"))),
+                None => Paragraph::new().add_run(body(line)),
+            }
+            .line_spacing(body_spacing());
+            if line == "此致" {
+                closing = Closing::Court;
+                p = p.indent(None, Some(SpecialIndentType::FirstLine(TWO_CHARS)), None, None);
+            } else if closing == Closing::Court {
+                closing = Closing::Signature;
+            } else if closing == Closing::Signature {
+                p = p.align(AlignmentType::Right);
+            } else if bullet.is_none() {
+                p = p.indent(None, Some(SpecialIndentType::FirstLine(TWO_CHARS)), None, None);
+            }
+            docx = docx.add_paragraph(p);
+        }
+    }
+    docx
+}
+
+/// The layout for non-Chinese documents: YaHei 10.5pt, 1.5 line spacing.
+fn plain_document(title: &str, content: &str) -> docx_rs::Docx {
+    use docx_rs::*;
     let mut docx = Docx::new();
-
-    // Default font: use CJK-friendly font stack.
     let default_font = "Microsoft YaHei";
     let font_size = 21; // 10.5pt in half-points
 
@@ -400,6 +486,26 @@ fn create_word(args: &Value, path: &Path) -> Result<Value> {
             }
         }
     }
+    docx
+}
+
+fn create_word(args: &Value, path: &Path) -> Result<Value> {
+
+    let title = args["title"].as_str().unwrap_or("");
+    let content = skip_repeated_title(args["content"].as_str().unwrap_or(""), title);
+
+    if content.is_empty() && title.is_empty() {
+        return Ok(json!({
+            "error": "create_word requires 'content' parameter. Please provide the text content to write into the document.",
+            "hint": "Retry with: {\"action\": \"create_word\", \"path\": \"file.docx\", \"content\": \"your text here\"}"
+        }));
+    }
+
+    let docx = if is_mostly_cjk(content) || is_mostly_cjk(title) {
+        chinese_document(title, content)
+    } else {
+        plain_document(title, content)
+    };
 
     let file = std::fs::File::create(path)?;
     docx.build().pack(file)?;
@@ -1562,25 +1668,47 @@ mod tests {
         println!("DOCX output: {}", path.display());
     }
 
-    #[tokio::test]
-    async fn create_word_keeps_single_line_breaks() {
-        let dir = std::env::temp_dir().join("rsclaw_doc_linebreak_test");
-        std::fs::create_dir_all(&dir).expect("create test dir");
-        let path = dir.join("brief.docx");
-        let args = json!({
-            "action": "create_word",
-            "path": path.to_str().expect("path"),
-            "content": "答辩人：武汉安和置业有限公司\n住所地：武汉市汉阳区江城大道88号\n法定代表人：周宁\n\n此致\n武汉市汉阳区人民法院",
-        });
-        handle(&args, &path).await.expect("create_word");
-        let file = std::fs::File::open(&path).expect("open docx");
+    fn document_xml(path: &std::path::Path) -> String {
+        let file = std::fs::File::open(path).expect("open docx");
         let mut zip = zip::ZipArchive::new(file).expect("zip");
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut zip.by_name("word/document.xml").expect("document.xml"), &mut xml)
             .expect("read xml");
-        // Three party lines → two breaks; "此致" / court → one more.
-        assert_eq!(xml.matches("<w:br").count(), 3, "{xml}");
-        assert!(!xml.contains("有限公司住所地"), "lines ran together: {xml}");
+        xml
+    }
+
+    #[tokio::test]
+    async fn create_word_lays_out_a_chinese_brief() {
+        let dir = std::env::temp_dir().join("rsclaw_doc_brief_test");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("brief.docx");
+        let content = "# 民事答辩状\n\n答辩人：武汉安和置业有限公司\n住所地：武汉市汉阳区江城大道88号\n\
+            法定代表人：周宁\n\n## 一、答辩请求\n\n请求驳回被答辩人的全部诉讼请求。\n\n此致\n武汉市汉阳区人民法院\n\n\
+            答辩人：武汉安和置业有限公司\n二〇二六年 月 日";
+        let args = json!({"action": "create_word", "path": path.to_str().expect("path"), "content": content});
+        handle(&args, &path).await.expect("create_word");
+        let xml = document_xml(&path);
+        assert!(!xml.contains("有限公司住所地"), "party lines ran together: {xml}");
+        assert!(xml.contains("仿宋") && xml.contains("黑体") && xml.contains("Times New Roman"), "{xml}");
+        assert!(xml.contains(r#"w:jc w:val="center""#), "title not centred: {xml}");
+        assert!(xml.contains(r#"w:firstLine="560""#), "body not indented two characters: {xml}");
+        // Signature and date on the right; the court flush left.
+        assert_eq!(xml.matches(r#"w:jc w:val="right""#).count(), 2, "{xml}");
+        assert!(xml.contains(r#"w:top="2098""#), "official margins missing: {xml}");
+    }
+
+    #[tokio::test]
+    async fn create_word_keeps_line_breaks_in_plain_documents() {
+        let dir = std::env::temp_dir().join("rsclaw_doc_linebreak_test");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("notes.docx");
+        let args = json!({
+            "action": "create_word",
+            "path": path.to_str().expect("path"),
+            "content": "Attendees: Alice\nBob\nCarol\n\nNext meeting on Monday",
+        });
+        handle(&args, &path).await.expect("create_word");
+        assert_eq!(document_xml(&path).matches("<w:br").count(), 2);
     }
 
     #[tokio::test]
