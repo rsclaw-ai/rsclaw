@@ -337,6 +337,10 @@ impl AgentRuntime {
         let mut last_result_hash: Option<String> = None;
         let mut last_tool_name = String::new();
         let mut wrapup_injected = false;
+        // Times this turn ran into the model's context limit. Each recovery
+        // cuts older tool results, and a model that then re-reads what was
+        // cut fills the context again: a loop with no end.
+        let mut context_overflows = 0usize;
         // Responses after the wrap-up prompt whose tool calls were refused.
         let mut wrapup_refusals = 0usize;
         // Responses cut off because the model fell into repeating itself.
@@ -1185,6 +1189,28 @@ impl AgentRuntime {
                             shrunk,
                             "context exceeded: compaction freed nothing; shrank older tool results"
                         );
+                    }
+                    context_overflows += 1;
+                    if context_overflows >= MAX_CONTEXT_OVERFLOWS && !daemon_mode && !wrapup_injected {
+                        warn!(
+                            session = %ctx.session_key,
+                            context_overflows,
+                            "agent_loop: context keeps overflowing, wrapping up"
+                        );
+                        // LLM-facing; English like the other wrap-up nudges.
+                        turn_scratchpad.push(Message {
+                            role: Role::User,
+                            content: MessageContent::Text(
+                                "[system] This turn has filled the model's context several times; \
+                                 older tool results are being cut, and reading them again will not \
+                                 fit. Stop calling tools. Answer now with what you already have: \
+                                 the result if it is ready, otherwise what you found and what is \
+                                 left, so the user can continue in a new message."
+                                    .to_owned(),
+                            ),
+                            rsclaw_hidden: None,
+                        });
+                        wrapup_injected = true;
                     }
                     // Rebuild from compacted session + this turn's scratchpad
                     // (never the session alone — that drops tool results).
@@ -3782,6 +3808,9 @@ mod tool_target_tests {
 
 /// Whether the end of `text` is one piece of 1–8 characters repeated for
 /// at least 600 characters: a model stuck in a loop, not prose.
+/// Context-limit recoveries in one turn before it is wrapped up.
+const MAX_CONTEXT_OVERFLOWS: usize = 3;
+
 fn degenerate_tail(text: &str) -> bool {
     // A 1-8 char piece filling the last 600 chars ("////…"), or a phrase of
     // 9-24 chars repeated 60 times in a row ("edit_word, edit_word, …" ran
