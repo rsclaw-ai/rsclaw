@@ -290,6 +290,34 @@ pub fn from_json(raw: &str) -> Vec<KeyDatum> {
         .collect()
 }
 
+/// A safe overestimate of `text`'s token count: a token per non-ASCII
+/// character, one per two ASCII characters.
+pub fn token_upper_bound(text: &str) -> usize {
+    let (wide, ascii) = text.chars().fold((0usize, 0usize), |(w, a), c| {
+        if c.is_ascii() { (w, a + 1) } else { (w + 1, a) }
+    });
+    wide + ascii.div_ceil(2)
+}
+
+/// `render`, keeping only the newest lines that fit in `budget` tokens
+/// (by [`token_upper_bound`]), in their original order. `None` when not
+/// even one fits.
+pub fn render_within(ledger: &[KeyDatum], budget: usize) -> Option<String> {
+    let rendered = render(ledger);
+    let lines: Vec<&str> = rendered.lines().collect();
+    let mut used = 0usize;
+    let mut keep = 0usize;
+    for line in lines.iter().rev() {
+        let cost = token_upper_bound(line) + 1;
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        keep += 1;
+    }
+    (keep > 0).then(|| lines[lines.len() - keep..].join("\n"))
+}
+
 /// The facts for the model: each one's context once, as `- ` lines (one
 /// line usually carries several facts of the same party).
 pub fn render(ledger: &[KeyDatum]) -> String {
@@ -370,6 +398,17 @@ mod tests {
         let got: Vec<String> =
             extract(text, &kinds(&["org", "date"])).into_iter().map(|d| d.value).collect();
         assert_eq!(got, vec!["武汉市黄陂区人民法院", "2024-03-05"]);
+    }
+
+    #[test]
+    fn key_data_render_within_keeps_the_newest_that_fit() {
+        let d = |v: &str| KeyDatum { kind: "case_no", value: v.into(), context: format!("案号{v}") };
+        let ledger = vec![d("一"), d("二"), d("三")];
+        assert_eq!(render_within(&ledger, 100).as_deref(), Some("- 案号一\n- 案号二\n- 案号三"));
+        // Each line costs 5 here ("- " is 1, three CJK chars, newline 1).
+        assert_eq!(render_within(&ledger, 10).as_deref(), Some("- 案号二\n- 案号三"));
+        assert_eq!(render_within(&ledger, 3), None);
+        assert_eq!(token_upper_bound("ab案"), 2);
     }
 
     #[test]

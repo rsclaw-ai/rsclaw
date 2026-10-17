@@ -1218,6 +1218,14 @@ impl AgentRuntime {
                     retry_req.messages = self.build_request_messages(ctx, &mut turn_scratchpad);
                     self.failover.call(retry_req, &providers).await?
                 }
+                // The backend caps the per-turn recall channel; over it, the
+                // turn goes out without recall rather than failing outright.
+                Err(ref e) if format!("{e:#}").contains("recall_too_large") && req.recall.is_some() => {
+                    warn!(session = %ctx.session_key, error = %e, "recall over the backend cap; retrying without it");
+                    let mut retry_req = req.clone();
+                    retry_req.recall = None;
+                    self.failover.call(retry_req, &providers).await?
+                }
                 other => other?,
             };
             let mut text_buf = String::new();

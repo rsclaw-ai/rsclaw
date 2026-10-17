@@ -959,6 +959,11 @@ pub use super::model_resolution::{
     resolve_primary_model_for, resolve_vision_model_for, vision_unavailable_message,
 };
 
+/// Tokens (by `key_data::token_upper_bound`) a turn's recall channel may
+/// carry to the rsclaw backend, under its `--rsclaw-max-recall-tokens`
+/// (2048) with room for the wire wrapper.
+pub(crate) const RSCLAW_RECALL_BUDGET: usize = 1800;
+
 impl AgentRuntime {
     /// Estimate fixed context overhead: system prompt + tools tokens.
     /// Used for pre-flight context budget check before LLM call, and by
@@ -1985,29 +1990,36 @@ impl AgentRuntime {
     /// What a session carries from turn to turn outside its history: the
     /// working plan and the key-data ledger, for the per-turn recall
     /// channel. `None` when there is neither.
-    pub(crate) fn session_carryover(&self, session_key: &str) -> Option<String> {
+    ///
+    /// `budget` (tokens, by `key_data::token_upper_bound`) bounds it where the
+    /// backend caps the recall channel: the plan comes first, then as many of
+    /// the newest facts as fit.
+    pub(crate) fn session_carryover(&self, session_key: &str, budget: Option<usize>) -> Option<String> {
+        const FACTS_HEADER: &str = "[Key facts from earlier tool results in this session, verbatim]";
         let mut parts = Vec::new();
+        let mut left = budget.unwrap_or(usize::MAX);
         if let Some(plan) = self.load_todo_rendered(session_key) {
-            parts.push(format!("[Current plan]\n{plan}"));
+            let plan = format!("[Current plan]\n{plan}");
+            let cost = crate::key_data::token_upper_bound(&plan) + 2;
+            if cost <= left {
+                left -= cost;
+                parts.push(plan);
+            }
         }
-        if let Some(facts) = self.load_key_data_rendered(session_key) {
-            parts.push(format!(
-                "[Key facts from earlier tool results in this session, verbatim]\n{facts}"
-            ));
+        let header_cost = crate::key_data::token_upper_bound(FACTS_HEADER) + 3;
+        if left > header_cost {
+            let raw = self
+                .store
+                .db
+                .kv_get(&crate::key_data::ledger_kv_key(session_key))
+                .ok()
+                .flatten();
+            let ledger = raw.map(|r| crate::key_data::from_json(&r)).unwrap_or_default();
+            if let Some(facts) = crate::key_data::render_within(&ledger, left - header_cost) {
+                parts.push(format!("{FACTS_HEADER}\n{facts}"));
+            }
         }
         (!parts.is_empty()).then(|| parts.join("\n\n"))
-    }
-
-    /// The session's ledger for the per-turn context, or `None` when empty.
-    pub(crate) fn load_key_data_rendered(&self, session_key: &str) -> Option<String> {
-        let raw = self
-            .store
-            .db
-            .kv_get(&crate::key_data::ledger_kv_key(session_key))
-            .ok()
-            .flatten()?;
-        let ledger = crate::key_data::from_json(&raw);
-        (!ledger.is_empty()).then(|| crate::key_data::render(&ledger))
     }
 
     /// The model `/model` switched this session to. The gateway records the

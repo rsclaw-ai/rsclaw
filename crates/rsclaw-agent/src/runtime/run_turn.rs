@@ -1815,7 +1815,16 @@ impl AgentRuntime {
         // turn-local recall channel, so they never dirty the KV prefix and
         // survive the original tool results being dropped at turn end.
         let auto_recall_bundle = if model_provider == "rsclaw" || recall_external {
-            match (auto_recall_bundle, self.session_carryover(session_key)) {
+            // The rsclaw backend refuses a recall channel over its cap
+            // (recall_too_large): the carryover gets what memory recall
+            // leaves of the budget.
+            let carry_budget = (model_provider == "rsclaw").then(|| {
+                let used = auto_recall_bundle
+                    .as_ref()
+                    .map_or(0, |b| crate::key_data::token_upper_bound(&b.context));
+                super::RSCLAW_RECALL_BUDGET.saturating_sub(used)
+            });
+            match (auto_recall_bundle, self.session_carryover(session_key, carry_budget)) {
                 (bundle, None) => bundle,
                 (Some(mut bundle), Some(carryover)) => {
                     bundle.context.push_str("\n\n");
