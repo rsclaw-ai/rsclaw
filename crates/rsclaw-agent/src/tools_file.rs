@@ -326,6 +326,42 @@ async fn ask_approval(
     }
 }
 
+/// Is `path` an Office document `read_office_text` can read?
+pub(crate) fn is_office_document(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    [".doc", ".xls", ".docx", ".xlsx", ".pptx"].iter().any(|ext| lower.ends_with(ext))
+}
+
+/// The text of an Office document (`.docx` / `.xlsx` / `.pptx`, and legacy
+/// `.doc` / `.xls` through whatever converter the system has). `None` when
+/// `path` isn't one.
+pub(crate) async fn read_office_text(path: &str, full: &std::path::Path) -> Result<Option<String>> {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".doc") || lower.ends_with(".xls") {
+        // Legacy binary Office: converted through what the system has
+        // (textutil, antiword, Word, LibreOffice...), off the async thread.
+        let file = full.to_path_buf();
+        let text = tokio::task::spawn_blocking(move || crate::doc::legacy_office_text(&file))
+            .await
+            .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?
+            .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
+        return Ok(Some(text));
+    }
+    if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
+        let bytes = read_regular_file_capped(full, MAX_LOCAL_BINARY_READ_BYTES)
+            .await
+            .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
+        if let Some(text) = rsclaw_channel::extract_office_text(path, &bytes) {
+            return Ok(Some(text));
+        }
+        anyhow::bail!(
+            "read `{}`: could not extract text — the file may be corrupt, password-protected, or not a real OOXML document. Verify with exec `file <path>`, or tell the user this file cannot be parsed.",
+            full.display()
+        );
+    }
+    Ok(None)
+}
+
 /// Whether `path` is under a directory approved for this session or earlier
 /// in this call.
 fn path_approved(session: &str, approved: &[std::path::PathBuf], path: &std::path::Path) -> bool {
@@ -1106,27 +1142,8 @@ impl super::runtime::AgentRuntime {
             };
             return Ok(json!({"content": content, "path": path}));
         }
-        if lower.ends_with(".doc") || lower.ends_with(".xls") {
-            // Legacy binary Office: converted through what the system has
-            // (textutil, antiword, Word, LibreOffice...), off the async thread.
-            let file = full.clone();
-            let text = tokio::task::spawn_blocking(move || crate::doc::legacy_office_text(&file))
-                .await
-                .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?
-                .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
+        if let Some(text) = read_office_text(path, &full).await? {
             return Ok(json!({"content": text, "path": path}));
-        }
-        if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
-            let bytes = read_regular_file_capped(&full, MAX_LOCAL_BINARY_READ_BYTES)
-                .await
-                .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
-            if let Some(text) = rsclaw_channel::extract_office_text(path, &bytes) {
-                return Ok(json!({"content": text, "path": path}));
-            }
-            anyhow::bail!(
-                "read `{}`: could not extract text — the file may be corrupt, password-protected, or not a real OOXML document. Verify with exec `file <path>`, or tell the user this file cannot be parsed.",
-                full.display()
-            );
         }
 
         // Regular files only (a FIFO would hang, `/dev/zero` would OOM), and

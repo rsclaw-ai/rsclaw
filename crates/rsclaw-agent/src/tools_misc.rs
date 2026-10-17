@@ -54,6 +54,12 @@ fn render_todo(items: &[TodoItem]) -> String {
         .join("\n")
 }
 
+/// PDF files start with `%PDF` within their first KiB (the spec tolerates
+/// junk before the header).
+fn looks_like_pdf(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(1024)].windows(4).any(|w| w == b"%PDF")
+}
+
 impl AgentRuntime {
     // -----------------------------------------------------------------------
     // TTS (text-to-speech)
@@ -674,6 +680,25 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
         )
         .await
         .map_err(|e| anyhow!("pdf: read failed: {e}"))?;
+        // Not a PDF at all (a model handed it a .docx): read an Office file
+        // the way read_file does instead of failing on the header, and say
+        // which tool fits next time.
+        if !looks_like_pdf(&pdf_bytes) {
+            let name = local_path.to_string_lossy();
+            if super::tools_file::is_office_document(&name) {
+                if let Some(text) = super::tools_file::read_office_text(&name, &local_path).await? {
+                    return Ok(json!({
+                        "path": path,
+                        "content": text,
+                        "note": "This is not a PDF but an Office document; it was read as one. Use read_file for Word / Excel / PowerPoint files."
+                    }));
+                }
+            }
+            return Ok(json!({
+                "error": format!("pdf: `{path}` is not a PDF file"),
+                "hint": "Use read_file for documents and text files, and ocr for images."
+            }));
+        }
         let text = match crate::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
             Ok(t) => t,
             Err(e) => {
@@ -1314,5 +1339,19 @@ mod todo_tests {
     #[test]
     fn todo_kv_key_is_namespaced() {
         assert_eq!(todo_kv_key("telegram:123"), "todo:telegram:123");
+    }
+}
+
+#[cfg(test)]
+mod pdf_header_tests {
+    use super::looks_like_pdf;
+
+    #[test]
+    fn pdf_header_tells_a_pdf_from_a_docx() {
+        assert!(looks_like_pdf(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj"));
+        assert!(looks_like_pdf(b"\xef\xbb\xbf\r\n%PDF-1.4"));
+        // A .docx is a zip.
+        assert!(!looks_like_pdf(b"PK\x03\x04\x14\x00\x06\x00"));
+        assert!(!looks_like_pdf(b""));
     }
 }
