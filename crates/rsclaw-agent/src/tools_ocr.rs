@@ -123,20 +123,47 @@ impl super::runtime::AgentRuntime {
 
         let request = OcrRequest { client, prompt, max_tokens, lang };
         let (text, note) = match reading {
-            Reading::Whole(payload) => (request.read(payload).await.map(|r| r.text), None),
+            Reading::Whole(payload) => {
+                let read = request.read(payload).await.map(|r| r.text);
+                let note = read.as_ref().ok().filter(|t| looping_text(t)).map(|_| {
+                    "The reading repeats itself; parts of it are likely invented. Don't rely on it."
+                        .to_owned()
+                });
+                (read, note)
+            }
             Reading::Strips(parts) => {
                 let count = parts.len();
-                let reads: Vec<_> = futures::stream::iter(parts.into_iter().map(|p| request.read(p)))
-                    .buffered(STRIPS_IN_FLIGHT)
-                    .collect()
-                    .await;
-                let text = reads
-                    .into_iter()
-                    .map(|r| r.map(|r| r.text))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(|t| t.join("\n"));
-                let note = (count > 1).then(|| format!("Read in {count} strips, top to bottom."));
-                (text, note)
+                // A strip is a third of a page: cap its reading so a model
+                // that loops can't run on for pages.
+                let strip_request = OcrRequest {
+                    max_tokens: request.max_tokens.or(Some(STRIP_MAX_TOKENS)),
+                    ..request.clone()
+                };
+                let reads: Vec<_> =
+                    futures::stream::iter(parts.into_iter().map(|p| strip_request.read(p)))
+                        .buffered(STRIPS_IN_FLIGHT)
+                        .collect()
+                        .await;
+                match reads.into_iter().collect::<Result<Vec<_>, _>>() {
+                    Ok(reads) => {
+                        let looping = reads.iter().filter(|r| looping_text(&r.text)).count();
+                        let text = reads
+                            .into_iter()
+                            .filter(|r| !looping_text(&r.text))
+                            .map(|r| r.text)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let mut note = (count > 1).then(|| format!("Read in {count} strips, top to bottom."));
+                        if looping > 0 {
+                            note = Some(format!(
+                                "{}{looping} strip(s) came back as a repeating loop and were left out; that part of the page may be unread.",
+                                note.map(|n| format!("{n} ")).unwrap_or_default()
+                            ));
+                        }
+                        (Ok(text), note)
+                    }
+                    Err(e) => (Err(e), None),
+                }
             }
             Reading::Rotations([turned_90, turned_270]) => {
                 let payloads = [turned_90.0, turned_90.1, turned_270.0, turned_270.1];
@@ -220,6 +247,30 @@ fn plan_reading(bytes: Vec<u8>, mime: String, plan_page: bool) -> Reading {
     }
 }
 
+/// Output cap for one strip when the caller set none.
+const STRIP_MAX_TOKENS: u32 = 2048;
+
+/// Whether a reading is mostly one sentence said over and over — what some
+/// OCR models produce for a blank or unreadable image ("The transcript is
+/// too blurry to be identified. The transcript is …").
+fn looping_text(text: &str) -> bool {
+    let sentences: Vec<&str> = text
+        .split(|c: char| matches!(c, '.' | '。' | '!' | '！' | '?' | '？' | '\n'))
+        .map(str::trim)
+        .filter(|s| s.chars().count() >= 8)
+        .collect();
+    if sentences.len() < 5 {
+        return false;
+    }
+    let mut counts = std::collections::HashMap::new();
+    for s in &sentences {
+        *counts.entry(*s).or_insert(0usize) += 1;
+    }
+    let top = counts.values().copied().max().unwrap_or(0);
+    top >= 5 && top * 2 >= sentences.len()
+}
+
+#[derive(Clone)]
 struct OcrRequest {
     client: std::sync::Arc<OcrClient>,
     prompt: Option<String>,
@@ -392,6 +443,17 @@ mod tests {
         assert!(!is_server_failure(
             "ocr request failed: HTTP status client error (413 Request Entity Too Large) for url (x)"
         ));
+    }
+
+    #[test]
+    fn ocr_spots_a_reading_that_loops() {
+        let blurry = "The transcript is too blurry to be identified. ".repeat(40);
+        assert!(looping_text(&blurry));
+        let summons = "武汉市汉阳区人民法院\n传票\n案号 （2026）鄂0105民初16393号\n案由 中介合同纠纷\n\
+            注意事项：\n1、被传唤人必须准时到达应到处所。\n2、本票由被传唤人携带来院报到。\n\
+            3、原告经传票传唤，无正当理由拒不到庭的，可以按撤诉处理。";
+        assert!(!looping_text(summons));
+        assert!(!looping_text("短。"));
     }
 
     #[test]

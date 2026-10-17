@@ -17,6 +17,8 @@ const MIN_STRIP_PAGE_HEIGHT: u32 = 1600;
 /// Strips about twice as wide as tall read as well as a cropped header.
 const STRIP_ASPECT: f64 = 0.5;
 const MAX_STRIPS: usize = 4;
+/// Share of a strip's pixels that must be ink for it to be read.
+const MIN_STRIP_INK: f64 = 0.002;
 /// A pixel is ink when its brightest channel is below this: black and dark
 /// grey text count, a red seal does not.
 const INK_MAX_CHANNEL: u8 = 110;
@@ -199,9 +201,18 @@ fn strips(img: &DynamicImage) -> Option<Vec<Vec<u8>>> {
         cuts.push(cut);
     }
     cuts.push(h as usize);
-    cuts.windows(2)
+    // A strip with next to no ink (the blank lower part of a short page) is
+    // left out: some OCR models answer a blank image with paragraphs of
+    // invented text.
+    let parts: Vec<Vec<u8>> = cuts
+        .windows(2)
+        .filter(|c| {
+            let ink: u64 = row_ink[c[0]..c[1]].iter().map(|&n| u64::from(n)).sum();
+            ink as f64 >= (c[1] - c[0]) as f64 * f64::from(w) * MIN_STRIP_INK
+        })
         .map(|c| encode(&img.crop_imm(0, c[0] as u32, w, (c[1] - c[0]) as u32)))
-        .collect()
+        .collect::<Option<_>>()?;
+    (!parts.is_empty()).then_some(parts)
 }
 
 /// Share of a turned page kept as its top part.
@@ -275,6 +286,19 @@ mod tests {
             top += strip.height();
         }
         assert_eq!(top, 2828);
+    }
+
+    #[test]
+    fn ocr_page_leaves_out_blank_strips() {
+        // Text only in the top third of a tall page.
+        let mut img = RgbImage::from_pixel(2000, 2828, Rgb([255, 255, 255]));
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            if (200..1800).contains(&x) && (100..900).contains(&y) && y % 100 < 40 {
+                *p = Rgb([20, 20, 20]);
+            }
+        }
+        let parts = strips(&DynamicImage::ImageRgb8(img)).expect("the inked strip is read");
+        assert_eq!(parts.len(), 1);
     }
 
     #[test]
