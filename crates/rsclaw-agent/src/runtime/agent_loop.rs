@@ -928,9 +928,11 @@ impl AgentRuntime {
                     });
                 let per_agent_ctx =
                     per_agent_entry.and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
-                let context_limit = per_agent_ctx
-                    .or(agents_live.defaults.context_tokens)
-                    .unwrap_or(128_000) as usize;
+                // Unset: the turn model's own window, capped at the default.
+                let context_limit = crate::model_resolution::effective_context_window(
+                    per_agent_ctx.or(agents_live.defaults.context_tokens).map(|v| v as usize),
+                    self.model_limits(&model),
+                );
                 (temperature, context_limit)
             };
 

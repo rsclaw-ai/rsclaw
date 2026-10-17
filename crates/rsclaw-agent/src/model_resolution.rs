@@ -376,3 +376,82 @@ pub fn vision_unavailable_message(reason: &str) -> String {
     let lang = rsclaw_i18n::default_lang();
     rsclaw_i18n::t_fmt("vision_unavailable", lang, &[("reason", reason)])
 }
+
+/// Context window assumed when nothing says otherwise. A model's own
+/// window only lowers it: a 1M-token model is not filled to 1M (every
+/// request would pay for it) unless `contextTokens` says so.
+pub const DEFAULT_CONTEXT_TOKENS: usize = 128_000;
+
+/// What a model can take in and put out, from its provider's model list
+/// (`models.providers.<p>.models[]`) or the built-in catalog. `None` where
+/// neither knows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelLimits {
+    pub context_window: Option<usize>,
+    pub max_output: Option<usize>,
+}
+
+/// Limits of `model` (`provider/id`).
+pub fn model_limits(models: Option<&rsclaw_config::schema::ModelsConfig>, model: &str) -> ModelLimits {
+    let (provider, id) = rsclaw_provider::registry::ProviderRegistry::parse_model(model);
+    let def = models
+        .and_then(|m| m.providers.get(provider))
+        .and_then(|p| p.models.as_ref())
+        .and_then(|ms| ms.iter().find(|m| m.id == id));
+    let builtin = rsclaw_provider::model_defaults::get_model_defaults(provider, id);
+    ModelLimits {
+        context_window: def
+            .and_then(|d| d.context_window)
+            .map(|v| v as usize)
+            .or(builtin.map(|b| b.context_window as usize))
+            .filter(|&v| v > 0),
+        max_output: def
+            .and_then(|d| d.max_tokens)
+            .map(|v| v as usize)
+            .or(builtin.map(|b| b.max_tokens as usize))
+            .filter(|&v| v > 0),
+    }
+}
+
+/// The context window to work with: `explicit` (`contextTokens`) when
+/// set, else the model's own window capped at [`DEFAULT_CONTEXT_TOKENS`].
+pub fn effective_context_window(explicit: Option<usize>, limits: ModelLimits) -> usize {
+    explicit.filter(|&v| v > 0).unwrap_or_else(|| {
+        limits
+            .context_window
+            .map_or(DEFAULT_CONTEXT_TOKENS, |w| w.min(DEFAULT_CONTEXT_TOKENS))
+    })
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::*;
+
+    #[test]
+    fn context_window_only_shrinks_without_explicit_config() {
+        let small = ModelLimits { context_window: Some(32_768), max_output: Some(4096) };
+        let huge = ModelLimits { context_window: Some(1_048_576), max_output: None };
+        assert_eq!(effective_context_window(None, small), 32_768);
+        assert_eq!(effective_context_window(None, huge), DEFAULT_CONTEXT_TOKENS);
+        assert_eq!(effective_context_window(None, ModelLimits::default()), DEFAULT_CONTEXT_TOKENS);
+        assert_eq!(effective_context_window(Some(500_000), huge), 500_000);
+        assert_eq!(effective_context_window(Some(0), small), 32_768);
+    }
+
+    #[test]
+    fn context_window_reads_provider_models_then_catalog() {
+        let models: rsclaw_config::schema::ModelsConfig = serde_json::from_value(serde_json::json!({
+            "providers": {"local": {"baseUrl": "http://x", "models": [
+                {"id": "tiny", "contextWindow": 8192, "maxTokens": 1024}
+            ]}}
+        }))
+        .unwrap();
+        assert_eq!(
+            model_limits(Some(&models), "local/tiny"),
+            ModelLimits { context_window: Some(8192), max_output: Some(1024) }
+        );
+        assert_eq!(model_limits(Some(&models), "local/other"), ModelLimits::default());
+        assert_eq!(model_limits(None, "deepseek/deepseek-v4-flash").context_window, Some(1_048_576));
+        assert_eq!(model_limits(None, "rsclaw/rsclaw-agent-v2"), ModelLimits::default());
+    }
+}

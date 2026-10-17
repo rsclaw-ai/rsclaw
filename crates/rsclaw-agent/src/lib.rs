@@ -11,6 +11,7 @@
 pub mod bootstrap;
 pub mod collaboration;
 pub mod compaction;
+pub mod compaction_profile;
 pub mod context_mgr;
 pub mod direct_apis;
 pub use rsclaw_doc as doc;

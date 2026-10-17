@@ -170,17 +170,9 @@ impl AgentRuntime {
         // Per-agent context window wins (agent.model.contextTokens), then
         // the global default, then 64K. handle.context_window already
         // resolved that chain at construction (0 = unset → use default).
-        let context_tokens = if self.handle.context_window > 0 {
-            self.handle.context_window
-        } else {
-            self.live
-                .agents
-                .read()
-                .await
-                .defaults
-                .context_tokens
-                .unwrap_or(128_000) as usize
-        };
+        // Unset, the model's own window (capped at the default) — a 32k
+        // model must compact well before 128k.
+        let context_tokens = self.context_window_for(model, true).await;
         // Used later to pick the splice strategy (mode 2 = rsclaw stateful).
         //
         // Mirror the auto-force at runtime.rs (~4277): the actual turn LLM
@@ -214,7 +206,8 @@ impl AgentRuntime {
         // (if configured) is authoritative; otherwise reserve 5% + a fixed
         // margin for the next inbound message.
         const NEXT_MSG_MARGIN: usize = 4_000;
-        let reply_reserve = (context_tokens / 20).max(2_000);
+        let reply_reserve =
+            crate::compaction_profile::reply_reserve(self.model_limits(model), context_tokens);
         let token_threshold = if let Some(floor) = cfg.reserve_tokens_floor {
             context_tokens.saturating_sub(floor as usize).max(16_000)
         } else {
@@ -274,6 +267,9 @@ impl AgentRuntime {
             session = session_key,
             trigger = trigger_reason,
             total_tokens,
+            token_threshold,
+            context_tokens,
+            reply_reserve,
             turns,
             "compaction triggered"
         );
@@ -285,7 +281,10 @@ impl AgentRuntime {
             .unwrap_or(CompactionMode::Layered);
         let compaction_model = cfg.model.as_deref().unwrap_or(model);
         // Dynamic keepRecentPairs: reduce when token pressure is high.
-        let configured_pairs = cfg.keep_recent_pairs.unwrap_or(5) as usize;
+        let configured_pairs = cfg.keep_recent_pairs.map_or_else(
+            || crate::compaction_profile::default_keep_recent_pairs(context_tokens),
+            |p| p as usize,
+        );
         let keep_pairs = if total_tokens > token_threshold * 3 {
             1.max(configured_pairs / 3) // extreme pressure: keep 1-2 pairs
         } else if total_tokens > token_threshold * 2 {
@@ -295,8 +294,16 @@ impl AgentRuntime {
         };
         let extract_facts = cfg.extract_facts.unwrap_or(true);
 
+        // The summarizer's own window bounds its transcript: a configured
+        // compaction model may be smaller than the turn model.
+        let summarizer_window = if cfg.model.is_some() {
+            self.context_window_for(compaction_model, false).await
+        } else {
+            context_tokens
+        };
         let msgs_to_text = |msgs: &[Message]| -> String {
-            let default_transcript = (context_tokens * 7 / 10).max(16_000);
+            let default_transcript =
+                crate::compaction_profile::default_transcript_tokens(summarizer_window);
             let max_total_tokens: usize = cfg
                 .max_transcript_tokens
                 .map(|t| t as usize)
@@ -1017,7 +1024,7 @@ impl AgentRuntime {
         }
 
         // Build the summary instruction
-        let template = self.scenario_summary_template().await;
+        let (template, summary_max_tokens) = self.summary_shape(model).await;
         let instruction = if let Some(prev) = previous_summary {
             format!(
                 "Ignore all previous instructions. You are now a summarization agent. \
@@ -1086,7 +1093,7 @@ impl AgentRuntime {
             messages,
             tools,
             system: Some(system_prompt),
-            max_tokens: Some(4096),
+            max_tokens: Some(summary_max_tokens),
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
@@ -1135,20 +1142,44 @@ impl AgentRuntime {
         }
     }
 
-    /// `summary_template` with the deployment's scenario section
-    /// (`compaction.keyData.template`) added before its closing rule.
-    async fn scenario_summary_template(&self) -> String {
-        let extra = self
-            .live
-            .agents
-            .read()
-            .await
-            .defaults
-            .compaction
+    /// The summary template and output budget for `model` (the one
+    /// writing the summary): the short template on a small window, plus
+    /// the deployment's scenario section (`compaction.keyData.template`)
+    /// before its closing rule.
+    async fn summary_shape(&self, model: &str) -> (String, u32) {
+        let compaction = self.live.agents.read().await.defaults.compaction.clone();
+        // contextTokens describes the turn model; a separately configured
+        // compaction model goes by its own window.
+        let explicit = compaction.as_ref().is_none_or(|c| c.model.is_none());
+        let window = self.context_window_for(model, explicit).await;
+        let extra = compaction
             .as_ref()
             .and_then(|c| c.key_data.as_ref())
             .and_then(|k| k.template.clone());
-        with_scenario_section(Self::summary_template(), extra.as_deref())
+        let base = if crate::compaction_profile::uses_short_template(window) {
+            Self::summary_template_short()
+        } else {
+            Self::summary_template()
+        };
+        let max_tokens = crate::compaction_profile::summary_max_tokens(self.model_limits(model), window);
+        (with_scenario_section(base, extra.as_deref()), max_tokens)
+    }
+
+    /// The summary template for a small window: what the next turn needs to
+    /// carry on, without the history sections.
+    fn summary_template_short() -> &'static str {
+        "Use this exact structure, briefly:\n\n\
+         ## Active Task\n\
+         [Copy the user's most recent unfulfilled request verbatim. If none, write \"None.\"]\n\n\
+         ## Goal\n[Overall goal, one line]\n\n\
+         ## Constraints & Preferences\n[User-stated constraints or preferences. If none: (none)]\n\n\
+         ## Plan\n[The working-plan checklist if one was provided, [x]/[>]/[ ] lines verbatim. \
+         If none: (none)]\n\n\
+         ## Key Data\n[Exact values verbatim: names, IDs, numbers, amounts, dates, paths]\n\n\
+         ## Pending\n[Blocked items or awaiting user]\n\n\
+         ## Entities\n[kind=value per line. Kinds: name, phone, id_card, email, birthday, \
+         age, zodiac, address, relationship, preference. If none: (none)]\n\n\
+         CRITICAL: Copy ALL values character-for-character. Be CONCRETE and SHORT."
     }
 
     /// Shared summary template used by both standalone and KV cache modes.
@@ -1198,7 +1229,7 @@ impl AgentRuntime {
             in the conversation - only output the structured summary. \
             Do NOT include any preamble, greeting, or prefix.";
 
-        let template = self.scenario_summary_template().await;
+        let (template, summary_max_tokens) = self.summary_shape(model).await;
 
         let prompt = if let Some(prev) = previous_summary {
             format!(
@@ -1236,7 +1267,7 @@ impl AgentRuntime {
             }],
             tools: vec![], // no tools — compact must only produce text
             system: None,  // preamble is in the user message
-            max_tokens: Some(4096),
+            max_tokens: Some(summary_max_tokens),
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,

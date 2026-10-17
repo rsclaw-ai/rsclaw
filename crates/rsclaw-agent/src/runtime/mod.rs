@@ -1921,6 +1921,25 @@ impl AgentRuntime {
 
     /// If the key has an alias, returns the canonical (old) key so all data
     /// stays under one key. Otherwise returns the key unchanged.
+    /// The context window `model` works with: `contextTokens` (per agent,
+    /// then defaults) when set, else the model's own window capped at the
+    /// default. `explicit` = false ignores `contextTokens` (a separately
+    /// configured compaction model).
+    pub(crate) async fn context_window_for(&self, model: &str, explicit: bool) -> usize {
+        let configured = if !explicit {
+            None
+        } else if self.handle.context_window > 0 {
+            Some(self.handle.context_window)
+        } else {
+            self.live.agents.read().await.defaults.context_tokens.map(|v| v as usize)
+        };
+        crate::model_resolution::effective_context_window(configured, self.model_limits(model))
+    }
+
+    pub(crate) fn model_limits(&self, model: &str) -> crate::model_resolution::ModelLimits {
+        crate::model_resolution::model_limits(self.config.model.models.as_ref(), model)
+    }
+
     /// Key-data kinds and ledger size for this deployment
     /// (`compaction.keyData`).
     pub(crate) async fn key_data_settings(&self) -> (Vec<String>, usize) {
