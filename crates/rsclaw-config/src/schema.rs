@@ -2826,6 +2826,12 @@ pub struct KbOcrConfig {
     /// Optional language hint ("zh"/"en"/…); omitted → endpoint auto-detects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// Instruction sent with every image unless the caller gives its own.
+    /// Unset, the endpoint picks one. Models differ: PaddleOCR-VL only
+    /// knows its task prompts ("OCR:", "Table Recognition:"), and a long
+    /// free-form instruction makes it drop table values and invent text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     /// Kill-switch without deleting the block. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,

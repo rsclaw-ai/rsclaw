@@ -24,6 +24,7 @@ pub struct OcrClient {
     model: Option<String>,
     api_key: Option<String>,
     lang: Option<String>,
+    prompt: Option<String>,
 }
 
 impl OcrClient {
@@ -70,6 +71,7 @@ impl OcrClient {
             model: oc.model,
             api_key,
             lang: oc.lang,
+            prompt: oc.prompt.filter(|p| !p.trim().is_empty()),
         }))
     }
 
@@ -110,7 +112,7 @@ impl OcrClient {
     ) -> Result<String> {
         let body = ocr_request_body(
             image,
-            prompt,
+            prompt.or(self.prompt.as_deref()),
             max_tokens,
             model.or(self.model.as_deref()),
             lang.or(self.lang.as_deref()),
