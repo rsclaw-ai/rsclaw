@@ -636,11 +636,21 @@ impl LlmProvider for RsclawProvider {
                     None => {
                         self.forget(&session_key);
                         let history = history_for_replay(&req.messages);
+                        let path = if history.is_empty() { "open" } else { "replay" };
                         let resp = if history.is_empty() {
                             self.open(&split).await?
                         } else {
                             self.replay(&split, history).await?
                         };
+                        // The server's id names the node serving the
+                        // session (rs_<host>_<random>): what to quote when a
+                        // fleet problem needs chasing.
+                        tracing::info!(
+                            session = %session_key,
+                            server_session = %resp.session_id,
+                            path,
+                            "rsclaw session started"
+                        );
                         let entry = SessionEntry {
                             session_id: resp.session_id.clone(),
                             // Cache key MUST be the request value, not the
@@ -718,6 +728,12 @@ impl LlmProvider for RsclawProvider {
                     self.forget(&session_key);
                     let replay_history = history_for_replay(&req.messages);
                     let replayed = self.replay(&split, replay_history).await?;
+                    tracing::info!(
+                        session = %session_key,
+                        server_session = %replayed.session_id,
+                        path = "replay",
+                        "rsclaw session started"
+                    );
                     let entry = SessionEntry {
                         session_id: replayed.session_id.clone(),
                         // Same rationale as the open/replay path above:
