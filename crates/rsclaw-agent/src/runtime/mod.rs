@@ -558,6 +558,29 @@ pub struct RunContext {
     pub turn_ctx: super::registry::TurnContext,
 }
 
+/// How long a context limit learned from a backend's refusals is trusted.
+const LEARNED_LIMIT_TTL_SECS: u64 = 7 * 24 * 3600;
+/// Never learn a limit below this: a refusal of a tiny request is not about size.
+const MIN_LEARNED_LIMIT: usize = 16_000;
+
+fn learned_limit_key(model: &str) -> String {
+    format!("ctx_limit:{model}")
+}
+
+/// "limit:unix-seconds" as stored, while still fresh at `now`.
+fn parse_learned_limit(raw: &str, now: u64) -> Option<usize> {
+    let (limit, at) = raw.split_once(':')?;
+    let fresh = now.saturating_sub(at.parse().ok()?) < LEARNED_LIMIT_TTL_SECS;
+    fresh.then(|| limit.parse().ok()).flatten()
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// A tool call as one short line: its name and the argument that says what
 /// it worked on (a path, a command, a query), if any.
 pub(crate) fn step_line(tool: &str, args_json: &str) -> String {
@@ -2014,6 +2037,28 @@ impl AgentRuntime {
         crate::model_resolution::model_limits(self.config.model.models.as_ref(), model)
     }
 
+    /// The context size `model`'s backend turned a request away at, learned
+    /// from its "context exceeded" errors in the last week (a backend may
+    /// cap sessions well below the model's window).
+    pub(crate) fn learned_context_limit(&self, model: &str) -> Option<usize> {
+        let raw = self.store.db.kv_get(&learned_limit_key(model)).ok().flatten()?;
+        parse_learned_limit(&raw, now_unix())
+    }
+
+    /// Records that `model`'s backend refused a request of about
+    /// `rejected_tokens` (same estimate as the pre-flight check), so later
+    /// requests compact and shrink below it instead of being refused.
+    pub(crate) fn learn_context_limit(&self, model: &str, rejected_tokens: usize) {
+        let limit = (rejected_tokens * 9 / 10).max(MIN_LEARNED_LIMIT);
+        if self.learned_context_limit(model).is_some_and(|known| known <= limit) {
+            return;
+        }
+        tracing::warn!(model, rejected_tokens, limit, "context limit learned from the backend");
+        if let Err(e) = self.store.db.kv_set(&learned_limit_key(model), &format!("{limit}:{}", now_unix())) {
+            tracing::warn!(model, "failed to store learned context limit: {e:#}");
+        }
+    }
+
     /// Key-data kinds and ledger size for this deployment
     /// (`compaction.keyData`).
     pub(crate) async fn key_data_settings(&self) -> (Vec<String>, usize) {
@@ -3157,6 +3202,23 @@ pub(crate) fn resolve_thinking_budget(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod learned_limit_tests {
+    #[test]
+    fn a_learned_limit_expires_after_a_week() {
+        let at = 1_790_000_000u64;
+        assert_eq!(super::parse_learned_limit(&format!("70000:{at}"), at + 3600), Some(70_000));
+        assert_eq!(super::parse_learned_limit(&format!("70000:{at}"), at + 8 * 24 * 3600), None);
+        assert_eq!(super::parse_learned_limit("garbage", at), None);
+    }
+
+    #[test]
+    fn learned_limit_key_is_per_model() {
+        assert_eq!(super::learned_limit_key("rsclaw/rsclaw-agent-v2"), "ctx_limit:rsclaw/rsclaw-agent-v2");
+        assert_ne!(super::learned_limit_key("a/x"), super::learned_limit_key("a/y"));
+    }
+}
 
 #[cfg(test)]
 mod failed_turn_tests {

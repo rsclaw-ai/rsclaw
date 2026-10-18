@@ -937,6 +937,11 @@ impl AgentRuntime {
                     per_agent_ctx.or(agents_live.defaults.context_tokens).map(|v| v as usize),
                     self.model_limits(&model),
                 );
+                // A backend that refused requests below that (a per-session
+                // cap) sets the real limit.
+                let context_limit = self
+                    .learned_context_limit(&model)
+                    .map_or(context_limit, |learned| context_limit.min(learned));
                 (temperature, context_limit)
             };
 
@@ -1175,6 +1180,7 @@ impl AgentRuntime {
                         == rsclaw_provider::health::ErrorKind::ContextExceeded =>
                 {
                     warn!(session = %ctx.session_key, error = %e, "session context exceeded; compacting and retrying once");
+                    self.learn_context_limit(&model, total_est);
                     let before = self.session_token_sum(&ctx.session_key);
                     self.compact_inner(&ctx.session_key, &model, true).await;
                     if self.session_token_sum(&ctx.session_key) >= before {
