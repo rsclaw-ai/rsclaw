@@ -54,7 +54,8 @@ impl super::runtime::AgentRuntime {
         ctx: &super::runtime::RunContext,
         args: Value,
     ) -> Result<Value> {
-        let image = args["image"].as_str().unwrap_or("").trim();
+        // "case.pdf#pages=3-5" picks pages of a PDF (see `split_page_spec`).
+        let (image, path_pages) = split_page_spec(args["image"].as_str().unwrap_or("").trim());
         if image.is_empty() {
             return Ok(json!({
                 "error": "ocr: `image` is required",
@@ -136,7 +137,7 @@ impl super::runtime::AgentRuntime {
         let request = OcrRequest { client, prompt, max_tokens, lang };
         // A PDF handed to ocr: every page, read like the pdf tool reads it.
         if let Reading::Pdf(pdf) = reading {
-            return Ok(read_pdf(image, pdf, args["pages"].as_str(), Some(request)).await);
+            return Ok(read_pdf(image, pdf, args["pages"].as_str().or(path_pages), Some(request)).await);
         }
         let (text, note) = read_reading(&request, reading).await;
 
@@ -172,7 +173,7 @@ fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
 /// One image's text, the way it was planned (whole, strips, or both ways
 /// up for a sideways page), with a note for the model when it helps.
 async fn read_reading(request: &OcrRequest, reading: Reading) -> (std::result::Result<String, String>, Option<String>) {
-    match reading {
+    let (read, note) = match reading {
         Reading::Whole(payload) => {
             let read = request.read(payload).await.map(|r| r.text);
             let note = read.as_ref().ok().filter(|t| looping_text(t)).map(|_| {
@@ -236,11 +237,76 @@ async fn read_reading(request: &OcrRequest, reading: Reading) -> (std::result::R
             (Ok(text), Some(note))
         }
         Reading::Pdf(_) => (Err("ocr: a PDF is read page by page, not as one image".to_owned()), None),
+    };
+    match read.as_deref().ok().and_then(cut_runaway) {
+        Some(cut) => {
+            let warning = "Part of the reading ran away into one repeated character or phrase; that run was cut to \"…\" and what it covered (often a number or a table cell) may be unread.";
+            let note = Some(match note {
+                Some(n) => format!("{n} {warning}"),
+                None => warning.to_owned(),
+            });
+            (Ok(cut), note)
+        }
+        None => (read, note),
     }
+}
+
+/// Shortest run, in characters, that counts as a runaway.
+const RUNAWAY_CHARS: usize = 64;
+
+/// The text with every runaway (one character or a phrase of up to eight
+/// repeated for `RUNAWAY_CHARS` or more, as when a model gets stuck on
+/// "0000…") cut to three copies and "…", or `None` when there is none.
+/// Rule lines and blank fields (`---`, `|---|`, `____`) are left alone.
+fn cut_runaway(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut cut = false;
+    let mut i = 0;
+    'scan: while i < chars.len() {
+        for period in 1..=8 {
+            let unit = match chars.get(i..i + period) {
+                Some(unit) => unit,
+                None => break,
+            };
+            if unit.iter().all(|c| c.is_whitespace() || "-|:=_.·…—".contains(*c)) {
+                continue;
+            }
+            let mut repeats = 1;
+            while chars.get(i + repeats * period..i + (repeats + 1) * period) == Some(unit) {
+                repeats += 1;
+            }
+            if repeats * period >= RUNAWAY_CHARS {
+                for _ in 0..3 {
+                    out.extend(unit);
+                }
+                out.push('…');
+                i += repeats * period;
+                cut = true;
+                continue 'scan;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    cut.then_some(out)
 }
 
 /// Pages one pdf / ocr call reads by OCR; the rest are named for a follow-up.
 const MAX_OCR_PAGES: usize = 30;
+
+/// Splits a page selection off a PDF path: "case.pdf#pages=3-5,8" or
+/// "case.pdf#page=4" (the PDF open-parameter convention). The pdf tool's
+/// schema has only `path`, so this is how a model reads part of a long file.
+pub(crate) fn split_page_spec(path: &str) -> (&str, Option<&str>) {
+    if let Some((file, fragment)) = path.rsplit_once('#') {
+        let spec = fragment.strip_prefix("pages=").or_else(|| fragment.strip_prefix("page="));
+        if let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) {
+            return (file.trim_end(), Some(spec));
+        }
+    }
+    (path, None)
+}
 
 /// Reads a PDF: each page's text layer, and pages without one (scans)
 /// rendered in pure Rust and read by OCR. `pages` ("1-5,8", 1-based)
@@ -338,9 +404,9 @@ pub(crate) async fn read_pdf(
     }
     if !later.is_empty() {
         notes.push(format!(
-            "Scanned page(s) {} were not read in this call ({MAX_OCR_PAGES} at most): call pdf again with pages \"{}\".",
+            "Scanned page(s) {} were not read in this call ({MAX_OCR_PAGES} at most): call pdf again with path \"{path}#pages={}\".",
             page_list(&later),
-            page_list(&later)
+            page_list(&later).replace(' ', "")
         ));
     }
     if request.is_none() && !scans.is_empty() {
@@ -368,7 +434,7 @@ pub(crate) async fn read_pdf(
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}...\n[truncated at 100000 chars; read fewer pages with \"pages\"]", &text[..end])
+        format!("{}...\n[truncated at 100000 chars; read fewer pages with a path like \"{path}#pages=1-5\"]", &text[..end])
     } else {
         text
     };
@@ -701,6 +767,10 @@ mod tests {
     #[test]
     fn ocr_pages_parse_and_print() {
         assert_eq!(parse_pages("1-3, 8", 10), vec![0, 1, 2, 7]);
+        assert_eq!(split_page_spec("汉阳安和/证据.pdf#pages=31-60"), ("汉阳安和/证据.pdf", Some("31-60")));
+        assert_eq!(split_page_spec("a.pdf#page=4"), ("a.pdf", Some("4")));
+        assert_eq!(split_page_spec("https://x.cn/a.pdf#top"), ("https://x.cn/a.pdf#top", None));
+        assert_eq!(split_page_spec("a.pdf"), ("a.pdf", None));
         assert_eq!(parse_pages("9-20", 10), vec![8, 9]);
         assert_eq!(parse_pages("0,x,5", 4), Vec::<usize>::new());
         assert_eq!(page_list(&[0, 1, 2, 7, 9, 10]), "1-3,8,10-11");
@@ -715,6 +785,18 @@ mod tests {
             3、原告经传票传唤，无正当理由拒不到庭的，可以按撤诉处理。";
         assert!(!looping_text(summons));
         assert!(!looping_text("短。"));
+    }
+
+    #[test]
+    fn cut_runaway_trims_stuck_runs_only() {
+        let receipt = format!("事由 1{}\n\n收款单位 武汉安和", "0".repeat(1990));
+        let cut = cut_runaway(&receipt).unwrap();
+        assert_eq!(cut, "事由 1000…\n\n收款单位 武汉安和");
+        let phrase = format!("金额：{}元", "壹佰".repeat(40));
+        assert_eq!(cut_runaway(&phrase).unwrap(), "金额：壹佰壹佰壹佰…元");
+        // Amounts, rule lines and blank fields stay as they are.
+        assert!(cut_runaway("人民币 1000000.00 元").is_none());
+        assert!(cut_runaway(&format!("|{}|\n签名：{}", "-".repeat(120), "_".repeat(80))).is_none());
     }
 
     #[test]

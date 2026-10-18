@@ -633,10 +633,13 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
     }
 
     pub(crate) async fn tool_pdf(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let path = args["path"]
-            .as_str()
-            .ok_or_else(|| anyhow!("pdf: `path` required"))?
-            .trim();
+        // "case.pdf#pages=31-60" reads part of a long PDF.
+        let (path, path_pages) = super::tools_ocr::split_page_spec(
+            args["path"]
+                .as_str()
+                .ok_or_else(|| anyhow!("pdf: `path` required"))?
+                .trim(),
+        );
 
         // If URL, download (SSRF-checked, size-bounded) into a private,
         // uniquely named temp file that is removed when this call returns.
@@ -705,7 +708,7 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
         Ok(super::tools_ocr::read_pdf(
             path,
             pdf_bytes,
-            args["pages"].as_str(),
+            args["pages"].as_str().or(path_pages),
             super::tools_ocr::OcrRequest::from_config(),
         )
         .await)
