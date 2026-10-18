@@ -1066,6 +1066,7 @@ impl AgentRuntime {
                             turn_metrics: crate::turn_metrics::TurnMetrics::new(),
                             user_text: String::new(),
                             full_trace: None,
+                            steps: Vec::new(),
                             turn_ctx: crate::registry::TurnContext::default(),
                         },
                         "",
@@ -2553,6 +2554,7 @@ impl AgentRuntime {
             turn_metrics: crate::turn_metrics::TurnMetrics::new(),
             user_text: text.to_owned(),
             full_trace: init_full_trace(text),
+            steps: Vec::new(),
             turn_ctx,
         };
 
@@ -2576,18 +2578,48 @@ impl AgentRuntime {
             extra_tools,
             abort_flag.clone(),
         );
-        let reply = if daemon_mode {
+        let outcome = if daemon_mode {
             // No turn timeout for daemon agents — they loop indefinitely.
-            agent_loop_fut.await?
+            agent_loop_fut.await
         } else {
             time::timeout(Duration::from_secs(timeout_secs), agent_loop_fut)
                 .await
-                .map_err(|_| {
-                    anyhow!(
+                .unwrap_or_else(|_| {
+                    Err(anyhow!(
                         "agent `{}` turn timed out after {timeout_secs}s",
                         self.handle.id
-                    )
-                })??
+                    ))
+                })
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(e) => {
+                // Only the user message was persisted so far: leave a note
+                // with the steps done, or a reload shows the question alone
+                // and "继续" starts from nothing.
+                if !is_internal_session(session_key) {
+                    let note = Message {
+                        role: Role::Assistant,
+                        content: MessageContent::Text(super::failed_turn_note(
+                            text,
+                            &format!("{e:#}"),
+                            &ctx.steps,
+                        )),
+                        rsclaw_hidden: None,
+                    };
+                    if let Err(err) = self
+                        .store
+                        .db
+                        .append_message(session_key, &serde_json::to_value(&note).unwrap_or_default())
+                    {
+                        tracing::warn!("failed to persist failed-turn note: {err:#}");
+                    }
+                    if let Some(sess) = self.sessions.get_mut(session_key) {
+                        sess.push(note);
+                    }
+                }
+                return Err(e);
+            }
         };
 
         // Update live status: turn finished.

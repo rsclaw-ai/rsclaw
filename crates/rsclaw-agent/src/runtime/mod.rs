@@ -547,12 +547,72 @@ pub struct RunContext {
     /// `RSCLAW_CAPTURE_TRACES=1`; flushed to the JSONL path in
     /// `RSCLAW_TRACES_PATH` on normal turn completion.
     pub full_trace: Option<super::trace_capture::FullTrace>,
+    /// One line per tool call this turn ("read_file 汉阳安和/起诉状.pdf"),
+    /// so a turn that fails still leaves a record of what it did.
+    pub steps: Vec<String>,
     /// Per-turn observability/control wires for A2A callers
     /// (cancel_token, event_tx, input_request_tx, task/context ids).
     /// Default-constructed for non-A2A turns; `agent_loop` polls
     /// `is_cancelled()` between iterations and at tool-dispatch
     /// boundaries, and calls `emit_working()` before each tool.
     pub turn_ctx: super::registry::TurnContext,
+}
+
+/// A tool call as one short line: its name and the argument that says what
+/// it worked on (a path, a command, a query), if any.
+pub(crate) fn step_line(tool: &str, args_json: &str) -> String {
+    let args: Value = serde_json::from_str(args_json).unwrap_or(Value::Null);
+    let target = ["path", "file_path", "image", "url", "command", "query", "pattern", "action"]
+        .iter()
+        .find_map(|k| args[*k].as_str().map(str::trim).filter(|s| !s.is_empty()));
+    match target {
+        Some(target) => {
+            let target = target.replace('\n', " ");
+            let short = rsclaw_util::truncate_str(&target, 120);
+            let ellipsis = if short.len() < target.len() { "…" } else { "" };
+            format!("{tool} {short}{ellipsis}")
+        }
+        None => tool.to_owned(),
+    }
+}
+
+/// The note a failed turn leaves in the session: why it stopped and the
+/// steps it got through, so the user sees them after a reload and the next
+/// turn ("继续") knows where to pick up. The raw error stays in the log.
+pub(crate) fn failed_turn_note(user_text: &str, error: &str, steps: &[String]) -> String {
+    const SHOWN: usize = 30;
+    let chinese = user_text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+    let reason = if error.contains("turn aborted") || error.contains("canceled") {
+        ("已手动停止", "stopped by the user")
+    } else if error.contains("timed out") {
+        ("运行超时", "it ran out of time")
+    } else if error.contains("session_ctx_exceeded") || error.contains("context") {
+        ("模型上下文已满", "the model's context filled up")
+    } else {
+        ("模型服务出错", "the model service failed")
+    };
+    let skipped = steps.len().saturating_sub(SHOWN);
+    let mut lines: Vec<String> = Vec::new();
+    if skipped > 0 {
+        lines.push(if chinese { format!("…（前 {skipped} 步略）") } else { format!("… ({skipped} earlier steps)") });
+    }
+    lines.extend(steps[skipped..].iter().enumerate().map(|(i, s)| format!("{}. {s}", skipped + i + 1)));
+    match (chinese, steps.is_empty()) {
+        (true, true) => format!("⚠️ 这一轮没有完成（{}），还没有执行任何步骤。可以重新发送。", reason.0),
+        (true, false) => format!(
+            "⚠️ 这一轮没有完成（{}）。已完成的 {} 步：\n{}\n\n回复「继续」可以接着做。",
+            reason.0,
+            steps.len(),
+            lines.join("\n")
+        ),
+        (false, true) => format!("⚠️ This turn did not finish ({}) before any step ran. Send it again.", reason.1),
+        (false, false) => format!(
+            "⚠️ This turn did not finish ({}). The {} steps done:\n{}\n\nReply \"continue\" to pick up from here.",
+            reason.1,
+            steps.len(),
+            lines.join("\n")
+        ),
+    }
 }
 
 fn init_full_trace(user_text: &str) -> Option<super::trace_capture::FullTrace> {
@@ -3088,6 +3148,24 @@ pub(crate) fn resolve_thinking_budget(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod failed_turn_tests {
+    use super::{failed_turn_note, step_line};
+
+    #[test]
+    fn a_failed_turn_lists_its_steps() {
+        assert_eq!(step_line("read_file", r#"{"path":"汉阳安和/起诉状.pdf"}"#), "read_file 汉阳安和/起诉状.pdf");
+        assert_eq!(step_line("todo", r#"{"items":[]}"#), "todo");
+        let steps: Vec<String> = (1..=33).map(|i| format!("read_file {i}.pdf")).collect();
+        let note = failed_turn_note("写个答辩状", "rsclaw turn failed 413: session_ctx_exceeded", &steps);
+        assert!(note.starts_with("⚠️ 这一轮没有完成（模型上下文已满）。已完成的 33 步"), "{note}");
+        assert!(note.contains("…（前 3 步略）\n4. read_file 4.pdf"), "{note}");
+        assert!(note.ends_with("回复「继续」可以接着做。"), "{note}");
+        let note = failed_turn_note("draft it", "agent `main` turn timed out after 1800s", &[]);
+        assert!(note.contains("ran out of time") && note.contains("Send it again"), "{note}");
+    }
+}
 
 #[cfg(test)]
 mod format_artifact_read_tests {
