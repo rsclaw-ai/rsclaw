@@ -581,6 +581,17 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// The name a run of repeated calls is counted under. Every plugin tool
+/// arrives as `plugin_invoke`, so driving a page through a plugin (click,
+/// look, fill, look again) would read as one tool called over and over;
+/// it is counted by the plugin tool named inside instead.
+pub(crate) fn streak_name(tool: &str, input: &Value) -> String {
+    match (tool, input["plugin"].as_str(), input["tool"].as_str()) {
+        ("plugin_invoke", Some(plugin), Some(inner)) => format!("plugin_invoke:{}/{}", plugin.trim(), inner.trim()),
+        _ => tool.to_owned(),
+    }
+}
+
 /// A tool call as one short line: its name and the argument that says what
 /// it worked on (a path, a command, a query), if any.
 pub(crate) fn step_line(tool: &str, args_json: &str) -> String {
@@ -3217,6 +3228,26 @@ mod learned_limit_tests {
     fn learned_limit_key_is_per_model() {
         assert_eq!(super::learned_limit_key("rsclaw/rsclaw-agent-v2"), "ctx_limit:rsclaw/rsclaw-agent-v2");
         assert_ne!(super::learned_limit_key("a/x"), super::learned_limit_key("a/y"));
+    }
+}
+
+#[cfg(test)]
+mod streak_name_tests {
+    use super::streak_name;
+    use serde_json::json;
+
+    #[test]
+    fn plugin_tools_are_counted_apart() {
+        let click = json!({"plugin": "lvsi", "tool": "click_element", "arguments": {"text": "下一步"}});
+        let look = json!({"plugin": "lvsi", "tool": "inspect_page", "arguments": {}});
+        assert_eq!(streak_name("plugin_invoke", &click), "plugin_invoke:lvsi/click_element");
+        assert_ne!(streak_name("plugin_invoke", &click), streak_name("plugin_invoke", &look));
+    }
+
+    #[test]
+    fn other_tools_keep_their_name() {
+        assert_eq!(streak_name("read_artifact", &json!({"mode": "head"})), "read_artifact");
+        assert_eq!(streak_name("plugin_invoke", &json!({"plugin": "lvsi"})), "plugin_invoke");
     }
 }
 

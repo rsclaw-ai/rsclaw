@@ -2431,12 +2431,18 @@ impl AgentRuntime {
                 // same_call_streak (args differ) and the stagnation budget (each
                 // result is "new"), so deplete the budget hard past the
                 // threshold to force the wrap-up prompt instead of spinning.
-                let name_limit = if matches!(tool_name.as_str(), "shell" | "execute_command" | "exec") {
+                // A plugin tool such as fill_field runs once per form field,
+                // so it gets the longer run that shell gets.
+                let name_limit = if matches!(
+                    tool_name.as_str(),
+                    "shell" | "execute_command" | "exec" | "plugin_invoke"
+                ) {
                     MAX_SAME_NAME_STREAK_SHELL
                 } else {
                     MAX_SAME_NAME_STREAK
                 };
-                if tool_name == last_tool_name_only {
+                let streak_name = super::streak_name(&tool_name, &tool_input);
+                if streak_name == last_tool_name_only {
                     same_name_streak += 1;
                     if same_name_streak > name_limit {
                         budget -= 4;
@@ -2449,7 +2455,7 @@ impl AgentRuntime {
                         );
                     }
                 } else {
-                    last_tool_name_only = tool_name.clone();
+                    last_tool_name_only = streak_name;
                     same_name_streak = 1;
                 }
 
