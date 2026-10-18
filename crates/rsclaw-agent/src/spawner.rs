@@ -347,6 +347,98 @@ pub struct AgentSpawner {
 /// gateway, which owns the task queue.
 pub type GoalContinuationFn = Arc<dyn Fn(&str, &str, &str, &str) + Send + Sync>;
 
+/// How many lanes (runtimes) an agent runs turns on: one per permit of its
+/// concurrency limit (`agents.defaults.maxConcurrent`, default 4).
+pub fn lane_count(handle: &AgentHandle) -> usize {
+    handle.concurrency.available_permits().clamp(1, 16)
+}
+
+/// The lane a session's turns run on. The same key always maps to the same
+/// lane, so a session's turns stay in order on one runtime.
+fn lane_for(session_key: &str, lanes: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_key.hash(&mut hasher);
+    (hasher.finish() % lanes as u64) as usize
+}
+
+/// Runs an agent's turns on `lanes`, one runtime each. A message goes to the
+/// lane its session (alias resolved) hashes to: one session's turns run in
+/// order and keep their in-memory history on one runtime, while a long turn
+/// in one session no longer holds up every other session of the agent.
+/// `cancel_mid_turn` drops an in-flight turn when the agent's lifetime ends
+/// (hot-replaced agents); otherwise the turn finishes first.
+pub fn spawn_lanes(
+    handle: Arc<AgentHandle>,
+    mut rx: mpsc::Receiver<AgentMessage>,
+    lanes: Vec<AgentRuntime>,
+    goal_continuation: Option<GoalContinuationFn>,
+    cancel_mid_turn: bool,
+    started_msg: &'static str,
+) {
+    let aliases = lanes
+        .first()
+        .and_then(|rt| rt.store.db.load_all_aliases().ok())
+        .unwrap_or_default();
+    let mut senders = Vec::with_capacity(lanes.len());
+    for (lane, mut runtime) in lanes.into_iter().enumerate() {
+        let (tx, mut lane_rx) = mpsc::channel::<AgentMessage>(32);
+        senders.push(tx);
+        let handle = Arc::clone(&handle);
+        let goal_continuation = goal_continuation.clone();
+        tokio::spawn(async move {
+            loop {
+                let msg = tokio::select! {
+                    _ = handle.lifetime.cancelled() => break,
+                    msg = lane_rx.recv() => match msg {
+                        Some(m) => m,
+                        None => break,
+                    },
+                };
+                if cancel_mid_turn {
+                    tokio::select! {
+                        _ = process_queued_message(&mut runtime, msg, goal_continuation.as_ref()) => {}
+                        _ = handle.lifetime.cancelled() => {
+                            info!(agent_id = %handle.id, lane, "agent lifetime cancelled mid-turn");
+                            break;
+                        }
+                    }
+                } else {
+                    process_queued_message(&mut runtime, msg, goal_continuation.as_ref()).await;
+                }
+            }
+        });
+    }
+    tokio::spawn(async move {
+        info!(agent_id = %handle.id, lanes = senders.len(), "{started_msg}");
+        loop {
+            let msg = tokio::select! {
+                _ = handle.lifetime.cancelled() => {
+                    info!(agent_id = %handle.id, "agent lifetime cancelled, stopping");
+                    break;
+                }
+                msg = rx.recv() => match msg {
+                    Some(m) => m,
+                    None => break,
+                },
+            };
+            let key = aliases.get(&msg.session_key).unwrap_or(&msg.session_key);
+            let lane = lane_for(key, senders.len());
+            info!(
+                agent_id = %handle.id,
+                session_key = %msg.session_key,
+                channel = %msg.channel,
+                lane,
+                "agent runtime: received msg from queue"
+            );
+            if senders[lane].send(msg).await.is_err() {
+                break;
+            }
+        }
+        info!(agent_id = %handle.id, "agent task ended (channel closed)");
+    });
+}
+
 /// Gateway-level plumbing that `AgentRuntime::new` does not take but every
 /// agent worker needs. Boot-time agents get it directly from gateway startup;
 /// dynamically spawned and hot-replaced agents get the same values through
@@ -575,7 +667,7 @@ impl AgentSpawner {
     fn start_worker(
         &self,
         handle: Arc<AgentHandle>,
-        mut rx: mpsc::Receiver<AgentMessage>,
+        rx: mpsc::Receiver<AgentMessage>,
         config: Arc<RuntimeConfig>,
         started_msg: &'static str,
     ) {
@@ -596,56 +688,62 @@ impl AgentSpawner {
             .unwrap_or_else(|_| Arc::new(ProviderRegistry::new()));
 
         let wiring = self.wiring_snapshot();
-        let mut runtime = AgentRuntime::new(
-            Arc::clone(&handle),
-            config,
-            Arc::clone(&self.live),
-            providers_snapshot,
-            fallback_models,
-            Arc::clone(&self.skills),
-            Arc::clone(&self.store),
-            self.memory.clone(),
-            Some(Arc::clone(&self.registry)),
-            Some(self.event_tx.clone()),
-            self_arc,
-            self.plugins.clone(),
-            wiring.mcp.clone(),
-            handle.notification_tx().or_else(|| wiring.notification_tx.clone()),
-            self.model_health.clone(),
-            self.cap_manager.clone(),
-            self.cap_live_manager.clone(),
-        );
-        // run_turn refreshes plugins/skills from the handle each turn; seed
-        // the first turn from the handle too.
-        runtime.wasm_plugins = handle.wasm_plugins_snapshot();
-        runtime.computer_permission = wiring.computer_permission.clone();
-        runtime.computer_permission_tx = wiring.computer_permission_tx.clone();
-        runtime.computer_status_tx = wiring.computer_status_tx.clone();
-        runtime.computer_runs = wiring.computer_runs.clone();
+        let build = || {
+            let mut runtime = AgentRuntime::new(
+                Arc::clone(&handle),
+                Arc::clone(&config),
+                Arc::clone(&self.live),
+                Arc::clone(&providers_snapshot),
+                fallback_models.clone(),
+                Arc::clone(&self.skills),
+                Arc::clone(&self.store),
+                self.memory.clone(),
+                Some(Arc::clone(&self.registry)),
+                Some(self.event_tx.clone()),
+                self_arc.clone(),
+                self.plugins.clone(),
+                wiring.mcp.clone(),
+                handle.notification_tx().or_else(|| wiring.notification_tx.clone()),
+                self.model_health.clone(),
+                self.cap_manager.clone(),
+                self.cap_live_manager.clone(),
+            );
+            // run_turn refreshes plugins/skills from the handle each turn; seed
+            // the first turn from the handle too.
+            runtime.wasm_plugins = handle.wasm_plugins_snapshot();
+            runtime.computer_permission = wiring.computer_permission.clone();
+            runtime.computer_permission_tx = wiring.computer_permission_tx.clone();
+            runtime.computer_status_tx = wiring.computer_status_tx.clone();
+            runtime.computer_runs = wiring.computer_runs.clone();
+            runtime
+        };
+        let count = lane_count(&handle);
+        let first = build();
+        let mut lanes = Vec::with_capacity(count);
+        for _ in 1..count {
+            let mut lane = build();
+            lane.share_lane_resources(&first);
+            lanes.push(lane);
+        }
+        lanes.insert(0, first);
         let goal_continuation = wiring.goal_continuation.clone();
+        spawn_lanes(handle, rx, lanes, goal_continuation, true, started_msg);
+    }
+}
 
-        tokio::spawn(async move {
-            info!(agent_id = %handle.id, "{started_msg}");
-            loop {
-                let msg = tokio::select! {
-                    _ = handle.lifetime.cancelled() => {
-                        info!(agent_id = %handle.id, "dynamic agent lifetime cancelled, stopping");
-                        break;
-                    }
-                    msg = rx.recv() => match msg {
-                        Some(m) => m,
-                        None => break,
-                    },
-                };
-                tokio::select! {
-                    _ = process_queued_message(&mut runtime, msg, goal_continuation.as_ref()) => {}
-                    _ = handle.lifetime.cancelled() => {
-                        info!(agent_id = %handle.id, "dynamic agent lifetime cancelled mid-turn");
-                        break;
-                    }
-                }
-            }
-            info!(agent_id = %handle.id, "dynamic agent task ended");
-        });
+#[cfg(test)]
+mod tests {
+    use super::lane_for;
+
+    #[test]
+    fn a_session_keeps_its_lane_and_sessions_spread() {
+        let keys: Vec<String> = (0..64).map(|i| format!("desktop:main:{i:06}")).collect();
+        for key in &keys {
+            assert_eq!(lane_for(key, 4), lane_for(key, 4));
+            assert!(lane_for(key, 4) < 4);
+            assert_eq!(lane_for(key, 1), 0);
+        }
+        let used: std::collections::HashSet<usize> = keys.iter().map(|k| lane_for(k, 4)).collect();
+        assert_eq!(used.len(), 4, "64 sessions should use every lane");
     }
 }

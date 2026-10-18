@@ -991,6 +991,15 @@ impl AgentRuntime {
         rt
     }
 
+    /// Makes this runtime, another lane of the same agent, share `first`'s
+    /// browser, background-exec pool and async task results, so lanes drive
+    /// one Chrome and one exec limit rather than one each.
+    pub fn share_lane_resources(&mut self, first: &AgentRuntime) {
+        self.browser = Arc::clone(&first.browser);
+        self.exec_pool = Arc::clone(&first.exec_pool);
+        self.pending_task_results = Arc::clone(&first.pending_task_results);
+    }
+
     /// Resolve the current model name from agent config with fallback.
     pub(crate) fn resolve_model_name(&self) -> String {
         self.handle

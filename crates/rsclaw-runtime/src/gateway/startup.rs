@@ -2244,7 +2244,7 @@ fn spawn_agent_tasks(
             goal_continuation: Some(Arc::clone(&goal_continuation)),
         });
     }
-    for (agent_id, mut rx) in receivers {
+    for (agent_id, rx) in receivers {
         let handle = match registry.get(&agent_id) {
             Ok(h) => h,
             Err(e) => {
@@ -2269,66 +2269,59 @@ fn spawn_agent_tasks(
             })
             .unwrap_or_default();
 
-        let mut runtime = AgentRuntime::new(
-            Arc::clone(&handle),
-            Arc::clone(&config),
-            Arc::clone(&live),
-            Arc::clone(&providers),
-            fallback_models,
-            Arc::clone(&skills),
-            Arc::clone(&store),
-            memory.clone(),
-            Some(Arc::clone(&registry)),
-            Some(event_tx.clone()),
-            spawner.clone(),
-            plugins.clone(),
-            mcp.clone(),
-            notification_tx.clone(),
-            model_health.clone(),
-            Some(Arc::clone(&cap_manager)),
-            Some(Arc::clone(&cap_live_manager)),
+        let build = || {
+            let mut runtime = AgentRuntime::new(
+                Arc::clone(&handle),
+                Arc::clone(&config),
+                Arc::clone(&live),
+                Arc::clone(&providers),
+                fallback_models.clone(),
+                Arc::clone(&skills),
+                Arc::clone(&store),
+                memory.clone(),
+                Some(Arc::clone(&registry)),
+                Some(event_tx.clone()),
+                spawner.clone(),
+                plugins.clone(),
+                mcp.clone(),
+                notification_tx.clone(),
+                model_health.clone(),
+                Some(Arc::clone(&cap_manager)),
+                Some(Arc::clone(&cap_live_manager)),
+            );
+
+            // Inject WASM plugins into the agent runtime.
+            runtime.wasm_plugins = Arc::clone(&wasm_plugins);
+
+            // Share the computer_use permission store + broadcast channel
+            // so `tool_vlm_drive` can register pending requests that the WS
+            // handler can resolve.
+            runtime.computer_permission = Some(Arc::clone(&computer_permission));
+            runtime.computer_permission_tx = Some(computer_permission_tx.clone());
+            runtime.computer_status_tx = Some(computer_status_tx.clone());
+            runtime.computer_runs = Some(Arc::clone(&computer_runs));
+            runtime
+        };
+
+        // Lanes: each session's turns run in order on one runtime, while
+        // different sessions run side by side (see `spawn_lanes`).
+        let count = rsclaw_agent::spawner::lane_count(&handle);
+        let first = build();
+        let mut lanes = Vec::with_capacity(count);
+        for _ in 1..count {
+            let mut lane = build();
+            lane.share_lane_resources(&first);
+            lanes.push(lane);
+        }
+        lanes.insert(0, first);
+        rsclaw_agent::spawner::spawn_lanes(
+            handle,
+            rx,
+            lanes,
+            Some(goal_continuation.clone()),
+            false,
+            "agent runtime task started",
         );
-
-        // Inject WASM plugins into the agent runtime.
-        runtime.wasm_plugins = Arc::clone(&wasm_plugins);
-
-        // Share the computer_use permission store + broadcast channel
-        // so `tool_vlm_drive` can register pending requests that the WS
-        // handler can resolve.
-        runtime.computer_permission = Some(Arc::clone(&computer_permission));
-        runtime.computer_permission_tx = Some(computer_permission_tx.clone());
-        runtime.computer_status_tx = Some(computer_status_tx.clone());
-        runtime.computer_runs = Some(Arc::clone(&computer_runs));
-
-        let goal_continuation = goal_continuation.clone();
-        tokio::spawn(async move {
-            info!(agent_id = %handle.id, "agent runtime task started");
-            loop {
-                let msg = tokio::select! {
-                    _ = handle.lifetime.cancelled() => {
-                        info!(agent_id = %handle.id, "agent runtime lifetime cancelled, stopping");
-                        break;
-                    }
-                    msg = rx.recv() => match msg {
-                        Some(m) => m,
-                        None => break,
-                    },
-                };
-                info!(
-                    agent_id = %handle.id,
-                    session_key = %msg.session_key,
-                    channel = %msg.channel,
-                    "agent runtime: received msg from queue"
-                );
-                // Shared worker body (trust + A2A wires into TurnContext,
-                // cancel-token registration, watchdog, error mapping, done
-                // emit, /goal hook, reply) — the same function drives
-                // dynamically spawned / hot-replaced agents in AgentSpawner.
-                rsclaw_agent::process_queued_message(&mut runtime, msg, Some(&goal_continuation))
-                    .await;
-            }
-            info!(agent_id = %handle.id, "agent runtime task ended (channel closed)");
-        });
     }
 }
 
