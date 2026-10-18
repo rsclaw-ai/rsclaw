@@ -66,10 +66,18 @@ pub(crate) fn joined_mode(args: &Value) -> String {
     if mode.len() > bare.len() + 1 {
         return mode.to_owned();
     }
-    let value = keys.iter().find_map(|k| match &args[*k] {
+    let as_text = |v: &Value| match v {
         Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
         Value::Number(n) => Some(n.to_string()),
         _ => None,
+    };
+    // Known names first, then any other argument the model put it under
+    // ("keyword", "text", …).
+    let value = keys.iter().find_map(|k| as_text(&args[*k])).or_else(|| {
+        args.as_object()?
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "tool_result_id" | "id" | "mode"))
+            .find_map(|(_, v)| as_text(v))
     });
     match value {
         Some(value) => format!("{bare}:{value}"),
@@ -714,7 +722,9 @@ mod tests {
         assert_eq!(j(json!({"mode": "grep:", "pattern": "陈东"})), "grep:陈东");
         assert_eq!(j(json!({"mode": "head", "n": 40})), "head:40");
         assert_eq!(j(json!({"mode": "lines:1-9", "range": "5-6"})), "lines:1-9");
+        assert_eq!(j(json!({"mode": "query:", "keyword": "委托代理费用"})), "query:委托代理费用");
         assert_eq!(j(json!({"mode": "query"})), "query");
+        assert_eq!(j(json!({"mode": "query:", "tool_result_id": "tr_1"})), "query:");
         assert_eq!(j(json!({})), "");
     }
 
