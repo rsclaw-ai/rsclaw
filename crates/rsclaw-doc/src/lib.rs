@@ -12,6 +12,7 @@
 //!   - edit_pdf     (.pdf)  replace text / delete pages via lopdf
 //!   - read_doc     (.xlsx/.docx/.pdf) extract text content for inspection
 
+pub mod pdf_render;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -34,6 +35,16 @@ pub fn safe_extract_pdf_text(path: &Path) -> Result<String> {
 }
 
 /// Extract text from PDF bytes in memory, catching panics.
+/// Text of each page, guarded like [`safe_extract_pdf_from_mem`].
+pub fn safe_extract_pdf_pages_from_mem(bytes: &[u8]) -> Result<Vec<String>> {
+    let bytes_owned = bytes.to_vec();
+    match std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem_by_pages(&bytes_owned)) {
+        Ok(Ok(pages)) => Ok(pages),
+        Ok(Err(e)) => Err(anyhow!("pdf extract error: {e}")),
+        Err(_) => Err(anyhow!("pdf extract panicked (likely malformed font encoding)")),
+    }
+}
+
 pub fn safe_extract_pdf_from_mem(bytes: &[u8]) -> Result<String> {
     let bytes_owned = bytes.to_vec();
     match std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem(&bytes_owned)) {

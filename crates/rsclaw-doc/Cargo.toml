@@ -14,6 +14,9 @@ calamine = "0.36"
 docx-rs = "0.4.22"
 krilla = "0.7"
 lopdf = "0.42"
+# Pure-Rust PDF rasterizer: renders pages for OCR (no poppler / pdftoppm).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+hayro = { version = "0.8", default-features = false, features = ["simd"] }
 rust_xlsxwriter = "0.83"
 zip = "2"
 pdf-extract = "0.12"

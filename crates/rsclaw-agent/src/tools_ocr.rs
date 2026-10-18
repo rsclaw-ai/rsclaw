@@ -134,70 +134,11 @@ impl super::runtime::AgentRuntime {
         };
 
         let request = OcrRequest { client, prompt, max_tokens, lang };
-        let (text, note) = match reading {
-            Reading::Whole(payload) => {
-                let read = request.read(payload).await.map(|r| r.text);
-                let note = read.as_ref().ok().filter(|t| looping_text(t)).map(|_| {
-                    "The reading repeats itself; parts of it are likely invented. Don't rely on it."
-                        .to_owned()
-                });
-                (read, note)
-            }
-            Reading::Strips(parts) => {
-                let count = parts.len();
-                // A strip is a third of a page: cap its reading so a model
-                // that loops can't run on for pages.
-                let strip_request = OcrRequest {
-                    max_tokens: request.max_tokens.or(Some(STRIP_MAX_TOKENS)),
-                    ..request.clone()
-                };
-                let reads: Vec<_> =
-                    futures::stream::iter(parts.into_iter().map(|p| strip_request.read(p)))
-                        .buffered(STRIPS_IN_FLIGHT)
-                        .collect()
-                        .await;
-                match reads.into_iter().collect::<Result<Vec<_>, _>>() {
-                    Ok(reads) => {
-                        let looping = reads.iter().filter(|r| looping_text(&r.text)).count();
-                        let text = reads
-                            .into_iter()
-                            .filter(|r| !looping_text(&r.text))
-                            .map(|r| r.text)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let mut note = (count > 1).then(|| format!("Read in {count} strips, top to bottom."));
-                        if looping > 0 {
-                            note = Some(format!(
-                                "{}{looping} strip(s) came back as a repeating loop and were left out; that part of the page may be unread.",
-                                note.map(|n| format!("{n} ")).unwrap_or_default()
-                            ));
-                        }
-                        (Ok(text), note)
-                    }
-                    Err(e) => (Err(e), None),
-                }
-            }
-            Reading::Rotations([turned_90, turned_270]) => {
-                let payloads = [turned_90.0, turned_90.1, turned_270.0, turned_270.1];
-                let reads: Vec<_> = futures::stream::iter(payloads.into_iter().map(|p| request.read(p)))
-                    .buffered(STRIPS_IN_FLIGHT)
-                    .collect()
-                    .await;
-                let [whole_90, top_90, whole_270, top_270]: [_; 4] =
-                    reads.try_into().unwrap_or_else(|_| unreachable!("four reads"));
-                let (text, degrees) = match (whole_90, whole_270) {
-                    (Ok(a), Ok(b)) => match (top_90, top_270) {
-                        (Ok(ta), Ok(tb)) => pick_consistent(a, ta, b, tb),
-                        _ => pick_upright(a, b),
-                    },
-                    (Ok(a), Err(_)) => (a.text, 90),
-                    (Err(_), Ok(b)) => (b.text, 270),
-                    (Err(e), Err(_)) => return Ok(failure(e)),
-                };
-                let note = format!("The page was sideways; read after turning it {degrees}° clockwise.");
-                (Ok(text), Some(note))
-            }
-        };
+        // A PDF handed to ocr: every page, read like the pdf tool reads it.
+        if let Reading::Pdf(pdf) = reading {
+            return Ok(read_pdf(image, pdf, args["pages"].as_str(), Some(request)).await);
+        }
+        let (text, note) = read_reading(&request, reading).await;
 
         match text {
             Ok(t) => {
@@ -228,6 +169,257 @@ fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
     image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
 }
 
+/// One image's text, the way it was planned (whole, strips, or both ways
+/// up for a sideways page), with a note for the model when it helps.
+async fn read_reading(request: &OcrRequest, reading: Reading) -> (std::result::Result<String, String>, Option<String>) {
+    match reading {
+        Reading::Whole(payload) => {
+            let read = request.read(payload).await.map(|r| r.text);
+            let note = read.as_ref().ok().filter(|t| looping_text(t)).map(|_| {
+                "The reading repeats itself; parts of it are likely invented. Don't rely on it."
+                    .to_owned()
+            });
+            (read, note)
+        }
+        Reading::Strips(parts) => {
+            let count = parts.len();
+            // A strip is a third of a page: cap its reading so a model
+            // that loops can't run on for pages.
+            let strip_request = OcrRequest {
+                max_tokens: request.max_tokens.or(Some(STRIP_MAX_TOKENS)),
+                ..request.clone()
+            };
+            let reads: Vec<_> =
+                futures::stream::iter(parts.into_iter().map(|p| strip_request.read(p)))
+                    .buffered(STRIPS_IN_FLIGHT)
+                    .collect()
+                    .await;
+            match reads.into_iter().collect::<Result<Vec<_>, _>>() {
+                Ok(reads) => {
+                    let looping = reads.iter().filter(|r| looping_text(&r.text)).count();
+                    let text = reads
+                        .into_iter()
+                        .filter(|r| !looping_text(&r.text))
+                        .map(|r| r.text)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let mut note = (count > 1).then(|| format!("Read in {count} strips, top to bottom."));
+                    if looping > 0 {
+                        note = Some(format!(
+                            "{}{looping} strip(s) came back as a repeating loop and were left out; that part of the page may be unread.",
+                            note.map(|n| format!("{n} ")).unwrap_or_default()
+                        ));
+                    }
+                    (Ok(text), note)
+                }
+                Err(e) => (Err(e), None),
+            }
+        }
+        Reading::Rotations([turned_90, turned_270]) => {
+            let payloads = [turned_90.0, turned_90.1, turned_270.0, turned_270.1];
+            let reads: Vec<_> = futures::stream::iter(payloads.into_iter().map(|p| request.read(p)))
+                .buffered(STRIPS_IN_FLIGHT)
+                .collect()
+                .await;
+            let [whole_90, top_90, whole_270, top_270]: [_; 4] =
+                reads.try_into().unwrap_or_else(|_| unreachable!("four reads"));
+            let (text, degrees) = match (whole_90, whole_270) {
+                (Ok(a), Ok(b)) => match (top_90, top_270) {
+                    (Ok(ta), Ok(tb)) => pick_consistent(a, ta, b, tb),
+                    _ => pick_upright(a, b),
+                },
+                (Ok(a), Err(_)) => (a.text, 90),
+                (Err(_), Ok(b)) => (b.text, 270),
+                (Err(e), Err(_)) => return (Err(e), None),
+            };
+            let note = format!("The page was sideways; read after turning it {degrees}° clockwise.");
+            (Ok(text), Some(note))
+        }
+        Reading::Pdf(_) => (Err("ocr: a PDF is read page by page, not as one image".to_owned()), None),
+    }
+}
+
+/// Pages one pdf / ocr call reads by OCR; the rest are named for a follow-up.
+const MAX_OCR_PAGES: usize = 30;
+
+/// Reads a PDF: each page's text layer, and pages without one (scans)
+/// rendered in pure Rust and read by OCR. `pages` ("1-5,8", 1-based)
+/// limits which pages are returned. Without an OCR endpoint scans are
+/// reported, not read.
+pub(crate) async fn read_pdf(
+    path: &str,
+    pdf: Vec<u8>,
+    pages: Option<&str>,
+    request: Option<OcrRequest>,
+) -> Value {
+    let pdf = std::sync::Arc::new(pdf);
+    let layer = {
+        let pdf = pdf.clone();
+        tokio::task::spawn_blocking(move || crate::doc::safe_extract_pdf_pages_from_mem(&pdf))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
+    let total = match &layer {
+        Some(texts) => texts.len(),
+        None => {
+            let pdf = pdf.clone();
+            match tokio::task::spawn_blocking(move || crate::doc::pdf_render::page_count(&pdf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return json!({ "error": format!("{e:#}") }),
+                Err(e) => return json!({ "error": format!("pdf: {e}") }),
+            }
+        }
+    };
+    let selected = match pages.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(spec) => parse_pages(spec, total),
+        None => (0..total).collect(),
+    };
+    let is_scan = |i: usize| {
+        layer
+            .as_ref()
+            .is_none_or(|t| t[i].chars().filter(|c| !c.is_whitespace()).count() < 20)
+    };
+    let scans: Vec<usize> = selected.iter().copied().filter(|&i| is_scan(i)).collect();
+    let (to_read, later): (Vec<usize>, Vec<usize>) = if request.is_some() {
+        let n = scans.len().min(MAX_OCR_PAGES);
+        (scans[..n].to_vec(), scans[n..].to_vec())
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut read: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut notes: Vec<String> = Vec::new();
+    if let (Some(request), false) = (&request, to_read.is_empty()) {
+        let rendered = {
+            let pdf = pdf.clone();
+            let idx = to_read.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::doc::pdf_render::render_pages_jpeg(&pdf, &idx, crate::doc::pdf_render::OCR_MAX_EDGE)
+            })
+            .await
+        };
+        let rendered = match rendered {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return json!({ "error": format!("{e:#}") }),
+            Err(e) => return json!({ "error": format!("pdf: render task failed: {e}") }),
+        };
+        let jobs = to_read.iter().copied().zip(rendered).map(|(i, jpeg)| async move {
+            let out = match jpeg {
+                Ok(bytes) => {
+                    let reading = tokio::task::spawn_blocking(move || plan_reading(bytes, "image/jpeg".into(), true))
+                        .await
+                        .map_err(|e| e.to_string());
+                    match reading {
+                        Ok(reading) => read_reading(request, reading).await,
+                        Err(e) => (Err(e), None),
+                    }
+                }
+                Err(e) => (Err(format!("{e:#}")), None),
+            };
+            (i, out)
+        });
+        let results: Vec<_> = futures::stream::iter(jobs).buffered(PAGES_IN_FLIGHT).collect().await;
+        let mut failed = Vec::new();
+        for (i, (text, note)) in results {
+            match text {
+                Ok(t) => {
+                    read.insert(i, t.trim().to_owned());
+                    if let Some(n) = note {
+                        notes.push(format!("Page {}: {n}", i + 1));
+                    }
+                }
+                Err(e) => failed.push(format!("{} ({e})", i + 1)),
+            }
+        }
+        if !failed.is_empty() {
+            notes.push(format!("OCR failed on page(s) {}.", failed.join(", ")));
+        }
+        notes.push(format!("Scanned page(s) {} were read by OCR.", page_list(&to_read)));
+    }
+    if !later.is_empty() {
+        notes.push(format!(
+            "Scanned page(s) {} were not read in this call ({MAX_OCR_PAGES} at most): call pdf again with pages \"{}\".",
+            page_list(&later),
+            page_list(&later)
+        ));
+    }
+    if request.is_none() && !scans.is_empty() {
+        notes.push(format!(
+            "Page(s) {} are scans with no text layer, and no OCR endpoint is configured (kb.ocr).",
+            page_list(&scans)
+        ));
+    }
+    let mut text = String::new();
+    for &i in &selected {
+        let page_text = read
+            .get(&i)
+            .cloned()
+            .or_else(|| layer.as_ref().map(|t| t[i].trim().to_owned()))
+            .unwrap_or_default();
+        if total > 1 {
+            text.push_str(&format!("\n[Page {}]\n", i + 1));
+        }
+        text.push_str(&page_text);
+        text.push('\n');
+    }
+    let text = text.trim().to_owned();
+    let text = if text.len() > 100_000 {
+        let mut end = 100_000usize;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...\n[truncated at 100000 chars; read fewer pages with \"pages\"]", &text[..end])
+    } else {
+        text
+    };
+    let mut out = json!({ "path": path, "pages": total, "text": text, "chars": text.len() });
+    if !notes.is_empty() {
+        out["note"] = json!(notes.join(" "));
+    }
+    out
+}
+
+/// Pages read by OCR at once (each also splits into strips).
+const PAGES_IN_FLIGHT: usize = 2;
+
+/// 0-based pages from a 1-based spec like "1-5,8", clamped to `total`,
+/// sorted and deduplicated.
+fn parse_pages(spec: &str, total: usize) -> Vec<usize> {
+    let mut out = std::collections::BTreeSet::new();
+    for part in spec.split([',', '，', ' ']).map(str::trim).filter(|p| !p.is_empty()) {
+        let (a, b) = match part.split_once(['-', '–', '~']) {
+            Some((a, b)) => (a.trim().parse::<usize>().ok(), b.trim().parse::<usize>().ok()),
+            None => {
+                let n = part.parse::<usize>().ok();
+                (n, n)
+            }
+        };
+        if let (Some(a), Some(b)) = (a, b) {
+            for p in a.max(1)..=b.min(total) {
+                out.insert(p - 1);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// "1-3, 7" for 0-based pages.
+fn page_list(pages: &[usize]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < pages.len() {
+        let start = pages[i];
+        let mut end = start;
+        while i + 1 < pages.len() && pages[i + 1] == end + 1 {
+            i += 1;
+            end = pages[i];
+        }
+        parts.push(if start == end { format!("{}", start + 1) } else { format!("{}-{}", start + 1, end + 1) });
+        i += 1;
+    }
+    parts.join(",")
+}
+
 /// OCR requests one page may have in flight: each fleet OCR node reads one
 /// image at a time, so one page must not take most of the pool.
 const STRIPS_IN_FLIGHT: usize = 3;
@@ -240,6 +432,8 @@ enum Reading {
     /// A sideways page turned 90° and 270° clockwise, each as (whole page,
     /// top part).
     Rotations([(String, String); 2]),
+    /// A PDF: read page by page.
+    Pdf(Vec<u8>),
 }
 
 fn data_uri(mime: &str, bytes: &[u8]) -> String {
@@ -250,6 +444,9 @@ fn data_uri(mime: &str, bytes: &[u8]) -> String {
 
 /// Blocking: decodes the page to decide how to read it.
 fn plan_reading(bytes: Vec<u8>, mime: String, plan_page: bool) -> Reading {
+    if bytes[..bytes.len().min(1024)].windows(4).any(|w| w == b"%PDF") {
+        return Reading::Pdf(bytes);
+    }
     use rsclaw_util::ocr_page::{OcrPlan, plan_ocr_page};
     let plan = if plan_page { plan_ocr_page(&bytes) } else { OcrPlan::Whole };
     match plan {
@@ -294,7 +491,7 @@ fn looping_text(text: &str) -> bool {
 }
 
 #[derive(Clone)]
-struct OcrRequest {
+pub(crate) struct OcrRequest {
     client: std::sync::Arc<OcrClient>,
     prompt: Option<String>,
     max_tokens: Option<u32>,
@@ -308,6 +505,15 @@ struct OcrRead {
 }
 
 impl OcrRequest {
+    /// The configured OCR endpoint with no per-call overrides, or `None`
+    /// when none is configured or it was found down moments ago.
+    pub(crate) fn from_config() -> Option<Self> {
+        if now_secs() < OCR_DOWN_UNTIL.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(Self { client: OcrClient::from_config()?, prompt: None, max_tokens: None, lang: None })
+    }
+
     /// One image to text. A busy or failing endpoint gets a few backed-off
     /// retries first.
     async fn read(&self, payload: String) -> std::result::Result<OcrRead, String> {
@@ -476,6 +682,28 @@ mod tests {
         image::RgbImage::new(300, 200).save(&path).unwrap();
         assert_eq!(image_dimensions(&path), Some((300, 200)));
         assert_eq!(image_dimensions(&dir.join("missing.png")), None);
+    }
+
+    #[tokio::test]
+    async fn read_pdf_returns_text_pages_without_ocr() {
+        let dir = std::env::temp_dir().join("rsclaw_read_pdf_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("brief.pdf");
+        let args = json!({"action": "create_pdf", "path": path.to_str().unwrap(),
+            "content": "民事答辩状\n\n答辩人：武汉安和置业有限公司，统一社会信用代码 91420104MA4B7NQT21。"});
+        crate::doc::handle(&args, &path).await.unwrap();
+        let out = read_pdf("brief.pdf", std::fs::read(&path).unwrap(), None, None).await;
+        assert_eq!(out["pages"], 1, "{out}");
+        assert!(out["text"].as_str().unwrap().contains("91420104MA4B7NQT21"), "{out}");
+        assert!(out.get("note").is_none(), "a text PDF has no scans to report: {out}");
+    }
+
+    #[test]
+    fn ocr_pages_parse_and_print() {
+        assert_eq!(parse_pages("1-3, 8", 10), vec![0, 1, 2, 7]);
+        assert_eq!(parse_pages("9-20", 10), vec![8, 9]);
+        assert_eq!(parse_pages("0,x,5", 4), Vec::<usize>::new());
+        assert_eq!(page_list(&[0, 1, 2, 7, 9, 10]), "1-3,8,10-11");
     }
 
     #[test]

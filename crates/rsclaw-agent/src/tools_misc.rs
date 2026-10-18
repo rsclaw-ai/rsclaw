@@ -699,43 +699,16 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
                 "hint": "Use read_file for documents and text files, and ocr for images."
             }));
         }
-        let text = match crate::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("pdf-extract failed ({e}), trying pdftotext CLI");
-                #[allow(unused_mut)]
-                let mut pdf_cmd = tokio::process::Command::new("pdftotext");
-                pdf_cmd.args([local_path.to_str().unwrap_or(""), "-"]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    pdf_cmd.creation_flags(0x08000000);
-                }
-                let output = pdf_cmd.output().await
-                    .map_err(|e2| anyhow!("pdf: built-in extraction failed ({e}) and the pdftotext fallback could not be run ({e2} — likely poppler-utils not installed). Install poppler-utils, or the PDF may be scanned/image-only and need OCR"))?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(anyhow!("pdf: extraction failed: {e}, pdftotext: {stderr}"));
-                }
-                String::from_utf8_lossy(&output.stdout).into_owned()
-            }
-        };
-        // Truncate to 100k chars to avoid blowing up context.
-        let truncated = if text.len() > 100_000 {
-            let mut end = 100_000usize;
-            while end < text.len() && !text.is_char_boundary(end) {
-                end += 1;
-            }
-            format!("{}...\n[truncated at 100000 chars]", &text[..end])
-        } else {
-            text
-        };
-
-        Ok(json!({
-            "path": path,
-            "text": truncated,
-            "chars": truncated.len()
-        }))
+        // Each page's text layer; pages without one (scans) are rendered in
+        // pure Rust and read by OCR, so scanned case files need no
+        // pdftoppm / poppler and no page-by-page shell work.
+        Ok(super::tools_ocr::read_pdf(
+            path,
+            pdf_bytes,
+            args["pages"].as_str(),
+            super::tools_ocr::OcrRequest::from_config(),
+        )
+        .await)
     }
 
     // -------------------------------------------------------------------
