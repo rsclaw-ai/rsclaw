@@ -98,6 +98,18 @@ impl super::runtime::AgentRuntime {
                 Ok(p) => p,
                 Err(e) => return Ok(json!({ "error": format!("ocr: {e}") })),
             };
+            // Size first, from the header alone: an odd PDF page rendered
+            // at 300 dpi came out 19200x25600 px (48 MB), which can't be
+            // decoded or sent, and the model's own attempts to shrink it
+            // with a guessed tool flag failed the turn.
+            if let Some((w, h)) = image_dimensions(&path) {
+                if u64::from(w) * u64::from(h) > MAX_OCR_PIXELS {
+                    return Ok(json!({
+                        "error": format!("ocr: `{image}` is {w}x{h} pixels, too large to read"),
+                        "hint": SHRINK_HINT,
+                    }));
+                }
+            }
             let bytes = match super::security::read_regular_file_capped(
                 &path,
                 super::security::MAX_LOCAL_READ_BYTES,
@@ -108,7 +120,7 @@ impl super::runtime::AgentRuntime {
                 Err(e) => {
                     return Ok(json!({
                         "error": format!("ocr: cannot read image file `{image}`: {e}"),
-                        "hint": "Use a path relative to the workspace, or pass an http(s) URL / data URI."
+                        "hint": format!("Use a path relative to the workspace, or pass an http(s) URL / data URI. If the file is too large: {SHRINK_HINT}")
                     }));
                 }
             };
@@ -203,6 +215,17 @@ impl super::runtime::AgentRuntime {
             Err(e) => Ok(failure(e)),
         }
     }
+}
+
+/// Images with more pixels than this are refused before decoding.
+const MAX_OCR_PIXELS: u64 = 60_000_000;
+
+/// How to make an oversized image readable.
+const SHRINK_HINT: &str = "Shrink it to about 3000 px on the long side, then OCR the smaller file: for a PDF page `pdftoppm -scale-to 3000 -png -f N -l N <file.pdf> <prefix>`; for an image on macOS `sips -Z 3000 <in.png> --out <out.png>`.";
+
+/// Width and height from the image header, without decoding the pixels.
+fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
 }
 
 /// OCR requests one page may have in flight: each fleet OCR node reads one
@@ -443,6 +466,16 @@ mod tests {
         assert!(!is_server_failure(
             "ocr request failed: HTTP status client error (413 Request Entity Too Large) for url (x)"
         ));
+    }
+
+    #[test]
+    fn ocr_reads_image_size_from_the_header() {
+        let dir = std::env::temp_dir().join("rsclaw_ocr_dims_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("page.png");
+        image::RgbImage::new(300, 200).save(&path).unwrap();
+        assert_eq!(image_dimensions(&path), Some((300, 200)));
+        assert_eq!(image_dimensions(&dir.join("missing.png")), None);
     }
 
     #[test]
