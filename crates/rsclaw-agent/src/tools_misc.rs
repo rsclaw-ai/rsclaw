@@ -673,10 +673,13 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
             _tmp_guard = Some(tmp);
             p
         } else {
-            self.resolve_readable_path(ctx, path)?
+            let full = self.resolve_readable_path(ctx, path)?;
+            if let Some(note) = super::tools_file::missing_file_note(&full) {
+                bail!("pdf: {note}");
+            }
+            full
         };
 
-        // Pure Rust PDF extraction, with pdftotext CLI fallback.
         let pdf_bytes = super::security::read_regular_file_capped(
             &local_path,
             super::security::MAX_LOCAL_BINARY_READ_BYTES,

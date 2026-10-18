@@ -2689,6 +2689,25 @@ fn format_tool_result(val: &serde_json::Value) -> String {
     else if let Some(results) = val.get("results").and_then(|v| v.as_array()) {
         let mut out = String::new();
         for (i, r) in results.iter().enumerate() {
+            // search_content returns plain "file:line:text" strings, and
+            // search_file {path, size, is_dir}: show them as they are, or
+            // the model sees "(no title)" and guesses file names.
+            if let Some(line) = r.as_str() {
+                out.push_str(&format!("{}. {line}\n", i + 1));
+                continue;
+            }
+            if r.get("title").is_none()
+                && let Some(path) = r.get("path").and_then(|v| v.as_str())
+            {
+                if r.get("is_dir").and_then(|v| v.as_bool()) == Some(true) {
+                    out.push_str(&format!("{}. {path}/\n", i + 1));
+                } else if let Some(size) = r.get("size").and_then(|v| v.as_u64()) {
+                    out.push_str(&format!("{}. {path}  {size}B\n", i + 1));
+                } else {
+                    out.push_str(&format!("{}. {path}\n", i + 1));
+                }
+                continue;
+            }
             // Title fallback chain widened: skill_search returns
             // {slug, description, installs, registry} (no `title`), so
             // every result was rendering as "(no title)". Try the common
@@ -3080,6 +3099,20 @@ mod format_artifact_read_tests {
             {"name": "a.py", "path": "/w/a.py", "is_dir": false, "size": 12},
             {"name": "docs", "path": "/w/docs", "is_dir": true, "size": 0}]});
         assert_eq!(format_tool_result(&v), "[/w] 2 entries\na.py  12B\ndocs/");
+    }
+
+    #[test]
+    fn search_results_show_their_paths() {
+        let found = serde_json::json!({"pattern": "*合同*", "results": [
+            {"path": "/d/汉阳安和/1民事委托代理合同 陈东 .docx", "size": 72723, "is_dir": false},
+            {"path": "/d/汉阳安和/原告陈东", "size": 256, "is_dir": true},
+        ]});
+        assert_eq!(
+            format_tool_result(&found),
+            "1. /d/汉阳安和/1民事委托代理合同 陈东 .docx  72723B\n2. /d/汉阳安和/原告陈东/"
+        );
+        let lines = serde_json::json!({"results": ["a.md:3:陈东"]});
+        assert_eq!(format_tool_result(&lines), "1. a.md:3:陈东");
     }
 
     #[test]

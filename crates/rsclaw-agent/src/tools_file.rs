@@ -327,6 +327,66 @@ async fn ask_approval(
 }
 
 /// Is `path` an Office document `read_office_text` can read?
+/// Why `full` can't be read when it doesn't exist, naming files in the
+/// same folder whose names are close (a model that drops a leading "1"
+/// from "1民事委托代理合同 陈东 .docx" then sees the real name), or `None`
+/// when it exists.
+pub(crate) fn missing_file_note(full: &std::path::Path) -> Option<String> {
+    if full.exists() {
+        return None;
+    }
+    let parent = full.parent()?;
+    let name = full.file_name()?.to_string_lossy();
+    let Ok(dir) = std::fs::read_dir(parent) else {
+        return Some(format!(
+            "folder `{}` does not exist. list_dir a folder above it to see what is there.",
+            parent.display()
+        ));
+    };
+    let mut close: Vec<(f32, String)> = dir
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with('.'))
+        .map(|n| (name_similarity(&name, &n), n))
+        .filter(|(score, _)| *score >= 0.5)
+        .collect();
+    close.sort_by(|a, b| b.0.total_cmp(&a.0));
+    if close.is_empty() {
+        return Some(format!(
+            "there is no `{name}` in `{}`. list_dir that folder for the exact file names.",
+            parent.display()
+        ));
+    }
+    let names: Vec<String> = close.into_iter().take(3).map(|(_, n)| format!("\"{n}\"")).collect();
+    Some(format!(
+        "there is no `{name}` in `{}`. Close names there: {}. Use the exact name.",
+        parent.display(),
+        names.join(", ")
+    ))
+}
+
+/// Dice coefficient over character pairs: 1.0 for the same name, near it
+/// for one with a character added or dropped.
+fn name_similarity(a: &str, b: &str) -> f32 {
+    let pairs = |s: &str| -> Vec<(char, char)> {
+        let chars: Vec<char> = s.to_lowercase().chars().collect();
+        chars.windows(2).map(|w| (w[0], w[1])).collect()
+    };
+    let (a, mut b) = (pairs(a), pairs(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let total = (a.len() + b.len()) as f32;
+    let mut shared = 0;
+    for pair in &a {
+        if let Some(i) = b.iter().position(|p| p == pair) {
+            b.swap_remove(i);
+            shared += 1;
+        }
+    }
+    2.0 * shared as f32 / total
+}
+
 pub(crate) fn is_office_document(path: &str) -> bool {
     let lower = path.to_lowercase();
     [".doc", ".xls", ".docx", ".xlsx", ".pptx"].iter().any(|ext| lower.ends_with(ext))
@@ -1104,43 +1164,25 @@ impl super::runtime::AgentRuntime {
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
             .ok_or_else(|| anyhow!("read: `path` required"))?;
+        // "case.pdf#pages=1-4" asks for some pages of a PDF.
+        let (path, page_spec) = super::tools_ocr::split_page_spec(path.trim());
 
         // Scope: non-owners stay inside the workspace; secret files are
         // refused for everyone (unless an owner disabled tools.exec.safety).
         let full = self.resolve_readable_path(ctx, path)?;
+        if let Some(note) = missing_file_note(&full) {
+            bail!("read `{path}`: {note}");
+        }
 
         let lower = path.to_lowercase();
-        // Binary file types: extract text instead of raw read
+        // A PDF is read the way the pdf tool reads it: text layer, scanned
+        // pages by OCR, page selection.
         if lower.ends_with(".pdf") {
-            let pdf_bytes = read_regular_file_capped(&full, MAX_LOCAL_BINARY_READ_BYTES)
-                .await
-                .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
-            let content = match crate::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
-                Ok(text) => text,
-                Err(e) => {
-                    // Fallback to pdftotext CLI
-                    tracing::warn!("pdf-extract failed ({e}), trying pdftotext CLI");
-                    #[allow(unused_mut)]
-                    let mut pdf_cmd = tokio::process::Command::new("pdftotext");
-                    pdf_cmd.args([full.to_str().unwrap_or(""), "-"]);
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::process::CommandExt;
-                        pdf_cmd.creation_flags(0x08000000);
-                    }
-                    let output = pdf_cmd.output().await.map_err(|e2| {
-                        anyhow!(
-                            "read `{}`: pdf extraction failed: {e}, pdftotext: {e2}",
-                            full.display()
-                        )
-                    })?;
-                    if !output.status.success() {
-                        anyhow::bail!("read `{}`: pdf extraction failed: {e}", full.display());
-                    }
-                    String::from_utf8_lossy(&output.stdout).to_string()
-                }
-            };
-            return Ok(json!({"content": content, "path": path}));
+            let mut pdf_args = json!({ "path": path });
+            if let Some(pages) = page_spec {
+                pdf_args["pages"] = json!(pages);
+            }
+            return self.tool_pdf(ctx, pdf_args).await;
         }
         if let Some(text) = read_office_text(path, &full).await? {
             return Ok(json!({"content": text, "path": path}));
@@ -2026,6 +2068,24 @@ async fn run_ripgrep(
         "engine": "ripgrep",
         "results": results,
     }))
+}
+
+#[cfg(test)]
+mod missing_file_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_file_names_the_close_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("1民事委托代理合同 陈东 .docx"), b"x").unwrap();
+        std::fs::write(dir.path().join("安和证据.pdf"), b"x").unwrap();
+        let note = missing_file_note(&dir.path().join("民事委托代理合同 陈东 .docx")).unwrap();
+        assert!(note.contains("\"1民事委托代理合同 陈东 .docx\""), "{note}");
+        assert!(!note.contains("安和证据"), "{note}");
+        assert!(missing_file_note(&dir.path().join("安和证据.pdf")).is_none());
+        let note = missing_file_note(&dir.path().join("_jixin/答辩状.docx")).unwrap();
+        assert!(note.contains("does not exist"), "{note}");
+    }
 }
 
 #[cfg(test)]
