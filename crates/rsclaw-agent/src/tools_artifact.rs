@@ -50,6 +50,33 @@ pub(crate) fn validate_read_mode(mode: &str) -> Result<()> {
     ))
 }
 
+/// `mode`, with its argument joined back on when a model split it off:
+/// `{"mode": "query", "query": "合同金额"}` → `query:合同金额`, and the same
+/// for grep (`pattern`), lines (`range`), head / tail (`n`).
+pub(crate) fn joined_mode(args: &Value) -> String {
+    let mode = args["mode"].as_str().unwrap_or("").trim();
+    let bare = mode.trim_end_matches(':');
+    let keys: &[&str] = match bare {
+        "query" => &["query", "q", "question"],
+        "grep" => &["grep", "pattern"],
+        "lines" => &["lines", "range"],
+        "head" | "tail" => &[bare, "n", "count"],
+        _ => return mode.to_owned(),
+    };
+    if mode.len() > bare.len() + 1 {
+        return mode.to_owned();
+    }
+    let value = keys.iter().find_map(|k| match &args[*k] {
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    });
+    match value {
+        Some(value) => format!("{bare}:{value}"),
+        None => mode.to_owned(),
+    }
+}
+
 /// Apply `mode` to `full` text and return the selected slice.
 ///
 /// Factored out from the tool handler so unit tests can hit the parser
@@ -317,7 +344,8 @@ impl AgentRuntime {
 
         // No mode = cursor mode (return the next unread chunk). The model
         // never has to compute line ranges; calling again always advances.
-        let mode = args["mode"].as_str().unwrap_or("").trim();
+        let mode = joined_mode(&args);
+        let mode = mode.as_str();
         validate_read_mode(mode)?;
         let store = default_store();
         let full = store.read(&ctx.session_key, &id).map_err(|e| {
@@ -677,6 +705,17 @@ mod tests {
             let err = validate_read_mode(bad).expect_err(bad).to_string();
             assert!(err.contains("read_artifact"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn a_split_mode_argument_is_joined_back() {
+        let j = |v: serde_json::Value| joined_mode(&v);
+        assert_eq!(j(json!({"mode": "query", "query": "委托代理费用"})), "query:委托代理费用");
+        assert_eq!(j(json!({"mode": "grep:", "pattern": "陈东"})), "grep:陈东");
+        assert_eq!(j(json!({"mode": "head", "n": 40})), "head:40");
+        assert_eq!(j(json!({"mode": "lines:1-9", "range": "5-6"})), "lines:1-9");
+        assert_eq!(j(json!({"mode": "query"})), "query");
+        assert_eq!(j(json!({})), "");
     }
 
     #[test]
