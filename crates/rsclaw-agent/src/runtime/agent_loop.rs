@@ -368,6 +368,9 @@ impl AgentRuntime {
         // Headroom kept under the context limit once the estimate is
         // calibrated: the next turn's new input plus a full reply.
         const PREFLIGHT_RESERVE_TOKENS: usize = 12_288;
+        // Headroom under the context limit at which a stateful backend is
+        // re-sent the shrunk history: a reply and a little new input.
+        const REPLAY_RESERVE_TOKENS: usize = 4_096;
         // Set once pre-flight compaction proves to be a no-op this turn, so it
         // isn't re-attempted (and re-billed) on every iteration.
         let mut preflight_compaction_stalled = false;
@@ -996,11 +999,16 @@ impl AgentRuntime {
                         "pre-flight: near the context limit, shrank older tool results of this turn"
                     );
                     messages = self.build_request_messages(ctx, &mut turn_scratchpad);
-                    // A stateful backend still holds those results in full
-                    // and would reach its cap regardless: have it take the
-                    // shrunk history instead. Its reported size no longer
-                    // describes the request, so stop scaling by it until
-                    // the next call reports again.
+                }
+                // A stateful backend still holds those results in full and
+                // keeps growing to its cap. Once it is about to reach it,
+                // have it take the shrunk history instead of failing there.
+                // Not sooner: a re-sent history is rendered afresh, and a
+                // model reading its past calls rendered as text may write
+                // its next one as text too. Its reported size then no
+                // longer describes the request, so stop scaling by it until
+                // the next call reports again.
+                if total_est > context_limit.saturating_sub(REPLAY_RESERVE_TOKENS) {
                     let (resolved_provider, _) = self.providers.resolve_model(&model);
                     if let Ok(provider) = self.providers.get(resolved_provider) {
                         provider.drop_session(&ctx.session_key);
