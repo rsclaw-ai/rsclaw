@@ -4031,11 +4031,12 @@ data: [DONE]
             &state,
         )
         .await;
-        // Exactly one ToolCall, no intermediate TextDelta events.
+        // Exactly one ToolCall; the input shards yield only the empty
+        // keep-alive deltas, no text.
         let mut tool_calls = Vec::new();
         for e in &evs {
-            if let Ok(StreamEvent::TextDelta(_)) = e {
-                panic!("tool_call deltas must NOT emit TextDelta");
+            if let Ok(StreamEvent::TextDelta(t)) = e {
+                assert!(t.is_empty(), "tool_call deltas must NOT emit text: {t:?}");
             }
             if let Ok(StreamEvent::ToolCall { id, name, input }) = e {
                 tool_calls.push((id.clone(), name.clone(), input.clone()));
@@ -4077,7 +4078,8 @@ data: {"type":"block_stop","index":0}
         let mut tool_calls = Vec::new();
         for e in evs {
             match e.unwrap() {
-                StreamEvent::TextDelta(s) => texts.push(s),
+                // Empty deltas are the keep-alives a tool input's shards send.
+                StreamEvent::TextDelta(s) if !s.is_empty() => texts.push(s),
                 StreamEvent::ToolCall { id, name, input } => tool_calls.push((id, name, input)),
                 _ => {}
             }
