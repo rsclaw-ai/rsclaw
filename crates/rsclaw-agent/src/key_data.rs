@@ -99,6 +99,9 @@ re!(
     r"[\p{Han}（）()]{2,40}?(?:集团股份有限公司|集团有限公司|股份有限公司|有限责任公司|有限公司|律师事务所|人民法院|人民检察院|仲裁委员会)"
 );
 re!(LEGAL_REP, r"(?:法定代表人|负责人)[：:\s]*(\p{Han}{2,4})");
+// 住所地：黄陂区滠水湖…科创中心（一期）企业总部A座/栋/单元3层8室, up to the
+// clause's end.
+re!(ADDRESS, r"(?:住所地|住所|住址|地址)[：:\s]*([^，,。；;\n]{6,80})");
 re!(TIME_AFTER, r"^[\sT]\d{1,2}:\d{2}");
 
 static KINDS: &[Kind] = &[
@@ -112,6 +115,7 @@ static KINDS: &[Kind] = &[
     Kind { name: "date", re: &DATE, bounded: true, group: 0 },
     Kind { name: "org", re: &ORG, bounded: false, group: 0 },
     Kind { name: "legal_rep", re: &LEGAL_REP, bounded: false, group: 1 },
+    Kind { name: "address", re: &ADDRESS, bounded: false, group: 1 },
 ];
 
 /// Words that open a party line and get swept into an organisation match
@@ -125,6 +129,11 @@ const ROLE_PREFIXES: &[&str] = &[
 /// An organisation "name" holding one of these is a generic reference
 /// ("工程所在地人民法院"), not a named party or court.
 const GENERIC_ORG_WORDS: &[&str] = &["所在地", "住所地", "有管辖权", "当地", "相关", "该"];
+
+/// Words a real address holds somewhere.
+const ADDRESS_MARKS: &[&str] = &[
+    "路", "街", "道", "号", "村", "镇", "乡", "巷", "弄", "组", "幢", "栋", "室", "层", "楼", "中心", "园",
+];
 
 /// Whether `name` is a kind this module knows.
 pub fn is_known_kind(name: &str) -> bool {
@@ -195,6 +204,13 @@ fn plausible(kind: &str, value: &str) -> bool {
         "credit_code" => value.chars().any(|c| c.is_ascii_uppercase()),
         // An org needs a name in front of its suffix.
         "org" => value.chars().count() >= 6 && !GENERIC_ORG_WORDS.iter().any(|w| value.contains(w)),
+        // A place someone can be reached at, not "住所地人民法院" or a field
+        // label left empty.
+        "address" => {
+            ADDRESS_MARKS.iter().any(|m| value.contains(m))
+                && !value.contains("人民法院")
+                && !value.starts_with(['（', '('])
+        }
         _ => true,
     }
 }
@@ -349,6 +365,17 @@ mod tests {
     const ALL: &[&str] = &[
         "credit_code", "id_card", "phone", "landline", "case_no", "amount", "date", "org", "legal_rep",
     ];
+
+    #[test]
+    fn key_data_keeps_a_party_address_whole() {
+        let got: Vec<String> = extract(PETITION, &kinds(&["address"])).into_iter().map(|d| d.value).collect();
+        assert_eq!(
+            got,
+            ["黄陂区滠水湖经济开发区长丰路以东、云阳路以北、和平路以西科创中心（一期）企业总部A座/栋/单元3层8室"]
+        );
+        let none = extract("由被告住所地人民法院管辖。地址：（none）", &kinds(&["address"]));
+        assert!(none.is_empty(), "{none:?}");
+    }
 
     #[test]
     fn key_data_pulls_legal_facts() {
