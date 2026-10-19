@@ -1064,8 +1064,8 @@ pub use super::model_resolution::{
 
 /// Tokens (by `key_data::token_upper_bound`) a turn's recall channel may
 /// carry to the rsclaw backend, under its `--rsclaw-max-recall-tokens`
-/// (2048) with room for the wire wrapper.
-pub(crate) const RSCLAW_RECALL_BUDGET: usize = 1800;
+/// (1200 on the fleet) with room for the wire wrapper.
+pub(crate) const RSCLAW_RECALL_BUDGET: usize = 1000;
 
 impl AgentRuntime {
     /// Estimate fixed context overhead: system prompt + tools tokens.
