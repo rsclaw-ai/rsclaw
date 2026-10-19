@@ -335,6 +335,14 @@ impl AgentRuntime {
         }
         ctx.turn_metrics.stagnation_budget = budget;
         let mut last_result_hash: Option<String> = None;
+        // Recent (call, result) pairs. A loop of two or more calls that keep
+        // returning the same (click 下一步 → look at the page → click again)
+        // never repeats one call back to back, and each result differs from
+        // the one before it, so neither check above sees it.
+        let mut recent_outcomes: std::collections::VecDeque<(String, Option<String>)> =
+            std::collections::VecDeque::new();
+        const OUTCOME_WINDOW: usize = 12;
+        const MAX_SAME_OUTCOME: usize = 3;
         let mut last_tool_name = String::new();
         let mut wrapup_injected = false;
         // Times this turn ran into the model's context limit. Each recovery
@@ -960,6 +968,10 @@ impl AgentRuntime {
             let total_est = scale.map_or(overhead + session_tokens + turn_tokens, |s| {
                 ((overhead + session_tokens + turn_tokens) as f32 * s) as usize
             });
+            // The parts above can come in far under the request being sent
+            // (16k against an 83k request the fleet refused): take the
+            // request's own estimate when it is larger.
+            let total_est = total_est.max(calibrated_tokens);
             // Calibrated against the provider's real count: compact once the
             // next input and reply would no longer fit. Uncalibrated: keep a
             // 20% margin for the estimate's error.
@@ -2969,6 +2981,24 @@ impl AgentRuntime {
                             budget -= 1;
                         }
                         // else: new output, budget unchanged
+                        let outcome = (
+                            crate::loop_detection::hash_tool_call(&tool_name, &tool_input_for_metrics),
+                            current_hash.clone(),
+                        );
+                        let seen = recent_outcomes.iter().filter(|o| **o == outcome).count() + 1;
+                        if recent_outcomes.len() == OUTCOME_WINDOW {
+                            recent_outcomes.pop_front();
+                        }
+                        recent_outcomes.push_back(outcome);
+                        if !daemon_mode && seen >= MAX_SAME_OUTCOME && budget > 0 {
+                            warn!(
+                                session = %ctx.session_key,
+                                tool = %tool_name,
+                                seen,
+                                "agent_loop: a call keeps returning the same result in a cycle, asking for a final answer"
+                            );
+                            budget = 0;
+                        }
                         last_result_hash = current_hash;
                         ctx.turn_metrics.stagnation_budget = budget;
                         // Loop A: capture recalled memory IDs from search results.
