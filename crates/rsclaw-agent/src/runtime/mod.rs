@@ -558,8 +558,9 @@ pub struct RunContext {
     pub turn_ctx: super::registry::TurnContext,
 }
 
-/// How long a context limit learned from a backend's refusals is trusted.
-const LEARNED_LIMIT_TTL_SECS: u64 = 7 * 24 * 3600;
+/// How long a context limit learned from a backend's refusals is trusted:
+/// hours, not days, so a backend whose cap is raised is used to it soon.
+const LEARNED_LIMIT_TTL_SECS: u64 = 6 * 3600;
 /// Never learn a limit below this: a refusal of a tiny request is not about size.
 const MIN_LEARNED_LIMIT: usize = 16_000;
 
@@ -2051,7 +2052,7 @@ impl AgentRuntime {
     }
 
     /// The context size `model`'s backend turned a request away at, learned
-    /// from its "context exceeded" errors in the last week (a backend may
+    /// from its "context exceeded" errors in the last few hours (a backend may
     /// cap sessions well below the model's window).
     pub(crate) fn learned_context_limit(&self, model: &str) -> Option<usize> {
         let raw = self.store.db.kv_get(&learned_limit_key(model)).ok().flatten()?;
@@ -3219,10 +3220,10 @@ mod tests;
 #[cfg(test)]
 mod learned_limit_tests {
     #[test]
-    fn a_learned_limit_expires_after_a_week() {
+    fn a_learned_limit_expires_within_hours() {
         let at = 1_790_000_000u64;
         assert_eq!(super::parse_learned_limit(&format!("70000:{at}"), at + 3600), Some(70_000));
-        assert_eq!(super::parse_learned_limit(&format!("70000:{at}"), at + 8 * 24 * 3600), None);
+        assert_eq!(super::parse_learned_limit(&format!("70000:{at}"), at + 7 * 3600), None);
         assert_eq!(super::parse_learned_limit("garbage", at), None);
     }
 
