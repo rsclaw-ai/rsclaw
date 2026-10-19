@@ -563,8 +563,10 @@ const LEARNED_LIMIT_TTL_SECS: u64 = 7 * 24 * 3600;
 /// Never learn a limit below this: a refusal of a tiny request is not about size.
 const MIN_LEARNED_LIMIT: usize = 16_000;
 
+/// `ctx_limit2:`: limits stored under `ctx_limit:` were learned from an
+/// undercount of the refused request and are left behind.
 fn learned_limit_key(model: &str) -> String {
-    format!("ctx_limit:{model}")
+    format!("ctx_limit2:{model}")
 }
 
 /// "limit:unix-seconds" as stored, while still fresh at `now`.
@@ -3226,7 +3228,7 @@ mod learned_limit_tests {
 
     #[test]
     fn learned_limit_key_is_per_model() {
-        assert_eq!(super::learned_limit_key("rsclaw/rsclaw-agent-v2"), "ctx_limit:rsclaw/rsclaw-agent-v2");
+        assert_eq!(super::learned_limit_key("rsclaw/rsclaw-agent-v2"), "ctx_limit2:rsclaw/rsclaw-agent-v2");
         assert_ne!(super::learned_limit_key("a/x"), super::learned_limit_key("a/y"));
     }
 }

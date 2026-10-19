@@ -1180,7 +1180,10 @@ impl AgentRuntime {
                         == rsclaw_provider::health::ErrorKind::ContextExceeded =>
                 {
                     warn!(session = %ctx.session_key, error = %e, "session context exceeded; compacting and retrying once");
-                    self.learn_context_limit(&model, total_est);
+                    // The pre-flight total leaves out much of what the
+                    // request carried (it came in at 16k on a refused 83k
+                    // request); learn from the size of the request itself.
+                    self.learn_context_limit(&model, approx_tokens.max(total_est));
                     let before = self.session_token_sum(&ctx.session_key);
                     self.compact_inner(&ctx.session_key, &model, true).await;
                     if self.session_token_sum(&ctx.session_key) >= before {
