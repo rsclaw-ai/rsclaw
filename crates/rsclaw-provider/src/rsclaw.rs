@@ -784,6 +784,14 @@ impl LlmProvider for RsclawProvider {
         })
     }
 
+    /// The next call on `session_key` re-opens the session by
+    /// /sessions/replay from the request's history.
+    fn drop_session(&self, session_key: &str) {
+        if self.lock_sessions().remove(session_key).is_some() {
+            tracing::info!(session = session_key, "rsclaw: dropped the server session; next call replays");
+        }
+    }
+
     /// Resolve `session_key` → wire `session_id` via the cached
     /// `SessionEntry`, then delegate to the inner `compact_splice`
     /// helper. On HTTP success, update the cached entry's
@@ -6245,6 +6253,27 @@ data: {"type":"block_stop","index":0}
             msg.contains("not supported") && msg.contains("stub"),
             "default impl Err should name the provider: {msg}"
         );
+    }
+
+    #[test]
+    fn drop_session_makes_the_next_call_replay() {
+        // Shrinking messages the server already holds changes nothing
+        // there; dropping the cached entry sends the next call down the
+        // replay path with the history as it is now.
+        use crate::LlmProvider;
+        let provider = RsclawProvider::new("http://nonexistent-host.invalid", None);
+        provider.lock_sessions().insert(
+            "k".to_owned(),
+            SessionEntry {
+                session_id: "rs_w7_abc".to_owned(),
+                prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
+                last_seen_msgs_len: 40,
+            },
+        );
+        provider.drop_session("k");
+        assert!(provider.lock_sessions().get("k").is_none());
+        // Dropping an unknown session is harmless.
+        provider.drop_session("k");
     }
 
     #[tokio::test]

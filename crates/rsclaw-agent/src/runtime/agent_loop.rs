@@ -996,6 +996,16 @@ impl AgentRuntime {
                         "pre-flight: near the context limit, shrank older tool results of this turn"
                     );
                     messages = self.build_request_messages(ctx, &mut turn_scratchpad);
+                    // A stateful backend still holds those results in full
+                    // and would reach its cap regardless: have it take the
+                    // shrunk history instead. Its reported size no longer
+                    // describes the request, so stop scaling by it until
+                    // the next call reports again.
+                    let (resolved_provider, _) = self.providers.resolve_model(&model);
+                    if let Ok(provider) = self.providers.get(resolved_provider) {
+                        provider.drop_session(&ctx.session_key);
+                    }
+                    forget_token_scale(&ctx.session_key);
                 }
             }
             if !preflight_compaction_stalled && total_est > preflight_threshold {
@@ -3914,6 +3924,14 @@ fn token_scale(session: &str) -> Option<f32> {
     token_scales().lock().ok()?.get(session).copied()
 }
 
+/// Drop what earlier calls taught about this session's size: the provider
+/// is about to be sent a different history than the one it counted.
+fn forget_token_scale(session: &str) {
+    if let Ok(mut map) = token_scales().lock() {
+        map.remove(session);
+    }
+}
+
 /// Learn from a call's reported prompt size (`real`) against our estimate
 /// of the same request. Only ever scales up (1.0 to 3.0): some providers
 /// leave cached tokens out of the count, and a low count must not make us
@@ -3931,7 +3949,7 @@ fn record_token_scale(session: &str, real: u64, estimated: usize) {
 
 #[cfg(test)]
 mod token_scale_tests {
-    use super::{record_token_scale, token_scale};
+    use super::{forget_token_scale, record_token_scale, token_scale};
 
     #[test]
     fn scales_up_from_real_counts_only() {
@@ -3946,5 +3964,7 @@ mod token_scale_tests {
         // Tiny calls teach nothing.
         record_token_scale("ts-c", 500, 400);
         assert_eq!(token_scale("ts-c"), None);
+        forget_token_scale("ts-a");
+        assert_eq!(token_scale("ts-a"), None);
     }
 }

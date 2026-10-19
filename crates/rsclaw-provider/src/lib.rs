@@ -611,6 +611,17 @@ pub trait LlmProvider: Send + Sync {
         let name = self.name().to_owned();
         Box::pin(async move { anyhow::bail!("compact splice not supported by provider {name}") })
     }
+
+    /// Forget the server-side copy of `session_key`'s history, so the next
+    /// call re-sends the history as the request now carries it.
+    ///
+    /// A stateful provider (rsclaw kvCacheMode=2) keeps every message it
+    /// was sent and is then sent only what is new: shrinking messages the
+    /// server already holds changes nothing there, and its copy keeps
+    /// growing to the session cap. Stateless providers re-send the whole
+    /// history on every call, so the default does nothing.
+    #[allow(unused_variables)]
+    fn drop_session(&self, session_key: &str) {}
 }
 
 // ---------------------------------------------------------------------------
