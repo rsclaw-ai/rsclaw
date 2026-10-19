@@ -1675,7 +1675,7 @@ struct CreateSessionReq<'a> {
     /// The same registry-path segment under the field name the worker's
     /// static (registered-prefix) create/replay path reads. Workers since
     /// the v1.9 rename only consult `user_suffix` there, so sending
-    /// `user_system` alone silently dropped the persona, distributor policy
+    /// `user_system` alone silently dropped the persona, distributor policy, workspace instructions
     /// and plugin/skill listings. Sent alongside `user_system` (identical
     /// content) so both old and new workers overlay it; empty on the
     /// dynamic path.
@@ -1710,7 +1710,7 @@ struct ReplayReq<'a> {
     /// The same registry-path segment under the field name the worker's
     /// static (registered-prefix) create/replay path reads. Workers since
     /// the v1.9 rename only consult `user_suffix` there, so sending
-    /// `user_system` alone silently dropped the persona, distributor policy
+    /// `user_system` alone silently dropped the persona, distributor policy, workspace instructions
     /// and plugin/skill listings. Sent alongside `user_system` (identical
     /// content) so both old and new workers overlay it; empty on the
     /// dynamic path.
