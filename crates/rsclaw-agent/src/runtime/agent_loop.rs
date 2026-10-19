@@ -3159,7 +3159,16 @@ impl AgentRuntime {
                         // (wasm trap, http status, panic msg) is hidden.
                         let err_chain = format!("{e:#}");
                         result_is_error = true;
-                        warn!(tool = %tool_name, "tool error: {}", err_chain);
+                        // The arguments as the model sent them (before any
+                        // tool rejoins a split one), so a malformed call can
+                        // be told apart from a parser that dropped a field.
+                        let sent = tool_input_for_metrics.to_string();
+                        warn!(
+                            tool = %tool_name,
+                            args = rsclaw_util::truncate_str(&sent, 600),
+                            "tool error: {}",
+                            err_chain
+                        );
                         // Store error info for user feedback when breaking loop
                         last_error_info = Some(err_chain.clone());
                         // Err-path failures feed the identical-failure ledger
