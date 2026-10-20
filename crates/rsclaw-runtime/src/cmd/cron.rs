@@ -49,28 +49,31 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             }
         }
         CronCommand::Run { id } => {
-            // Manual trigger: POST to gateway API if running.
+            // Manual trigger through the gateway's own trigger path, so a job
+            // with a plugin preflight runs it first, exactly like a scheduled
+            // run (posting the bare message would skip it).
             let config = config::load()?;
             let port = config.gateway.port;
             let (jobs, _) = crate::cron::load_cron_jobs();
-            let job = jobs
-                .iter()
-                .find(|j| j.id == id)
-                .ok_or_else(|| anyhow::anyhow!("cron job '{id}' not found"))?;
-            let url = format!("http://127.0.0.1:{port}/api/v1/message");
-            let body = serde_json::json!({
-                "text": job.effective_message(),
-                "agent_id": job.agent_id,
-                "session_key": format!("cron:{id}:manual"),
-            });
+            if !jobs.iter().any(|j| j.id == id) {
+                anyhow::bail!("cron job '{id}' not found");
+            }
+            let url = format!("http://127.0.0.1:{port}/api/v1/cron/{id}/trigger");
             let client = crate::cmd::gateway_http::local_client();
             let resp = with_gateway_auth(client.post(&url), config.gateway.auth_token.as_deref())
-                .json(&body)
                 .send()
                 .await
                 .map_err(|e| anyhow::anyhow!("gateway unreachable at {url}: {e}"))?;
             if resp.status().is_success() {
-                ok(&format!("cron job '{}' triggered", cyan(&id)));
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                if body["noWork"].as_bool() == Some(true) {
+                    ok(&format!(
+                        "cron job '{}' triggered: plugin preflight found no work",
+                        cyan(&id)
+                    ));
+                } else {
+                    ok(&format!("cron job '{}' triggered", cyan(&id)));
+                }
             } else {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();

@@ -740,9 +740,13 @@ pub async fn cron_run(ctx: MethodCtx) -> MethodResult {
         .as_str()
         .ok_or_else(|| ErrorShape::bad_request("missing id"))?;
 
-    use crate::server::CronTriggerError;
+    use crate::server::{CronTriggerError, CronTriggered};
     match crate::server::trigger_cron_job(&ctx.state, id).await {
-        Ok(()) => Ok(serde_json::json!({ "triggered": id })),
+        Ok(CronTriggered::Dispatched) => Ok(serde_json::json!({ "triggered": id })),
+        Ok(CronTriggered::NoWork) => Ok(serde_json::json!({ "triggered": id, "noWork": true })),
+        Err(CronTriggerError::Preflight(e)) => Err(ErrorShape::internal(format!(
+            "cron job '{id}': plugin preflight failed: {e}"
+        ))),
         Err(CronTriggerError::NotFound) => {
             Err(ErrorShape::not_found(format!("cron job '{id}' not found")))
         }

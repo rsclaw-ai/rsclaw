@@ -4545,14 +4545,34 @@ pub(crate) enum CronTriggerError {
     Store(String),
     /// The target agent is missing or its inbox is closed.
     Dispatch,
+    /// The job's plugin preflight failed.
+    Preflight(String),
+}
+
+/// What a manual cron trigger did.
+pub(crate) enum CronTriggered {
+    /// The message went to the job's agent.
+    Dispatched,
+    /// The job's plugin preflight found no work, so no agent turn ran.
+    NoWork,
 }
 
 /// POST /api/v1/cron/:id/trigger — manually trigger a cron job.
 async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match trigger_cron_job(&state, &id).await {
-        Ok(()) => (
+        Ok(CronTriggered::Dispatched) => (
             StatusCode::OK,
             Json(serde_json::json!({"triggered": true, "job_id": id})),
+        )
+            .into_response(),
+        Ok(CronTriggered::NoWork) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"triggered": true, "job_id": id, "noWork": true})),
+        )
+            .into_response(),
+        Err(CronTriggerError::Preflight(e)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("plugin preflight failed: {e}")})),
         )
             .into_response(),
         Err(CronTriggerError::NotFound) => (
@@ -4572,8 +4592,13 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
 /// Run a cron job now, in-process: load it from the authoritative store,
 /// dispatch its message to the job's agent, and deliver the reply through the
 /// job's delivery config in the background. Returns once the message is
-/// queued. Shared by `POST /api/v1/cron/:id/trigger` and WS `cron.run`.
-pub(crate) async fn trigger_cron_job(state: &AppState, id: &str) -> Result<(), CronTriggerError> {
+/// queued. A job with a plugin preflight runs it first, as the scheduler does:
+/// no work means no agent turn. Shared by `POST /api/v1/cron/:id/trigger` and
+/// WS `cron.run`.
+pub(crate) async fn trigger_cron_job(
+    state: &AppState,
+    id: &str,
+) -> Result<CronTriggered, CronTriggerError> {
     let id = id.to_owned();
     let jobs = cron_load_jobs().await.map_err(CronTriggerError::Store)?;
     let Some(job) = jobs.iter().find(|j| j["id"].as_str() == Some(&id)) else {
@@ -4592,6 +4617,17 @@ pub(crate) async fn trigger_cron_job(state: &AppState, id: &str) -> Result<(), C
         .or_else(|| job["agentId"].as_str())
         .filter(|s| !s.is_empty())
         .unwrap_or("main");
+
+    let wake_mode = job["wakeMode"].as_str();
+    let plugins = state.wasm_plugins.read().await.clone();
+    let message = match crate::cron::preflight_message(wake_mode, &message, Some(&plugins)).await {
+        Ok(Some(message)) => message,
+        Ok(None) => {
+            tracing::info!(job_id = %id, "cron trigger: plugin preflight found no work");
+            return Ok(CronTriggered::NoWork);
+        }
+        Err(e) => return Err(CronTriggerError::Preflight(format!("{e:#}"))),
+    };
 
     // Send message to the agent via registry. The placeholder ids "default"
     // (WS `cron.add`) and "main" fall back to the default agent.
@@ -4686,7 +4722,7 @@ pub(crate) async fn trigger_cron_job(state: &AppState, id: &str) -> Result<(), C
                     }
                 }
             });
-            return Ok(());
+            return Ok(CronTriggered::Dispatched);
         }
     }
 

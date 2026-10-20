@@ -970,7 +970,7 @@ impl CronRunner {
                     info!(job_id = %job.id, "cron job triggered");
 
                     let preflight_result = match parse_plugin_preflight(job.wake_mode.as_deref()) {
-                        Ok(Some(preflight)) => {
+                        Ok(Some(_)) => {
                             // Read the CURRENT plugin registry at dispatch
                             // time, not whatever was live when the cron
                             // scheduler was constructed.
@@ -978,18 +978,16 @@ impl CronRunner {
                                 Some(lock) => Some(lock.read().await.clone()),
                                 None => None,
                             };
-                            match run_plugin_preflight(wasm_plugins_now.as_deref(), &preflight)
-                                .await
+                            match preflight_message(
+                                job.wake_mode.as_deref(),
+                                job.effective_message(),
+                                wasm_plugins_now.as_deref(),
+                            )
+                            .await
                             {
-                                Ok(outcome) if !outcome.should_run => {
-                                    Some(Ok("plugin preflight: no work".to_string()))
-                                }
-                                Ok(outcome) => {
-                                    job.bake_message(format!(
-                                    "{}\n\nPlugin preflight result (already executed; do not call it again):\n{}",
-                                    job.effective_message(),
-                                    outcome.result
-                                ));
+                                Ok(None) => Some(Ok("plugin preflight: no work".to_string())),
+                                Ok(Some(message)) => {
+                                    job.bake_message(message);
                                     None
                                 }
                                 Err(error) => Some(Err(error)),
@@ -1504,6 +1502,30 @@ async fn run_plugin_preflight(
     Ok(PluginPreflightOutcome { result, should_run })
 }
 
+/// The message a job's agent turn receives once its plugin preflight
+/// (`wakeMode: plugin-preflight:<plugin>:<tool>`) has run: the job's message
+/// with the preflight result appended, or `None` when the preflight found no
+/// work. A job without a preflight gets its message unchanged. The scheduler
+/// and manual triggers both go through here, so a manual run never hands the
+/// agent a message that promises a result it does not carry.
+pub(crate) async fn preflight_message(
+    wake_mode: Option<&str>,
+    message: &str,
+    plugins: Option<&Vec<rsclaw_plugin::WasmPlugin>>,
+) -> Result<Option<String>> {
+    let Some(preflight) = parse_plugin_preflight(wake_mode)? else {
+        return Ok(Some(message.to_owned()));
+    };
+    let outcome = run_plugin_preflight(plugins, &preflight).await?;
+    if !outcome.should_run {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{message}\n\nPlugin preflight result (already executed; do not call it again):\n{}",
+        outcome.result
+    )))
+}
+
 /// Fill `state.nextRunAtMs` on an enabled job (raw JSON, as served by the
 /// HTTP / WS cron list). A future value the runner already persisted wins
 /// (it accounts for error backoff); otherwise the next fire time is computed
@@ -1573,7 +1595,29 @@ mod annotate_next_run_tests {
 
 #[cfg(test)]
 mod plugin_preflight_tests {
-    use super::{PluginPreflight, parse_plugin_preflight};
+    use super::{PluginPreflight, parse_plugin_preflight, preflight_message};
+
+    #[tokio::test]
+    async fn message_without_preflight_passes_unchanged() {
+        for wake_mode in [None, Some("next-heartbeat")] {
+            let message = preflight_message(wake_mode, "run once", None)
+                .await
+                .expect("no preflight to run");
+            assert_eq!(message.as_deref(), Some("run once"));
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_without_its_plugin_fails_instead_of_running_bare() {
+        let error = preflight_message(
+            Some("plugin-preflight:sample-plugin:scan"),
+            "result attached below",
+            Some(&Vec::new()),
+        )
+        .await
+        .expect_err("a missing plugin must not hand the agent the bare message");
+        assert!(error.to_string().contains("not loaded"));
+    }
 
     #[test]
     fn parses_plugin_and_tool_from_wake_mode() {
