@@ -1,6 +1,7 @@
 use rsclaw_config::schema::{ContextPruningConfig, HardClearConfig, SoftTrimConfig};
 use rsclaw_provider::{Message, MessageContent, Role};
 use rsclaw_skill::SkillRegistry;
+use sha2::Digest;
 
 use super::*;
 use crate::context_mgr::msg_chars;
@@ -278,6 +279,39 @@ fn recall_bundle_from_docs_is_raw_context_with_metadata() {
     assert_eq!(bundle.metadata.max_tokens, Some(1200));
     assert!(bundle.metadata.hash.starts_with("sha256:"));
     assert!(!bundle.metadata.truncated);
+}
+
+#[test]
+fn rsclaw_recall_cap_applies_after_memory_kb_and_todo_are_combined() {
+    let context = format!(
+        "- {}\n\n[Knowledge base]\n{}\n\n[Current plan]\n{}",
+        "记忆".repeat(500),
+        "知识".repeat(500),
+        "计划".repeat(500),
+    );
+    let original_hash = "sha256:stale".to_owned();
+    let bundle = RecallBundle {
+        context,
+        metadata: rsclaw_provider::RecallMetadata {
+            max_tokens: Some(1200),
+            hash: original_hash.clone(),
+            ..Default::default()
+        },
+    };
+
+    let capped = crate::tools_memory::cap_rsclaw_recall_bundle(bundle).expect("capped bundle");
+
+    assert!(crate::tools_memory::rsclaw_recall_wire_token_upper_bound(&capped.context) <= 1200);
+    assert!(capped.metadata.truncated);
+    assert_eq!(capped.metadata.max_tokens, Some(1200));
+    assert_ne!(capped.metadata.hash, original_hash);
+    assert_eq!(
+        capped.metadata.hash,
+        format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(capped.context.as_bytes())
+        )
+    );
 }
 
 #[test]

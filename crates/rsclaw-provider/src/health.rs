@@ -543,6 +543,14 @@ pub fn classify_str(s: &str) -> ErrorKind {
     if lower.contains("max_tokens") && (lower.contains("400") || lower.contains("exceed")) {
         return ErrorKind::BadRequest;
     }
+    // rsclaw-server currently wraps a worker recall budget rejection in a
+    // generic 502 backend_unreachable envelope. The payload is deterministic:
+    // retrying the identical recall context cannot succeed and can desynchronise
+    // a stateful session, so classify by the nested worker code before generic
+    // 5xx handling below.
+    if lower.contains("recall_too_large") || lower.contains("--rsclaw-max-recall-tokens") {
+        return ErrorKind::BadRequest;
+    }
 
     // -------- Generic non-retryable 4xx --------
     // Matched on the status phrase the providers format into their errors
@@ -654,6 +662,12 @@ mod tests {
             classify_str("connection failed: timed out"),
             ErrorKind::Transient
         );
+    }
+
+    #[test]
+    fn classify_wrapped_recall_too_large_as_bad_request() {
+        let body = r#"rsclaw turn failed 502 Bad Gateway: {"error":{"code":"backend_unreachable","detail":"upstream 502 Bad Gateway: recall_too_large: recall_context 1231 tokens exceeds cap (1200; --rsclaw-max-recall-tokens)"}}"#;
+        assert_eq!(classify_str(body), ErrorKind::BadRequest);
     }
 
     #[test]

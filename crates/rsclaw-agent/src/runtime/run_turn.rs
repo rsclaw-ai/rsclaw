@@ -1855,6 +1855,11 @@ impl AgentRuntime {
         } else {
             auto_recall_bundle
         };
+        let auto_recall_bundle = if model_provider == "rsclaw" {
+            auto_recall_bundle.and_then(crate::tools_memory::cap_rsclaw_recall_bundle)
+        } else {
+            auto_recall_bundle
+        };
         let auto_recalled_ids = auto_recall_bundle
             .as_ref()
             .map(|b| b.metadata.doc_ids.iter().cloned().collect())
