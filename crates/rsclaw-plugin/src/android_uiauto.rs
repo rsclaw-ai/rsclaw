@@ -35,6 +35,13 @@ const LATEST_MESSAGE_BUBBLE_COMMAND: &str = "latest-message-bubble";
 const INPUT_TEXT_COMMAND: &str = "input-text";
 const CLIPBOARD_SET_COMMAND: &str = "clipboard-set";
 const OCR_REGION_COMMAND: &str = "ocr-region";
+/// Describe the screen with the installed screen observer (`vision_observer`).
+const VISION_OBSERVE_COMMAND: &str = "vision-observe";
+/// A full screenshot may travel inside `vision-observe`'s args.
+const MAX_VISION_ARGS_BYTES: usize = 16 * 1024 * 1024;
+/// Recent screenshots kept by `frameId`, so `vision-observe` can describe the
+/// very frame a plugin already holds without the plugin sending it back.
+const FRAME_CACHE_LEN: usize = 3;
 const WAKEUP_SCREEN_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(500),
     Duration::from_millis(750),
@@ -234,10 +241,13 @@ impl Drop for TempJsonFile {
 
 /// Run one allowlisted Android operation through the requested CLS transport.
 pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, String> {
-    if args_json.len() > MAX_ARGS_BYTES {
-        return Err(format!(
-            "android uiauto: args exceed {MAX_ARGS_BYTES} bytes"
-        ));
+    let max_args = if command == VISION_OBSERVE_COMMAND {
+        MAX_VISION_ARGS_BYTES
+    } else {
+        MAX_ARGS_BYTES
+    };
+    if args_json.len() > max_args {
+        return Err(format!("android uiauto: args exceed {max_args} bytes"));
     }
     let (args_json, options) = split_operation_options(args_json)?;
     validate_operation_mode(command, options)?;
@@ -266,6 +276,9 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     }
     if command == OCR_REGION_COMMAND {
         return ocr_region(&args_json, &config, options.op_type).await;
+    }
+    if command == VISION_OBSERVE_COMMAND {
+        return vision_observe(&args_json, &config, options.op_type).await;
     }
     if command == "foreground-package" {
         validate_no_args(command, &args_json)?;
@@ -332,6 +345,7 @@ fn validate_operation_mode(command: &str, options: AndroidOperationOptions) -> R
                 | KEYBOARD_VISIBLE_COMMAND
                 | SEND_BUTTON_COMMAND
                 | LATEST_MESSAGE_BUBBLE_COMMAND
+                | VISION_OBSERVE_COMMAND
         )
     {
         return Err(format!(
@@ -1365,6 +1379,122 @@ async fn screenshot_with_wakeup(config: &Config, op_type: AndroidOpType) -> Resu
     )
 }
 
+/// Recent screenshots, oldest first, by `frameId`.
+type FrameCache = std::sync::Mutex<VecDeque<(String, Vec<u8>)>>;
+
+fn frame_cache() -> &'static FrameCache {
+    static CACHE: std::sync::OnceLock<FrameCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(VecDeque::new()))
+}
+
+/// Keep a screenshot for `vision-observe` and name it by its content.
+fn remember_frame(png: Vec<u8>) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(&png);
+    let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    match frame_cache().lock() {
+        Ok(mut cache) => {
+            cache.retain(|(known, _)| known != &id);
+            cache.push_back((id.clone(), png));
+            while cache.len() > FRAME_CACHE_LEN {
+                cache.pop_front();
+            }
+        }
+        Err(error) => tracing::warn!(%error, "android screenshot frame cache poisoned"),
+    }
+    id
+}
+
+fn cached_frame(id: &str) -> Option<Vec<u8>> {
+    frame_cache()
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(known, _)| known == id)
+        .map(|(_, png)| png.clone())
+}
+
+/// `vision-observe`: describe a screenshot with the installed screen observer.
+///
+/// The image is the plugin's (`image`: a data URI), a recent screenshot by its
+/// `frameId` (`frame`), or else one taken now — then the answer carries it
+/// (unless `return_image` is false) with its `frameId`. The answer always
+/// carries the foreground package, read while the observer works. Every other
+/// arg goes to the observer as it is.
+async fn vision_observe(
+    args_json: &str,
+    config: &Config,
+    op_type: AndroidOpType,
+) -> Result<String, String> {
+    let mut args: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("vision-failed: invalid args JSON: {error}"))?;
+    let object = args
+        .as_object_mut()
+        .ok_or_else(|| "vision-failed: args must be an object".to_string())?;
+    let image = object.remove("image");
+    let frame = object.remove("frame");
+    let return_image = object.remove("return_image").and_then(|v| v.as_bool());
+    let (bytes, taken) = match (image.as_ref().and_then(Value::as_str), frame.as_ref().and_then(Value::as_str)) {
+        (Some(uri), _) => (decode_image_data_uri(uri)?, None),
+        (None, Some(id)) => (
+            cached_frame(id).ok_or_else(|| {
+                format!("vision-failed: frame {id} is no longer cached; send the image or take a new screenshot")
+            })?,
+            None,
+        ),
+        (None, None) => {
+            let response = screenshot_with_wakeup(config, op_type).await?;
+            let png = screenshot_png(&response)?;
+            let id = serde_json::from_str::<Value>(&response)
+                .ok()
+                .and_then(|v| v.get("frameId").and_then(Value::as_str).map(str::to_string));
+            (png, Some(id))
+        }
+    };
+    // The foreground now: the plugin calls with a frame it took with no input
+    // since, so it is the foreground of that frame. A look-alike chat in another
+    // app must not pass for WeChat's.
+    let (answer, foreground) = tokio::join!(
+        crate::vision_observer::observe(&args, &bytes),
+        foreground_package_name(config)
+    );
+    let mut answer = answer?;
+    if let Some(object) = answer.as_object_mut() {
+        object.insert("foreground".to_string(), serde_json::json!(foreground));
+        if let Some(frame_id) = taken {
+            object.insert("host_frame_id".to_string(), serde_json::json!(frame_id));
+            if return_image.unwrap_or(true) {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                object.insert(
+                    "image".to_string(),
+                    serde_json::json!(format!("data:image/png;base64,{encoded}")),
+                );
+            }
+        }
+    }
+    serde_json::to_string(&answer).map_err(|error| format!("vision-failed: encode answer: {error}"))
+}
+
+/// The foreground package, or `None` when it cannot be read.
+async fn foreground_package_name(config: &Config) -> Option<String> {
+    foreground_activity_dump(config)
+        .await
+        .ok()
+        .and_then(|dump| foreground_package_from_dump(&dump))
+}
+
+fn decode_image_data_uri(uri: &str) -> Result<Vec<u8>, String> {
+    let (header, data) = uri
+        .split_once(',')
+        .ok_or_else(|| "vision-failed: image is not a data URI".to_string())?;
+    if !(header.starts_with("data:image/") && header.ends_with(";base64")) {
+        return Err("vision-failed: image must be a base64 image data URI".to_string());
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .map_err(|error| format!("vision-failed: invalid image base64: {error}"))
+}
+
 fn annotate_screenshot(response: String) -> Result<String, String> {
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
@@ -1385,6 +1515,10 @@ fn annotate_screenshot(response: String) -> Result<String, String> {
         .ok_or_else(|| "android uiauto: screenshot response must be an object".to_string())?;
     object.insert("width".to_string(), serde_json::json!(image.width()));
     object.insert("height".to_string(), serde_json::json!(image.height()));
+    object.insert(
+        "frameId".to_string(),
+        serde_json::json!(remember_frame(png)),
+    );
     object.insert(
         "contactBadge".to_string(),
         serde_json::json!({

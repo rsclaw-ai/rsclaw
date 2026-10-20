@@ -23,6 +23,7 @@ pub mod host_methods;
 pub mod js_runtime;
 pub mod manifest;
 pub mod slots;
+pub mod vision_observer;
 pub mod wasm_runtime;
 
 use std::{
