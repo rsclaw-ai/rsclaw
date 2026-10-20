@@ -8405,7 +8405,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw-runtime"
-version = "2026.10.1"
+version = "2026.10.20"
 dependencies = [
  "aes",
  "anycli",
