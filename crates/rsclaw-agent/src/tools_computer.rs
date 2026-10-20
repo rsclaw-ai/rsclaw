@@ -100,8 +100,9 @@ impl super::runtime::AgentRuntime {
             }
 
             // ---- Operator-backed actions ---------------------------------
-            "mouse_move" | "mouse_click" | "left_click" | "double_click" | "right_click"
-            | "middle_click" | "drag" | "scroll" | "type" | "key" | "hold_key" | "wait" => {
+            "mouse_move" | "mouse_click" | "click" | "left_click" | "double_click"
+            | "right_click" | "middle_click" | "drag" | "scroll" | "type" | "key"
+            | "hold_key" | "wait" => {
                 // Input synthesis without grounding is how a run ends up
                 // typing into the wrong window: the model reads a
                 // screenshot, guesses pixel coordinates, and fires blind.
@@ -135,8 +136,8 @@ impl super::runtime::AgentRuntime {
 
             other => Err(anyhow!(
                 "computer_use: unsupported action `{other}` \
-                 (supported: screenshot, mouse_move, mouse_click, double_click, triple_click, \
-                 right_click, middle_click, drag, scroll, type, key, hold_key, cursor_position, \
+                 (supported: screenshot, mouse_move, mouse_click, click, left_click, double_click, \
+                 triple_click, right_click, middle_click, drag, scroll, type, key, hold_key, cursor_position, \
                  get_active_window, ui_tree, list_app_rules, get_app_rule, wait, vlm_drive)"
             )),
         }
@@ -511,12 +512,21 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         // permission channel so the Tauri UI can show a modal. When
         // the channel is missing (CLI), permission_emit is None and
         // the driver behaves as if the user had answered AllowOnce.
-        let permission_emit: Option<Arc<dyn Fn(PermissionRequest) + Send + Sync>> =
-            self.computer_permission_tx.as_ref().map(|tx| {
+        let permission_emit: Option<Arc<dyn Fn(PermissionRequest) + Send + Sync>> = self
+            .computer_permission_tx
+            .as_ref()
+            .and_then(|tx| {
+                if tx.receiver_count() == 0 {
+                    tracing::warn!(
+                        channel = %ctx.channel,
+                        "computer_use: no desktop permission listener connected; permission requests will fail immediately"
+                    );
+                    return None;
+                }
                 let tx = tx.clone();
-                Arc::new(move |req: PermissionRequest| {
+                Some(Arc::new(move |req: PermissionRequest| {
                     let _ = tx.send(req);
-                }) as Arc<dyn Fn(PermissionRequest) + Send + Sync>
+                }) as Arc<dyn Fn(PermissionRequest) + Send + Sync>)
             });
 
         // Status events feed the live status panel. Same `None`-as-no-op
@@ -958,25 +968,18 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 "steps_taken": steps,
                 "error": "user aborted",
             }),
-            DriverOutcome::PermissionDenied => json!({
-                "action": "vlm_drive",
-                "instruction": instruction,
-                "completed": false,
-                "outcome_kind": "permission_denied",
-                "completion_verified": false,
-                "steps_taken": 0,
-                "error": "user declined the computer-control permission prompt",
-                "hint": "do not retry automatically; tell the user the action was blocked and ask how to proceed",
-            }),
-            DriverOutcome::OperatorError { message, steps } => json!({
-                "action": "vlm_drive",
-                "instruction": instruction,
-                "completed": false,
-                "outcome_kind": "operator_error",
-                "completion_verified": false,
-                "steps_taken": steps,
-                "error": message,
-            }),
+            DriverOutcome::PermissionDenied => {
+                return Err(anyhow!(
+                    "computer_use permission denied or no desktop approval UI is connected; \
+                     do not retry automatically — tell the user the action was blocked"
+                ));
+            }
+            DriverOutcome::OperatorError { message, steps } => {
+                return Err(anyhow!(
+                    "computer_use operator failed after {steps} step(s): {message}; \
+                     do not retry the same action unchanged"
+                ));
+            }
         })
     }
 }
@@ -993,6 +996,7 @@ fn is_input_synthesis(action: &str) -> bool {
     matches!(
         action,
         "mouse_click"
+            | "click"
             | "left_click"
             | "double_click"
             | "right_click"
@@ -1089,13 +1093,22 @@ async fn dispatch_via_native_operator(action: &str, args: &Value) -> Result<Valu
         factors: [1000, 1000],
     };
     let op = NativeOperator::new();
-    let out = op
-        .execute(&action_enum, &ctx)
-        .await
-        .map_err(|e| anyhow!("operator execute: {e}"))?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        op.execute(&action_enum, &ctx),
+    )
+    .await
+    .map_err(|_| anyhow!("computer_use {action} timed out after 10s; do not retry unchanged"))?
+    .map_err(|e| anyhow!("operator execute: {e}"))?;
+    if !out.ok {
+        return Err(anyhow!(
+            "computer_use {action} failed: {}; do not retry unchanged",
+            out.message.as_deref().unwrap_or("operator returned ok=false")
+        ));
+    }
     Ok(json!({
         "action": action,
-        "ok": out.ok,
+        "ok": true,
         "message": out.message,
     }))
 }
@@ -1115,7 +1128,7 @@ fn parse_native_action(action: &str, args: &Value) -> Result<Action> {
             let (x, y) = xy();
             Ok(Action::MouseMove { x, y })
         }
-        "mouse_click" | "left_click" => {
+        "mouse_click" | "click" | "left_click" => {
             let (x, y) = xy();
             let button = match args["button"].as_str().unwrap_or("left") {
                 "right" => MouseButton::Right,
@@ -1603,6 +1616,7 @@ mod tests {
     fn input_synthesis_covers_every_action_that_can_act_on_a_target() {
         for a in [
             "mouse_click",
+            "click",
             "left_click",
             "double_click",
             "right_click",
@@ -1614,6 +1628,19 @@ mod tests {
         ] {
             assert!(is_input_synthesis(a), "`{a}` must be gated");
         }
+    }
+
+    #[test]
+    fn click_alias_is_gated_and_maps_to_left_click() {
+        assert!(is_input_synthesis("click"));
+        assert_eq!(
+            parse_native_action("click", &json!({ "x": 12, "y": 34 })).expect("click action"),
+            Action::Click {
+                x: 12,
+                y: 34,
+                button: MouseButton::Left,
+            }
+        );
     }
 
     #[test]
