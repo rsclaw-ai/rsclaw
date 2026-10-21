@@ -1340,7 +1340,20 @@ fn bottom_tab_active_probe(
     }
 }
 
+/// A screenshot (woken if black). With a screen observer installed, the
+/// foreground package is read alongside and kept with the frame:
+/// `vision-observe` on that frame then needs no read of its own, which through
+/// the relay takes seconds.
 async fn screenshot_with_wakeup(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
+    let foreground = crate::vision_observer::observer_path().map(|_| read_foreground_soon(config));
+    let response = screenshot_taken(config, op_type).await?;
+    if let (Some(foreground), Some(id)) = (foreground, frame_id_of(&response)) {
+        attach_foreground(&id, foreground);
+    }
+    Ok(response)
+}
+
+async fn screenshot_taken(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
     let args = explicit_base_args(config, op_type, "screenshot")?;
     let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
     if !screenshot_is_black(&response)? {
@@ -1379,8 +1392,52 @@ async fn screenshot_with_wakeup(config: &Config, op_type: AndroidOpType) -> Resu
     )
 }
 
+/// The foreground package being read (or read) for a frame.
+type Foreground = futures::future::Shared<futures::future::BoxFuture<'static, Option<String>>>;
+
+/// A recent screenshot, with the foreground read alongside it when one was.
+struct CachedFrame {
+    id: String,
+    png: Vec<u8>,
+    foreground: Option<Foreground>,
+}
+
 /// Recent screenshots, oldest first, by `frameId`.
-type FrameCache = std::sync::Mutex<VecDeque<(String, Vec<u8>)>>;
+type FrameCache = std::sync::Mutex<VecDeque<CachedFrame>>;
+
+/// Start reading the foreground package now; the result can be awaited later,
+/// any number of times.
+fn read_foreground_soon(config: &Config) -> Foreground {
+    use futures::FutureExt as _;
+    let config = config.clone();
+    let task = tokio::spawn(async move { foreground_package_name(&config).await });
+    async move { task.await.ok().flatten() }.boxed().shared()
+}
+
+fn frame_id_of(response: &str) -> Option<String> {
+    serde_json::from_str::<Value>(response)
+        .ok()?
+        .get("frameId")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn attach_foreground(id: &str, foreground: Foreground) {
+    if let Ok(mut cache) = frame_cache().lock()
+        && let Some(frame) = cache.iter_mut().find(|f| f.id == id)
+    {
+        frame.foreground = Some(foreground);
+    }
+}
+
+fn frame_foreground(id: &str) -> Option<Foreground> {
+    frame_cache()
+        .lock()
+        .ok()?
+        .iter()
+        .find(|f| f.id == id)
+        .and_then(|f| f.foreground.clone())
+}
 
 fn frame_cache() -> &'static FrameCache {
     static CACHE: std::sync::OnceLock<FrameCache> = std::sync::OnceLock::new();
@@ -1394,8 +1451,12 @@ fn remember_frame(png: Vec<u8>) -> String {
     let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     match frame_cache().lock() {
         Ok(mut cache) => {
-            cache.retain(|(known, _)| known != &id);
-            cache.push_back((id.clone(), png));
+            cache.retain(|f| f.id != id);
+            cache.push_back(CachedFrame {
+                id: id.clone(),
+                png,
+                foreground: None,
+            });
             while cache.len() > FRAME_CACHE_LEN {
                 cache.pop_front();
             }
@@ -1410,8 +1471,8 @@ fn cached_frame(id: &str) -> Option<Vec<u8>> {
         .lock()
         .ok()?
         .iter()
-        .find(|(known, _)| known == id)
-        .map(|(_, png)| png.clone())
+        .find(|f| f.id == id)
+        .map(|f| f.png.clone())
 }
 
 /// `vision-observe`: describe a screenshot with the installed screen observer.
@@ -1451,13 +1512,23 @@ async fn vision_observe(
             (png, Some(id))
         }
     };
-    // The foreground now: the plugin calls with a frame it took with no input
-    // since, so it is the foreground of that frame. A look-alike chat in another
-    // app must not pass for WeChat's.
-    let (answer, foreground) = tokio::join!(
-        crate::vision_observer::observe(&args, &bytes),
-        foreground_package_name(config)
-    );
+    // The frame's foreground: read alongside the screenshot when the frame came
+    // from one, else now (the plugin calls with no input since its screenshot).
+    // A look-alike chat in another app must not pass for WeChat's.
+    let known = frame
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| taken.clone().flatten())
+        .and_then(|id| frame_foreground(&id));
+    let foreground = known.unwrap_or_else(|| read_foreground_soon(config));
+    let (answer, foreground) =
+        tokio::join!(crate::vision_observer::observe(&args, &bytes), async {
+            tokio::time::timeout(Duration::from_secs(8), foreground)
+                .await
+                .ok()
+                .flatten()
+        });
     let mut answer = answer?;
     if let Some(object) = answer.as_object_mut() {
         object.insert("foreground".to_string(), serde_json::json!(foreground));
@@ -3617,5 +3688,23 @@ mod tests {
         );
         assert!(clipboard_request(r#"{"sessionId":"abc","text":""}"#).is_err());
         assert!(clipboard_request(r#"{"sessionId":"abc","text":"x","extra":1}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn vision_frame_keeps_the_foreground_read_with_it() {
+        use futures::FutureExt as _;
+        let id = remember_frame(b"frame-with-foreground".to_vec());
+        assert!(frame_foreground(&id).is_none());
+        let ready: Foreground = async { Some("com.tencent.mm".to_string()) }
+            .boxed()
+            .shared();
+        attach_foreground(&id, ready);
+        let fg = frame_foreground(&id).expect("attached");
+        assert_eq!(fg.await.as_deref(), Some("com.tencent.mm"));
+        assert_eq!(
+            cached_frame(&id).as_deref(),
+            Some(&b"frame-with-foreground"[..])
+        );
+        assert!(frame_foreground("no-such-frame").is_none());
     }
 }
