@@ -817,6 +817,25 @@ function getAgentTemplates(): AgentTemplate[] {
 
 const AGENT_TEMPLATES = getAgentTemplates();
 
+// A model block's thinking switch. "on" writes the 8K budget the global Deep
+// Thinking setting uses; "inherit" leaves the block without `thinking`, so the
+// engine falls back to the default model, then to agents.defaults.thinking.
+type ThinkingMode = "inherit" | "on" | "off";
+const THINKING_ON_BUDGET = 8192;
+
+function thinkingModeOf(thinking: any): ThinkingMode {
+  if (!thinking || typeof thinking !== "object") return "inherit";
+  const budget = thinking.budget ?? thinking.budgetTokens;
+  if (typeof budget === "number") return budget > 0 ? "on" : "off";
+  if (typeof thinking.level === "string") return thinking.level === "off" ? "off" : "on";
+  if (typeof thinking.enabled === "boolean") return thinking.enabled ? "on" : "off";
+  return "inherit";
+}
+
+function thinkingConfigOf(mode: ThinkingMode) {
+  return mode === "inherit" ? undefined : { budget: mode === "on" ? THINKING_ON_BUDGET : 0 };
+}
+
 function AgentManagerPage() {
   const [agentList, setAgentList] = useState<AgentInfo[]>([]);
   const [showModal, setShowModal] = useState(false);
@@ -833,6 +852,9 @@ function AgentManagerPage() {
   const [newSystem, setNewSystem] = useState("");
   // "auto" or a numeric string like "0", "0.5", "1"
   const [newTemperature, setNewTemperature] = useState<string>("auto");
+  const [newThinking, setNewThinking] = useState<ThinkingMode>("inherit");
+  // The agent's stored `model.thinking`, kept as-is unless the switch changes.
+  const [loadedThinking, setLoadedThinking] = useState<{ mode: ThinkingMode; raw: any }>({ mode: "inherit", raw: undefined });
   const [idError, setIdError] = useState("");
   const [channelAccounts, setChannelAccounts] = useState<Record<string, string[]>>({});
   const [configModels, setConfigModels] = useState<string[]>([]);
@@ -939,7 +961,6 @@ function AgentManagerPage() {
       id: newId.trim(),
       name: newName || undefined,
       avatar: newAvatar || undefined,
-      model: newModel ? { primary: newModel, toolset: newToolset, ...(newMaxTokens > 0 ? { maxTokens: newMaxTokens } : {}) } : (newMaxTokens > 0 ? { maxTokens: newMaxTokens } : undefined),
       channels: newChannels.length > 0 ? newChannels : [],
       temperature: typeof tempVal === "number" && !Number.isNaN(tempVal) ? tempVal : undefined,
     };
@@ -958,6 +979,23 @@ function AgentManagerPage() {
         }
       }
       const idx = cfg.agents.list.findIndex((a: any) => a.id === agent.id);
+      // Merge into the stored model block: this form owns primary, toolset,
+      // maxTokens and thinking; other keys (tools, fallbacks, ...) stay.
+      const prevModel = idx >= 0 && cfg.agents.list[idx].model && typeof cfg.agents.list[idx].model === "object" ? cfg.agents.list[idx].model : {};
+      const model: Record<string, any> = { ...prevModel };
+      if (newModel) {
+        model.primary = newModel;
+        model.toolset = newToolset;
+      } else {
+        delete model.primary;
+        delete model.toolset;
+      }
+      if (newMaxTokens > 0) model.maxTokens = newMaxTokens;
+      else delete model.maxTokens;
+      const thinking = newThinking === loadedThinking.mode ? loadedThinking.raw : thinkingConfigOf(newThinking);
+      if (thinking !== undefined) model.thinking = thinking;
+      else delete model.thinking;
+      agent.model = Object.keys(model).length > 0 ? model : undefined;
       if (idx >= 0) {
         cfg.agents.list[idx] = { ...cfg.agents.list[idx], ...agent };
       } else {
@@ -1042,6 +1080,8 @@ function AgentManagerPage() {
     setNewMaxTokens(agent.maxTokens || 0);
     setNewSystem("");
     setNewTemperature(typeof agent.temperature === "number" ? String(agent.temperature) : "auto");
+    setNewThinking("inherit");
+    setLoadedThinking({ mode: "inherit", raw: undefined });
     setSelectedProvider("");
     setProviderModels([]);
     setShowModal(true);
@@ -1058,6 +1098,10 @@ function AgentManagerPage() {
             const m = agentCfg.model;
             setNewModel(typeof m === "string" ? m : m?.primary || "");
             if (m?.toolset) setNewToolset(m.toolset);
+            const rawThinking = typeof m === "object" ? m?.thinking : undefined;
+            const thinkingMode = thinkingModeOf(rawThinking);
+            setNewThinking(thinkingMode);
+            setLoadedThinking({ mode: thinkingMode, raw: rawThinking });
           }
           if (agentCfg.channels) setNewChannels(agentCfg.channels);
           if (agentCfg.toolset?.[0]) setNewToolset(agentCfg.toolset[0]);
@@ -1102,6 +1146,8 @@ function AgentManagerPage() {
     setNewMaxTokens(0);
     setNewSystem("");
     setNewTemperature("auto");
+    setNewThinking("inherit");
+    setLoadedThinking({ mode: "inherit", raw: undefined });
     setIdError("");
     setSelectedProvider("");
     setProviderModels([]);
@@ -1525,6 +1571,20 @@ function AgentManagerPage() {
                 <option value="0.8">0.8</option>
                 <option value="0.9">0.9</option>
                 <option value="1">1.0</option>
+              </select>
+            </div>
+
+            {/* Thinking */}
+            <div className={styles["cfg-f"]}>
+              <div className={styles["cfg-lbl"]}>{getLang() === "cn" ? "深度思考" : "Deep Thinking"} <span className={styles["cfg-hint"]}>({getLang() === "cn" ? "跟随默认 = 沿用默认模型的设置" : "inherit = the default model's setting"})</span></div>
+              <select
+                className={styles["cfg-select-narrow"]}
+                value={newThinking}
+                onChange={(e) => setNewThinking(e.target.value as ThinkingMode)}
+              >
+                <option value="inherit">{getLang() === "cn" ? "跟随默认" : "Inherit"}</option>
+                <option value="on">{getLang() === "cn" ? "开启" : "On"}</option>
+                <option value="off">{getLang() === "cn" ? "关闭" : "Off"}</option>
               </select>
             </div>
 
@@ -3146,6 +3206,21 @@ function TauriConfigPageInner() {
               fieldRow={fieldRow}
               zh={zh}
             />
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "主模型思考" : "Primary Model Thinking"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.thinking ({zh ? "跟随全局 = 沿用「深度思考」" : "inherit = Deep Thinking setting"})</div>
+              </div>
+              <select style={{ ...fSelect, minWidth: 200 }} value={thinkingModeOf(getVal("agents.defaults.model.thinking", undefined))} onChange={(e) => {
+                const mode = e.target.value as ThinkingMode;
+                if (mode === "inherit") deleteConfig("agents.defaults.model.thinking");
+                else updateConfig("agents.defaults.model.thinking", thinkingConfigOf(mode));
+              }}>
+                <option value="inherit">{zh ? "跟随全局" : "Inherit"}</option>
+                <option value="on">{zh ? "开启（每次思考上限 8K tokens）" : "On (up to 8K tokens per reasoning block)"}</option>
+                <option value="off">{zh ? "关闭" : "Off"}</option>
+              </select>
+            </div>
             <ModelChainInput
               path="agents.defaults.model.flash"
               labelZh={"\u5FEB\u901F\u6A21\u578B"}
