@@ -969,6 +969,7 @@ impl CronRunner {
                         .unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
+                    let mut after_turn: Option<AfterTurn> = None;
                     let preflight_result = match parse_plugin_preflight(job.wake_mode.as_deref()) {
                         Ok(Some(_)) => {
                             // Read the CURRENT plugin registry at dispatch
@@ -986,8 +987,9 @@ impl CronRunner {
                             .await
                             {
                                 Ok(None) => Some(Ok("plugin preflight: no work".to_string())),
-                                Ok(Some(message)) => {
-                                    job.bake_message(message);
+                                Ok(Some(preflighted)) => {
+                                    job.bake_message(preflighted.message);
+                                    after_turn = preflighted.after_turn;
                                     None
                                 }
                                 Err(error) => Some(Err(error)),
@@ -1046,6 +1048,15 @@ impl CronRunner {
                             }
                         }
                     };
+                    // The turn has ended, however it ended: let the
+                    // preflight settle what it may have left open.
+                    if let Some(after) = &after_turn {
+                        let wasm_plugins_now = match &wasm_plugins {
+                            Some(lock) => Some(lock.read().await.clone()),
+                            None => None,
+                        };
+                        run_after_turn(after, wasm_plugins_now.as_deref(), &job.id).await;
+                    }
                     let duration_ms = current_timestamp_ms() - start_time;
                     drop(permit);
 
@@ -1435,10 +1446,86 @@ struct PluginPreflight {
     tool_name: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 struct PluginPreflightOutcome {
     result: String,
     should_run: bool,
+    after_turn: Option<AfterTurn>,
+}
+
+/// A call the preflight asks for once the agent turn it fed has ended, on the
+/// preflight's own plugin: the preflight result's
+/// `afterTurn: {tool, arguments}`. It settles what the turn may have left
+/// open (a reply ticket nobody answered holds the phone otherwise).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AfterTurn {
+    plugin_name: String,
+    tool_name: String,
+    arguments: serde_json::Value,
+}
+
+/// A job message after its plugin preflight, and what to call when the turn
+/// it starts has ended.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PreflightedMessage {
+    pub(crate) message: String,
+    pub(crate) after_turn: Option<AfterTurn>,
+}
+
+fn parse_after_turn(plugin_name: &str, value: &serde_json::Value) -> Result<Option<AfterTurn>> {
+    let Some(spec) = value.get("afterTurn").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let tool_name = spec
+        .get("tool")
+        .and_then(serde_json::Value::as_str)
+        .filter(|t| !t.is_empty())
+        .context("plugin preflight afterTurn is missing its tool")?;
+    let arguments = match spec.get("arguments") {
+        None | Some(serde_json::Value::Null) => serde_json::json!({}),
+        Some(args @ serde_json::Value::Object(_)) => args.clone(),
+        Some(_) => {
+            return Err(anyhow!(
+                "plugin preflight afterTurn arguments must be an object"
+            ));
+        }
+    };
+    Ok(Some(AfterTurn {
+        plugin_name: plugin_name.to_owned(),
+        tool_name: tool_name.to_owned(),
+        arguments,
+    }))
+}
+
+/// Runs a preflight's after-turn call. Called once the turn has ended however
+/// it ended (reply, error, timeout, cancel); the outcome is only logged and
+/// never changes the run's result.
+pub(crate) async fn run_after_turn(
+    after: &AfterTurn,
+    plugins: Option<&Vec<rsclaw_plugin::WasmPlugin>>,
+    job_id: &str,
+) {
+    let Some(plugin) = plugins.and_then(|p| p.iter().find(|p| p.name == after.plugin_name)) else {
+        warn!(job_id, plugin = %after.plugin_name, "cron: after-turn plugin is not loaded");
+        return;
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(PLUGIN_PREFLIGHT_TIMEOUT_SECS),
+        plugin.call_tool(&after.tool_name, after.arguments.clone()),
+    )
+    .await
+    {
+        Ok(Ok(result)) => info!(
+            job_id,
+            tool = %after.tool_name,
+            result = %rsclaw_util::truncate_str(&result.to_string(), 300),
+            "cron: after-turn call done"
+        ),
+        Ok(Err(e)) => {
+            warn!(job_id, tool = %after.tool_name, error = %e, "cron: after-turn call failed")
+        }
+        Err(_) => warn!(job_id, tool = %after.tool_name, "cron: after-turn call timed out"),
+    }
 }
 
 fn parse_plugin_preflight(wake_mode: Option<&str>) -> Result<Option<PluginPreflight>> {
@@ -1499,7 +1586,12 @@ async fn run_plugin_preflight(
         .get("shouldRun")
         .and_then(serde_json::Value::as_bool)
         .context("plugin preflight result is missing boolean shouldRun")?;
-    Ok(PluginPreflightOutcome { result, should_run })
+    let after_turn = parse_after_turn(&preflight.plugin_name, &value)?;
+    Ok(PluginPreflightOutcome {
+        result,
+        should_run,
+        after_turn,
+    })
 }
 
 /// The message a job's agent turn receives once its plugin preflight
@@ -1507,23 +1599,30 @@ async fn run_plugin_preflight(
 /// with the preflight result appended, or `None` when the preflight found no
 /// work. A job without a preflight gets its message unchanged. The scheduler
 /// and manual triggers both go through here, so a manual run never hands the
-/// agent a message that promises a result it does not carry.
+/// agent a message that promises a result it does not carry. The preflight's
+/// `afterTurn`, if any, comes back for the caller to run once the turn ends.
 pub(crate) async fn preflight_message(
     wake_mode: Option<&str>,
     message: &str,
     plugins: Option<&Vec<rsclaw_plugin::WasmPlugin>>,
-) -> Result<Option<String>> {
+) -> Result<Option<PreflightedMessage>> {
     let Some(preflight) = parse_plugin_preflight(wake_mode)? else {
-        return Ok(Some(message.to_owned()));
+        return Ok(Some(PreflightedMessage {
+            message: message.to_owned(),
+            after_turn: None,
+        }));
     };
     let outcome = run_plugin_preflight(plugins, &preflight).await?;
     if !outcome.should_run {
         return Ok(None);
     }
-    Ok(Some(format!(
-        "{message}\n\nPlugin preflight result (already executed; do not call it again):\n{}",
-        outcome.result
-    )))
+    Ok(Some(PreflightedMessage {
+        message: format!(
+            "{message}\n\nPlugin preflight result (already executed; do not call it again):\n{}",
+            outcome.result
+        ),
+        after_turn: outcome.after_turn,
+    }))
 }
 
 /// Fill `state.nextRunAtMs` on an enabled job (raw JSON, as served by the
@@ -1595,7 +1694,10 @@ mod annotate_next_run_tests {
 
 #[cfg(test)]
 mod plugin_preflight_tests {
-    use super::{PluginPreflight, parse_plugin_preflight, preflight_message};
+    use super::{
+        AfterTurn, PluginPreflight, PreflightedMessage, parse_after_turn, parse_plugin_preflight,
+        preflight_message,
+    };
 
     #[tokio::test]
     async fn message_without_preflight_passes_unchanged() {
@@ -1603,8 +1705,57 @@ mod plugin_preflight_tests {
             let message = preflight_message(wake_mode, "run once", None)
                 .await
                 .expect("no preflight to run");
-            assert_eq!(message.as_deref(), Some("run once"));
+            assert_eq!(
+                message,
+                Some(PreflightedMessage {
+                    message: "run once".to_string(),
+                    after_turn: None,
+                })
+            );
         }
+    }
+
+    #[test]
+    fn after_turn_runs_on_the_preflights_own_plugin() {
+        let value = serde_json::json!({
+            "shouldRun": true,
+            "afterTurn": {"tool": "release_prepared", "arguments": {"reason": "retry"}},
+        });
+        assert_eq!(
+            parse_after_turn("sample-plugin", &value).expect("valid afterTurn"),
+            Some(AfterTurn {
+                plugin_name: "sample-plugin".to_string(),
+                tool_name: "release_prepared".to_string(),
+                arguments: serde_json::json!({"reason": "retry"}),
+            })
+        );
+        let bare = serde_json::json!({"afterTurn": {"tool": "settle"}});
+        assert_eq!(
+            parse_after_turn("sample-plugin", &bare)
+                .expect("arguments default to {}")
+                .map(|a| a.arguments),
+            Some(serde_json::json!({}))
+        );
+    }
+
+    #[test]
+    fn after_turn_absent_or_malformed() {
+        assert_eq!(
+            parse_after_turn("p", &serde_json::json!({"shouldRun": true})).expect("absent is fine"),
+            None
+        );
+        assert_eq!(
+            parse_after_turn("p", &serde_json::json!({"afterTurn": null})).expect("null is absent"),
+            None
+        );
+        assert!(parse_after_turn("p", &serde_json::json!({"afterTurn": {}})).is_err());
+        assert!(
+            parse_after_turn(
+                "p",
+                &serde_json::json!({"afterTurn": {"tool": "t", "arguments": "x"}})
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

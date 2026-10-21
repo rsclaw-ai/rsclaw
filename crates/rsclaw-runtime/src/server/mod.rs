@@ -4620,14 +4620,15 @@ pub(crate) async fn trigger_cron_job(
 
     let wake_mode = job["wakeMode"].as_str();
     let plugins = state.wasm_plugins.read().await.clone();
-    let message = match crate::cron::preflight_message(wake_mode, &message, Some(&plugins)).await {
-        Ok(Some(message)) => message,
-        Ok(None) => {
-            tracing::info!(job_id = %id, "cron trigger: plugin preflight found no work");
-            return Ok(CronTriggered::NoWork);
-        }
-        Err(e) => return Err(CronTriggerError::Preflight(format!("{e:#}"))),
-    };
+    let (message, after_turn) =
+        match crate::cron::preflight_message(wake_mode, &message, Some(&plugins)).await {
+            Ok(Some(preflighted)) => (preflighted.message, preflighted.after_turn),
+            Ok(None) => {
+                tracing::info!(job_id = %id, "cron trigger: plugin preflight found no work");
+                return Ok(CronTriggered::NoWork);
+            }
+            Err(e) => return Err(CronTriggerError::Preflight(format!("{e:#}"))),
+        };
 
     // Send message to the agent via registry. The placeholder ids "default"
     // (WS `cron.add`) and "main" fall back to the default agent.
@@ -4674,8 +4675,16 @@ pub(crate) async fn trigger_cron_job(
             let job_id = id.clone();
             let ws_conns = state.ws_conns.clone();
             let job_name = job["name"].as_str().unwrap_or(&id).to_owned();
+            let wasm_plugins = state.wasm_plugins.clone();
             tokio::spawn(async move {
-                if let Ok(reply) = reply_rx.await {
+                let reply = reply_rx.await;
+                // The turn has ended (or its reply channel dropped): let the
+                // preflight settle what it may have left open.
+                if let Some(after) = &after_turn {
+                    let plugins = wasm_plugins.read().await.clone();
+                    crate::cron::run_after_turn(after, Some(&plugins), &job_id).await;
+                }
+                if let Ok(reply) = reply {
                     // Build notification text: use reply if non-empty, else fallback summary
                     let notify_text = if !reply.text.is_empty() {
                         reply.text.clone()
