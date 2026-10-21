@@ -80,6 +80,13 @@ const PLUGIN_PREFLIGHT_WAKE_MODE_PREFIX: &str = "plugin-preflight:";
 
 /// Bound plugin preflights so an unavailable external UI cannot stall cron.
 const PLUGIN_PREFLIGHT_TIMEOUT_SECS: u64 = 180;
+/// Knowledge-base excerpts a preflight's `kbQuery` puts in front of the
+/// agent: how many hits, how long each may be, and how long the search may
+/// take before the turn goes ahead without them.
+const KB_PREFETCH_HITS: usize = 5;
+const KB_PREFETCH_HIT_BYTES: usize = 1200;
+const KB_PREFETCH_QUERY_BYTES: usize = 600;
+const KB_PREFETCH_TIMEOUT_SECS: u64 = 10;
 
 // ---------------------------------------------------------------------------
 // CronRunner
@@ -1451,6 +1458,7 @@ struct PluginPreflightOutcome {
     result: String,
     should_run: bool,
     after_turn: Option<AfterTurn>,
+    kb_query: Option<String>,
 }
 
 /// A call the preflight asks for once the agent turn it fed has ended, on the
@@ -1495,6 +1503,80 @@ fn parse_after_turn(plugin_name: &str, value: &serde_json::Value) -> Result<Opti
         tool_name: tool_name.to_owned(),
         arguments,
     }))
+}
+
+/// The preflight result's `kbQuery`: what to look up in the knowledge base
+/// before the turn, so the agent can answer without a search round of its
+/// own. Blank or non-string values are ignored.
+fn parse_kb_query(value: &serde_json::Value) -> Option<String> {
+    let query = value.get("kbQuery")?.as_str()?.trim();
+    (!query.is_empty())
+        .then(|| rsclaw_util::truncate_str(query, KB_PREFETCH_QUERY_BYTES).to_owned())
+}
+
+/// The block appended to the job message for a `kbQuery`, from
+/// `(source title, chunk text)` hits; `None` when nothing was found.
+fn format_kb_prefetch<'a>(
+    query: &str,
+    hits: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
+    let lines: Vec<String> = hits
+        .into_iter()
+        .map(|(title, text)| {
+            let title = match title.trim() {
+                "" => "untitled",
+                title => title,
+            };
+            let text = rsclaw_util::truncate_str(text.trim(), KB_PREFETCH_HIT_BYTES);
+            format!("- ({title}) {text}")
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Knowledge base excerpts for kbQuery {query:?} (already searched; use what answers \
+         the question, call knowledge_base only if they don't cover it):\n{}",
+        lines.join("\n")
+    ))
+}
+
+/// Searches the knowledge base for a preflight's `kbQuery`. Best effort: no
+/// knowledge base, no hits, an error or a slow search all give `None` and the
+/// turn goes ahead without excerpts.
+async fn kb_prefetch(query: &str) -> Option<String> {
+    let kb = rsclaw_kb::global_service().filter(|kb| kb.has_content())?;
+    let started = std::time::Instant::now();
+    let search = {
+        let query = query.to_owned();
+        tokio::task::spawn_blocking(move || kb.search(&query, &[], KB_PREFETCH_HITS, 0.0))
+    };
+    let hits =
+        match tokio::time::timeout(Duration::from_secs(KB_PREFETCH_TIMEOUT_SECS), search).await {
+            Ok(Ok(Ok(hits))) => hits,
+            Ok(Ok(Err(e))) => {
+                warn!(error = %e, "cron: kbQuery search failed");
+                return None;
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "cron: kbQuery search task failed");
+                return None;
+            }
+            Err(_) => {
+                warn!("cron: kbQuery search timed out");
+                return None;
+            }
+        };
+    info!(
+        hits = hits.len(),
+        ms = started.elapsed().as_millis() as u64,
+        "cron: kbQuery prefetched"
+    );
+    format_kb_prefetch(
+        query,
+        hits.iter()
+            .map(|h| (h.source_title.as_str(), h.chunk_text.as_str())),
+    )
 }
 
 /// Runs a preflight's after-turn call. Called once the turn has ended however
@@ -1587,10 +1669,12 @@ async fn run_plugin_preflight(
         .and_then(serde_json::Value::as_bool)
         .context("plugin preflight result is missing boolean shouldRun")?;
     let after_turn = parse_after_turn(&preflight.plugin_name, &value)?;
+    let kb_query = parse_kb_query(&value);
     Ok(PluginPreflightOutcome {
         result,
         should_run,
         after_turn,
+        kb_query,
     })
 }
 
@@ -1616,11 +1700,18 @@ pub(crate) async fn preflight_message(
     if !outcome.should_run {
         return Ok(None);
     }
+    let mut message = format!(
+        "{message}\n\nPlugin preflight result (already executed; do not call it again):\n{}",
+        outcome.result
+    );
+    if let Some(query) = &outcome.kb_query
+        && let Some(excerpts) = kb_prefetch(query).await
+    {
+        message.push_str("\n\n");
+        message.push_str(&excerpts);
+    }
     Ok(Some(PreflightedMessage {
-        message: format!(
-            "{message}\n\nPlugin preflight result (already executed; do not call it again):\n{}",
-            outcome.result
-        ),
+        message,
         after_turn: outcome.after_turn,
     }))
 }
@@ -1695,9 +1786,33 @@ mod annotate_next_run_tests {
 #[cfg(test)]
 mod plugin_preflight_tests {
     use super::{
-        AfterTurn, PluginPreflight, PreflightedMessage, parse_after_turn, parse_plugin_preflight,
-        preflight_message,
+        AfterTurn, PluginPreflight, PreflightedMessage, format_kb_prefetch, parse_after_turn,
+        parse_kb_query, parse_plugin_preflight, preflight_message,
     };
+
+    #[test]
+    fn kb_query_is_a_trimmed_non_blank_string() {
+        let query = |value| parse_kb_query(&value);
+        assert_eq!(
+            query(serde_json::json!({"kbQuery": "  宝宝吐奶怎么办 "})),
+            Some("宝宝吐奶怎么办".to_string())
+        );
+        assert_eq!(query(serde_json::json!({"kbQuery": "   "})), None);
+        assert_eq!(query(serde_json::json!({"kbQuery": 42})), None);
+        assert_eq!(query(serde_json::json!({"shouldRun": true})), None);
+        let long = "吐".repeat(2000);
+        let clipped = query(serde_json::json!({ "kbQuery": long })).expect("clipped query");
+        assert!(clipped.len() <= super::KB_PREFETCH_QUERY_BYTES);
+    }
+
+    #[test]
+    fn kb_prefetch_block_lists_each_hit_or_nothing() {
+        assert_eq!(format_kb_prefetch("q", Vec::<(&str, &str)>::new()), None);
+        let block = format_kb_prefetch("吐奶", [("溢奶护理", " 竖抱拍嗝 "), ("", "少量多餐")])
+            .expect("hits make a block");
+        assert!(block.starts_with("Knowledge base excerpts for kbQuery \"吐奶\""));
+        assert!(block.ends_with("- (溢奶护理) 竖抱拍嗝\n- (untitled) 少量多餐"));
+    }
 
     #[tokio::test]
     async fn message_without_preflight_passes_unchanged() {
