@@ -1548,10 +1548,51 @@ async fn vision_observe(
 
 /// The foreground package, or `None` when it cannot be read.
 async fn foreground_package_name(config: &Config) -> Option<String> {
-    foreground_activity_dump(config)
-        .await
-        .ok()
-        .and_then(|dump| foreground_package_from_dump(&dump))
+    foreground_now(config).await.ok().flatten()
+}
+
+/// The package owning Android's top resumed activity (or focused window).
+///
+/// cls-service reads it from the activity manager on the device and answers
+/// over the tunnel screenshots already keep warm. The ADB relay is the
+/// fallback for a cls-service without that endpoint: each of its commands
+/// opens a new Wireless Debugging connection, which can stall for seconds on
+/// the controller and which Android announces with a heads-up notification
+/// that lands in the next screenshot.
+async fn foreground_now(config: &Config) -> Result<Option<String>, String> {
+    if let Ok(package) = foreground_from_service(config).await {
+        return Ok(package);
+    }
+    Ok(foreground_package_from_dump(
+        &foreground_activity_dump(config).await?,
+    ))
+}
+
+/// cls-service's `GET /appium/device/foreground`: `Err` when it cannot answer
+/// (an older cls-service, a dead tunnel), `Ok(None)` when it found no app.
+async fn foreground_from_service(config: &Config) -> Result<Option<String>, String> {
+    let mut args = uiauto_base_args(config, "raw");
+    args.extend(["--method".to_string(), "GET".to_string()]);
+    args.push("/appium/device/foreground".to_string());
+    let response = run_cls(&config.cls_bin, &args, Duration::from_secs(10)).await?;
+    foreground_from_service_response(&response)
+}
+
+fn foreground_from_service_response(response: &str) -> Result<Option<String>, String> {
+    let value: Value = serde_json::from_str(response)
+        .map_err(|error| format!("android uiauto: foreground answer: {error}"))?;
+    let answer = value
+        .get("value")
+        .filter(|v| v.is_object() && v.get("package").is_some())
+        .ok_or_else(|| {
+            format!("android uiauto: foreground answer without a package: {response}")
+        })?;
+    Ok(answer
+        .get("package")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|package| !package.is_empty())
+        .map(str::to_string))
 }
 
 fn decode_image_data_uri(uri: &str) -> Result<Vec<u8>, String> {
@@ -1981,8 +2022,8 @@ fn command_option<'a>(args: &'a [String], option: &str) -> Result<&'a str, Strin
 
 /// Return the package owning Android's resumed activity or focused window.
 async fn foreground_package(config: &Config) -> Result<String, String> {
-    let output = foreground_activity_dump(config).await?;
-    foreground_package_from_dump(&output)
+    foreground_now(config)
+        .await?
         .map(|package| serde_json::json!({ "package": package }).to_string())
         .ok_or_else(|| "android uiauto: foreground package is unavailable".to_string())
 }
@@ -2007,10 +2048,7 @@ async fn wait_for_foreground_package(config: &Config, package: &str) -> Result<b
 
 /// Verify the target package owns Android's resumed activity or focused window.
 async fn foreground_package_matches(config: &Config, package: &str) -> Result<bool, String> {
-    Ok(
-        foreground_package_from_dump(&foreground_activity_dump(config).await?).as_deref()
-            == Some(package),
-    )
+    Ok(foreground_now(config).await?.as_deref() == Some(package))
 }
 
 /// Read Android's current resumed/focused activity through the CLS ADB relay.
@@ -2706,7 +2744,9 @@ fn validate_raw_endpoint(method: &str, path: &str) -> Result<(), String> {
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     let allowed = match (method, segments.as_slice()) {
-        ("GET", ["status" | "sessions"]) | ("POST", ["session"]) => true,
+        ("GET", ["status" | "sessions"])
+        | ("GET", ["appium", "device", "foreground"])
+        | ("POST", ["session"]) => true,
         (_, ["session", session_id, rest @ ..]) if is_identifier(session_id) => {
             session_endpoint_allowed(method, rest)
         }
@@ -3380,6 +3420,22 @@ mod tests {
                 ".MainActivity",
             ]
         );
+    }
+
+    #[test]
+    fn foreground_from_service_reads_the_package_or_says_it_cannot() {
+        let found = r#"{"sessionId":"None","value":{"activity":"com.tencent.mm.ui.LauncherUI","package":"com.tencent.mm","source":"activity"}}"#;
+        assert_eq!(
+            foreground_from_service_response(found),
+            Ok(Some("com.tencent.mm".to_string()))
+        );
+        let none = r#"{"sessionId":"None","value":{"activity":null,"package":null,"source":null}}"#;
+        assert_eq!(foreground_from_service_response(none), Ok(None));
+        // an older cls-service: unknown command, so the caller asks adb instead
+        let unknown = r#"{"sessionId":null,"value":{"error":"unknown command","message":"…"}}"#;
+        assert!(foreground_from_service_response(unknown).is_err());
+        assert!(validate_raw_endpoint("GET", "/appium/device/foreground").is_ok());
+        assert!(validate_raw_endpoint("POST", "/appium/device/foreground").is_err());
     }
 
     #[test]
