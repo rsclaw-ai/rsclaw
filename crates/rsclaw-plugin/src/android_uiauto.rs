@@ -35,6 +35,9 @@ const LATEST_MESSAGE_BUBBLE_COMMAND: &str = "latest-message-bubble";
 const INPUT_TEXT_COMMAND: &str = "input-text";
 const CLIPBOARD_SET_COMMAND: &str = "clipboard-set";
 const OCR_REGION_COMMAND: &str = "ocr-region";
+const KEY_REPEAT_COMMAND: &str = "key-repeat";
+/// Most presses one `key-repeat` call may carry.
+const MAX_KEY_REPEAT: u64 = 500;
 /// Describe the screen with the installed screen observer (`vision_observer`).
 const VISION_OBSERVE_COMMAND: &str = "vision-observe";
 /// A full screenshot may travel inside `vision-observe`'s args.
@@ -293,6 +296,9 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         let keycode = keyevent_keycode(&args_json)?;
         return run_keycode(&config, options.op_type, keycode).await;
     }
+    if command == KEY_REPEAT_COMMAND {
+        return key_repeat(&args_json, &config, options.op_type).await;
+    }
     if command == "screenshot" {
         validate_no_args(command, &args_json)?;
         return screenshot_with_wakeup(&config, options.op_type).await;
@@ -337,6 +343,7 @@ fn validate_operation_mode(command: &str, options: AndroidOperationOptions) -> R
                 | "drag"
                 | "key"
                 | "keyevent"
+                | KEY_REPEAT_COMMAND
                 | "launch"
                 | "relaunch"
                 | INPUT_TEXT_COMMAND
@@ -490,7 +497,7 @@ fn single_u2_session_id(response: &str) -> Result<String, String> {
         .ok_or_else(|| "android uiauto: malformed U2 sessions response".to_string())?;
     let [session] = sessions.as_slice() else {
         return Err(format!(
-            "android uiauto: U2 clipboard fallback requires exactly one existing session (got {})",
+            "android uiauto: needs exactly one existing U2 session (got {})",
             sessions.len()
         ));
     };
@@ -616,6 +623,73 @@ async fn run_keycode(
         }
     };
     run_cls(&config.cls_bin, &args, Duration::from_secs(15)).await
+}
+
+/// Parse `key-repeat` args: a deletion keycode (67 backspace, 112 forward
+/// delete) and a press count. Returns the W3C key value and the count.
+fn key_repeat_request(args_json: &str) -> Result<(&'static str, u64), String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android key-repeat: invalid args JSON: {error}"))?;
+    let object = object_with_keys(&value, &["keycode", "count"])?;
+    let key = match object.get("keycode").and_then(Value::as_i64) {
+        Some(67) => "\u{E003}",
+        Some(112) => "\u{E017}",
+        _ => {
+            return Err(
+                "android key-repeat: `keycode` must be 67 (backspace) or 112 (forward delete)"
+                    .to_string(),
+            );
+        }
+    };
+    let count = object
+        .get("count")
+        .and_then(Value::as_u64)
+        .filter(|count| (1..=MAX_KEY_REPEAT).contains(count))
+        .ok_or_else(|| format!("android key-repeat: `count` must be 1-{MAX_KEY_REPEAT}"))?;
+    Ok((key, count))
+}
+
+/// One W3C key source pressing `key` `count` times.
+fn key_repeat_body(key: &str, count: u64) -> String {
+    let press = [
+        serde_json::json!({ "type": "keyDown", "value": key }),
+        serde_json::json!({ "type": "keyUp", "value": key }),
+    ];
+    let actions: Vec<Value> = (0..count).flat_map(|_| press.clone()).collect();
+    serde_json::json!({
+        "actions": [{ "type": "key", "id": "keyboard", "actions": actions }]
+    })
+    .to_string()
+}
+
+/// About 45 ms a press measured on a Pixel, with room for a slow tunnel.
+fn key_repeat_timeout(count: u64) -> Duration {
+    Duration::from_secs(5) + Duration::from_millis(100 * count)
+}
+
+/// Press one deletion key many times in a single UIAutomator2 actions
+/// request, instead of one CLS round trip a key. The body is built here, so
+/// it skips the raw-endpoint allowlist, which keeps key sources closed.
+async fn key_repeat(
+    args_json: &str,
+    config: &Config,
+    op_type: AndroidOpType,
+) -> Result<String, String> {
+    if !matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
+        return Err("android key-repeat: supports only opType=auto or u2".to_string());
+    }
+    let (key, count) = key_repeat_request(args_json)?;
+    let sessions = raw_with_config(config, "GET", "/sessions", None).await?;
+    let session_id = single_u2_session_id(&sessions)?;
+    let body = key_repeat_body(key, count);
+    run_raw_request(
+        config,
+        "POST",
+        &format!("/session/{session_id}/actions"),
+        Some(&body),
+        key_repeat_timeout(count),
+    )
+    .await
 }
 
 async fn run_high_level_operation(
@@ -1849,19 +1923,31 @@ async fn raw_with_config(
     json_body: Option<&str>,
 ) -> Result<String, String> {
     let method = validate_raw_request(method, path, json_body)?;
+    run_raw_request(config, &method, path, json_body, Duration::from_secs(30)).await
+}
+
+/// Send one raw request through CLS without endpoint validation; callers
+/// either validated it or built the body themselves.
+async fn run_raw_request(
+    config: &Config,
+    method: &str,
+    path: &str,
+    json_body: Option<&str>,
+    timeout: Duration,
+) -> Result<String, String> {
     let request_file = match json_body {
         Some(body) => Some(TempJsonFile::create(body.as_bytes())?),
         None => None,
     };
-    let mut args = uiauto_base_args(&config, "raw");
+    let mut args = uiauto_base_args(config, "raw");
     args.push("--method".to_string());
-    args.push(method);
+    args.push(method.to_string());
     if let Some(file) = request_file.as_ref() {
         args.push("--json-file".to_string());
         args.push(file.path.to_string_lossy().into_owned());
     }
     args.push(path.to_string());
-    run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+    run_cls(&config.cls_bin, &args, timeout).await
 }
 
 /// Push a local artifact file to device shared storage through the CLS
@@ -3580,6 +3666,63 @@ mod tests {
         assert!(validate_raw_request("POST", "/session/abc/actions", Some(key_input)).is_err());
         let long_pause = r#"{"actions":[{"type":"pointer","id":"finger1","parameters":{"pointerType":"touch"},"actions":[{"type":"pause","duration":60001}]}]}"#;
         assert!(validate_raw_request("POST", "/session/abc/actions", Some(long_pause)).is_err());
+    }
+
+    #[test]
+    fn key_repeat_accepts_only_deletion_keys_and_a_bounded_count() {
+        assert_eq!(
+            key_repeat_request(r#"{"keycode":67,"count":3}"#),
+            Ok(("\u{E003}", 3))
+        );
+        assert_eq!(
+            key_repeat_request(r#"{"keycode":112,"count":500}"#),
+            Ok(("\u{E017}", 500))
+        );
+        for refused in [
+            r#"{"keycode":66,"count":3}"#,
+            r#"{"keycode":29,"count":1}"#,
+            r#"{"keycode":67,"count":0}"#,
+            r#"{"keycode":67,"count":501}"#,
+            r#"{"keycode":67}"#,
+            r#"{"keycode":67,"count":3,"metastate":4096}"#,
+        ] {
+            assert!(key_repeat_request(refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn key_repeat_body_presses_the_key_count_times_in_one_source() {
+        let body: Value = serde_json::from_str(&key_repeat_body("\u{E003}", 3)).unwrap();
+        let sources = body["actions"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["type"], "key");
+        let actions = sources[0]["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 6);
+        for pair in actions.chunks(2) {
+            assert_eq!(pair[0]["type"], "keyDown");
+            assert_eq!(pair[1]["type"], "keyUp");
+            assert_eq!(pair[0]["value"], "\u{E003}");
+            assert_eq!(pair[1]["value"], "\u{E003}");
+        }
+        // The public raw endpoint still refuses key sources.
+        assert!(
+            validate_raw_request("POST", "/session/abc/actions", Some(&body.to_string())).is_err()
+        );
+    }
+
+    #[test]
+    fn key_repeat_timeout_grows_with_the_count() {
+        assert_eq!(key_repeat_timeout(1), Duration::from_millis(5_100));
+        assert_eq!(key_repeat_timeout(500), Duration::from_secs(55));
+    }
+
+    #[test]
+    fn key_repeat_is_allowed_in_vision_mode() {
+        let vision = AndroidOperationOptions {
+            op_type: AndroidOpType::U2,
+            op_mode: Some(AndroidOpMode::Vision),
+        };
+        assert!(validate_operation_mode(KEY_REPEAT_COMMAND, vision).is_ok());
     }
 
     #[test]
