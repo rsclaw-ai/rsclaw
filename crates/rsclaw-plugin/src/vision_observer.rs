@@ -201,6 +201,25 @@ pub async fn observe(args: &Value, image: &[u8]) -> Result<Value, String> {
     }
 }
 
+/// Start the observer in the background, so the first `vision-observe` does
+/// not wait for its models to load (seconds; tens of seconds on a cold disk).
+/// Only where a phone is configured: Android plugins are its only callers. A
+/// failed start is logged and left to the first request to try again.
+pub fn warm_up() {
+    if observer_path().is_none() || std::env::var_os("RSCLAW_ANDROID_NODE").is_none() {
+        return;
+    }
+    tokio::spawn(async {
+        let mut guard = slot().lock().await;
+        if guard.is_none() {
+            match start().await {
+                Ok(observer) => *guard = Some(observer),
+                Err(error) => tracing::warn!(%error, "screen observer warm-up failed"),
+            }
+        }
+    });
+}
+
 /// The model versions the running observer reported, if one is running.
 pub async fn running_versions() -> Option<Value> {
     slot().lock().await.as_ref().map(|o| o.versions.clone())

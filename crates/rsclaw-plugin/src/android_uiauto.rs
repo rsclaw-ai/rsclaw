@@ -1428,8 +1428,7 @@ async fn screenshot_with_wakeup(config: &Config, op_type: AndroidOpType) -> Resu
 }
 
 async fn screenshot_taken(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
-    let args = explicit_base_args(config, op_type, "screenshot")?;
-    let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
+    let response = capture_screenshot(config, op_type).await?;
     if !screenshot_is_black(&response)? {
         return annotate_screenshot(response);
     }
@@ -1448,8 +1447,7 @@ async fn screenshot_taken(config: &Config, op_type: AndroidOpType) -> Result<Str
 
     for (index, delay) in WAKEUP_SCREEN_RETRY_DELAYS.iter().enumerate() {
         tokio::time::sleep(*delay).await;
-        let retry = explicit_base_args(config, op_type, "screenshot")?;
-        let response = run_cls(&config.cls_bin, &retry, deadline_for("screenshot")).await?;
+        let response = capture_screenshot(config, op_type).await?;
         if !screenshot_is_black(&response)? {
             return annotate_screenshot(response);
         }
@@ -1464,6 +1462,69 @@ async fn screenshot_taken(config: &Config, op_type: AndroidOpType) -> Result<Str
         "android uiauto: screenshot remains black after CLS power-wake retries; device may be locked or its display unavailable"
             .to_string(),
     )
+}
+
+/// A screenshot through cls-service's session-less endpoint: one round trip
+/// and a quickly encoded PNG, against three round trips (a session created
+/// and deleted around it) and Android's slow encoder for
+/// `cls android uiauto screenshot`, which a cls-service without the endpoint
+/// still gets.
+async fn capture_screenshot(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
+    let uiauto = matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2);
+    if uiauto && !lacks_quick_screenshot(&config.node) {
+        match screenshot_from_service(config).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                tracing::debug!(node = %config.node, %error, "quick screenshot unavailable");
+                if error.contains("404") {
+                    remember_lacks_quick_screenshot(&config.node);
+                }
+            }
+        }
+    }
+    let args = explicit_base_args(config, op_type, "screenshot")?;
+    run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await
+}
+
+async fn screenshot_from_service(config: &Config) -> Result<String, String> {
+    let mut args = uiauto_base_args(config, "raw");
+    args.extend(["--method".to_string(), "GET".to_string()]);
+    args.push("/appium/device/screenshot".to_string());
+    let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
+    screenshot_from_service_response(&response)
+}
+
+/// cls-service's `{"value": "<base64 PNG>"}` in the shape
+/// `cls android uiauto screenshot` prints.
+fn screenshot_from_service_response(response: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(response)
+        .map_err(|error| format!("android uiauto: screenshot answer: {error}"))?;
+    let data = value
+        .get("value")
+        .and_then(Value::as_str)
+        .filter(|data| !data.is_empty())
+        .ok_or_else(|| "android uiauto: screenshot answer without an image".to_string())?;
+    Ok(serde_json::json!({ "ok": true, "source": "cls-service", "data": data }).to_string())
+}
+
+/// Nodes whose cls-service predates `/appium/device/screenshot`.
+fn nodes_without_quick_screenshot() -> &'static std::sync::Mutex<std::collections::HashSet<String>>
+{
+    static NODES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NODES.get_or_init(Default::default)
+}
+
+fn lacks_quick_screenshot(node: &str) -> bool {
+    nodes_without_quick_screenshot()
+        .lock()
+        .is_ok_and(|nodes| nodes.contains(node))
+}
+
+fn remember_lacks_quick_screenshot(node: &str) {
+    if let Ok(mut nodes) = nodes_without_quick_screenshot().lock() {
+        nodes.insert(node.to_string());
+    }
 }
 
 /// The foreground package being read (or read) for a frame.
@@ -3506,6 +3567,19 @@ mod tests {
                 ".MainActivity",
             ]
         );
+    }
+
+    #[test]
+    fn screenshot_from_service_reads_the_image_or_says_it_cannot() {
+        let answer = screenshot_from_service_response(r#"{"sessionId":null,"value":"iVBORw0K"}"#)
+            .expect("an image");
+        let answer: Value = serde_json::from_str(&answer).expect("json");
+        assert_eq!(answer["ok"], true);
+        assert_eq!(answer["data"], "iVBORw0K");
+        assert!(
+            screenshot_from_service_response(r#"{"value":{"error":"unknown command"}}"#).is_err()
+        );
+        assert!(screenshot_from_service_response("not json").is_err());
     }
 
     #[test]

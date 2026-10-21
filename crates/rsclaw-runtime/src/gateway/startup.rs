@@ -435,6 +435,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         warn!("plugin load error: {e:#}");
         PluginRegistry::new()
     });
+    rsclaw_plugin::vision_observer::warm_up();
+
     if let Some(ref mem_arc) = memory
         && !plugin_registry.slots.has_memory()
     {
