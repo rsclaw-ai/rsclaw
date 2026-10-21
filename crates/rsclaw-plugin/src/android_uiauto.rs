@@ -36,6 +36,9 @@ const INPUT_TEXT_COMMAND: &str = "input-text";
 const CLIPBOARD_SET_COMMAND: &str = "clipboard-set";
 const OCR_REGION_COMMAND: &str = "ocr-region";
 const KEY_REPEAT_COMMAND: &str = "key-repeat";
+const CLEAR_FOCUSED_COMMAND: &str = "clear-focused";
+/// Ctrl+A, then Delete: select the focused field's text and delete it.
+const SELECT_ALL_DELETE_BODY: &str = r#"{"keys":[[113,29],[67]]}"#;
 /// Most presses one `key-repeat` call may carry.
 const MAX_KEY_REPEAT: u64 = 500;
 /// Describe the screen with the installed screen observer (`vision_observer`).
@@ -299,6 +302,10 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     if command == KEY_REPEAT_COMMAND {
         return key_repeat(&args_json, &config, options.op_type).await;
     }
+    if command == CLEAR_FOCUSED_COMMAND {
+        validate_no_args(command, &args_json)?;
+        return clear_focused(&config, options.op_type).await;
+    }
     if command == "screenshot" {
         validate_no_args(command, &args_json)?;
         return screenshot_with_wakeup(&config, options.op_type).await;
@@ -344,6 +351,7 @@ fn validate_operation_mode(command: &str, options: AndroidOperationOptions) -> R
                 | "key"
                 | "keyevent"
                 | KEY_REPEAT_COMMAND
+                | CLEAR_FOCUSED_COMMAND
                 | "launch"
                 | "relaunch"
                 | INPUT_TEXT_COMMAND
@@ -623,6 +631,25 @@ async fn run_keycode(
         }
     };
     run_cls(&config.cls_bin, &args, Duration::from_secs(15)).await
+}
+
+/// Clear the focused text field in one request: cls-service presses Ctrl+A
+/// then Delete through UiAutomation (no adb). A cls-service without the
+/// session-less `/appium/device/keys` route answers 404, so this fails and
+/// the caller falls back to deleting key by key. Callers check the field is
+/// empty afterwards: with nothing focused, Delete removes one character.
+async fn clear_focused(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
+    if !matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
+        return Err("android clear-focused: supports only opType=auto or u2".to_string());
+    }
+    run_raw_request(
+        config,
+        "POST",
+        "/appium/device/keys",
+        Some(SELECT_ALL_DELETE_BODY),
+        Duration::from_secs(15),
+    )
+    .await
 }
 
 /// Parse `key-repeat` args: a deletion keycode (67 backspace, 112 forward
@@ -3788,6 +3815,17 @@ mod tests {
     fn key_repeat_timeout_grows_with_the_count() {
         assert_eq!(key_repeat_timeout(1), Duration::from_millis(5_100));
         assert_eq!(key_repeat_timeout(500), Duration::from_secs(55));
+    }
+
+    #[test]
+    fn clear_focused_presses_select_all_then_delete() {
+        let body: Value = serde_json::from_str(SELECT_ALL_DELETE_BODY).unwrap();
+        assert_eq!(body, serde_json::json!({"keys": [[113, 29], [67]]}));
+        let vision = AndroidOperationOptions {
+            op_type: AndroidOpType::U2,
+            op_mode: Some(AndroidOpMode::Vision),
+        };
+        assert!(validate_operation_mode(CLEAR_FOCUSED_COMMAND, vision).is_ok());
     }
 
     #[test]
