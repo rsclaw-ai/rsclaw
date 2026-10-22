@@ -2050,6 +2050,10 @@ pub struct SessionResultLimits {
     pub web_browser: Option<usize>,
     /// exec result max chars in session (default: 3000)
     pub exec: Option<usize>,
+    /// plugin_invoke result max chars in session (default: 12000). A
+    /// plugin's result is structured state the model acts on (a ticket, the
+    /// next chat to answer); cut short, the model can't see what to do next.
+    pub plugin: Option<usize>,
     /// Default for all other tools (default: 3000)
     pub default: Option<usize>,
 }

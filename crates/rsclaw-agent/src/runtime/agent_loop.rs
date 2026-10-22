@@ -3608,6 +3608,9 @@ impl AgentRuntime {
                         // then loops re-reading an artifact it can never see.
                         "read_artifact" | "read_session_archive" => usize::MAX,
                         "read_file" | "read" => limits.and_then(|l| l.default).unwrap_or(3000),
+                        "plugin_invoke" | "plugin.invoke" => {
+                            limits.and_then(|l| l.plugin).unwrap_or(12_000)
+                        }
                         _ => limits.and_then(|l| l.default).unwrap_or(3000),
                     };
 
