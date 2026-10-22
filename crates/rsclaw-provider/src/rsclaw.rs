@@ -645,10 +645,13 @@ impl LlmProvider for RsclawProvider {
                         // The server's id names the node serving the
                         // session (rs_<host>_<random>): what to quote when a
                         // fleet problem needs chasing.
+                        let (segment_cache, segment_promote_ms) = resp.user_segment_cache();
                         tracing::info!(
                             session = %session_key,
                             server_session = %resp.session_id,
                             path,
+                            segment_cache,
+                            segment_promote_ms,
                             "rsclaw session started"
                         );
                         let entry = SessionEntry {
@@ -1860,6 +1863,29 @@ struct CreateSessionResp {
     #[serde(default)]
     #[allow(dead_code)]
     prefix_id: Option<String>,
+    /// What the worker did with the per-user segment (user_system + user
+    /// tools): `gpu_hit`, `cold_built`, ... Logged only: it tells a 3s
+    /// cold prefill apart from a cached open.
+    #[serde(default)]
+    cache_status: Option<Value>,
+}
+
+impl CreateSessionResp {
+    /// `user_system` placement and promote time, when the server reports them.
+    fn user_segment_cache(&self) -> (Option<&str>, Option<u64>) {
+        let segment = self
+            .cache_status
+            .as_ref()
+            .and_then(|c| c.get("user_system"));
+        (
+            segment
+                .and_then(|s| s.get("placement"))
+                .and_then(Value::as_str),
+            segment
+                .and_then(|s| s.get("promote_ms"))
+                .and_then(Value::as_u64),
+        )
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -6447,5 +6473,21 @@ data: {"type":"block_stop","index":0}
             entry.last_seen_msgs_len, 15,
             "last_seen recomputed from the GROWN tail: head(2)+summary(1)+tail(12)"
         );
+    }
+}
+
+#[cfg(test)]
+mod create_session_resp_tests {
+    use super::CreateSessionResp;
+
+    #[test]
+    fn reads_the_user_segment_placement_when_reported() {
+        let resp: CreateSessionResp = serde_json::from_str(
+            r#"{"session_id":"rs_a_1","cache_status":{"user_system":{"placement":"gpu_hit","promote_ms":0}}}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.user_segment_cache(), (Some("gpu_hit"), Some(0)));
+        let bare: CreateSessionResp = serde_json::from_str(r#"{"session_id":"rs_a_2"}"#).unwrap();
+        assert_eq!(bare.user_segment_cache(), (None, None));
     }
 }
