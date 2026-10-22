@@ -4642,7 +4642,16 @@ pub(crate) async fn trigger_cron_job(
         }
     });
     if let Ok(handle) = handle {
-        let session_key = format!("cron:{}", id);
+        // Like a scheduled run: the job's own session if it names one,
+        // else a fresh one per run, so one run's conversation (one
+        // customer's, for a monitor) never carries into the next.
+        let session_key = job["sessionKey"]
+            .as_str()
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!("cron:{}:{}", id, chrono::Utc::now().timestamp_millis())
+            });
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = rsclaw_agent::AgentMessage {
             trust: rsclaw_agent::SenderTrust::Owner,
