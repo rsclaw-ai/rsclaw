@@ -986,10 +986,15 @@ impl CronRunner {
                                 Some(lock) => Some(lock.read().await.clone()),
                                 None => None,
                             };
+                            let kb_scope = agents
+                                .get(&job.agent_id)
+                                .ok()
+                                .and_then(|a| a.config.kb.as_ref()?.collections.clone());
                             match preflight_message(
                                 job.wake_mode.as_deref(),
                                 job.effective_message(),
                                 wasm_plugins_now.as_deref(),
+                                kb_scope.as_deref(),
                             )
                             .await
                             {
@@ -1541,15 +1546,19 @@ fn format_kb_prefetch<'a>(
     ))
 }
 
-/// Searches the knowledge base for a preflight's `kbQuery`. Best effort: no
-/// knowledge base, no hits, an error or a slow search all give `None` and the
-/// turn goes ahead without excerpts.
-async fn kb_prefetch(query: &str) -> Option<String> {
+/// Searches the knowledge base for a preflight's `kbQuery`, within the job
+/// agent's collections (`kb_scope`, None = all). Best effort: no knowledge
+/// base, no hits, an error or a slow search all give `None` and the turn goes
+/// ahead without excerpts.
+async fn kb_prefetch(query: &str, kb_scope: Option<&[String]>) -> Option<String> {
     let kb = rsclaw_kb::global_service().filter(|kb| kb.has_content())?;
     let started = std::time::Instant::now();
     let search = {
         let query = query.to_owned();
-        tokio::task::spawn_blocking(move || kb.search(&query, &[], KB_PREFETCH_HITS, 0.0))
+        let scope = kb_scope.map(<[String]>::to_vec);
+        tokio::task::spawn_blocking(move || {
+            kb.search_scoped(&query, scope.as_deref(), &[], KB_PREFETCH_HITS, 0.0)
+        })
     };
     let hits =
         match tokio::time::timeout(Duration::from_secs(KB_PREFETCH_TIMEOUT_SECS), search).await {
@@ -1685,10 +1694,12 @@ async fn run_plugin_preflight(
 /// and manual triggers both go through here, so a manual run never hands the
 /// agent a message that promises a result it does not carry. The preflight's
 /// `afterTurn`, if any, comes back for the caller to run once the turn ends.
+/// `kb_scope` is the job agent's knowledge-base collections, for `kbQuery`.
 pub(crate) async fn preflight_message(
     wake_mode: Option<&str>,
     message: &str,
     plugins: Option<&Vec<rsclaw_plugin::WasmPlugin>>,
+    kb_scope: Option<&[String]>,
 ) -> Result<Option<PreflightedMessage>> {
     let Some(preflight) = parse_plugin_preflight(wake_mode)? else {
         return Ok(Some(PreflightedMessage {
@@ -1705,7 +1716,7 @@ pub(crate) async fn preflight_message(
         outcome.result
     );
     if let Some(query) = &outcome.kb_query
-        && let Some(excerpts) = kb_prefetch(query).await
+        && let Some(excerpts) = kb_prefetch(query, kb_scope).await
     {
         message.push_str("\n\n");
         message.push_str(&excerpts);
@@ -1817,7 +1828,7 @@ mod plugin_preflight_tests {
     #[tokio::test]
     async fn message_without_preflight_passes_unchanged() {
         for wake_mode in [None, Some("next-heartbeat")] {
-            let message = preflight_message(wake_mode, "run once", None)
+            let message = preflight_message(wake_mode, "run once", None, None)
                 .await
                 .expect("no preflight to run");
             assert_eq!(
@@ -1879,6 +1890,7 @@ mod plugin_preflight_tests {
             Some("plugin-preflight:sample-plugin:scan"),
             "result attached below",
             Some(&Vec::new()),
+            None,
         )
         .await
         .expect_err("a missing plugin must not hand the agent the bare message");

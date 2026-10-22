@@ -678,6 +678,22 @@ pub struct AgentEntry {
     /// list.
     #[serde(default)]
     pub daemon: bool,
+    /// rsclaw extension: which knowledge-base collections this agent may
+    /// read. None = every collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kb: Option<AgentKbConfig>,
+}
+
+/// An agent's knowledge-base scope (`agents.list[].kb`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentKbConfig {
+    /// Collections (id or name) every knowledge-base search of this agent is
+    /// limited to: the `knowledge_base` tool, auto-recall and a cron
+    /// preflight's `kbQuery`. A subscribed pack is the collection
+    /// `pack_<pack id>`. Unset = every collection; empty = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collections: Option<Vec<String>>,
 }
 
 /// OpenCode ACP configuration for an agent.
@@ -2784,6 +2800,31 @@ pub struct KbConfig {
     /// defense-in-depth bound on an arbitrary-file-read surface; widen it only
     /// if you trust every local process that can reach the gateway.
     pub allowed_upload_roots: Option<Vec<String>>,
+    /// Knowledge packs this machine subscribes to: the packs its account may
+    /// read on the server, each kept as a local read-only collection
+    /// `pack_<pack id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packs: Option<KbPacksConfig>,
+}
+
+/// Knowledge-pack subscription (`kb.packs`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KbPacksConfig {
+    /// Server API root, e.g. `https://api.rsclaw.ai/v1`. Unset = the rsclaw
+    /// provider's base URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// API key of the account whose packs to follow. Unset = the rsclaw
+    /// provider's key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretOrString>,
+    /// Seconds between checks for a new published version. Default 600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+    /// Kill-switch without deleting the block. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 /// Cross-encoder rerank endpoint for the KB search pipeline (`kb.rerank`).

@@ -8,7 +8,10 @@ pub mod source;
 pub mod version;
 
 pub use chunk::{ChunkStatus, KbChunk, chunk_id};
-pub use collection::{COLLECTION_TAG_PREFIX, KbCollection, collection_tag};
+pub use collection::{
+    COLLECTION_TAG_PREFIX, KbCollection, PACK_COLLECTION_PREFIX, collection_tag,
+    is_pack_collection, pack_collection_id,
+};
 pub use doc::{CallerScope, KbDoc, KbStatus, KbVisibility};
 pub use entity::{EntityKind, KbEntity, KbEntityIndex};
 pub use locator::KbLocator;

@@ -17,6 +17,21 @@ pub fn collection_tag(id: &str) -> String {
     format!("{COLLECTION_TAG_PREFIX}{id}")
 }
 
+/// Collection-id prefix of a subscribed knowledge pack. Pack `parenting` is
+/// the collection `pack_parenting`; its docs come from the pack's server and
+/// are read-only here.
+pub const PACK_COLLECTION_PREFIX: &str = "pack_";
+
+/// The local collection id of knowledge pack `pack_id`.
+pub fn pack_collection_id(pack_id: &str) -> String {
+    format!("{PACK_COLLECTION_PREFIX}{pack_id}")
+}
+
+/// Whether `collection_id` holds a subscribed knowledge pack.
+pub fn is_pack_collection(collection_id: &str) -> bool {
+    collection_id.starts_with(PACK_COLLECTION_PREFIX)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KbCollection {
     pub id: String,

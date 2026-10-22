@@ -62,6 +62,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
                 default: Some(true),
                 description: None,
                 daemon: false,
+                kb: None,
                 workspace: None,
                 model: None,
                 lane: None,

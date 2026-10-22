@@ -251,6 +251,7 @@ mod tests {
         AgentEntry {
             id: id.to_owned(),
             daemon: false,
+            kb: None,
             description: None,
             default: if default { Some(true) } else { None },
             workspace: None,

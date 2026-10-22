@@ -1262,6 +1262,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             // Register the single live instance so agent tools (knowledge_base)
             // reach it without re-opening redb (which is exclusively locked).
             rsclaw_kb::set_global_service(Arc::clone(&svc));
+            // Keep the knowledge packs this account subscribes to in step
+            // with the server (no-op without `kb.packs`).
+            rsclaw_kb::sync::pack::spawn_from_config(Arc::clone(&svc));
             Some(svc)
         }
         Err(e) => {

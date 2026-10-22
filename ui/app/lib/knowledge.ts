@@ -32,6 +32,8 @@ export interface KbCollection {
   bytes: number;
   createdAt: string;
   updatedAt: string;
+  /** A subscribed knowledge pack: synced from its server, not editable here. */
+  readOnly?: boolean;
 }
 
 export type KbDocStatus = "pending" | "indexing" | "ready" | "failed";

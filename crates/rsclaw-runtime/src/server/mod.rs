@@ -3828,6 +3828,7 @@ pub(crate) async fn apply_reload_scopes(
                 system: None,
                 temperature: None,
                 daemon: false,
+                kb: None,
                 description: None,
             }]
         } else {
@@ -4620,15 +4621,26 @@ pub(crate) async fn trigger_cron_job(
 
     let wake_mode = job["wakeMode"].as_str();
     let plugins = state.wasm_plugins.read().await.clone();
-    let (message, after_turn) =
-        match crate::cron::preflight_message(wake_mode, &message, Some(&plugins)).await {
-            Ok(Some(preflighted)) => (preflighted.message, preflighted.after_turn),
-            Ok(None) => {
-                tracing::info!(job_id = %id, "cron trigger: plugin preflight found no work");
-                return Ok(CronTriggered::NoWork);
-            }
-            Err(e) => return Err(CronTriggerError::Preflight(format!("{e:#}"))),
-        };
+    let kb_scope = state
+        .agents
+        .get(agent_id)
+        .ok()
+        .and_then(|a| a.config.kb.as_ref()?.collections.clone());
+    let (message, after_turn) = match crate::cron::preflight_message(
+        wake_mode,
+        &message,
+        Some(&plugins),
+        kb_scope.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(preflighted)) => (preflighted.message, preflighted.after_turn),
+        Ok(None) => {
+            tracing::info!(job_id = %id, "cron trigger: plugin preflight found no work");
+            return Ok(CronTriggered::NoWork);
+        }
+        Err(e) => return Err(CronTriggerError::Preflight(format!("{e:#}"))),
+    };
 
     // Send message to the agent via registry. The placeholder ids "default"
     // (WS `cron.add`) and "main" fall back to the default agent.

@@ -93,6 +93,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
                 default: Some(true),
                 description: None,
                 daemon: false,
+                kb: None,
                 workspace: None,
                 model: None,
                 lane: None,

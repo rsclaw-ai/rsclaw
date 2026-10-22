@@ -948,6 +948,7 @@ impl AgentRegistry {
             vec![rsclaw_config::schema::AgentEntry {
                 id: "main".to_owned(),
                 daemon: false,
+                kb: None,
                 description: None,
                 default: Some(true),
                 name: Some(
@@ -1307,6 +1308,7 @@ mod tests {
             system: None,
             temperature: None,
             daemon: false,
+            kb: None,
         }
     }
 

@@ -84,6 +84,7 @@ fn err_response(e: KnowledgeError) -> Response {
         KnowledgeError::CollectionNotFound => (StatusCode::NOT_FOUND, "collection_not_found"),
         KnowledgeError::DocNotFound => (StatusCode::NOT_FOUND, "doc_not_found"),
         KnowledgeError::DuplicateName => (StatusCode::CONFLICT, "duplicate_name"),
+        KnowledgeError::ReadOnly => (StatusCode::FORBIDDEN, "read_only"),
         KnowledgeError::Internal(ref err) => {
             tracing::warn!("knowledge internal error: {err:#}");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal")
@@ -109,6 +110,9 @@ struct CollectionDto {
     bytes: u64,
     created_at: String,
     updated_at: String,
+    /// A subscribed knowledge pack: kept in sync from its server, so its
+    /// documents and name cannot be changed here.
+    read_only: bool,
 }
 
 fn ms_to_rfc3339(ms: i64) -> String {
@@ -131,6 +135,7 @@ impl CollectionDto {
 impl From<KbCollection> for CollectionDto {
     fn from(c: KbCollection) -> Self {
         CollectionDto {
+            read_only: rsclaw_kb::model::is_pack_collection(&c.id),
             id: c.id,
             name: c.name,
             description: c.description,
@@ -684,6 +689,9 @@ async fn upload_from_url(
     // 404 early if the collection is gone (before any network fetch).
     if let Err(e) = svc.get_collection(&cid) {
         return err_response(e);
+    }
+    if rsclaw_kb::model::is_pack_collection(&cid) {
+        return err_response(KnowledgeError::ReadOnly);
     }
     match svc.ingest_url(&cid, url).await {
         Ok(outcome) => {

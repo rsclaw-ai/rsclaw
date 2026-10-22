@@ -4,6 +4,7 @@
 //! the same trait.
 
 pub mod manual;
+pub mod pack;
 pub mod state;
 pub mod url;
 

@@ -29,10 +29,22 @@ impl AgentRuntime {
         match action {
             "search" | "" => self.kb_action_search(kb, args).await,
             "list_collections" => {
-                let cols = tokio::task::spawn_blocking(move || kb.list_collections())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("kb list task failed: {e}"))?
-                    .map_err(|e| anyhow::anyhow!("kb list_collections failed: {e}"))?;
+                let scope = self.kb_scope();
+                let cols = tokio::task::spawn_blocking(move || {
+                    let cols = kb.list_collections()?;
+                    let Some(scope) = scope else {
+                        return Ok(cols);
+                    };
+                    let ids = kb.resolve_collections(&scope)?;
+                    Ok::<_, rsclaw_kb::KnowledgeError>(
+                        cols.into_iter()
+                            .filter(|c| ids.contains(&c.id))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("kb list task failed: {e}"))?
+                .map_err(|e| anyhow::anyhow!("kb list_collections failed: {e}"))?;
                 let list: Vec<Value> = cols
                     .into_iter()
                     .map(|c| json!({"id": c.id, "name": c.name, "description": c.description}))
@@ -171,6 +183,16 @@ impl AgentRuntime {
         }
     }
 
+    /// The collections this agent's knowledge-base reads are limited to
+    /// (`agents.list[].kb.collections`); None = every collection.
+    fn kb_scope(&self) -> Option<Vec<String>> {
+        self.handle
+            .config
+            .kb
+            .as_ref()
+            .and_then(|kb| kb.collections.clone())
+    }
+
     /// The read path of `knowledge_base` (action=search).
     async fn kb_action_search(
         &self,
@@ -193,14 +215,16 @@ impl AgentRuntime {
             })
             .unwrap_or_default();
         let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 50) as usize;
+        let scope = self.kb_scope();
 
         // KnowledgeService::search is synchronous and CPU-heavy (embed + HNSW +
         // tantivy); run it off the async executor so it doesn't stall the turn.
-        let hits =
-            tokio::task::spawn_blocking(move || kb.search(&query, &collection_ids, top_k, 0.0))
-                .await
-                .map_err(|e| anyhow::anyhow!("knowledge_base search task failed: {e}"))?
-                .map_err(|e| anyhow::anyhow!("knowledge_base search failed: {e}"))?;
+        let hits = tokio::task::spawn_blocking(move || {
+            kb.search_scoped(&query, scope.as_deref(), &collection_ids, top_k, 0.0)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("knowledge_base search task failed: {e}"))?
+        .map_err(|e| anyhow::anyhow!("knowledge_base search failed: {e}"))?;
 
         let results: Vec<Value> = hits
             .into_iter()
@@ -345,9 +369,14 @@ impl AgentRuntime {
             && kb.has_content()
         {
             let q = query.trim().to_owned();
+            let scope = self.kb_scope();
             // KnowledgeService::search is synchronous and CPU-heavy (embed +
             // HNSW + tantivy) — same off-executor treatment as the kb tool.
-            match tokio::task::spawn_blocking(move || kb.search(&q, &[], KB_RECALL_K, 0.0)).await {
+            match tokio::task::spawn_blocking(move || {
+                kb.search_scoped(&q, scope.as_deref(), &[], KB_RECALL_K, 0.0)
+            })
+            .await
+            {
                 Ok(Ok(hits)) if !hits.is_empty() => {
                     let block = format_kb_recall_block(&hits, KB_RECALL_MAX_TOKENS);
                     if !block.is_empty() {
