@@ -337,69 +337,128 @@ impl FleetHttp {
                 }
             };
 
-            let status = resp.status();
-            if status != StatusCode::TEMPORARY_REDIRECT && status != StatusCode::PERMANENT_REDIRECT
-            {
-                return Ok(resp);
-            }
-
-            let location = resp
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let cache_control = resp
-                .headers()
-                .get("cache-control")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-
-            let Some(loc) = location else {
-                anyhow::bail!(
-                    "rsclaw: {status} redirect from {current_url} omitted Location header"
-                );
-            };
-            let Some(next_url) = resolve_location(&current_url, &loc) else {
-                anyhow::bail!(
-                    "rsclaw: {status} redirect from {current_url} had unsupported Location {loc:?}"
-                );
-            };
-
-            // The Bearer is re-attached on every hop, so only follow to the
-            // same host / registrable domain and never downgrade to http.
-            if !redirect_allowed(&current_url, &next_url) {
-                anyhow::bail!(
-                    "rsclaw: refusing {status} redirect from {current_url} to {next_url} \
-                     (cross-site or https->http downgrade)"
-                );
-            }
-
-            // 308 only: cache the target origin. 307 is temporary by spec.
-            if status == StatusCode::PERMANENT_REDIRECT
-                && let (Some(current_origin), Some(next_origin)) =
-                    (origin_of(&current_url), origin_of(&next_url))
-                && current_origin != next_origin
-            {
-                let ttl = parse_max_age(cache_control.as_deref())
-                    .unwrap_or(DEFAULT_REDIRECT_TTL)
-                    .min(MAX_REDIRECT_TTL);
-                if let Ok(mut cache) = self.cache.lock() {
-                    cache.store(current_origin.to_owned(), next_origin.to_owned(), ttl);
+            match self.redirect_target(&current_url, &resp)? {
+                None => return Ok(resp),
+                Some(next_url) => {
+                    hops += 1;
+                    if hops > MAX_REDIRECT_HOPS {
+                        anyhow::bail!(
+                            "rsclaw: too many redirects ({MAX_REDIRECT_HOPS} hops) for {url}"
+                        );
+                    }
+                    current_url = next_url;
                 }
-                tracing::info!(
-                    from = %current_origin,
-                    to = %next_origin,
-                    ttl_secs = ttl.as_secs(),
-                    "rsclaw: cached 308 redirect"
-                );
             }
-
-            hops += 1;
-            if hops > MAX_REDIRECT_HOPS {
-                anyhow::bail!("rsclaw: too many redirects ({MAX_REDIRECT_HOPS} hops) for {url}");
-            }
-            current_url = next_url;
         }
+    }
+
+    /// GET `url` with the same redirect handling as
+    /// [`Self::post_following_redirects`]: 307/308 followed with the Bearer
+    /// re-attached, 308 targets cached by origin. `headers` go on every hop.
+    /// Non-redirect statuses (incl. errors and 304) are returned as-is.
+    pub async fn get_following_redirects(
+        &self,
+        url: &str,
+        bearer: Option<&str>,
+        headers: &[(&str, &str)],
+        builder_timeout: Option<Duration>,
+    ) -> Result<reqwest::Response> {
+        let mut current_url = self.resolve_url(url);
+        let mut hops = 0;
+        loop {
+            let mut builder = self.client.get(&current_url);
+            if let Some(t) = builder_timeout {
+                builder = builder.timeout(t);
+            }
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            if let Some(k) = bearer.filter(|k| !k.is_empty()) {
+                builder = builder.header("authorization", format!("Bearer {k}"));
+            }
+            let resp = match send_with_transport_retry(builder, true).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.invalidate_redirect_for(&current_url);
+                    return Err(anyhow::Error::from(e).context(format!("rsclaw GET {current_url}")));
+                }
+            };
+            match self.redirect_target(&current_url, &resp)? {
+                None => return Ok(resp),
+                Some(next_url) => {
+                    hops += 1;
+                    if hops > MAX_REDIRECT_HOPS {
+                        anyhow::bail!(
+                            "rsclaw: too many redirects ({MAX_REDIRECT_HOPS} hops) for {url}"
+                        );
+                    }
+                    current_url = next_url;
+                }
+            }
+        }
+    }
+
+    /// Where a 307/308 answer to a request for `current_url` sends the next
+    /// hop (caching a 308's target origin), or `None` for any other status.
+    fn redirect_target(
+        &self,
+        current_url: &str,
+        resp: &reqwest::Response,
+    ) -> Result<Option<String>> {
+        let status = resp.status();
+        if status != StatusCode::TEMPORARY_REDIRECT && status != StatusCode::PERMANENT_REDIRECT {
+            return Ok(None);
+        }
+
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+
+        let Some(loc) = location else {
+            anyhow::bail!("rsclaw: {status} redirect from {current_url} omitted Location header");
+        };
+        let Some(next_url) = resolve_location(current_url, &loc) else {
+            anyhow::bail!(
+                "rsclaw: {status} redirect from {current_url} had unsupported Location {loc:?}"
+            );
+        };
+
+        // The Bearer is re-attached on every hop, so only follow to the
+        // same host / registrable domain and never downgrade to http.
+        if !redirect_allowed(current_url, &next_url) {
+            anyhow::bail!(
+                "rsclaw: refusing {status} redirect from {current_url} to {next_url} \
+                 (cross-site or https->http downgrade)"
+            );
+        }
+
+        // 308 only: cache the target origin. 307 is temporary by spec.
+        if status == StatusCode::PERMANENT_REDIRECT
+            && let (Some(current_origin), Some(next_origin)) =
+                (origin_of(current_url), origin_of(&next_url))
+            && current_origin != next_origin
+        {
+            let ttl = parse_max_age(cache_control.as_deref())
+                .unwrap_or(DEFAULT_REDIRECT_TTL)
+                .min(MAX_REDIRECT_TTL);
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.store(current_origin.to_owned(), next_origin.to_owned(), ttl);
+            }
+            tracing::info!(
+                from = %current_origin,
+                to = %next_origin,
+                ttl_secs = ttl.as_secs(),
+                "rsclaw: cached 308 redirect"
+            );
+        }
+        Ok(Some(next_url))
     }
 
     /// Convenience: a plain JSON POST that follows + caches redirects (no SSE,
