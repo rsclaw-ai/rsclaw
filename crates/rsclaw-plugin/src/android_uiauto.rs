@@ -1113,7 +1113,7 @@ async fn run_high_level_operation(
             } else {
                 build_explicit_call_args(config, op_type, command, args_json)?
             };
-            if command == "relaunch" && op_type == AndroidOpType::Auto {
+            if command == "relaunch" && matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
                 return relaunch_with_adb_foreground_fallback(config, &args).await;
             }
             run_cls(&config.cls_bin, &args, deadline_for(command)).await
@@ -2529,9 +2529,14 @@ async fn relaunch_with_adb_foreground_fallback(
 ) -> Result<String, String> {
     let package = command_option(relaunch_args, "--package")?;
     let cls_result = run_cls(&config.cls_bin, relaunch_args, Duration::from_secs(20)).await;
+    // A device service without app control refuses at once; nothing was
+    // started, so go straight to the launcher intent.
+    let refused = cls_result
+        .as_ref()
+        .is_err_and(|error| error.contains("unsupported"));
     // On this device CLS can complete the start but report an empty current
     // window. The activity manager is the authoritative foreground signal.
-    if wait_for_foreground_package(config, package).await? {
+    if !refused && wait_for_foreground_package(config, package).await? {
         return Ok(cls_result.unwrap_or_else(|_| {
             serde_json::json!({ "relaunch": "cls-verified-by-adb", "package": package }).to_string()
         }));
