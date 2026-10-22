@@ -2919,6 +2919,9 @@ impl AgentRuntime {
                 // Kept apart from the body so the per-tool char truncation
                 // below can never cut it off.
                 let mut artifact_hint: Option<String> = None;
+                let can_read_artifacts = self
+                    .allowed_tools_for_dispatch()
+                    .is_none_or(|allowed| allowed.contains("read_artifact"));
                 let (mut result_text, result_images) = match result {
                     Ok(v) => {
                         // Reset parse error counter on successful tool execution
@@ -3611,6 +3614,12 @@ impl AgentRuntime {
                         "plugin_invoke" | "plugin.invoke" => {
                             limits.and_then(|l| l.plugin).unwrap_or(12_000)
                         }
+                        // Search hits are what the model answers from; cut
+                        // at 3000 it pages them back through read_artifact
+                        // or searches again for the part it lost.
+                        "knowledge_base" | "memory_search" => {
+                            limits.and_then(|l| l.knowledge).unwrap_or(12_000)
+                        }
                         _ => limits.and_then(|l| l.default).unwrap_or(3000),
                     };
 
@@ -3709,7 +3718,13 @@ impl AgentRuntime {
                 // The read_artifact handle goes last: after truncation (so it is
                 // never cut off) and after the hints above (so the per-turn
                 // guard's `split_artifact_marker` still finds it at the tail).
+                // An agent whose tool list leaves out read_artifact cannot
+                // follow the handle; pointing it there only sends it looking.
                 let session_text = match artifact_hint {
+                    Some(_) if !can_read_artifacts => format!(
+                        "{session_text}\n\n[truncated — the rest is not available to this agent; \
+                         work from what is shown above]"
+                    ),
                     Some(hint) => format!("{session_text}{hint}"),
                     None => session_text,
                 };

@@ -2070,6 +2070,9 @@ pub struct SessionResultLimits {
     /// plugin's result is structured state the model acts on (a ticket, the
     /// next chat to answer); cut short, the model can't see what to do next.
     pub plugin: Option<usize>,
+    /// knowledge_base / memory_search result max chars in session (default:
+    /// 12000). The hits are what the model answers from.
+    pub knowledge: Option<usize>,
     /// Default for all other tools (default: 3000)
     pub default: Option<usize>,
 }
