@@ -265,7 +265,8 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
     if args_json.len() > max_args {
         return Err(format!("android uiauto: args exceed {max_args} bytes"));
     }
-    let (args_json, options) = split_operation_options(args_json)?;
+    let (args_json, frame_jpeg) = take_frame_format(args_json)?;
+    let (args_json, options) = split_operation_options(&args_json)?;
     validate_operation_mode(command, options)?;
     let config = Config::from_env()?;
     if command == CONTACT_BADGE_COMMAND {
@@ -317,13 +318,36 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         return clear_focused(&config, options.op_type).await;
     }
     if command == WAIT_CHANGE_COMMAND {
-        return wait_change(&args_json, &config, options.op_type).await;
+        return wait_change(&args_json, &config, options.op_type, frame_jpeg).await;
     }
     if command == "screenshot" {
         validate_no_args(command, &args_json)?;
-        return screenshot_with_wakeup(&config, options.op_type).await;
+        return screenshot_with_wakeup(&config, options.op_type, frame_jpeg).await;
     }
     run_high_level_operation(&config, options.op_type, command, &args_json).await
+}
+
+/// Take the `frameFormat` option (`"jpeg"` or `"png"`, default png) off the
+/// args. A plugin asks for JPEG frames only when it decodes JPEG itself.
+fn take_frame_format(args_json: &str) -> Result<(String, bool), String> {
+    if !args_json.contains("frameFormat") {
+        return Ok((args_json.to_string(), false));
+    }
+    let mut value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android operation: invalid args JSON: {error}"))?;
+    let jpeg = match value
+        .as_object_mut()
+        .and_then(|object| object.remove("frameFormat"))
+        .as_ref()
+        .map(|v| v.as_str())
+    {
+        None | Some(Some("png")) => false,
+        Some(Some("jpeg")) => true,
+        Some(_) => {
+            return Err("android operation: `frameFormat` must be \"jpeg\" or \"png\"".to_string());
+        }
+    };
+    Ok((value.to_string(), jpeg))
 }
 
 fn split_operation_options(args_json: &str) -> Result<(String, AndroidOperationOptions), String> {
@@ -679,6 +703,7 @@ async fn wait_change(
     args_json: &str,
     config: &Config,
     op_type: AndroidOpType,
+    jpeg: bool,
 ) -> Result<String, String> {
     if !matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
         return Err("android wait-change: supports only opType=auto or u2".to_string());
@@ -686,7 +711,7 @@ async fn wait_change(
     let (body, timeout_ms) = wait_change_request(args_json)?;
     let deadline = Duration::from_millis(timeout_ms) + Duration::from_secs(20);
     let started = std::time::Instant::now();
-    let response = if lacks_jpeg_frames(&config.node) {
+    let response = if !jpeg || lacks_jpeg_frames(&config.node) {
         run_raw_request(
             config,
             "POST",
@@ -1124,7 +1149,7 @@ async fn ocr_region(
         let height = r.get("height")?.as_u64()? as u32;
         Some((x, y, width, height))
     });
-    let response = screenshot_with_wakeup(config, op_type).await?;
+    let response = screenshot_with_wakeup(config, op_type, false).await?;
     let png = screenshot_png(&response)?;
     tokio::task::spawn_blocking(move || rsclaw_desktop::ocr_image_region(&png, rect))
         .await
@@ -1192,7 +1217,7 @@ fn keyevent_keycode(args_json: &str) -> Result<i32, String> {
 }
 
 async fn detect_contact_badge(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config, op_type).await?;
+    let response = screenshot_with_wakeup(config, op_type, false).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -1215,7 +1240,7 @@ async fn detect_contact_badge(config: &Config, op_type: AndroidOpType) -> Result
 }
 
 async fn detect_send_button(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config, op_type).await?;
+    let response = screenshot_with_wakeup(config, op_type, false).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -1240,7 +1265,7 @@ async fn detect_latest_message_bubble(
     config: &Config,
     op_type: AndroidOpType,
 ) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config, op_type).await?;
+    let response = screenshot_with_wakeup(config, op_type, false).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -1405,7 +1430,7 @@ async fn detect_keyboard_visible(
     config: &Config,
     op_type: AndroidOpType,
 ) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config, op_type).await?;
+    let response = screenshot_with_wakeup(config, op_type, false).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -1726,17 +1751,25 @@ fn bottom_tab_active_probe(
 /// foreground package is read alongside and kept with the frame:
 /// `vision-observe` on that frame then needs no read of its own, which through
 /// the relay takes seconds.
-async fn screenshot_with_wakeup(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
+async fn screenshot_with_wakeup(
+    config: &Config,
+    op_type: AndroidOpType,
+    jpeg: bool,
+) -> Result<String, String> {
     let foreground = crate::vision_observer::observer_path().map(|_| read_foreground_soon(config));
-    let response = screenshot_taken(config, op_type).await?;
+    let response = screenshot_taken(config, op_type, jpeg).await?;
     if let (Some(foreground), Some(id)) = (foreground, frame_id_of(&response)) {
         attach_foreground(&id, foreground);
     }
     Ok(response)
 }
 
-async fn screenshot_taken(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
-    let response = capture_screenshot(config, op_type).await?;
+async fn screenshot_taken(
+    config: &Config,
+    op_type: AndroidOpType,
+    jpeg: bool,
+) -> Result<String, String> {
+    let response = capture_screenshot(config, op_type, jpeg).await?;
     if !screenshot_is_black(&response)? {
         return annotate_screenshot(response);
     }
@@ -1755,7 +1788,7 @@ async fn screenshot_taken(config: &Config, op_type: AndroidOpType) -> Result<Str
 
     for (index, delay) in WAKEUP_SCREEN_RETRY_DELAYS.iter().enumerate() {
         tokio::time::sleep(*delay).await;
-        let response = capture_screenshot(config, op_type).await?;
+        let response = capture_screenshot(config, op_type, jpeg).await?;
         if !screenshot_is_black(&response)? {
             return annotate_screenshot(response);
         }
@@ -1777,10 +1810,14 @@ async fn screenshot_taken(config: &Config, op_type: AndroidOpType) -> Result<Str
 /// and deleted around it) and Android's slow encoder for
 /// `cls android uiauto screenshot`, which a cls-service without the endpoint
 /// still gets.
-async fn capture_screenshot(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
+async fn capture_screenshot(
+    config: &Config,
+    op_type: AndroidOpType,
+    jpeg: bool,
+) -> Result<String, String> {
     let uiauto = matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2);
     if uiauto && !lacks_quick_screenshot(&config.node) {
-        match screenshot_from_service(config).await {
+        match screenshot_from_service(config, jpeg).await {
             Ok(response) => return Ok(response),
             Err(error) => {
                 tracing::debug!(node = %config.node, %error, "quick screenshot unavailable");
@@ -1794,8 +1831,9 @@ async fn capture_screenshot(config: &Config, op_type: AndroidOpType) -> Result<S
     run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await
 }
 
-async fn screenshot_from_service(config: &Config) -> Result<String, String> {
-    if !lacks_jpeg_frames(&config.node) {
+/// `jpeg` asks for a JPEG frame; only a caller that decodes JPEG itself asks.
+async fn screenshot_from_service(config: &Config, jpeg: bool) -> Result<String, String> {
+    if jpeg && !lacks_jpeg_frames(&config.node) {
         let path = format!("/appium/device/screenshot?format=jpeg&quality={FRAME_JPEG_QUALITY}");
         match screenshot_at(config, &path).await {
             Ok(response) => return Ok(response),
@@ -2001,7 +2039,7 @@ async fn vision_observe(
             None,
         ),
         (None, None) => {
-            let response = screenshot_with_wakeup(config, op_type).await?;
+            let response = screenshot_with_wakeup(config, op_type, false).await?;
             let png = screenshot_png(&response)?;
             let id = serde_json::from_str::<Value>(&response)
                 .ok()
@@ -4163,6 +4201,16 @@ mod tests {
         assert_eq!(body["until"], "stable");
         assert_eq!(image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), "image/jpeg");
         assert_eq!(image_mime(b"\x89PNG\r\n"), "image/png");
+    }
+
+    #[test]
+    fn frames_stay_png_unless_the_plugin_asks_for_jpeg() {
+        assert_eq!(take_frame_format("{}").unwrap(), ("{}".to_string(), false));
+        let (args, jpeg) = take_frame_format(r#"{"frameFormat":"jpeg","until":"stable"}"#).unwrap();
+        assert!(jpeg);
+        assert_eq!(args, r#"{"until":"stable"}"#);
+        assert!(!take_frame_format(r#"{"frameFormat":"png"}"#).unwrap().1);
+        assert!(take_frame_format(r#"{"frameFormat":"webp"}"#).is_err());
     }
 
     #[test]
