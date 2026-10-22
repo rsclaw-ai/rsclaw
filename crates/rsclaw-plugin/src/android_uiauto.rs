@@ -43,6 +43,10 @@ const WAIT_CHANGE_COMMAND: &str = "wait-change";
 const MAX_WAIT_CHANGE_MS: u64 = 5_000;
 /// Most regions one `wait-change` may watch.
 const MAX_WAIT_CHANGE_REGIONS: usize = 8;
+/// Frames are asked for as JPEG at this quality: about a quarter of the PNG's
+/// size, so each frame crosses the transport faster and a relay with a small
+/// message limit is less likely to cut it.
+const FRAME_JPEG_QUALITY: u8 = 90;
 /// Ctrl+A, then Delete: select the focused field's text and delete it.
 const SELECT_ALL_DELETE_BODY: &str = r#"{"keys":[[113,29],[67]]}"#;
 /// Most presses one `key-repeat` call may carry.
@@ -680,19 +684,62 @@ async fn wait_change(
         return Err("android wait-change: supports only opType=auto or u2".to_string());
     }
     let (body, timeout_ms) = wait_change_request(args_json)?;
+    let deadline = Duration::from_millis(timeout_ms) + Duration::from_secs(20);
     let started = std::time::Instant::now();
-    let response = run_raw_request(
-        config,
-        "POST",
-        "/appium/device/wait_change",
-        Some(&body),
-        Duration::from_millis(timeout_ms) + Duration::from_secs(20),
-    )
-    .await?;
+    let response = if lacks_jpeg_frames(&config.node) {
+        run_raw_request(
+            config,
+            "POST",
+            "/appium/device/wait_change",
+            Some(&body),
+            deadline,
+        )
+        .await?
+    } else {
+        let jpeg_body = with_jpeg_frame(&body);
+        match run_raw_request(
+            config,
+            "POST",
+            "/appium/device/wait_change",
+            Some(&jpeg_body),
+            deadline,
+        )
+        .await
+        {
+            Ok(response) => response,
+            // A 400 is answered before the input is performed, so the call
+            // can be made again without the format.
+            Err(error) if rejects_frame_format(&error) => {
+                tracing::info!(node = %config.node, %error, "device service sends no JPEG frames; asking for PNG");
+                remember_lacks_jpeg_frames(&config.node);
+                run_raw_request(
+                    config,
+                    "POST",
+                    "/appium/device/wait_change",
+                    Some(&body),
+                    deadline,
+                )
+                .await?
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let total_ms = started.elapsed().as_millis() as u64;
     let answer = wait_change_answer(&response)?;
     log_wait_change_split(&answer, response.len(), total_ms);
     annotate_screenshot(answer)
+}
+
+/// `body` asking for the frame as JPEG.
+fn with_jpeg_frame(body: &str) -> String {
+    let mut value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("format".to_string(), serde_json::json!("jpeg"));
+        object.insert("quality".to_string(), serde_json::json!(FRAME_JPEG_QUALITY));
+        value.to_string()
+    } else {
+        body.to_string()
+    }
 }
 
 /// Where a `wait-change` round trip went: the device's own time (input plus
@@ -1748,11 +1795,65 @@ async fn capture_screenshot(config: &Config, op_type: AndroidOpType) -> Result<S
 }
 
 async fn screenshot_from_service(config: &Config) -> Result<String, String> {
+    if !lacks_jpeg_frames(&config.node) {
+        let path = format!("/appium/device/screenshot?format=jpeg&quality={FRAME_JPEG_QUALITY}");
+        match screenshot_at(config, &path).await {
+            Ok(response) => return Ok(response),
+            // A screenshot is read-only, so any 404 is worth one plain retry
+            // before the route itself is judged missing.
+            Err(error) if rejects_frame_format(&error) || error.contains("404") => {
+                tracing::info!(node = %config.node, %error, "device service sends no JPEG frames; asking for PNG");
+                remember_lacks_jpeg_frames(&config.node);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    screenshot_at(config, "/appium/device/screenshot").await
+}
+
+async fn screenshot_at(config: &Config, path: &str) -> Result<String, String> {
     let mut args = uiauto_base_args(config, "raw");
     args.extend(["--method".to_string(), "GET".to_string()]);
-    args.push("/appium/device/screenshot".to_string());
+    args.push(path.to_string());
     let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
     screenshot_from_service_response(&response)
+}
+
+/// An answer saying the device service did not take the frame-format
+/// parameters (an older one): a 400 naming them, or a 404 for the route with
+/// a query string. Nothing was done on the device, so asking again without
+/// them is safe.
+fn rejects_frame_format(error: &str) -> bool {
+    (error.contains("400") && (error.contains("format") || error.contains("quality")))
+        || (error.contains("404") && error.contains("format=jpeg"))
+}
+
+/// Nodes whose device service sends PNG frames only.
+fn nodes_without_jpeg_frames() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static NODES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NODES.get_or_init(Default::default)
+}
+
+fn lacks_jpeg_frames(node: &str) -> bool {
+    nodes_without_jpeg_frames()
+        .lock()
+        .is_ok_and(|nodes| nodes.contains(node))
+}
+
+fn remember_lacks_jpeg_frames(node: &str) {
+    if let Ok(mut nodes) = nodes_without_jpeg_frames().lock() {
+        nodes.insert(node.to_string());
+    }
+}
+
+/// The media type of encoded image bytes, by their signature.
+fn image_mime(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else {
+        "image/png"
+    }
 }
 
 /// cls-service's `{"value": "<base64 PNG>"}` in the shape
@@ -1934,7 +2035,7 @@ async fn vision_observe(
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 object.insert(
                     "image".to_string(),
-                    serde_json::json!(format!("data:image/png;base64,{encoded}")),
+                    serde_json::json!(format!("data:{};base64,{encoded}", image_mime(&bytes))),
                 );
             }
         }
@@ -2021,6 +2122,7 @@ fn annotate_screenshot(response: String) -> Result<String, String> {
     let object = value
         .as_object_mut()
         .ok_or_else(|| "android uiauto: screenshot response must be an object".to_string())?;
+    object.insert("mime".to_string(), serde_json::json!(image_mime(&png)));
     object.insert("width".to_string(), serde_json::json!(image.width()));
     object.insert("height".to_string(), serde_json::json!(image.height()));
     object.insert(
@@ -4049,6 +4151,34 @@ mod tests {
     fn key_repeat_timeout_grows_with_the_count() {
         assert_eq!(key_repeat_timeout(1), Duration::from_millis(5_100));
         assert_eq!(key_repeat_timeout(500), Duration::from_secs(55));
+    }
+
+    #[test]
+    fn frames_are_asked_for_as_jpeg_and_named_by_their_bytes() {
+        let body: Value =
+            serde_json::from_str(&with_jpeg_frame(r#"{"until":"stable","returnImage":true}"#))
+                .unwrap();
+        assert_eq!(body["format"], "jpeg");
+        assert_eq!(body["quality"], FRAME_JPEG_QUALITY);
+        assert_eq!(body["until"], "stable");
+        assert_eq!(image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), "image/jpeg");
+        assert_eq!(image_mime(b"\x89PNG\r\n"), "image/png");
+    }
+
+    #[test]
+    fn only_a_refusal_of_the_format_falls_back_to_png() {
+        assert!(rejects_frame_format(
+            "android uiauto: cls exited with exit status: 1: HTTP 400: unknown field `format`"
+        ));
+        assert!(rejects_frame_format(
+            "HTTP 404 Not Found: /appium/device/screenshot?format=jpeg&quality=90"
+        ));
+        assert!(!rejects_frame_format(
+            "HTTP 404 Not Found: /appium/device/wait_change"
+        ));
+        assert!(!rejects_frame_format(
+            "truncated HTTP response from UIAutomator2"
+        ));
     }
 
     #[test]

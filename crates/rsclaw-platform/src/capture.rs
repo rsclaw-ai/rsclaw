@@ -50,9 +50,9 @@ fn tmp_png(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rsclaw_cap_{}_{tag}_{n}.png", std::process::id()))
 }
 
-/// Decode PNG bytes into an RGBA image (for pixel scanning).
+/// Decode PNG (or JPEG) bytes into an RGBA image (for pixel scanning).
 pub fn png_to_rgba(bytes: &[u8]) -> Result<image::RgbaImage> {
-    let img = image::load_from_memory(bytes).map_err(|e| anyhow!("decode PNG: {e}"))?;
+    let img = image::load_from_memory(bytes).map_err(|e| anyhow!("decode image: {e}"))?;
     Ok(img.to_rgba8())
 }
 
