@@ -680,6 +680,7 @@ async fn wait_change(
         return Err("android wait-change: supports only opType=auto or u2".to_string());
     }
     let (body, timeout_ms) = wait_change_request(args_json)?;
+    let started = std::time::Instant::now();
     let response = run_raw_request(
         config,
         "POST",
@@ -688,7 +689,28 @@ async fn wait_change(
         Duration::from_millis(timeout_ms) + Duration::from_secs(20),
     )
     .await?;
-    annotate_screenshot(wait_change_answer(&response)?)
+    let total_ms = started.elapsed().as_millis() as u64;
+    let answer = wait_change_answer(&response)?;
+    log_wait_change_split(&answer, response.len(), total_ms);
+    annotate_screenshot(answer)
+}
+
+/// Where a `wait-change` round trip went: the device's own time (input plus
+/// watching) against the rest, which is the request and the frame crossing
+/// the transport.
+fn log_wait_change_split(answer: &str, response_bytes: usize, total_ms: u64) {
+    let Ok(value) = serde_json::from_str::<Value>(answer) else {
+        return;
+    };
+    let ms = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let device_ms = ms("actionMs") + ms("elapsedMs");
+    tracing::info!(
+        total_ms,
+        device_ms,
+        transport_ms = total_ms.saturating_sub(device_ms),
+        response_kb = response_bytes / 1024,
+        "android wait-change round trip"
+    );
 }
 
 /// Check `wait-change` args and build the device service's request body (always
