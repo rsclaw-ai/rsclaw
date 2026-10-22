@@ -3984,32 +3984,50 @@ impl WasmPlugin {
             Arc::clone(&self.capabilities_arc),
         );
 
-        let instance = self
-            .linker
-            .instantiate_async(&mut store, &self.component)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to instantiate component for tool call: {e}"))?;
-
-        // Drill into the plugin-api interface to find handle-tool.
-        let iface_idx = instance
-            .get_export_index(&mut store, None, "rsclaw:plugin/plugin-api")
-            .with_context(|| "plugin-api interface not found")?;
-
-        let handle_tool_idx = instance
-            .get_export_index(&mut store, Some(&iface_idx), "handle-tool")
-            .with_context(|| "handle-tool export not found")?;
-
-        let handle_tool_fn = instance
-            .get_typed_func::<(&str, &str), (Result<String, String>,)>(&mut store, &handle_tool_idx)
-            .map_err(|e| anyhow::anyhow!("handle-tool has unexpected type: {e}"))?;
-
         let args_json =
             serde_json::to_string(&args).context("failed to serialize tool arguments")?;
 
-        let (result,) = handle_tool_fn
-            .call_async(&mut store, (tool_name, &args_json))
+        // Run the call on its own task. A caller that stops waiting (an HTTP
+        // client that hung up, a preflight timeout) would otherwise drop the
+        // call at whatever host await it had reached: the plugin never cleans
+        // up, so device locks and half-finished UI steps stay behind. The task
+        // runs the tool to its end even when nobody reads the result.
+        let linker = self.linker.clone();
+        let component = self.component.clone();
+        let tool = tool_name.to_string();
+        let call = tokio::spawn(async move {
+            let instance = linker
+                .instantiate_async(&mut store, &component)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to instantiate component for tool call: {e}")
+                })?;
+
+            // Drill into the plugin-api interface to find handle-tool.
+            let iface_idx = instance
+                .get_export_index(&mut store, None, "rsclaw:plugin/plugin-api")
+                .with_context(|| "plugin-api interface not found")?;
+
+            let handle_tool_idx = instance
+                .get_export_index(&mut store, Some(&iface_idx), "handle-tool")
+                .with_context(|| "handle-tool export not found")?;
+
+            let handle_tool_fn = instance
+                .get_typed_func::<(&str, &str), (Result<String, String>,)>(
+                    &mut store,
+                    &handle_tool_idx,
+                )
+                .map_err(|e| anyhow::anyhow!("handle-tool has unexpected type: {e}"))?;
+
+            let (result,) = handle_tool_fn
+                .call_async(&mut store, (tool.as_str(), args_json.as_str()))
+                .await
+                .map_err(|e| anyhow::anyhow!("handle-tool call failed for '{tool}': {e}"))?;
+            anyhow::Ok(result)
+        });
+        let result = call
             .await
-            .map_err(|e| anyhow::anyhow!("handle-tool call failed for '{tool_name}': {e}"))?;
+            .map_err(|e| anyhow::anyhow!("WASM tool task for '{tool_name}' failed: {e}"))??;
 
         match result {
             Ok(json_str) => {
