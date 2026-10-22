@@ -4649,9 +4649,7 @@ pub(crate) async fn trigger_cron_job(
             .as_str()
             .filter(|key| !key.is_empty())
             .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!("cron:{}:{}", id, chrono::Utc::now().timestamp_millis())
-            });
+            .unwrap_or_else(|| format!("cron:{}:{}", id, chrono::Utc::now().timestamp_millis()));
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = rsclaw_agent::AgentMessage {
             trust: rsclaw_agent::SenderTrust::Owner,
