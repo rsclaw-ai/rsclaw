@@ -156,7 +156,8 @@ impl PackSyncer {
         {
             let id = gone.clone();
             match blocking(kb, move |kb| Ok(kb.remove_pack(&id)?)).await {
-                Ok(_) => {
+                Ok(docs) => {
+                    tracing::info!(pack = %gone, docs, "kb pack removed: no longer listed for this account");
                     self.applied.remove(&gone);
                     report.packs_removed += 1;
                 }
