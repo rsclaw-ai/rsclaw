@@ -37,6 +37,12 @@ const CLIPBOARD_SET_COMMAND: &str = "clipboard-set";
 const OCR_REGION_COMMAND: &str = "ocr-region";
 const KEY_REPEAT_COMMAND: &str = "key-repeat";
 const CLEAR_FOCUSED_COMMAND: &str = "clear-focused";
+/// Do one input, then return the first settled frame after it.
+const WAIT_CHANGE_COMMAND: &str = "wait-change";
+/// Longest wait the device service grants one `wait-change`.
+const MAX_WAIT_CHANGE_MS: u64 = 5_000;
+/// Most regions one `wait-change` may watch.
+const MAX_WAIT_CHANGE_REGIONS: usize = 8;
 /// Ctrl+A, then Delete: select the focused field's text and delete it.
 const SELECT_ALL_DELETE_BODY: &str = r#"{"keys":[[113,29],[67]]}"#;
 /// Most presses one `key-repeat` call may carry.
@@ -306,6 +312,9 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         validate_no_args(command, &args_json)?;
         return clear_focused(&config, options.op_type).await;
     }
+    if command == WAIT_CHANGE_COMMAND {
+        return wait_change(&args_json, &config, options.op_type).await;
+    }
     if command == "screenshot" {
         validate_no_args(command, &args_json)?;
         return screenshot_with_wakeup(&config, options.op_type).await;
@@ -352,6 +361,7 @@ fn validate_operation_mode(command: &str, options: AndroidOperationOptions) -> R
                 | "keyevent"
                 | KEY_REPEAT_COMMAND
                 | CLEAR_FOCUSED_COMMAND
+                | WAIT_CHANGE_COMMAND
                 | "launch"
                 | "relaunch"
                 | INPUT_TEXT_COMMAND
@@ -650,6 +660,208 @@ async fn clear_focused(config: &Config, op_type: AndroidOpType) -> Result<String
         Duration::from_secs(15),
     )
     .await
+}
+
+/// `wait-change`: one input (tap, long press, swipe, keycode, key chords or a
+/// paste) and then, on the device, a look every `intervalMs` at `regions`
+/// until they have changed and settled (`until: "stable"`: only settled),
+/// or `timeoutMs` runs out. One round trip replaces a fixed sleep and the
+/// screenshot after it. The answer is a screenshot answer (`data`,
+/// `frameId`, …) plus how the wait went: `changed`, `stable`, `timedOut`,
+/// `elapsedMs` (input done to answer), `frameMs`, `actionMs`, `frames`,
+/// `changedRegions`. A timeout is not an error. A device service without the
+/// route answers 404; the caller then falls back to sleeping.
+async fn wait_change(
+    args_json: &str,
+    config: &Config,
+    op_type: AndroidOpType,
+) -> Result<String, String> {
+    if !matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
+        return Err("android wait-change: supports only opType=auto or u2".to_string());
+    }
+    let (body, timeout_ms) = wait_change_request(args_json)?;
+    let response = run_raw_request(
+        config,
+        "POST",
+        "/appium/device/wait_change",
+        Some(&body),
+        Duration::from_millis(timeout_ms) + Duration::from_secs(20),
+    )
+    .await?;
+    annotate_screenshot(wait_change_answer(&response)?)
+}
+
+/// Check `wait-change` args and build the device service's request body (always
+/// asking for the frame). Returns the body and the wait's timeout.
+fn wait_change_request(args_json: &str) -> Result<(String, u64), String> {
+    let mut value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android wait-change: invalid args JSON: {error}"))?;
+    let object = object_with_keys(
+        &value,
+        &[
+            "action",
+            "regions",
+            "until",
+            "minMs",
+            "timeoutMs",
+            "intervalMs",
+            "stableFrames",
+            "cell",
+            "cellDelta",
+            "threshold",
+            "ignoreCaret",
+        ],
+    )
+    .map_err(|error| error.replace("android uiauto raw: body", "android wait-change: arg"))?;
+    if let Some(action) = object.get("action") {
+        validate_wait_change_action(action)?;
+    }
+    if let Some(regions) = object.get("regions") {
+        let regions = regions
+            .as_array()
+            .filter(|r| !r.is_empty() && r.len() <= MAX_WAIT_CHANGE_REGIONS)
+            .ok_or_else(|| {
+                format!(
+                    "android wait-change: `regions` must list 1-{MAX_WAIT_CHANGE_REGIONS} regions"
+                )
+            })?;
+        for region in regions {
+            let region = region
+                .as_object()
+                .filter(|r| r.len() == 4)
+                .ok_or("android wait-change: a region is exactly {x, y, w, h}")?;
+            let size = |key: &str| region.get(key).and_then(Value::as_u64);
+            if size("x").is_none()
+                || size("y").is_none()
+                || !size("w").is_some_and(|w| w > 0)
+                || !size("h").is_some_and(|h| h > 0)
+            {
+                return Err(
+                    "android wait-change: a region's x, y need to be >= 0 and w, h > 0".to_string(),
+                );
+            }
+        }
+    }
+    if let Some(until) = object.get("until")
+        && !matches!(until.as_str(), Some("change" | "stable"))
+    {
+        return Err("android wait-change: `until` must be \"change\" or \"stable\"".to_string());
+    }
+    for key in ["minMs", "intervalMs", "stableFrames", "cell", "cellDelta"] {
+        if object.get(key).is_some_and(|v| v.as_u64().is_none()) {
+            return Err(format!(
+                "android wait-change: `{key}` must be a whole number"
+            ));
+        }
+    }
+    if object
+        .get("threshold")
+        .is_some_and(|v| !v.as_f64().is_some_and(|t| (0.0..=1.0).contains(&t)))
+    {
+        return Err("android wait-change: `threshold` must be between 0 and 1".to_string());
+    }
+    if object.get("ignoreCaret").is_some_and(|v| !v.is_boolean()) {
+        return Err("android wait-change: `ignoreCaret` must be true or false".to_string());
+    }
+    let timeout_ms = match object.get("timeoutMs") {
+        None => 2_500,
+        Some(v) => v
+            .as_u64()
+            .filter(|ms| (1..=MAX_WAIT_CHANGE_MS).contains(ms))
+            .ok_or_else(|| {
+                format!("android wait-change: `timeoutMs` must be 1-{MAX_WAIT_CHANGE_MS}")
+            })?,
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("returnImage".to_string(), Value::Bool(true));
+    }
+    Ok((value.to_string(), timeout_ms))
+}
+
+/// A `wait-change` action is one of the device service's: tap, longpress, swipe,
+/// keycode, keys or paste, with exactly that action's fields.
+fn validate_wait_change_action(action: &Value) -> Result<(), String> {
+    let object = action
+        .as_object()
+        .ok_or("android wait-change: `action` must be an object")?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or("android wait-change: `action.type` is required")?;
+    let (required, optional): (&[&str], &[&str]) = match kind {
+        "tap" | "longpress" => (&["x", "y"], &["durationMs"]),
+        "swipe" => (&["x", "y", "x2", "y2"], &["durationMs"]),
+        "keycode" => (&["keycode"], &[]),
+        "keys" => (&["keys"], &[]),
+        "paste" => (&["text"], &["x", "y"]),
+        other => {
+            return Err(format!(
+                "android wait-change: unknown action type `{other}`"
+            ));
+        }
+    };
+    for key in object.keys().filter(|key| key.as_str() != "type") {
+        if !required.contains(&key.as_str()) && !optional.contains(&key.as_str()) {
+            return Err(format!(
+                "android wait-change: `{key}` does not belong to a `{kind}` action"
+            ));
+        }
+    }
+    for key in required {
+        if !object.contains_key(*key) {
+            return Err(format!(
+                "android wait-change: a `{kind}` action needs `{key}`"
+            ));
+        }
+    }
+    for (key, value) in object {
+        let ok = match key.as_str() {
+            "type" => true,
+            "text" => value
+                .as_str()
+                .is_some_and(|t| !t.is_empty() && t.len() <= MAX_INPUT_TEXT_BYTES),
+            "keys" => value.as_array().is_some_and(|chords| {
+                !chords.is_empty()
+                    && chords.len() <= 16
+                    && chords.iter().all(|chord| {
+                        chord.as_array().is_some_and(|keys| {
+                            !keys.is_empty() && keys.len() <= 4 && keys.iter().all(Value::is_u64)
+                        })
+                    })
+            }),
+            _ => value.as_u64().is_some(),
+        };
+        if !ok {
+            return Err(format!(
+                "android wait-change: bad `{key}` in a `{kind}` action"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The device service's `{"value": {..., "image": "<base64 PNG>"}}` in the shape a
+/// screenshot answer has, with the wait's outcome alongside.
+fn wait_change_answer(response: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(response)
+        .map_err(|error| format!("android wait-change: answer: {error}"))?;
+    let mut outcome = value
+        .get("value")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| "android wait-change: answer without a value".to_string())?;
+    let image = outcome
+        .remove("image")
+        .and_then(|image| image.as_str().map(str::to_string))
+        .filter(|image| !image.is_empty())
+        .ok_or_else(|| "android wait-change: answer without a frame".to_string())?;
+    // The annotation measures the frame itself.
+    outcome.remove("width");
+    outcome.remove("height");
+    outcome.insert("ok".to_string(), Value::Bool(true));
+    outcome.insert("source".to_string(), serde_json::json!("cls-service"));
+    outcome.insert("data".to_string(), Value::String(image));
+    Ok(Value::Object(outcome).to_string())
 }
 
 /// Parse `key-repeat` args: a deletion keycode (67 backspace, 112 forward
@@ -3815,6 +4027,62 @@ mod tests {
     fn key_repeat_timeout_grows_with_the_count() {
         assert_eq!(key_repeat_timeout(1), Duration::from_millis(5_100));
         assert_eq!(key_repeat_timeout(500), Duration::from_secs(55));
+    }
+
+    #[test]
+    fn wait_change_asks_for_the_frame_and_keeps_the_rest() {
+        let (body, timeout) = wait_change_request(
+            r#"{"action":{"type":"tap","x":540,"y":2210},"regions":[{"x":0,"y":1600,"w":1080,"h":700}],"timeoutMs":3000,"ignoreCaret":true}"#,
+        )
+        .unwrap();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(timeout, 3000);
+        assert_eq!(body["returnImage"], true);
+        assert_eq!(body["action"]["x"], 540);
+        assert_eq!(body["regions"][0]["h"], 700);
+        let (_, timeout) = wait_change_request(r#"{"until":"stable"}"#).unwrap();
+        assert_eq!(timeout, 2500);
+        assert!(
+            wait_change_request(r#"{"action":{"type":"paste","text":"好"},"cell":40}"#).is_ok()
+        );
+        assert!(
+            wait_change_request(r#"{"action":{"type":"keys","keys":[[113,29],[67]]}}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn wait_change_refuses_what_the_device_would_not_take() {
+        for args in [
+            r#"{"returnImage":false}"#,
+            r#"{"timeoutMs":9000}"#,
+            r#"{"until":"forever"}"#,
+            r#"{"regions":[]}"#,
+            r#"{"regions":[{"x":0,"y":0,"w":0,"h":10}]}"#,
+            r#"{"regions":[{"x":-1,"y":0,"w":5,"h":10}]}"#,
+            r#"{"threshold":2}"#,
+            r#"{"action":{"type":"shell","cmd":"rm"}}"#,
+            r#"{"action":{"type":"tap","x":1}}"#,
+            r#"{"action":{"type":"tap","x":1,"y":2,"text":"x"}}"#,
+            r#"{"action":{"type":"paste","text":""}}"#,
+            r#"{"action":{"type":"keys","keys":[["a"]]}}"#,
+        ] {
+            assert!(wait_change_request(args).is_err(), "{args} must be refused");
+        }
+    }
+
+    #[test]
+    fn wait_change_answers_like_a_screenshot_with_the_outcome() {
+        let answer = wait_change_answer(
+            r#"{"value":{"changed":true,"stable":true,"timedOut":false,"elapsedMs":290,"frameMs":250,"actionMs":172,"frames":4,"changedRegions":[0],"width":1080,"height":2424,"image":"iVBOR"}}"#,
+        )
+        .unwrap();
+        let answer: Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(answer["ok"], true);
+        assert_eq!(answer["data"], "iVBOR");
+        assert_eq!(answer["changed"], true);
+        assert_eq!(answer["elapsedMs"], 290);
+        assert!(answer.get("image").is_none() && answer.get("width").is_none());
+        assert!(wait_change_answer(r#"{"value":{"changed":false}}"#).is_err());
     }
 
     #[test]
