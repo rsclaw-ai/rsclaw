@@ -2059,10 +2059,20 @@ async fn vision_observe(
     let foreground = known.unwrap_or_else(|| read_foreground_soon(config));
     let (answer, foreground) =
         tokio::join!(crate::vision_observer::observe(&args, &bytes), async {
-            tokio::time::timeout(Duration::from_secs(8), foreground)
+            let started = std::time::Instant::now();
+            let package = tokio::time::timeout(Duration::from_secs(8), foreground)
                 .await
                 .ok()
-                .flatten()
+                .flatten();
+            if package.is_none() {
+                // The observer abstains on an unknown foreground; say why.
+                tracing::warn!(
+                    node = %config.node,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "vision-observe: foreground package unknown (read failed or timed out)"
+                );
+            }
+            package
         });
     let mut answer = answer?;
     if let Some(object) = answer.as_object_mut() {
