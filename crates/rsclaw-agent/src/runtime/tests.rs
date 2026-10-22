@@ -1039,3 +1039,31 @@ fn thinking_budget_falls_back_to_defaults_model() {
     assert_eq!(resolve_thinking_budget(None, None, None), None);
 }
 
+#[test]
+fn finished_turn_text_joins_the_tools_summaries() {
+    use super::agent_loop::{finished_turn_text, turn_summary_of};
+    let sent =
+        serde_json::json!({"ok": true, "turnComplete": true, "turnSummary": " 已回复 东升 "});
+    let silent = serde_json::json!({"ok": true, "turnComplete": true});
+    assert_eq!(turn_summary_of(&sent), "已回复 东升");
+    assert_eq!(turn_summary_of(&silent), "");
+    assert_eq!(
+        finished_turn_text(vec![turn_summary_of(&sent), turn_summary_of(&silent)]),
+        "已回复 东升"
+    );
+    // Tools that finished the turn without a summary still close it.
+    assert_eq!(finished_turn_text(vec![String::new()]), "Done.");
+}
+
+#[tokio::test]
+async fn finished_turn_stream_says_the_text_then_ends() {
+    use futures::StreamExt;
+    let events: Vec<_> = super::agent_loop::finished_turn_stream("已回复 东升".to_owned())
+        .collect()
+        .await;
+    assert!(matches!(
+        events.as_slice(),
+        [Ok(rsclaw_provider::StreamEvent::TextDelta(text)), Ok(rsclaw_provider::StreamEvent::Done { usage: None })]
+            if text == "已回复 东升"
+    ));
+}

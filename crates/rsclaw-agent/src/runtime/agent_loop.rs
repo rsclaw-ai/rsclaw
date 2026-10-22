@@ -377,6 +377,10 @@ impl AgentRuntime {
         // Loop-detector CRITICAL hits this turn. The first one refuses the
         // call with a tool-result error; a second ends the turn gracefully.
         let mut loop_critical_hits = 0usize;
+        // Set when every tool of the last iteration reported
+        // `turnComplete: true`: the next iteration closes the turn with this
+        // text instead of asking the model to restate finished work.
+        let mut finished_by_tools: Option<String> = None;
         let mut iteration = 0usize;
 
         loop {
@@ -1195,7 +1199,10 @@ impl AgentRuntime {
             }
 
             let providers = Arc::clone(&self.providers);
-            let stream_result = self.failover.call(req.clone(), &providers).await;
+            let stream_result = match finished_by_tools.take() {
+                Some(text) => Ok(finished_turn_stream(text)),
+                None => self.failover.call(req.clone(), &providers).await,
+            };
 
             // If the LLM rejects for context overflow, compact and retry once.
             // Use the precise `ContextExceeded` classification rather than a
@@ -2206,6 +2213,7 @@ impl AgentRuntime {
                 tool_input_str: String,
             }
             let mut to_dispatch: Vec<PendingDispatch> = Vec::new();
+            let iteration_call_count = tool_calls.len();
 
             // After the wrap-up prompt, tools are closed: refuse the calls so
             // the model answers from what it has instead of working on.
@@ -2863,6 +2871,14 @@ impl AgentRuntime {
                 .map(|o| o.expect("every dispatch future yields exactly one result"))
                 .collect();
 
+            // The turn ends without another model call only when every call of
+            // this iteration ran and reported `turnComplete: true`; one that
+            // was refused, failed or said nothing leaves the model to go on.
+            let mut finished_summaries = (!daemon_mode
+                && !to_dispatch.is_empty()
+                && to_dispatch.len() == iteration_call_count)
+                .then(Vec::new);
+
             // ---- Phase 3: serial post-processing in LLM emit order ----
             for (dispatch_idx, (pending, timed_result)) in to_dispatch
                 .into_iter()
@@ -2914,6 +2930,13 @@ impl AgentRuntime {
                         // progress to stderr and exit 0.
                         let has_error = crate::loop_detection::is_result_failure(&v);
                         result_is_error = has_error;
+                        let completes =
+                            v.get("turnComplete").and_then(Value::as_bool) == Some(true);
+                        if has_error || !completes {
+                            finished_summaries = None;
+                        } else if let Some(summaries) = finished_summaries.as_mut() {
+                            summaries.push(turn_summary_of(&v));
+                        }
                         if has_error {
                             error_streak += 1;
                             last_error_info = Some(v.to_string());
@@ -3159,6 +3182,7 @@ impl AgentRuntime {
                         // (wasm trap, http status, panic msg) is hidden.
                         let err_chain = format!("{e:#}");
                         result_is_error = true;
+                        finished_summaries = None;
                         // The arguments as the model sent them (before any
                         // tool rejoins a split one), so a malformed call can
                         // be told apart from a parser that dropped a field.
@@ -3703,8 +3727,47 @@ impl AgentRuntime {
                 // Only the final assistant text reply enters the conversation history.
                 turn_scratchpad.push(tool_msg);
             }
+            if let Some(summaries) = finished_summaries {
+                info!(
+                    session = %ctx.session_key,
+                    tools = summaries.len(),
+                    "agent_loop: the tools reported the turn complete, ending it without another model call"
+                );
+                finished_by_tools = Some(finished_turn_text(summaries));
+            }
         }
     }
+}
+
+/// The reply text of a turn its tools finished: their `turnSummary` lines.
+pub(super) fn finished_turn_text(summaries: Vec<String>) -> String {
+    let text = summaries
+        .into_iter()
+        .filter(|summary| !summary.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        "Done.".to_owned()
+    } else {
+        text
+    }
+}
+
+pub(super) fn turn_summary_of(result: &Value) -> String {
+    result
+        .get("turnSummary")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+/// A model response that only says `text`, for a turn its tools finished.
+pub(super) fn finished_turn_stream(text: String) -> rsclaw_provider::LlmStream {
+    Box::pin(futures::stream::iter([
+        Ok(StreamEvent::TextDelta(text)),
+        Ok(StreamEvent::Done { usage: None }),
+    ]))
 }
 
 impl AgentRuntime {
