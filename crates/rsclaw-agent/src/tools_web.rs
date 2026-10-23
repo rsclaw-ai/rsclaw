@@ -24,6 +24,29 @@ use super::{
 };
 use crate::query_planner::{Intent, QueryPlan};
 
+/// How long a browser search engine that showed a CAPTCHA is tried last.
+const CAPTCHA_COOLDOWN: Duration = Duration::from_secs(600);
+
+static CAPTCHA_SEEN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Remember that `engine` answered the browser with a CAPTCHA page.
+fn note_captcha(engine: &str) {
+    if let Ok(mut seen) = CAPTCHA_SEEN.lock() {
+        seen.insert(engine.to_owned(), std::time::Instant::now());
+    }
+}
+
+/// Whether `engine` showed a CAPTCHA within [`CAPTCHA_COOLDOWN`].
+fn captcha_cooling(engine: &str) -> bool {
+    CAPTCHA_SEEN
+        .lock()
+        .ok()
+        .and_then(|seen| seen.get(engine).map(|at| at.elapsed() < CAPTCHA_COOLDOWN))
+        .unwrap_or(false)
+}
+
 /// Attach a pre-written raw-markdown artifact id to a `tool_web_fetch`
 /// JSON result so the runtime's "truncated → call read_artifact"
 /// envelope still works after summarization replaced `text` with the
@@ -1790,6 +1813,9 @@ impl AgentRuntime {
         let rotation = rsclaw_browser::pool::BrowserPool::global().next_engine_index() as usize;
         let len = engines.len();
         engines.rotate_left(rotation % len);
+        // An engine that just showed a CAPTCHA goes last: waiting out its
+        // challenge page costs seconds on every search.
+        engines.sort_by_key(|(name, ..)| captcha_cooling(name));
 
         for (name, url, result_selector, snippet_selector) in &engines {
             info!(engine = name, "browser_search: trying");
@@ -1815,6 +1841,7 @@ impl AgentRuntime {
                         engine = name,
                         "browser_search: CAPTCHA detected, trying next engine"
                     );
+                    note_captcha(name);
                     continue;
                 }
             }
