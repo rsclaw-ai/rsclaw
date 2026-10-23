@@ -432,6 +432,10 @@ impl AgentRuntime {
             "web_search" => {
                 // Inject the last user message so the query planner can work
                 // with the original intent rather than the agent's rewritten query.
+                // A long user message (a cron or plugin prompt, a pasted
+                // document) is no search intent: the planner would time out
+                // on it, so the agent's own query is planned instead.
+                const MAX_USER_QUERY_CHARS: usize = 500;
                 let mut args = args;
                 if args.get("_user_query").is_none() {
                     if let Some(msgs) = self.sessions.get(&ctx.session_key) {
@@ -443,6 +447,7 @@ impl AgentRuntime {
                                 rsclaw_provider::MessageContent::Text(t) => Some(t.as_str()),
                                 _ => None,
                             })
+                            .filter(|t| t.chars().count() <= MAX_USER_QUERY_CHARS)
                         {
                             args["_user_query"] = serde_json::Value::String(uq.to_owned());
                         }
