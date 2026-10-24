@@ -214,8 +214,18 @@ impl AgentRuntime {
 
         let ts = chrono::Utc::now().timestamp_millis();
         let tmp_dir = std::env::temp_dir();
-        // Final output is always mp3 for IM platform compatibility.
-        let out_path = tmp_dir.join(format!("rsclaw_tts_{ts}.mp3"));
+        // Final output is always mp3 for IM platform compatibility. It lands
+        // next to other generated media (~/Downloads/rsclaw/audios) so
+        // plugins can reuse it, e.g. as a voiceover for host compose-video.
+        let out_dir = crate::security::rsclaw_downloads_dir().join("audios");
+        let out_dir = match std::fs::create_dir_all(&out_dir) {
+            Ok(()) => out_dir,
+            Err(e) => {
+                tracing::warn!(dir = %out_dir.display(), error = %e, "tts: downloads dir unavailable, using temp");
+                tmp_dir.clone()
+            }
+        };
+        let out_path = out_dir.join(format!("rsclaw_tts_{ts}.mp3"));
         let out_path_str = out_path.to_string_lossy().to_string();
 
         let is_macos = cfg!(target_os = "macos");
@@ -228,6 +238,10 @@ impl AgentRuntime {
             let mut cmd = tokio::process::Command::new("say");
             if voice != "default" {
                 cmd.args(["-v", voice]);
+            } else if let Some(v) = macos_cjk_voice(text).await {
+                // The system default voice reads CJK as silence; pick an
+                // installed Chinese voice instead.
+                cmd.args(["-v", &v]);
             }
             cmd.args(["-o", &aiff_str, text]);
             let output = cmd
@@ -1333,4 +1347,54 @@ mod pdf_header_tests {
         assert!(!looks_like_pdf(b"PK\x03\x04\x14\x00\x06\x00"));
         assert!(!looks_like_pdf(b""));
     }
+}
+
+/// Pick an installed macOS `say` voice for Chinese text, or `None` when the
+/// text has no CJK characters or no Chinese voice is installed.
+async fn macos_cjk_voice(text: &str) -> Option<String> {
+    let has_cjk = text
+        .chars()
+        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3400}'..='\u{4dbf}').contains(&c));
+    if !has_cjk {
+        return None;
+    }
+    let out = tokio::process::Command::new("say")
+        .args(["-v", "?"])
+        .output()
+        .await
+        .ok()?;
+    let list = String::from_utf8_lossy(&out.stdout);
+    // Lines look like `Eddy (Chinese (China mainland)) zh_CN    # 你好！`;
+    // `say -v` needs the full name before the locale column.
+    let voices: Vec<(String, String)> = list
+        .lines()
+        .filter_map(|l| {
+            let head = l.split_once('#').map_or(l, |(h, _)| h).trim_end();
+            let (name, locale) = head.rsplit_once(char::is_whitespace)?;
+            Some((name.trim().to_string(), locale.trim().to_string()))
+        })
+        .filter(|(n, _)| !n.is_empty())
+        .collect();
+    // Newer macOS names voices `Tingting (Chinese (China mainland))`.
+    let by_name = |want: &str| {
+        let prefix = format!("{want} (");
+        voices
+            .iter()
+            .find(|(n, _)| n == want || n.starts_with(&prefix))
+            .map(|(n, _)| n.clone())
+    };
+    by_name("Tingting")
+        .or_else(|| {
+            voices
+                .iter()
+                .find(|(_, l)| l == "zh_CN")
+                .map(|(n, _)| n.clone())
+        })
+        .or_else(|| by_name("Meijia"))
+        .or_else(|| {
+            voices
+                .iter()
+                .find(|(_, l)| l.starts_with("zh_"))
+                .map(|(n, _)| n.clone())
+        })
 }
