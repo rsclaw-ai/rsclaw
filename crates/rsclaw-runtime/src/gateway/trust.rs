@@ -28,6 +28,15 @@ pub fn refresh_from_config(config: &RuntimeConfig) {
             .and_then(|g| g.trusted_redirect_sites.clone()),
     );
 
+    rsclaw_provider::rsclaw_http::set_configured_gen_host(
+        config
+            .model
+            .models
+            .as_ref()
+            .and_then(|m| m.providers.get("rsclaw"))
+            .and_then(|p| p.base_url.as_deref()),
+    );
+
     let mut lists: HashMap<String, HashSet<String>> = HashMap::new();
     if let Some(channels) = config.raw.channels.as_ref() {
         match serde_json::to_value(channels) {

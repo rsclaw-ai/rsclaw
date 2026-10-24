@@ -33,6 +33,29 @@ const MAX_HOPS: u8 = 5;
 /// LLM `/v1/agent` mount.
 pub const DEFAULT_GEN_HOST: &str = rsclaw_brand::API_URL;
 
+/// Gen host taken from `models.providers.rsclaw.baseUrl`, so OEM and
+/// self-hosted deployments send video / audio jobs (submit and the
+/// background poller) to the same backend that issued their API key.
+/// Callers without access to config pass `None` to [`gen_host_base`] and
+/// land here before the compiled-in brand default.
+static CONFIGURED_GEN_HOST: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Set (or clear with `None` / empty) the configured gen host. Called at
+/// gateway start and after every config reload.
+pub fn set_configured_gen_host(base: Option<&str>) {
+    let value = base
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    if let Ok(mut slot) = CONFIGURED_GEN_HOST.write() {
+        *slot = value;
+    }
+}
+
+fn configured_gen_host() -> Option<String> {
+    CONFIGURED_GEN_HOST.read().ok().and_then(|g| g.clone())
+}
+
 /// Resolve the canonical rsclaw gen host root from caller-supplied
 /// config.
 ///
@@ -45,8 +68,10 @@ pub const DEFAULT_GEN_HOST: &str = rsclaw_brand::API_URL;
 /// Returns the host with **no trailing slash** and **no version
 /// suffix**. Callers append `/v1/<resource>` themselves.
 pub fn gen_host_base(configured: Option<&str>) -> String {
+    let fallback = configured_gen_host();
     let raw = configured
         .filter(|s| !s.is_empty())
+        .or(fallback.as_deref())
         .unwrap_or(DEFAULT_GEN_HOST)
         .trim_end_matches('/');
     if let Some(s) = raw
