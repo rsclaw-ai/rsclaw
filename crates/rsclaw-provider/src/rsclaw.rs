@@ -66,7 +66,7 @@ pub const RSCLAW_DEFAULT_BASE: &str = rsclaw_brand::API_V1_URL;
 /// `tests/fixtures/baseline-<ver>.json`) actually changes, and
 /// coordinate with rsclaw-llm to re-ingest the new fixture under
 /// the new identifier.
-pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.8.28";
+pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.10.24";
 
 /// Default HTTP timeout (seconds) for the `/sessions/<id>/compact` splice
 /// call. The server holds the per-session lock and dispatches the splice

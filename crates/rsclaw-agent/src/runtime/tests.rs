@@ -419,7 +419,7 @@ fn build_tool_list_contains_builtins() {
         "read_file",
         "write_file",
         "shell",
-        "video_status",
+        "gen_status",
     ] {
         assert!(
             names.contains(expected),

@@ -283,7 +283,6 @@ pub(crate) const COLD_TOOLS: &[&str] = &[
     "cap_bind_sticky",
     "cap_unbind_sticky",
     "video_gen",
-    "video_status",
     "avatar_gen",
     "mv_gen",
     "music_gen",
@@ -437,7 +436,7 @@ pub fn toolset_allowed_names(
         "image_gen",
         "ocr",
         "video_gen",
-        "video_status",
+        "gen_status",
         "avatar_gen",
         "mv_gen",
         "music_gen",
@@ -1546,7 +1545,7 @@ pub fn build_tool_list(
 
     tools.push(ToolDef {
         name: "image_gen".to_owned(),
-        description: "Generate or EDIT an image with an AI image model. Text-to-image (prompt only) or image-to-image (pass `image` to transform/edit an existing picture). Pass the user's original description as-is (preserve their language, do not translate).".to_owned(),
+        description: "Generate or EDIT an image with an AI image model. Text-to-image (prompt only) or image-to-image (pass `image` to transform/edit an existing picture). Pass the user's original description as-is (preserve their language, do not translate). When the result is `status: submitted` with a `job_id`, the image is delivered automatically; check it with `gen_status` if the user asks.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1598,16 +1597,17 @@ pub fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "video_status".to_owned(),
-        description: "Query an existing video generation task without submitting a new one. \
-            Use this whenever the user asks for progress/status/result of a previously returned \
-            job ID. Pass the internal `job_id` returned by video_gen for any provider, or a native \
-            rsclaw `job_...` / legacy `video_...` task ID. Never call video_gen again merely to \
-            check status; duplicate submission may create a second billable task.".to_owned(),
+        name: "gen_status".to_owned(),
+        description: "Query an existing image / video / avatar / MV generation task without \
+            submitting a new one. Use this whenever the user asks for progress/status/result of a \
+            generation that returned a `job_id` (image_gen, video_gen, avatar_gen, mv_gen). Pass \
+            that internal `job_id`, or a native rsclaw `job_...` / legacy `video_...` task ID. \
+            Never call a *_gen tool again merely to check status; duplicate submission may create \
+            a second billable task.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "job_id": {"type": "string", "description": "Existing internal job UUID, native rsclaw job_... ID, or legacy video_... ID."}
+                "job_id": {"type": "string", "description": "Existing internal job UUID returned by a *_gen tool, native rsclaw job_... ID, or legacy video_... ID."}
             },
             "required": ["job_id"]
         }),

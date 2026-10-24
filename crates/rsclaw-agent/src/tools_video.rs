@@ -428,30 +428,32 @@ impl super::runtime::AgentRuntime {
             "provider": provider_key,
             "task_id": task_id,
             "job_id": job_id,
-            "message": "Video generation submitted. The finished video will be delivered automatically when ready (typically 30s–5min). The user has been informed; do NOT poll or wait — your turn is complete."
+            "message": "Video generation submitted. The finished video will be delivered automatically when ready (typically 30s–5min). The user has been informed; do not poll or wait — your turn is complete. If the user later asks about progress, call gen_status with this job_id."
         }))
     }
 
-    /// Query an existing video task without submitting or mutating it.
-    pub(crate) async fn tool_video_status(&self, args: Value) -> Result<Value> {
+    /// Query an existing generation task (image / video / avatar / MV)
+    /// without submitting or mutating it.
+    pub(crate) async fn tool_gen_status(&self, args: Value) -> Result<Value> {
         let job_id = args
             .get("job_id")
             .or_else(|| args.get("task_id"))
             .or_else(|| args.get("id"))
             .and_then(Value::as_str)
             .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| anyhow!("video_status: `job_id` is required"))?;
+            .ok_or_else(|| anyhow!("gen_status: `job_id` is required"))?;
 
-        // `video_gen` returns a gateway-internal UUID as `job_id`. This is the
-        // preferred provider-independent lookup: it works for Seedance, Agnes,
-        // OpenAI, native rsclaw and legacy avatar/MV jobs.
+        // Every async *_gen tool returns a gateway-internal UUID as `job_id`.
+        // This is the preferred provider-independent lookup: it works for
+        // rsclaw image jobs and for Seedance, Agnes, OpenAI, native rsclaw and
+        // legacy avatar/MV video jobs.
         if let Some(job) = self
             .store
             .db
             .get_external_job(job_id)
-            .map_err(|error| anyhow!("video_status: read local job: {error}"))?
+            .map_err(|error| anyhow!("gen_status: read local job: {error}"))?
         {
-            return Ok(local_video_job_status(&job));
+            return Ok(local_gen_job_status(&job));
         }
 
         // The tool also returns the provider `task_id`. Native rsclaw IDs are
@@ -468,7 +470,7 @@ impl super::runtime::AgentRuntime {
                 .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
                 .ok_or_else(|| {
                     anyhow!(
-                        "video_status: no rsclaw API key configured; query with the internal `job_id` instead"
+                        "gen_status: no rsclaw API key configured; query with the internal `job_id` instead"
                     )
                 })
         };
@@ -478,10 +480,10 @@ impl super::runtime::AgentRuntime {
             rsclaw_jobs::poll_rsclaw_legacy(&api_key()?, job_id).await?
         } else {
             return Err(anyhow!(
-                "video_status: unknown job ID `{job_id}`; use the internal `job_id`, native `job_...`, or legacy `video_...` returned by video_gen"
+                "gen_status: unknown job ID `{job_id}`; use the internal `job_id` returned by the *_gen tool, or a native `job_...` / legacy `video_...` ID"
             ));
         };
-        Ok(provider_video_status(job_id, outcome))
+        Ok(provider_gen_status(job_id, outcome))
     }
 
     /// Avatar (数字人) generation — `POST /v1/videos/avatar` (gen-api.md §3).
@@ -630,7 +632,7 @@ impl super::runtime::AgentRuntime {
             "kind": endpoint,
             "task_id": task_id,
             "job_id": job_id,
-            "message": "Generation submitted to the rsclaw gen service. The finished video will be delivered automatically when ready. The user has been informed; do NOT poll or wait — your turn is complete."
+            "message": "Generation submitted to the rsclaw gen service. The finished video will be delivered automatically when ready. The user has been informed; do not poll or wait — your turn is complete. If the user later asks about progress, call gen_status with this job_id."
         }))
     }
 }
@@ -755,7 +757,7 @@ async fn post_rsclaw_gen(endpoint: &str, api_key: &str, body: &Value) -> Result<
     Ok(id)
 }
 
-fn local_video_job_status(job: &rsclaw_types::ExternalJob) -> Value {
+fn local_gen_job_status(job: &rsclaw_types::ExternalJob) -> Value {
     let status = match job.status {
         rsclaw_types::ExternalJobStatus::Pending if job.progress.is_some() => "in_progress",
         rsclaw_types::ExternalJobStatus::Pending => "pending",
@@ -766,6 +768,10 @@ fn local_video_job_status(job: &rsclaw_types::ExternalJob) -> Value {
     };
     json!({
         "status": status,
+        "kind": match job.kind {
+            rsclaw_types::ExternalJobKind::VideoGen => "video",
+            rsclaw_types::ExternalJobKind::ImageGen => "image",
+        },
         "job_id": job.id,
         "task_id": job.external_task_id,
         "provider": job.provider,
@@ -779,7 +785,7 @@ fn local_video_job_status(job: &rsclaw_types::ExternalJob) -> Value {
     })
 }
 
-fn provider_video_status(task_id: &str, outcome: rsclaw_types::PollOutcome) -> Value {
+fn provider_gen_status(task_id: &str, outcome: rsclaw_types::PollOutcome) -> Value {
     match outcome {
         rsclaw_types::PollOutcome::Pending => json!({
             "status": "pending",
@@ -1040,22 +1046,22 @@ mod tests {
     }
 
     #[test]
-    fn video_status_maps_provider_outcomes_without_resubmitting() {
+    fn gen_status_maps_provider_outcomes_without_resubmitting() {
         assert_eq!(
-            provider_video_status("job_1", rsclaw_types::PollOutcome::Pending)["status"],
+            provider_gen_status("job_1", rsclaw_types::PollOutcome::Pending)["status"],
             "pending"
         );
         let running =
-            provider_video_status("job_1", rsclaw_types::PollOutcome::InProgress(Some(0.5)));
+            provider_gen_status("job_1", rsclaw_types::PollOutcome::InProgress(Some(0.5)));
         assert_eq!(running["status"], "in_progress");
         assert_eq!(running["progress"], 0.5);
-        let completed = provider_video_status(
+        let completed = provider_gen_status(
             "job_1",
             rsclaw_types::PollOutcome::Done("https://example.test/video.mp4".to_owned()),
         );
         assert_eq!(completed["status"], "completed");
         assert_eq!(completed["result_url"], "https://example.test/video.mp4");
-        let failed = provider_video_status(
+        let failed = provider_gen_status(
             "job_1",
             rsclaw_types::PollOutcome::Failed("backend_failure".to_owned()),
         );

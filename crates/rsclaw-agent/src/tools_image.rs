@@ -419,7 +419,7 @@ impl super::runtime::AgentRuntime {
             "provider": "rsclaw",
             "kind": "image",
             "job_id": job_id,
-            "message": "Image edit submitted to the rsclaw gen service (async, ~1–5min). The finished image will be delivered automatically when ready. The user has been informed; do NOT poll or wait — your turn is complete."
+            "message": "Image edit submitted to the rsclaw gen service (async, ~1–5min). The finished image will be delivered automatically when ready. The user has been informed; do not poll or wait — your turn is complete. If the user later asks about progress, call gen_status with this job_id."
         }))
     }
 
