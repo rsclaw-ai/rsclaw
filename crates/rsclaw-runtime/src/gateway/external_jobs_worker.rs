@@ -54,6 +54,10 @@ const CLAIM_LEASE_SECS: i64 = 600;
 pub struct ExternalJobsWorker {
     store: Arc<RedbStore>,
     notification_tx: broadcast::Sender<OutboundMessage>,
+    /// Session event bus (`/api/v1/stream`). A finished artifact is also
+    /// pushed here so clients that chat over the sync-only `api` channel,
+    /// where the notification router drops deliveries, still receive it.
+    event_tx: Option<broadcast::Sender<rsclaw_events::AgentEvent>>,
     shutdown: ShutdownCoordinator,
     config: Arc<RuntimeConfig>,
     client: reqwest::Client,
@@ -91,12 +95,22 @@ impl ExternalJobsWorker {
         Self {
             store,
             notification_tx,
+            event_tx: None,
             shutdown,
             config,
             client,
             op_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OPS)),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Also push finished artifacts onto the session event bus.
+    pub fn with_event_bus(
+        mut self,
+        event_tx: broadcast::Sender<rsclaw_events::AgentEvent>,
+    ) -> Self {
+        self.event_tx = Some(event_tx);
+        self
     }
 
     /// Main loop. Each tick: list due jobs, poll each in a spawned task,
@@ -334,6 +348,7 @@ impl ExternalJobsWorker {
             if let Err(e) = self.write_back_to_session(job) {
                 debug!(job_id = %job.id, "session writeback skipped: {e:#}");
             }
+            self.emit_session_event(job);
         } else {
             let now = chrono::Utc::now().timestamp();
             job.next_poll_at = now + DELIVERY_RETRY_DELAY_SECS as i64;
@@ -370,15 +385,37 @@ impl ExternalJobsWorker {
                 job.error.as_deref().unwrap_or("")
             )
         };
-        let msg = json!({
+        let mut msg = json!({
             "role": "assistant",
             "content": content,
             "external_job_id": job.id,
         });
+        // Same (name, mime, path) triples as the live delivery, so a client
+        // reloading the history renders the image or video, not just the path.
+        let files = result_files(job);
+        if !files.is_empty() {
+            msg["files"] = json!(files);
+        }
         self.store
             .append_message(&job.session_key, &msg)
             .map(|_| ())
             .map_err(|e| anyhow!("append_message: {e}"))
+    }
+
+    /// Push the finished artifact to `/api/v1/stream` subscribers of the
+    /// job's session. `done` stays false: a done event would end a turn that
+    /// is streaming in the same session right now.
+    fn emit_session_event(&self, job: &ExternalJob) {
+        let Some(tx) = &self.event_tx else { return };
+        let files = result_files(job);
+        if files.is_empty() {
+            return;
+        }
+        let _ = tx.send(rsclaw_events::AgentEvent {
+            session_id: job.session_key.clone(),
+            files,
+            ..Default::default()
+        });
     }
 
     /// Pick the right per-provider polling adapter.
@@ -474,18 +511,9 @@ impl ExternalJobsWorker {
     /// (`attempt_delivery`) uses the boolean to decide whether to stamp
     /// `delivered_at` or schedule another retry tick.
     async fn deliver_success(&self, job: &ExternalJob) -> bool {
-        let path = job.result_path.as_deref().unwrap_or("");
         let kind_label = match job.kind {
             ExternalJobKind::VideoGen => "video",
             ExternalJobKind::ImageGen => "image",
-        };
-        let filename = std::path::Path::new(path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(path);
-        let mime = match job.kind {
-            ExternalJobKind::VideoGen => "video/mp4",
-            ExternalJobKind::ImageGen => "image/png",
         };
         let prompt_preview: String = job.prompt.chars().take(80).collect();
         let out = OutboundMessage {
@@ -494,7 +522,7 @@ impl ExternalJobsWorker {
             text: format!("[{kind_label}] {prompt_preview}"),
             reply_to: job.delivery.reply_to.clone(),
             images: vec![],
-            files: vec![(filename.to_string(), mime.to_string(), path.to_string())],
+            files: result_files(job),
             channel: Some(job.delivery.channel.clone()),
             account: job.delivery.account.clone(),
         };
@@ -533,4 +561,24 @@ impl ExternalJobsWorker {
             }
         }
     }
+}
+
+/// The finished artifact as a `(filename, mime, path)` attachment; empty
+/// unless the job succeeded with a result file.
+fn result_files(job: &ExternalJob) -> Vec<(String, String, String)> {
+    if !matches!(job.status, ExternalJobStatus::Done) {
+        return Vec::new();
+    }
+    let Some(path) = job.result_path.as_deref().filter(|p| !p.is_empty()) else {
+        return Vec::new();
+    };
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+    let mime = match job.kind {
+        ExternalJobKind::VideoGen => "video/mp4",
+        ExternalJobKind::ImageGen => "image/png",
+    };
+    vec![(filename.to_string(), mime.to_string(), path.to_string())]
 }
