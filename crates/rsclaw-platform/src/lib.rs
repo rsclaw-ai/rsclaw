@@ -421,22 +421,25 @@ fn managed_chrome() -> Option<String> {
 
 /// Detect ffmpeg binary path.
 ///
-/// Priority: `~/.rsclaw/tools/ffmpeg/ffmpeg` > system PATH.
-/// Local-first because the bundled build is pinned to a known-good version
-/// and ships every codec we need; system ffmpeg may be a stripped distro
-/// build missing libopus/libx264.
+/// Priority: `~/.rsclaw/tools/ffmpeg/ffmpeg` > `tools/ffmpeg/bin/ffmpeg` >
+/// system PATH. Local-first because the bundled build is pinned to a
+/// known-good version and ships every codec we need; system ffmpeg may be a
+/// stripped distro build missing libopus/libx264. The `bin/` layout is what
+/// the Windows zip unpacks to (`tools install ffmpeg`).
 pub fn detect_ffmpeg() -> Option<String> {
     let tools_dir = rsclaw_config::loader::base_dir().join("tools/ffmpeg");
-    #[cfg(target_os = "windows")]
-    {
-        let local_win = tools_dir.join("ffmpeg.exe");
-        if local_win.exists() {
-            return Some(local_win.to_string_lossy().to_string());
+    let names: &[&str] = if cfg!(target_os = "windows") {
+        &["ffmpeg.exe", "ffmpeg"]
+    } else {
+        &["ffmpeg"]
+    };
+    for dir in [tools_dir.clone(), tools_dir.join("bin")] {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
         }
-    }
-    let local = tools_dir.join("ffmpeg");
-    if local.exists() {
-        return Some(local.to_string_lossy().to_string());
     }
     if let Ok(path) = which::which("ffmpeg") {
         return Some(path.to_string_lossy().to_string());
