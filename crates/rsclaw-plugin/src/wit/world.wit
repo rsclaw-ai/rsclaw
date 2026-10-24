@@ -185,6 +185,16 @@ interface host-media {
     /// Spreads `count` frames evenly across the video duration.
     /// Returns a list of PNG image file paths.
     extract-keyframes: func(video-path: string, count: u32) -> result<list<string>, string>;
+    /// Compose an upload-ready video with ffmpeg: concatenate local clips in
+    /// order, scale/crop each to one frame size, mix an optional voiceover
+    /// and looping background music, and burn in optional captions.
+    /// `spec-json` = {"clips": [path], "voiceover"?: path, "bgm"?: path,
+    /// "bgmVolume"?: 0-1, "captions"?: [{"text", "start"?, "end"?}],
+    /// "width"?: 1080, "height"?: 1920}. Every path must be a local file in
+    /// the plugin's artifact roots. Untimed captions are laid out across the
+    /// voiceover (or the clips) by length. Returns JSON {"path", "durationSec",
+    /// "captionsBurned"}; the video lasts as long as the clips combined.
+    compose-video: func(spec-json: string) -> result<string, string>;
 }
 
 interface host-android {

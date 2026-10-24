@@ -2078,6 +2078,391 @@ impl rsclaw::plugin::host_media::Host for HostState {
         };
         Ok(media_extract_keyframes(&input, count as usize, true).await)
     }
+
+    async fn compose_video(&mut self, spec_json: String) -> HostTrapResult<Result<String, String>> {
+        Ok(media_compose_video(&self.plugin_name, &spec_json).await)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ComposeCaption {
+    text: String,
+    /// Seconds from the start. When any caption omits `start`/`end`, all
+    /// captions are re-timed across the voiceover (or the clips) in
+    /// proportion to their length.
+    start: Option<f64>,
+    end: Option<f64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ComposeSpec {
+    clips: Vec<String>,
+    voiceover: Option<String>,
+    bgm: Option<String>,
+    bgm_volume: Option<f64>,
+    #[serde(default)]
+    captions: Vec<ComposeCaption>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+const COMPOSE_MAX_CLIPS: usize = 60;
+const COMPOSE_TIMEOUT_SECS: u64 = 900;
+
+/// Font used for burned-in captions: a CJK-capable system font per OS.
+fn caption_font() -> (&'static str, &'static str) {
+    if cfg!(target_os = "macos") {
+        ("/System/Library/Fonts", "Hiragino Sans GB")
+    } else if cfg!(target_os = "windows") {
+        ("C:/Windows/Fonts", "Microsoft YaHei")
+    } else {
+        ("/usr/share/fonts", "Noto Sans CJK SC")
+    }
+}
+
+fn srt_timestamp(t: f64) -> String {
+    let ms = (t.max(0.0) * 1000.0).round() as u64;
+    format!(
+        "{:02}:{:02}:{:02},{:03}",
+        ms / 3_600_000,
+        (ms / 60_000) % 60,
+        (ms / 1000) % 60,
+        ms % 1000
+    )
+}
+
+/// Quote a path for an ffmpeg filter option value.
+fn filter_quote_path(path: &std::path::Path) -> String {
+    let p = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('\'', "\\'")
+        .replace(':', "\\:");
+    format!("'{p}'")
+}
+
+async fn ffmpeg_has_filter(ffmpeg_bin: &str, name: &str) -> bool {
+    let mut cmd = media_command(std::ffi::OsStr::new(ffmpeg_bin), false);
+    cmd.args(["-hide_banner", "-filters"]);
+    match cmd.output().await {
+        Ok(o) => {
+            let needle = format!(" {name} ");
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.contains(&needle))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Build the ffmpeg filter graph for [`media_compose_video`]. `audio_inputs`
+/// is (voice index, bgm index, silent-source index).
+fn compose_filter_graph(
+    clip_count: usize,
+    width: u32,
+    height: u32,
+    subtitles: Option<&std::path::Path>,
+    audio_inputs: (Option<usize>, Option<usize>, Option<usize>),
+    bgm_volume: f64,
+) -> String {
+    let (w, h) = (width, height);
+    let mut graph = String::new();
+    for i in 0..clip_count {
+        graph.push_str(&format!(
+            "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps=30,format=yuv420p[v{i}];\n"
+        ));
+    }
+    for i in 0..clip_count {
+        graph.push_str(&format!("[v{i}]"));
+    }
+    graph.push_str(&format!("concat=n={clip_count}:v=1:a=0[vc];\n"));
+    match subtitles {
+        Some(srt) => {
+            let (fonts_dir, font_name) = caption_font();
+            // ASS sizes are relative to a 288-line canvas: 11 ≈ 73px at 1920.
+            graph.push_str(&format!(
+                "[vc]subtitles=filename={}:charenc=UTF-8:fontsdir={}:force_style='FontName={font_name},FontSize=11,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.6,Shadow=0,Alignment=2,MarginV=80'[v];\n",
+                filter_quote_path(srt),
+                filter_quote_path(std::path::Path::new(fonts_dir)),
+            ));
+        }
+        None => graph.push_str("[vc]null[v];\n"),
+    }
+    let stereo = "aresample=48000,aformat=channel_layouts=stereo";
+    match audio_inputs {
+        (Some(vi), Some(bi), _) => graph.push_str(&format!(
+            "[{vi}:a]{stereo}[va];[{bi}:a]{stereo},volume={bgm_volume}[ba];[va][ba]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,apad[a]"
+        )),
+        (Some(vi), None, _) => graph.push_str(&format!("[{vi}:a]{stereo},apad[a]")),
+        (None, Some(bi), _) => {
+            graph.push_str(&format!("[{bi}:a]{stereo},volume={bgm_volume}[a]"))
+        }
+        (None, None, Some(si)) => graph.push_str(&format!("[{si}:a]anull[a]")),
+        (None, None, None) => graph.push_str("anullsrc=r=48000:cl=stereo[a]"),
+    }
+    graph
+}
+
+/// Resolve caption timing to (text, start, end). Fully timed captions are
+/// kept as given; otherwise every caption is laid out back to back across
+/// the voiceover (or the clips' total length) by character count, so the
+/// caller never has to measure audio itself.
+async fn compose_caption_timeline(
+    ffmpeg_bin: &str,
+    captions: &[ComposeCaption],
+    voice: Option<&str>,
+    clips: &[String],
+) -> Vec<(String, f64, f64)> {
+    let items: Vec<&ComposeCaption> = captions
+        .iter()
+        .filter(|c| !c.text.trim().is_empty())
+        .collect();
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let timed = items.iter().all(|c| {
+        matches!((c.start, c.end), (Some(a), Some(b)) if a.is_finite() && b.is_finite() && b > a)
+    });
+    if timed {
+        return items
+            .iter()
+            .map(|c| (c.text.clone(), c.start.unwrap_or(0.0), c.end.unwrap_or(0.0)))
+            .collect();
+    }
+    let mut total = match voice {
+        Some(v) => probe_media_duration(ffmpeg_bin, v, true)
+            .await
+            .unwrap_or(0.0),
+        None => 0.0,
+    };
+    if total <= 0.0 {
+        for c in clips {
+            total += probe_media_duration(ffmpeg_bin, c, true)
+                .await
+                .unwrap_or(0.0);
+        }
+    }
+    if total <= 0.0 {
+        total = 3.0 * items.len() as f64;
+    }
+    let weights: Vec<f64> = items
+        .iter()
+        .map(|c| {
+            c.text
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .count()
+                .max(1) as f64
+        })
+        .collect();
+    let sum: f64 = weights.iter().sum();
+    let mut t = 0.0;
+    items
+        .iter()
+        .zip(weights)
+        .map(|(c, w)| {
+            let start = t;
+            t += total * w / sum;
+            (c.text.clone(), start, t)
+        })
+        .collect()
+}
+
+/// Concatenate clips, mix voiceover / BGM and burn captions into one mp4.
+/// All inputs are confined to the plugin's artifact roots.
+pub(crate) async fn media_compose_video(
+    plugin_name: &str,
+    spec_json: &str,
+) -> Result<String, String> {
+    let spec: ComposeSpec =
+        serde_json::from_str(spec_json).map_err(|e| format!("compose_video: invalid spec: {e}"))?;
+    if spec.clips.is_empty() {
+        return Err("compose_video: clips is empty".to_string());
+    }
+    if spec.clips.len() > COMPOSE_MAX_CLIPS {
+        return Err(format!("compose_video: at most {COMPOSE_MAX_CLIPS} clips"));
+    }
+    let width = spec.width.unwrap_or(1080);
+    let height = spec.height.unwrap_or(1920);
+    if !(240..=4096).contains(&width) || !(240..=4096).contains(&height) {
+        return Err(format!(
+            "compose_video: frame size {width}x{height} out of range"
+        ));
+    }
+    // libx264 + yuv420p needs even dimensions.
+    let (width, height) = (width & !1, height & !1);
+    let confine = |p: &String| confine_media_input(plugin_name, p, "compose_video");
+    let clips = spec
+        .clips
+        .iter()
+        .map(confine)
+        .collect::<Result<Vec<_>, _>>()?;
+    let voice = spec
+        .voiceover
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .map(confine)
+        .transpose()?;
+    let bgm = spec
+        .bgm
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .map(confine)
+        .transpose()?;
+    let bgm_volume = spec
+        .bgm_volume
+        .filter(|v| v.is_finite())
+        .unwrap_or(if voice.is_some() { 0.12 } else { 0.6 })
+        .clamp(0.0, 1.0);
+
+    let Some(ffmpeg_bin) = rsclaw_platform::detect_ffmpeg() else {
+        return Err(concat!(
+            "ffmpeg not found. Run: ",
+            rsclaw_brand::brand_cli_name!(),
+            " tools install ffmpeg"
+        )
+        .to_string());
+    };
+    let out_path = allocate_dl_paths("compose.mp4", 1)?
+        .pop()
+        .ok_or_else(|| "allocate_artifact returned no path".to_string())?;
+    let out = PathBuf::from(&out_path);
+    let srt_path = out.with_extension("srt");
+    let graph_path = out.with_extension("filter.txt");
+
+    if let Some(v) = &voice {
+        if let Some(d) = probe_media_duration(&ffmpeg_bin, v, true).await {
+            if d < 0.5 {
+                return Err(format!(
+                    "compose_video: voiceover is only {d:.2}s long, it looks empty (TTS produced silence?): {v}"
+                ));
+            }
+        }
+    }
+    let mut warnings: Vec<String> = Vec::new();
+    let captions =
+        compose_caption_timeline(&ffmpeg_bin, &spec.captions, voice.as_deref(), &clips).await;
+    let burn = !captions.is_empty() && ffmpeg_has_filter(&ffmpeg_bin, "subtitles").await;
+    if !captions.is_empty() && !burn {
+        warnings
+            .push("ffmpeg has no libass (subtitles filter); captions were not burned".to_string());
+    }
+    if burn {
+        let mut srt = String::new();
+        for (i, c) in captions.iter().enumerate() {
+            let text: Vec<&str> =
+                c.0.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+            srt.push_str(&format!(
+                "{}\n{} --> {}\n{}\n\n",
+                i + 1,
+                srt_timestamp(c.1),
+                srt_timestamp(c.2),
+                text.join("\n")
+            ));
+        }
+        tokio::fs::write(&srt_path, srt)
+            .await
+            .map_err(|e| format!("compose_video: write captions: {e}"))?;
+    }
+
+    let mut cmd = media_command(std::ffi::OsStr::new(&ffmpeg_bin), false);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    for clip in &clips {
+        cmd.args(["-protocol_whitelist", "file", "-i", clip]);
+    }
+    let mut next = clips.len();
+    let mut voice_idx = None;
+    let mut bgm_idx = None;
+    let mut silent_idx = None;
+    if let Some(v) = &voice {
+        cmd.args(["-protocol_whitelist", "file", "-i", v]);
+        voice_idx = Some(next);
+        next += 1;
+    }
+    if let Some(b) = &bgm {
+        cmd.args(["-protocol_whitelist", "file", "-stream_loop", "-1", "-i", b]);
+        bgm_idx = Some(next);
+        next += 1;
+    }
+    if voice_idx.is_none() && bgm_idx.is_none() {
+        cmd.args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]);
+        silent_idx = Some(next);
+    }
+    let graph = compose_filter_graph(
+        clips.len(),
+        width,
+        height,
+        burn.then_some(srt_path.as_path()),
+        (voice_idx, bgm_idx, silent_idx),
+        bgm_volume,
+    );
+    tokio::fs::write(&graph_path, &graph)
+        .await
+        .map_err(|e| format!("compose_video: write filter graph: {e}"))?;
+    cmd.arg("-filter_complex_script").arg(&graph_path);
+    cmd.args([
+        "-map",
+        "[v]",
+        "-map",
+        "[a]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        "30",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-ar",
+        "48000",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+    ]);
+    cmd.arg(&out_path);
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(COMPOSE_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await;
+    let _ = tokio::fs::remove_file(&graph_path).await;
+    let _ = tokio::fs::remove_file(&srt_path).await;
+    match result {
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&out_path).await;
+            return Err(format!(
+                "compose_video: ffmpeg timed out after {COMPOSE_TIMEOUT_SECS}s"
+            ));
+        }
+        Ok(Err(e)) => return Err(format!("compose_video: ffmpeg spawn error: {e}")),
+        Ok(Ok(o)) if !o.status.success() => {
+            let _ = tokio::fs::remove_file(&out_path).await;
+            return Err(format!(
+                "compose_video: ffmpeg failed: {}",
+                rsclaw_util::truncate_str(&String::from_utf8_lossy(&o.stderr), 2000)
+            ));
+        }
+        Ok(Ok(_)) => {}
+    }
+    let duration = probe_media_duration(&ffmpeg_bin, &out_path, true).await;
+    Ok(serde_json::json!({
+        "path": out_path,
+        "durationSec": duration,
+        "captionsBurned": burn,
+        "warnings": warnings,
+    })
+    .to_string())
 }
 
 /// Confine a wasm plugin's media input to an existing local file inside its
@@ -4394,5 +4779,49 @@ mod android_helper_tests {
         assert!(confine_outbound_attachments("demo", &msg).is_err());
         let msg = json!({"text": "x", "images": ["data:image/png;base64,AA"]}).to_string();
         assert!(confine_outbound_attachments("demo", &msg).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod compose_tests {
+    use super::*;
+
+    #[test]
+    fn srt_timestamps_round_to_millis() {
+        assert_eq!(srt_timestamp(0.0), "00:00:00,000");
+        assert_eq!(srt_timestamp(3661.2345), "01:01:01,235");
+        assert_eq!(srt_timestamp(-1.0), "00:00:00,000");
+    }
+
+    #[test]
+    fn filter_paths_escape_quotes_and_colons() {
+        assert_eq!(
+            filter_quote_path(std::path::Path::new("/a/b's.srt")),
+            "'/a/b\\'s.srt'"
+        );
+        assert_eq!(
+            filter_quote_path(std::path::Path::new("C:\\x\\y.srt")),
+            "'C\\:/x/y.srt'"
+        );
+    }
+
+    #[test]
+    fn filter_graph_audio_branches() {
+        let g = compose_filter_graph(2, 1080, 1920, None, (Some(2), Some(3), None), 0.12);
+        assert!(g.contains("[v0][v1]concat=n=2:v=1:a=0[vc]"));
+        assert!(g.contains("[vc]null[v]"));
+        assert!(g.contains("amix=inputs=2:duration=first"));
+        assert!(g.contains("volume=0.12"));
+
+        let g = compose_filter_graph(1, 720, 1280, None, (Some(1), None, None), 0.6);
+        assert!(g.contains("[1:a]aresample=48000,aformat=channel_layouts=stereo,apad[a]"));
+
+        let g = compose_filter_graph(1, 720, 1280, None, (None, None, Some(1)), 0.6);
+        assert!(g.ends_with("[1:a]anull[a]"));
+
+        let srt = std::path::Path::new("/tmp/x.srt");
+        let g = compose_filter_graph(1, 1080, 1920, Some(srt), (None, Some(1), None), 0.6);
+        assert!(g.contains("[vc]subtitles=filename='/tmp/x.srt'"));
+        assert!(g.contains("[1:a]aresample=48000,aformat=channel_layouts=stereo,volume=0.6[a]"));
     }
 }
