@@ -98,6 +98,37 @@ pub(crate) fn agnes_image_size(requested: &str) -> &'static str {
     }
 }
 
+/// The entries of an image / asset argument: a single string, an array of
+/// strings, or an array serialized into a string. The tool schemas type
+/// these parameters as `string`, so under constrained tool-calls the model
+/// writes an array as `"[\"/path/a.png\"]"`; without unpacking it the whole
+/// string is treated as one path and the input is silently dropped.
+pub(crate) fn image_arg_entries(v: &Value) -> Vec<String> {
+    fn from_array(a: &[Value]) -> Vec<String> {
+        a.iter()
+            .filter_map(|x| x.as_str().map(str::trim).filter(|s| !s.is_empty()))
+            .map(str::to_owned)
+            .collect()
+    }
+    match v {
+        Value::String(s) => {
+            let s = s.trim();
+            if s.starts_with('[') {
+                if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(s) {
+                    return from_array(&a);
+                }
+            }
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s.to_owned()]
+            }
+        }
+        Value::Array(a) => from_array(a),
+        _ => Vec::new(),
+    }
+}
+
 /// Normalize image-to-image input(s): accept a single string or an array of
 /// strings. http(s)/data: entries pass through; a LOCAL FILE PATH (e.g. an
 /// earlier image_gen result) is read and base64-encoded into a `data:` URI so
@@ -106,14 +137,7 @@ pub(crate) async fn normalize_image_inputs(
     v: &Value,
     scope: &super::security::ReadScope,
 ) -> Vec<String> {
-    let raw: Vec<String> = match v {
-        Value::String(s) if !s.is_empty() => vec![s.clone()],
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|x| x.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
-            .collect(),
-        _ => Vec::new(),
-    };
+    let raw = image_arg_entries(v);
     let mut out = Vec::with_capacity(raw.len());
     for img in raw {
         if img.starts_with("http://") || img.starts_with("https://") || img.starts_with("data:") {
@@ -1055,5 +1079,30 @@ impl super::runtime::AgentRuntime {
             "size": size,
             "model": image_model
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_arg_entries_unpacks_stringified_arrays() {
+        assert_eq!(image_arg_entries(&json!("/a.png")), vec!["/a.png"]);
+        assert_eq!(
+            image_arg_entries(&json!(["/a.png", "", "https://x/b.png"])),
+            vec!["/a.png", "https://x/b.png"]
+        );
+        assert_eq!(
+            image_arg_entries(&json!("[\n  \"/a.png\",\n  \"/b.png\"\n]")),
+            vec!["/a.png", "/b.png"]
+        );
+        // Not valid JSON: keep it as a single path rather than dropping it.
+        assert_eq!(
+            image_arg_entries(&json!("[draft].png")),
+            vec!["[draft].png"]
+        );
+        assert!(image_arg_entries(&json!("  ")).is_empty());
+        assert!(image_arg_entries(&Value::Null).is_empty());
     }
 }

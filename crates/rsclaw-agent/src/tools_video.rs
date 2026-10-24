@@ -49,14 +49,7 @@ impl super::runtime::AgentRuntime {
         // a base64 Data URI here so the provider gets self-contained input.
         // Only providers whose submit adapter supports it (currently agnes)
         // consume these; others ignore.
-        let raw_images: Vec<String> = match &args["image"] {
-            Value::String(s) if !s.is_empty() => vec![s.clone()],
-            Value::Array(a) => a
-                .iter()
-                .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
-                .collect(),
-            _ => Vec::new(),
-        };
+        let raw_images = super::tools_image::image_arg_entries(&args["image"]);
         let mut images: Vec<String> = Vec::with_capacity(raw_images.len());
         for img in raw_images {
             if img.starts_with("http://") || img.starts_with("https://") || img.starts_with("data:")
@@ -656,14 +649,7 @@ pub(crate) async fn normalize_gen_assets(
     v: &Value,
     scope: &super::security::ReadScope,
 ) -> Vec<String> {
-    let raw: Vec<String> = match v {
-        Value::String(s) if !s.is_empty() => vec![s.clone()],
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|x| x.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
-            .collect(),
-        _ => Vec::new(),
-    };
+    let raw = super::tools_image::image_arg_entries(v);
     let mut out = Vec::with_capacity(raw.len());
     for asset in raw {
         if asset.starts_with("http://")
