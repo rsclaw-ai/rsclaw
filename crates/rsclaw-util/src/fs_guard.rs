@@ -15,12 +15,15 @@ use anyhow::{Result, bail};
 ///
 /// - Relative paths are joined onto `root`.
 /// - Absolute paths are accepted only when they already point inside `root`.
-/// - `~` is NOT expanded (a leading `~` is treated as a literal directory
-///   name under `root`).
+/// - `~` is NOT expanded (a leading `~` is treated as a literal directory name
+///   under `root`).
 /// - The target itself need not exist; the deepest existing ancestor is
 ///   canonicalized and the remaining components must be plain names.
+/// - `root` itself need not exist either; it is canonicalized the same way, so
+///   both sides carry the same form (Windows `\\?\` prefix, macOS
+///   `/private/var`) even before the directory is created.
 pub fn resolve_within(root: &Path, user_path: &str) -> Result<PathBuf> {
-    let root_canon = canonical_or_self(root);
+    let root_canon = canonicalize_existing_prefix(&lexical_normalize(root)?);
     let candidate = Path::new(user_path);
     let joined = if candidate.is_absolute() || has_prefix(candidate) {
         candidate.to_path_buf()
@@ -91,10 +94,6 @@ fn has_prefix(p: &Path) -> bool {
     matches!(p.components().next(), Some(Component::Prefix(_)))
 }
 
-fn canonical_or_self(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
-}
-
 /// Resolve `.` and `..` lexically; error if `..` climbs above the start.
 fn lexical_normalize(p: &Path) -> Result<PathBuf> {
     let mut out = PathBuf::new();
@@ -126,7 +125,10 @@ fn canonicalize_existing_prefix(p: &Path) -> PathBuf {
             }
             return out;
         }
-        match (existing.file_name().map(|s| s.to_os_string()), existing.parent()) {
+        match (
+            existing.file_name().map(|s| s.to_os_string()),
+            existing.parent(),
+        ) {
             (Some(name), Some(parent)) => {
                 tail.push(name);
                 existing = parent.to_path_buf();
@@ -162,8 +164,27 @@ mod tests {
     }
 
     #[test]
+    fn missing_root_matches_canonical_children() {
+        // A root that does not exist yet (a fresh workspace dir) must still
+        // contain its own relative children: on Windows the canonical form of
+        // the existing parent gains a `\\?\` prefix, on macOS `/var` becomes
+        // `/private/var`.
+        let parent =
+            std::env::temp_dir().join(format!("rsclaw-fsguard-root-{}", std::process::id()));
+        std::fs::create_dir_all(&parent).expect("mkdir");
+        let root = parent.join("workspace");
+        assert!(!root.exists());
+        assert!(resolve_within(&root, "debug/frame-0.png").is_ok());
+        assert!(resolve_within(&root, "../outside.txt").is_err());
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
     fn filenames_and_slugs() {
-        assert_eq!(sanitize_filename("../../.ssh/authorized_keys", "f"), "authorized_keys");
+        assert_eq!(
+            sanitize_filename("../../.ssh/authorized_keys", "f"),
+            "authorized_keys"
+        );
         assert_eq!(sanitize_filename("..", "f"), "f");
         assert_eq!(sanitize_filename("C:\\x\\报告.pdf", "f"), "报告.pdf");
         assert!(is_safe_slug("coder-1"));
