@@ -1890,14 +1890,14 @@ impl AgentRuntime {
                     .iter()
                     .any(|kw| lower_text.contains(&kw.to_lowercase()) || text_buf.contains(kw));
 
-                // Check if turn_scratchpad contains tool calls (from earlier iterations)
+                // Check if turn_scratchpad contains tool calls (from earlier iterations).
+                // Any tool counts: a plugin call or an async image_gen that answered
+                // "已检查…" / "已交给…" is a real action, not a fabricated one.
                 let has_tool_in_turn = turn_scratchpad.iter().any(|msg| {
                     if let rsclaw_provider::MessageContent::Parts(parts) = &msg.content {
-                        parts.iter().any(|p| {
-                            matches!(p, rsclaw_provider::ContentPart::ToolUse { name, .. }
-                                if name == "cap"
-                                    || name == "web_search" || name == "shell" || name == "execute_command")
-                        })
+                        parts
+                            .iter()
+                            .any(|p| matches!(p, rsclaw_provider::ContentPart::ToolUse { .. }))
                     } else {
                         false
                     }
