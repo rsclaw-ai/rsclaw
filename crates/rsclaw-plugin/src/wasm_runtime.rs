@@ -2142,6 +2142,44 @@ fn filter_quote_path(path: &std::path::Path) -> String {
     format!("'{p}'")
 }
 
+/// H.264 encoders in preference order with their rate-control flags. LGPL
+/// ffmpeg builds (common on Windows) ship without libx264 but carry
+/// OpenH264 and Media Foundation.
+const H264_ENCODERS: &[(&str, &[&str])] = &[
+    ("libx264", &["-preset", "veryfast", "-crf", "20"]),
+    ("libopenh264", &["-b:v", "6M"]),
+    ("h264_mf", &["-b:v", "6M"]),
+    ("h264_videotoolbox", &["-b:v", "6M"]),
+];
+
+/// Pick the first available encoder from `ffmpeg -encoders` output.
+fn pick_h264_encoder(encoders_listing: &str) -> Option<(&'static str, &'static [&'static str])> {
+    let available: Vec<&str> = encoders_listing
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace();
+            let flags = parts.next()?;
+            // Codec rows start with a 6-char capability field like `V....D`.
+            if flags.len() == 6 && flags.starts_with('V') {
+                parts.next()
+            } else {
+                None
+            }
+        })
+        .collect();
+    H264_ENCODERS
+        .iter()
+        .find(|(name, _)| available.contains(name))
+        .map(|(name, args)| (*name, *args))
+}
+
+async fn ffmpeg_h264_encoder(ffmpeg_bin: &str) -> Option<(&'static str, &'static [&'static str])> {
+    let mut cmd = media_command(std::ffi::OsStr::new(ffmpeg_bin), false);
+    cmd.args(["-hide_banner", "-encoders"]);
+    let out = cmd.output().await.ok()?;
+    pick_h264_encoder(&String::from_utf8_lossy(&out.stdout))
+}
+
 async fn ffmpeg_has_filter(ffmpeg_bin: &str, name: &str) -> bool {
     let mut cmd = media_command(std::ffi::OsStr::new(ffmpeg_bin), false);
     cmd.args(["-hide_banner", "-filters"]);
@@ -2369,6 +2407,16 @@ pub(crate) async fn media_compose_video(
             .map_err(|e| format!("compose_video: write captions: {e}"))?;
     }
 
+    let Some((encoder, encoder_args)) = ffmpeg_h264_encoder(&ffmpeg_bin).await else {
+        return Err(format!(
+            "compose_video: this ffmpeg has no H.264 encoder (tried {})",
+            H264_ENCODERS
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
     let mut cmd = media_command(std::ffi::OsStr::new(&ffmpeg_bin), false);
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
     for clip in &clips {
@@ -2404,17 +2452,9 @@ pub(crate) async fn media_compose_video(
         .await
         .map_err(|e| format!("compose_video: write filter graph: {e}"))?;
     cmd.arg("-filter_complex_script").arg(&graph_path);
+    cmd.args(["-map", "[v]", "-map", "[a]", "-c:v", encoder]);
+    cmd.args(encoder_args);
     cmd.args([
-        "-map",
-        "[v]",
-        "-map",
-        "[a]",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "20",
         "-pix_fmt",
         "yuv420p",
         "-r",
@@ -2460,6 +2500,7 @@ pub(crate) async fn media_compose_video(
         "path": out_path,
         "durationSec": duration,
         "captionsBurned": burn,
+        "encoder": encoder,
         "warnings": warnings,
     })
     .to_string())
@@ -4802,6 +4843,22 @@ mod compose_tests {
         assert_eq!(
             filter_quote_path(std::path::Path::new("C:\\x\\y.srt")),
             "'C\\:/x/y.srt'"
+        );
+    }
+
+    #[test]
+    fn picks_best_available_h264_encoder() {
+        let lgpl = " V....D libopenh264          OpenH264 H.264\n V....D h264_mf              H264 via MediaFoundation\n A....D aac                  AAC\n";
+        assert_eq!(pick_h264_encoder(lgpl).map(|e| e.0), Some("libopenh264"));
+        let gpl = " V....D h264_mf  MF\n V....D libx264  libx264 H.264\n";
+        assert_eq!(pick_h264_encoder(gpl).map(|e| e.0), Some("libx264"));
+        let mf_only = " V....D h264_mf  MF\n";
+        assert_eq!(pick_h264_encoder(mf_only).map(|e| e.0), Some("h264_mf"));
+        assert_eq!(pick_h264_encoder(" A....D aac AAC\n"), None);
+        // Header lines and the legend must not count as encoders.
+        assert_eq!(
+            pick_h264_encoder("Encoders:\n V..... = Video\n ------\n"),
+            None
         );
     }
 
