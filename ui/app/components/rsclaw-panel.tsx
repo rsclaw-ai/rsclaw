@@ -3197,7 +3197,7 @@ function TauriConfigPageInner() {
               labelZh={"\u4E3B\u6A21\u578B"}
               labelEn="Primary Model"
               hint="agents.defaults.model.primary"
-              placeholder="rsclaw/rsclaw-agent-v1, doubao/seed-2.0-pro"
+              placeholder="rsclaw/rsclaw-agent-v2, doubao/seed-2.0-pro"
               readChain={readChain}
               writeChain={writeChain}
               healthMap={healthMap}
@@ -3265,7 +3265,7 @@ function TauriConfigPageInner() {
               labelZh={"\u56FE\u7247\u751F\u6210\u6A21\u578B"}
               labelEn="Image Generation Model"
               hint={`agents.defaults.model.image (${zh ? "\u7A7A=\u7981\u7528" : "empty = disabled"})`}
-              placeholder="rsclaw/rsclaw-image-v1, doubao/doubao-seedream-5-0-260128"
+              placeholder="rsclaw/rsclaw-image-v3, doubao/doubao-seedream-5-0-260128"
               readChain={readChain}
               writeChain={writeChain}
               healthMap={healthMap}

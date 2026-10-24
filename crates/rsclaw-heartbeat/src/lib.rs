@@ -484,7 +484,7 @@ impl HeartbeatRunner {
             let primary_model = self
                 .host
                 .agent_flash_model(agent_id)
-                .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
+                .unwrap_or_else(|| "rsclaw/rsclaw-agent-v2".to_owned());
             let skills_dir = rsclaw_skill::default_global_skills_dir()
                 .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("skills"));
 

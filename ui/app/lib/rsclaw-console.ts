@@ -185,7 +185,7 @@ export async function applyInstalledKey(
     if (!merged.agents) merged.agents = {};
     if (!merged.agents.defaults) merged.agents.defaults = {};
     if (!merged.agents.defaults.model) merged.agents.defaults.model = {};
-    merged.agents.defaults.model.primary = "rsclaw/rsclaw-agent-v1";
+    merged.agents.defaults.model.primary = "rsclaw/rsclaw-agent-v2";
   };
 
   try {
@@ -339,7 +339,7 @@ export async function readAccountState(): Promise<RsclawAccountState> {
 }
 
 /**
- * Flip `agents.defaults.model.primary` back to `rsclaw/rsclaw-agent-v1`
+ * Flip `agents.defaults.model.primary` back to `rsclaw/rsclaw-agent-v2`
  * without disturbing anything else in the config. Used when the user has
  * already connected an rsclaw key but then switched primary to another
  * provider — the rsclaw card surfaces a "set as default" action that
@@ -362,7 +362,7 @@ export async function setRsclawAsPrimary(): Promise<{
     if (!parsed.agents) parsed.agents = {};
     if (!parsed.agents.defaults) parsed.agents.defaults = {};
     if (!parsed.agents.defaults.model) parsed.agents.defaults.model = {};
-    parsed.agents.defaults.model.primary = "rsclaw/rsclaw-agent-v1";
+    parsed.agents.defaults.model.primary = "rsclaw/rsclaw-agent-v2";
     const next = JSON.stringify(parsed, null, 2);
     if (isTauri) {
       await invoke("write_config", { content: next });

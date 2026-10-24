@@ -579,7 +579,7 @@ impl AgentSpawner {
             .unwrap_or(0) as usize;
         let effective_model =
             crate::runtime::resolve_primary_model_for(&entry, &config.agents.defaults)
-                .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
+                .unwrap_or_else(|| "rsclaw/rsclaw-agent-v2".to_owned());
 
         let wiring = self.wiring_snapshot();
         let template = self.registry.default_agent().ok();

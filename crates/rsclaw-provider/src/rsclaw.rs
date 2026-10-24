@@ -89,7 +89,7 @@ pub const RSCLAW_DEFAULT_COMPACT_TIMEOUT_SECS: u64 = 180;
 /// a model name (e.g. `rsclaw-flash-v2`), bump both — clients on the
 /// new gateway version pick up the new defaults automatically without
 /// every user having to edit their config.
-pub const RSCLAW_DEFAULT_FLASH: &str = "rsclaw/rsclaw-flash-v1";
+pub const RSCLAW_DEFAULT_FLASH: &str = "rsclaw/rsclaw-flash-v2";
 pub const RSCLAW_DEFAULT_VISION: &str = "rsclaw/rsclaw-vision-v1";
 
 /// How long to wait for `/sessions/<id>/turn` to start responding
@@ -1334,9 +1334,16 @@ impl RsclawProvider {
         // whitelist. For /vision, prefer the caller's configured model
         // (from agents.defaults.model.vision) so upgrades like v2 take
         // effect without a code change. Fall back to the canonical slot
-        // name when the caller didn't specify a vision model.
+        // name when the caller didn't specify a vision model. /fastshot
+        // works the same way for the flash model.
         let canonical_model = match path {
-            "/fastshot" => "rsclaw-flash-v1".to_owned(),
+            "/fastshot" => req
+                .model
+                .rsplit('/')
+                .next()
+                .filter(|m| m.starts_with("rsclaw-flash-"))
+                .unwrap_or("rsclaw-flash-v2")
+                .to_owned(),
             "/vision" => req
                 .model
                 .rsplit('/')

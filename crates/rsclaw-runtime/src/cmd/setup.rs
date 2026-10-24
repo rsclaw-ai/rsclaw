@@ -177,7 +177,7 @@ fn default_config(lang: &str) -> String {
   }},
   agents: {{
     defaults: {{
-      model: {{ primary: "rsclaw/rsclaw-agent-v1" }},
+      model: {{ primary: "rsclaw/rsclaw-agent-v2" }},
       contextTokens: 128000,         // max context window tokens
       stripThinkTags: false,         // strip <think> tags (auto when thinking disabled)
       frequencyPenalty: 0.3,         // reduce repetition (0.0-2.0)

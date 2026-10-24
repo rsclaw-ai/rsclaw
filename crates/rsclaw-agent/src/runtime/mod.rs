@@ -1052,7 +1052,7 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|m| m.primary_head())
             })
-            .unwrap_or("rsclaw/rsclaw-agent-v1")
+            .unwrap_or("rsclaw/rsclaw-agent-v2")
             .to_owned()
     }
 }

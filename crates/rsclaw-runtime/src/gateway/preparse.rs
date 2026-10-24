@@ -2261,7 +2261,7 @@ pub(crate) async fn btw_direct_call(
         .model
         .as_ref()
         .and_then(|m| m.primary_head())
-        .unwrap_or("rsclaw/rsclaw-agent-v1");
+        .unwrap_or("rsclaw/rsclaw-agent-v2");
 
     let system = format!(
         "You are answering a quick side question (/btw). Be concise and direct. \

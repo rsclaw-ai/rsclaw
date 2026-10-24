@@ -6,7 +6,7 @@
 # any entries you added yourself; the previous file is saved as defaults.toml.bak.*.
 
 [meta]
-defaults_version = "2026.10.13"
+defaults_version = "2026.10.24"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Providers
@@ -19,7 +19,7 @@ defaults_version = "2026.10.13"
 name       = "rsclaw"
 label      = "RsClaw (recommended)"
 env_var    = "RSCLAW_API_KEY"
-model      = "rsclaw/rsclaw-agent-v1"
+model      = "rsclaw/rsclaw-agent-v2"
 base_url   = "https://api.rsclaw.ai/v1"
 api_type   = "rsclaw"
 needs_key  = true
@@ -636,7 +636,7 @@ base_url    = "https://ark.cn-beijing.volces.com/api/v3"
 [video_providers.rsclaw]
 label       = "RsClaw Gen (avatar / mv 聚合)"
 env_var     = "RSCLAW_API_KEY"
-model       = "rsclaw-video-v1"
+model       = "rsclaw-video-v3"
 base_url    = "https://api.rsclaw.ai"
 
 [video_providers.agnes]

@@ -1015,7 +1015,7 @@ impl AgentRegistry {
                     .unwrap_or(0) as usize;
                 let effective_model =
                     crate::runtime::resolve_primary_model_for(entry, &cfg.agents.defaults)
-                        .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
+                        .unwrap_or_else(|| "rsclaw/rsclaw-agent-v2".to_owned());
                 let handle = Arc::new(AgentHandle {
                     id: entry.id.clone(),
                     kind,

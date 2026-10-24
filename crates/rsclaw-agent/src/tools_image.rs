@@ -72,7 +72,7 @@ async fn save_generated_image_bytes(bytes: &[u8], mime: &str) -> Result<String> 
 pub(crate) fn default_image_model(provider: &str) -> Option<&'static str> {
     match provider {
         "agnes" => Some("agnes/agnes-image-2.1-flash"),
-        "rsclaw" => Some("rsclaw/rsclaw-image-v1"),
+        "rsclaw" => Some("rsclaw/rsclaw-image-v3"),
         _ => None,
     }
 }
@@ -194,7 +194,7 @@ impl super::runtime::AgentRuntime {
                     .as_ref()
                     .and_then(|m| m.primary_head())
             })
-            .unwrap_or("rsclaw/rsclaw-agent-v1");
+            .unwrap_or("rsclaw/rsclaw-agent-v2");
         Some(
             rsclaw_provider::registry::ProviderRegistry::parse_model(head)
                 .0
@@ -253,7 +253,7 @@ impl super::runtime::AgentRuntime {
 
         // No explicit image model configured? If the primary LLM provider
         // ships a first-party image model (agnes → agnes-image-2.1-flash,
-        // rsclaw → rsclaw-image-v1), default to it instead of erroring.
+        // rsclaw → rsclaw-image-v3), default to it instead of erroring.
         // The primary provider's key is already configured, so this stays
         // within the user's chosen vendor — no surprise cross-billing.
         if image_chain.is_empty()
@@ -541,21 +541,25 @@ impl super::runtime::AgentRuntime {
                 "qwen" => "qwen-image-2.0-pro",
                 "minimax" => "image-01",
                 "gemini" => "gemini-3-pro-image-preview",
-                "rsclaw" => "rsclaw-image-v1",
+                "rsclaw" => "rsclaw-image-v3",
                 "agnes" => "agnes-image-2.1-flash",
                 _ => "gpt-image-2",
             });
 
         // rsclaw: a reference image means image-edit, but the t2i model
-        // produces garbage on edit requests (gen-api.md note #4). When the
+        // produces garbage on edit requests (gen-api.md note #4), and v3 is a
+        // strict lane that refuses a reference image outright. When the
         // caller didn't name an explicit model and supplied a ref image, swap
-        // the default t2i model for the edit model.
+        // the default t2i model for its edit model.
         let image_model = if img_prov == "rsclaw"
             && args.get("model").and_then(|m| m.as_str()).is_none()
             && !args["image"].is_null()
-            && image_model == "rsclaw-image-v1"
         {
-            "rsclaw-image-edit-v1"
+            match image_model {
+                "rsclaw-image-v1" => "rsclaw-image-edit-v1",
+                "rsclaw-image-v3" => "rsclaw-image-edit-v3",
+                other => other,
+            }
         } else {
             image_model
         };

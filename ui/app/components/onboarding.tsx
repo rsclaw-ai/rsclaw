@@ -1814,7 +1814,7 @@ export function OnboardingPage() {
     // if it's actually invalid the user finds out at the
     // gateway-start step's health check.
     if (id === "rsclaw") {
-      const rdef = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v1";
+      const rdef = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v2";
       const fallback = [{ id: rdef, tag: "推荐", tagEn: "Recommended", rec: true }];
       const defaultModel = rdef;
       setProvs((prev) => {
@@ -2522,7 +2522,7 @@ export function OnboardingPage() {
                   // a "tested successfully" state so `canNextStep2`
                   // flips immediately — no need for the user to click
                   // 获取模型 (which would fail anyway, see below).
-                  const defaultModel = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v1";
+                  const defaultModel = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v2";
                   const rsclawModels = [
                     { id: defaultModel, tag: "推荐", tagEn: "Recommended", rec: true },
                   ];
