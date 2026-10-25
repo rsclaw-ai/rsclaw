@@ -25,6 +25,7 @@ use tracing::{debug, error, info, warn};
 use super::{
     external_jobs::{ExternalJob, ExternalJobKind, ExternalJobStatus, PollOutcome},
     shutdown::ShutdownCoordinator,
+    task_queue::{Priority, QueuedMessage},
 };
 
 /// Seconds between worker ticks when nothing is due — small enough that
@@ -349,6 +350,9 @@ impl ExternalJobsWorker {
                 debug!(job_id = %job.id, "session writeback skipped: {e:#}");
             }
             self.emit_session_event(job);
+            // Runs once per job: this branch is only reached while
+            // `delivered_at` was still unset.
+            wake_session(job);
         } else {
             let now = chrono::Utc::now().timestamp();
             job.next_poll_at = now + DELIVERY_RETRY_DELAY_SECS as i64;
@@ -563,6 +567,95 @@ impl ExternalJobsWorker {
     }
 }
 
+/// Channels whose sessions get no follow-up turn when a job ends: a
+/// scheduled run fires again on its own schedule, and heartbeat / system
+/// turns have no conversation to continue.
+const NO_WAKE_CHANNELS: &[&str] = &["cron", "heartbeat", "system"];
+
+fn should_wake(job: &ExternalJob) -> bool {
+    !NO_WAKE_CHANNELS.contains(&job.delivery.channel.as_str())
+        && !job.session_key.starts_with("cron:")
+}
+
+/// Queue one turn on the job's session so the agent can carry a multi-step
+/// request on ("make an image, then a video from it") instead of waiting
+/// for the user to speak again. Best-effort, like the history writeback.
+fn wake_session(job: &ExternalJob) {
+    if !should_wake(job) {
+        return;
+    }
+    let Some(tq) = super::task_queue::get_task_queue() else {
+        debug!(job_id = %job.id, "external jobs: task queue not installed, no follow-up turn");
+        return;
+    };
+    // Desktop chats run on the `ws` channel but reply through the `desktop`
+    // sender, the same mapping `/goal` uses.
+    let channel = match job.delivery.channel.as_str() {
+        "ws" => "desktop",
+        other => other,
+    };
+    let message = QueuedMessage {
+        text: wake_text(job),
+        sender: job.delivery.target_id.clone(),
+        channel: channel.to_owned(),
+        account: job.delivery.account.clone(),
+        chat_id: job.delivery.target_id.clone(),
+        is_group: job.delivery.is_group,
+        reply_to: None,
+        timestamp: chrono::Utc::now().timestamp(),
+        images: vec![],
+        files: vec![],
+    };
+    match tq.submit(&job.session_key, message, Priority::System) {
+        Ok((task_id, merged)) => info!(
+            job_id = %job.id,
+            session = %job.session_key,
+            %task_id,
+            merged,
+            "external jobs: follow-up turn queued"
+        ),
+        Err(e) => warn!(job_id = %job.id, "external jobs: follow-up turn not queued: {e:#}"),
+    }
+}
+
+/// The notice the agent wakes up to. It asks for NO_REPLY when nothing is
+/// left, which the runtime turns into an empty reply that never reaches the
+/// user. A failure must not be resubmitted, or a job that keeps failing
+/// would wake the agent forever.
+fn wake_text(job: &ExternalJob) -> String {
+    let kind = match job.kind {
+        ExternalJobKind::VideoGen => "video",
+        ExternalJobKind::ImageGen => "image",
+    };
+    let id = &job.id;
+    if matches!(job.status, ExternalJobStatus::Done) {
+        let path = job.result_path.as_deref().unwrap_or("");
+        format!(
+            "[{kind} generation complete] job {id}: {path}\n\
+             This is an automatic notice, not a message from the user. The user has \
+             already received the {kind}. If the request you were working on has steps \
+             that need it (for example making a video from this image, or publishing \
+             it), carry them out now using the path above. Do not resend or describe \
+             the {kind}. If nothing is left to do, or you already used this result, \
+             reply with exactly NO_REPLY."
+        )
+    } else {
+        let status = match job.status {
+            ExternalJobStatus::TimedOut => "timed out",
+            _ => "failed",
+        };
+        let reason = job.error.as_deref().unwrap_or("unknown error");
+        format!(
+            "[{kind} generation {status}] job {id}: {reason}\n\
+             This is an automatic notice, not a message from the user. The user has \
+             already been told. Do not resubmit this job. If the request you were \
+             working on can still finish without it, finish it; if the user needs to \
+             decide what to do next, ask them briefly. Otherwise reply with exactly \
+             NO_REPLY."
+        )
+    }
+}
+
 /// The finished artifact as a `(filename, mime, path)` attachment; empty
 /// unless the job succeeded with a result file.
 fn result_files(job: &ExternalJob) -> Vec<(String, String, String)> {
@@ -581,4 +674,55 @@ fn result_files(job: &ExternalJob) -> Vec<(String, String, String)> {
         ExternalJobKind::ImageGen => "image/png",
     };
     vec![(filename.to_string(), mime.to_string(), path.to_string())]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::external_jobs::{ExternalJobDelivery, ExternalJobOrigin};
+
+    fn job(channel: &str, session_key: &str) -> ExternalJob {
+        ExternalJob::new_submitted(
+            session_key,
+            ExternalJobDelivery {
+                channel: channel.to_owned(),
+                target_id: "u1".to_owned(),
+                is_group: false,
+                reply_to: None,
+                account: None,
+            },
+            ExternalJobOrigin::Agent,
+            "rsclaw_image",
+            "task",
+            ExternalJobKind::ImageGen,
+            "a cat",
+        )
+    }
+
+    #[test]
+    fn wake_skips_scheduled_and_internal_sessions() {
+        assert!(should_wake(&job("wechat", "agent:main:wechat:u1")));
+        assert!(should_wake(&job("ws", "desk-1")));
+        assert!(!should_wake(&job("cron", "agent:main:custom")));
+        assert!(!should_wake(&job("heartbeat", "hb")));
+        assert!(!should_wake(&job("wechat", "cron:job1")));
+    }
+
+    #[test]
+    fn wake_text_names_the_result_and_the_way_out() {
+        let mut done = job("wechat", "s");
+        done.status = ExternalJobStatus::Done;
+        done.result_path = Some("/tmp/cat.png".to_owned());
+        let text = wake_text(&done);
+        assert!(text.starts_with("[image generation complete]"));
+        assert!(text.contains("/tmp/cat.png"));
+        assert!(text.contains("NO_REPLY"));
+
+        let mut failed = job("wechat", "s");
+        failed.status = ExternalJobStatus::TimedOut;
+        failed.error = Some("timed out after 1800s".to_owned());
+        let text = wake_text(&failed);
+        assert!(text.starts_with("[image generation timed out]"));
+        assert!(text.contains("Do not resubmit"));
+    }
 }
