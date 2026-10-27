@@ -3940,9 +3940,6 @@ mod account_helper_tests {
     }
 }
 
-/// `gateway.language` from the brand's default config layer, so
-/// non-interactive setup seeds workspace templates in the brand's language.
-/// `None` for the default brand (English templates, as before).
 /// Language for a fresh install's workspace templates: the brand default
 /// when the brand sets one, else Chinese on a Chinese-language system.
 /// Without the fallback a Chinese desktop install got the English

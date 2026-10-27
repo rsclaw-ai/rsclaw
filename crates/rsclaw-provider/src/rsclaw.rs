@@ -1685,7 +1685,7 @@ struct CreateSessionReq<'a> {
     /// The same registry-path segment under the field name the worker's
     /// static (registered-prefix) create/replay path reads. Workers since
     /// the v1.9 rename only consult `user_suffix` there, so sending
-    /// `user_system` alone silently dropped the persona, distributor policy
+    /// `user_system` alone silently dropped the persona, distributor policy, workspace instructions
     /// and plugin/skill listings. Sent alongside `user_system` (identical
     /// content) so both old and new workers overlay it; empty on the
     /// dynamic path.
@@ -1720,7 +1720,7 @@ struct ReplayReq<'a> {
     /// The same registry-path segment under the field name the worker's
     /// static (registered-prefix) create/replay path reads. Workers since
     /// the v1.9 rename only consult `user_suffix` there, so sending
-    /// `user_system` alone silently dropped the persona, distributor policy
+    /// `user_system` alone silently dropped the persona, distributor policy, workspace instructions
     /// and plugin/skill listings. Sent alongside `user_system` (identical
     /// content) so both old and new workers overlay it; empty on the
     /// dynamic path.
@@ -4064,11 +4064,12 @@ data: [DONE]
             &state,
         )
         .await;
-        // Exactly one ToolCall, no intermediate TextDelta events.
+        // Exactly one ToolCall; the input shards yield only the empty
+        // keep-alive deltas, no text.
         let mut tool_calls = Vec::new();
         for e in &evs {
-            if let Ok(StreamEvent::TextDelta(_)) = e {
-                panic!("tool_call deltas must NOT emit TextDelta");
+            if let Ok(StreamEvent::TextDelta(t)) = e {
+                assert!(t.is_empty(), "tool_call deltas must NOT emit text: {t:?}");
             }
             if let Ok(StreamEvent::ToolCall { id, name, input }) = e {
                 tool_calls.push((id.clone(), name.clone(), input.clone()));
@@ -4110,7 +4111,8 @@ data: {"type":"block_stop","index":0}
         let mut tool_calls = Vec::new();
         for e in evs {
             match e.unwrap() {
-                StreamEvent::TextDelta(s) => texts.push(s),
+                // Empty deltas are the keep-alives a tool input's shards send.
+                StreamEvent::TextDelta(s) if !s.is_empty() => texts.push(s),
                 StreamEvent::ToolCall { id, name, input } => tool_calls.push((id, name, input)),
                 _ => {}
             }
