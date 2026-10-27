@@ -7649,28 +7649,72 @@ async fn default_workspace(state: &AppState) -> std::path::PathBuf {
         .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"))
 }
 
+#[derive(Debug, Deserialize)]
+struct MediaQuery {
+    /// Thumbnail long edge in pixels; images only.
+    w: Option<u32>,
+}
+
 /// GET /api/v1/media/{token} — an uploaded, generated or A2A-received file
 /// by its canonical token (`dl_i_202610271200abc.png`, no `@`), for clients
 /// that are not on the gateway's machine. Supports Range, so video can seek
 /// and audio resume, and Last-Modified / If-Modified-Since. Only names the
 /// `@`-reference resolver accepts are served, from the three media buckets;
-/// anything else is 404.
+/// anything else is 404. `?w=<px>` on an image returns a JPEG scaled to that
+/// long edge instead, so a phone need not pull a multi-megabyte original.
 async fn get_media(
     State(state): State<AppState>,
     Path(token): Path<String>,
+    Query(q): Query<MediaQuery>,
     req: axum::extract::Request,
 ) -> Response {
     let workspace = default_workspace(&state).await;
-    let Some(path) = rsclaw_channel::media_token_path(&token, &workspace) else {
+    let Some(mut path) = rsclaw_channel::media_token_path(&token, &workspace) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "media not found"})),
         )
             .into_response();
     };
+    if let Some(w) = q.w
+        && rsclaw_events::media::parse_token(&token).is_some_and(|(_, k)| k == 'i')
+    {
+        let source = path.clone();
+        let token = token.clone();
+        match tokio::task::spawn_blocking(move || media_thumbnail(&source, &token, w)).await {
+            Ok(Ok(thumb)) => path = thumb,
+            Ok(Err(e)) => warn!(%e, "media: thumbnail failed, serving the original"),
+            Err(e) => warn!(%e, "media: thumbnail task failed, serving the original"),
+        }
+    }
     use tower::ServiceExt as _;
     let Ok(res) = tower_http::services::ServeFile::new(path).oneshot(req).await;
     res.map(axum::body::Body::new).into_response()
+}
+
+/// A cached JPEG of the image at `source`, scaled down to a long edge of `w`
+/// (clamped to 32..=2048). The cache name carries the source's mtime, so an
+/// overwritten original gets a fresh thumbnail.
+fn media_thumbnail(source: &std::path::Path, token: &str, w: u32) -> anyhow::Result<PathBuf> {
+    let w = w.clamp(32, 2048);
+    let mtime = std::fs::metadata(source)?
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dir = rsclaw_config::loader::base_dir().join("var/cache/media-thumbs");
+    let thumb = dir.join(format!("{token}.{w}.{mtime}.jpg"));
+    if thumb.is_file() {
+        return Ok(thumb);
+    }
+    std::fs::create_dir_all(&dir)?;
+    let data = std::fs::read(source)?;
+    let (bytes, _) = rsclaw_util::downscale_image_for_vision(&data, "image/jpeg", 0, w, 80)?;
+    // Write then rename, so a concurrent request never serves half a file.
+    let tmp = dir.join(format!("{token}.{w}.{mtime}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &thumb)?;
+    Ok(thumb)
 }
 
 /// Generate a unique file ID: `file-{timestamp_hex}{random_hex}`.
