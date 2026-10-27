@@ -82,6 +82,15 @@ pub fn needs_approval(
         .any(|p| glob(p.trim(), session_key))
 }
 
+/// Whether a gated call is refused without asking: the turn was started by
+/// the runtime (a job's wake, heartbeat / system), not by a person, and
+/// `blockInWake` is on (the default).
+pub fn blocked_without_person(cfg: Option<&ToolApprovalConfig>, channel: &str, user_text: &str) -> bool {
+    let on = cfg.and_then(|c| c.block_in_wake).unwrap_or(true);
+    on && (matches!(channel, "heartbeat" | "system")
+        || rsclaw_events::notice::is_auto_notice_only(user_text))
+}
+
 /// Absolute local paths in file-ish arguments (`filePath`, `imagePaths`,
 /// `video`, `cover`, …) that don't exist. Checked before asking anyone, so
 /// nobody approves a call that can only fail.
@@ -168,6 +177,7 @@ mod tests {
             patterns: Some(patterns.iter().map(|s| s.to_string()).collect()),
             exempt_cron: None,
             exempt_sessions: None,
+            block_in_wake: None,
         }
     }
 
@@ -205,6 +215,17 @@ mod tests {
         assert!(!needs_approval(Some(&c), "douyin.publish", "wechat", "agent:ops:wechat:u1"));
         c.enabled = Some(false);
         assert!(!needs_approval(Some(&c), "douyin.publish", "wechat", "s"));
+    }
+
+    #[test]
+    fn runtime_started_turns_are_refused_unless_turned_off() {
+        let wake = format!("[video generation complete] job a: /v/a.mp4\n{}", rsclaw_events::notice::AUTO_NOTICE);
+        let mut c = cfg(&["douyin.publish"]);
+        assert!(blocked_without_person(Some(&c), "desktop", &wake));
+        assert!(blocked_without_person(Some(&c), "heartbeat", "tick"));
+        assert!(!blocked_without_person(Some(&c), "desktop", "发吧"));
+        c.block_in_wake = Some(false);
+        assert!(!blocked_without_person(Some(&c), "desktop", &wake));
     }
 
     #[test]

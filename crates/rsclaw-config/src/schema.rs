@@ -3037,6 +3037,9 @@ pub struct ToolApprovalConfig {
     pub exempt_cron: Option<bool>,
     /// Session keys (with `*`) whose calls are never gated.
     pub exempt_sessions: Option<Vec<String>>,
+    /// Refuse a gated call outright, without asking, in a turn no person
+    /// started (a job's wake, heartbeat / system turns). Default true.
+    pub block_in_wake: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

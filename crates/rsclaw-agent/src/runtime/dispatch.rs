@@ -193,6 +193,16 @@ impl AgentRuntime {
             let (tool_id, call_args) = crate::tool_approval::call_identity(name, &args);
             let gate = self.config.raw.approvals.as_ref().and_then(|a| a.tools.as_ref());
             if crate::tool_approval::needs_approval(gate, &tool_id, &ctx.channel, &ctx.session_key) {
+                // No person started this turn, so nobody here can have asked
+                // for it: refuse without raising a prompt.
+                if crate::tool_approval::blocked_without_person(gate, &ctx.channel, &ctx.user_text) {
+                    tracing::warn!(tool = %tool_id, session = %ctx.session_key, "approvals.tools: refused in a turn no person started");
+                    return Err(anyhow!(
+                        "这是生成完成后的自动轮次（不是负责人发起的），不能执行 {tool_id}。请把结果发给负责人，\
+                         等负责人在对话里确认后，由那一轮来执行。Do not call {tool_id} again in this turn \
+                         and do not work around it; tell the owner the result is ready and wait."
+                    ));
+                }
                 // A call naming a file that isn't there can only fail:
                 // send it back to the model instead of asking anyone.
                 let missing = crate::tool_approval::missing_files(call_args);

@@ -19,6 +19,21 @@ pub fn is_auto_notice(text: &str) -> bool {
     text.contains(AUTO_NOTICE)
 }
 
+/// Whether a turn's input is nothing but automatic notices (their
+/// `[… generation …] job …` lines and the notice sentence): the runtime
+/// started the turn, no person did. A user message merged into the same
+/// turn makes it a person's turn again.
+pub fn is_auto_notice_only(text: &str) -> bool {
+    is_auto_notice(text)
+        && text.lines().map(str::trim).filter(|l| !l.is_empty()).all(|l| {
+            l.contains(AUTO_NOTICE)
+                || (l.starts_with('[') && l.contains("] job "))
+                || l.starts_with("Now: ")
+                // The separator the task queue joins merged messages with.
+                || l == "---"
+        })
+}
+
 /// Whether `text` is a `NO_REPLY` answer.
 pub fn is_no_reply(text: &str) -> bool {
     text.trim_start().to_ascii_uppercase().starts_with(NO_REPLY)
@@ -63,6 +78,17 @@ mod tests {
         assert!(is_hidden_message(&json!({"role": "assistant", "content": " no_reply\n"})));
         assert!(!is_hidden_message(&json!({"role": "assistant", "content": "图片已生成"})));
         assert!(!is_hidden_message(&json!({"role": "user", "content": "NO_REPLY"})));
+    }
+
+    #[test]
+    fn wake_turn_input_is_told_from_a_person() {
+        let wake = format!(
+            "[video generation complete] job a: /v/a.mp4\n[video generation failed] job b: quota\n{AUTO_NOTICE} If nothing is left…"
+        );
+        assert!(is_auto_notice_only(&wake));
+        assert!(is_auto_notice_only(&format!("{wake}\n\n---\n\n{wake}")));
+        assert!(!is_auto_notice_only(&format!("{wake}\n发吧")));
+        assert!(!is_auto_notice_only("发吧"));
     }
 
     #[test]
