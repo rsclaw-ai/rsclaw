@@ -714,6 +714,8 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"\[file:([^\]]+)\]").expect("file ref regex")
     });
+    let rewritten = rewrite_library_refs(text);
+    let text = rewritten.as_str();
 
     let mut images = Vec::new();
     let mut files = Vec::new();
@@ -828,6 +830,74 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
     let cleaned = RE.replace_all(text, "").to_string();
     let cleaned = cleaned.trim().to_owned();
     (cleaned, images, files)
+}
+
+/// Rewrite gateway file-library markers, `[file:<name>](rsclaw-file:<id>)`,
+/// which a client inserts for a file it put through `POST /v1/files`.
+/// A file stored under a canonical upload name becomes its `@token`, which
+/// the `@`-reference resolver later lists for the model (images go to
+/// vision). An older library file is kept where it is: an image becomes a
+/// `[file:<path>]` marker and is attached below; anything else becomes a
+/// plain mention of its path, so audio and video reach the model's tools
+/// instead of being transcribed or parked in the file menu.
+fn rewrite_library_refs(text: &str) -> String {
+    static LIB_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\[file:([^\]\n]+)\]\(rsclaw-file:([^)\s]+)\)").expect("library ref regex")
+    });
+    if !text.contains("rsclaw-file:") {
+        return text.to_owned();
+    }
+    LIB_RE
+        .replace_all(text, |cap: &regex::Captures<'_>| {
+            let name = cap[1].trim();
+            let id = &cap[2];
+            match library_file(id) {
+                Some(LibraryFile::Token(token)) => format!("@{token}"),
+                Some(LibraryFile::Path(path)) => {
+                    let lower = path.to_lowercase();
+                    let image = [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+                        .iter()
+                        .any(|e| lower.ends_with(e));
+                    if image {
+                        format!("[file:{path}]")
+                    } else {
+                        format!("[attached file: {name} = {path}]")
+                    }
+                }
+                None => {
+                    tracing::warn!(file_id = id, "file ref: library file not found");
+                    format!("[attached file: {name} (unavailable)]")
+                }
+            }
+        })
+        .into_owned()
+}
+
+enum LibraryFile {
+    Token(String),
+    Path(String),
+}
+
+/// Find a `POST /v1/files` upload by id under `<base>/var/data/files/`.
+fn library_file(id: &str) -> Option<LibraryFile> {
+    // Ids are `file-<hex>`; anything else could walk out of the directory.
+    let hex = id.strip_prefix("file-")?;
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let dir = rsclaw_config::loader::base_dir().join("var/data/files");
+    if let Ok(meta) = std::fs::read_to_string(dir.join(format!("{id}.meta.json")))
+        && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta)
+        && let Some(token) = meta["token"].as_str().filter(|t| !t.is_empty())
+    {
+        return Some(LibraryFile::Token(token.to_owned()));
+    }
+    let prefix = format!("{id}_");
+    std::fs::read_dir(&dir).ok()?.flatten().find_map(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        (name.starts_with(&prefix) && !name.ends_with(".meta.json"))
+            .then(|| LibraryFile::Path(e.path().to_string_lossy().into_owned()))
+    })
 }
 
 /// Deferred file analysis that the per-user worker should process after

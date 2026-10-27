@@ -371,34 +371,16 @@ impl ExternalJobsWorker {
     /// agent's next turn knows the artifact landed. Best-effort — the
     /// channel-level delivery is the source of truth for the user.
     fn write_back_to_session(&self, job: &ExternalJob) -> Result<()> {
-        let kind_label = match job.kind {
-            ExternalJobKind::VideoGen => "video",
-            ExternalJobKind::ImageGen => "image",
-        };
-        let path = job.result_path.as_deref().unwrap_or("");
-        let content = if matches!(job.status, ExternalJobStatus::Done) {
-            format!("[{kind_label} generation complete] {path}")
-        } else {
-            format!(
-                "[{kind_label} generation {}] {}",
-                match job.status {
-                    ExternalJobStatus::Failed => "failed",
-                    ExternalJobStatus::TimedOut => "timed out",
-                    _ => "ended",
-                },
-                job.error.as_deref().unwrap_or("")
-            )
-        };
         let mut msg = json!({
             "role": "assistant",
-            "content": content,
+            "content": writeback_text(job),
             "external_job_id": job.id,
         });
-        // Same (name, mime, path) triples as the live delivery, so a client
-        // reloading the history renders the image or video, not just the path.
+        // Same attachments as the live delivery, so a client reloading the
+        // history renders the image or video rather than the sentence.
         let files = result_files(job);
         if !files.is_empty() {
-            msg["files"] = json!(files);
+            msg["files"] = rsclaw_events::media::files_json(&files);
         }
         self.store
             .append_message(&job.session_key, &msg)
@@ -567,6 +549,29 @@ impl ExternalJobsWorker {
     }
 }
 
+/// The history line for a finished job: one sentence the model can act on
+/// in a later turn, with the path to hand to the next tool and the `@token`
+/// the user can refer to. Clients render the attachment from `files`.
+fn writeback_text(job: &ExternalJob) -> String {
+    let kind = match job.kind {
+        ExternalJobKind::VideoGen => "video",
+        ExternalJobKind::ImageGen => "image",
+    };
+    if !matches!(job.status, ExternalJobStatus::Done) {
+        let status = match job.status {
+            ExternalJobStatus::TimedOut => "timed out",
+            _ => "failed",
+        };
+        let reason = job.error.as_deref().unwrap_or("unknown error");
+        return format!("The {kind} generation {status}: {reason}");
+    }
+    let path = job.result_path.as_deref().unwrap_or("");
+    match rsclaw_events::media::token_for_path(path) {
+        Some(token) => format!("The {kind} is ready at {path} (@{token})."),
+        None => format!("The {kind} is ready at {path}."),
+    }
+}
+
 /// Channels whose sessions get no follow-up turn when a job ends: a
 /// scheduled run fires again on its own schedule, and heartbeat / system
 /// turns have no conversation to continue.
@@ -706,6 +711,22 @@ mod tests {
         assert!(!should_wake(&job("cron", "agent:main:custom")));
         assert!(!should_wake(&job("heartbeat", "hb")));
         assert!(!should_wake(&job("wechat", "cron:job1")));
+    }
+
+    #[test]
+    fn writeback_is_a_sentence_with_path_and_token() {
+        let mut done = job("wechat", "s");
+        done.status = ExternalJobStatus::Done;
+        done.result_path = Some("/d/rsclaw/images/dl_i_202610271200abc.png".to_owned());
+        assert_eq!(
+            writeback_text(&done),
+            "The image is ready at /d/rsclaw/images/dl_i_202610271200abc.png \
+             (@dl_i_202610271200abc.png)."
+        );
+        let mut failed = job("wechat", "s");
+        failed.status = ExternalJobStatus::Failed;
+        failed.error = Some("quota".to_owned());
+        assert_eq!(writeback_text(&failed), "The image generation failed: quota");
     }
 
     #[test]

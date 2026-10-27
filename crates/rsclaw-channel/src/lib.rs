@@ -711,16 +711,20 @@ pub fn canonical_filename(prefix: &str, mime_type: &str, original_filename: &str
     let kind = kind_for_mime(mime_type, original_filename);
     let ts = canonical_timestamp();
     let abc = random_suffix3();
+    // Only a short ASCII extension survives: the name has to stay a valid
+    // `@` token whatever the user's file was called.
     let ext = std::path::Path::new(original_filename)
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or(match kind {
-            'i' => "png",
-            'v' => "mp4",
-            'a' => "mp3",
-            'd' => "pdf",
-            _ => "bin",
-        });
+        .filter(|e| e.len() <= 10 && e.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(str::to_ascii_lowercase);
+    let ext = ext.as_deref().unwrap_or(match kind {
+        'i' => "png",
+        'v' => "mp4",
+        'a' => "mp3",
+        'd' => "pdf",
+        _ => "bin",
+    });
     format!("{prefix}_{kind}_{ts}{abc}.{ext}")
 }
 
@@ -749,13 +753,7 @@ pub fn kind_from_extension(ext: &str) -> char {
 /// Subdirectory under `~/Downloads/rsclaw/` (or `<workspace>/uploads/`)
 /// for a given canonical kind letter.
 pub fn category_for_kind(kind: char) -> &'static str {
-    match kind {
-        'i' => "images",
-        'v' => "videos",
-        'a' => "audios",
-        'd' => "docs",
-        _ => "files",
-    }
+    rsclaw_events::media::category_for_kind(kind)
 }
 
 fn canonical_timestamp() -> String {
@@ -782,6 +780,105 @@ pub struct ResolvedRefs {
     pub image_paths: Vec<std::path::PathBuf>,
 }
 
+/// Root of the `dl` bucket: `~/Downloads/<CLI_NAME>/`, where generated and
+/// downloaded media land.
+pub fn downloads_root() -> std::path::PathBuf {
+    dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .map(|h| h.join("Downloads"))
+                .unwrap_or_else(rsclaw_config::loader::base_dir)
+        })
+        .join(rsclaw_brand::CLI_NAME)
+}
+
+/// Where the file named by a media token lives, if the token is canonical
+/// and the file exists. The token alone picks the place (bucket by prefix,
+/// directory by kind), so nothing outside the three buckets is reachable.
+pub fn media_token_path(token: &str, workspace: &std::path::Path) -> Option<std::path::PathBuf> {
+    let (source, kind) = rsclaw_events::media::parse_token(token)?;
+    let root = match source {
+        "dl" => downloads_root(),
+        "a2a" => workspace.join("a2a"),
+        _ => workspace.join("uploads"),
+    };
+    let path = root.join(category_for_kind(kind)).join(token);
+    path.is_file().then_some(path)
+}
+
+/// Sidecar holding an upload's original file name, next to the uploads
+/// tree rather than inside a category directory the agent lists.
+fn upload_name_path(workspace: &std::path::Path, token: &str) -> std::path::PathBuf {
+    workspace.join("uploads").join(".names").join(token)
+}
+
+/// The original file name recorded for an uploaded token, if any.
+pub fn upload_original_name(workspace: &std::path::Path, token: &str) -> Option<String> {
+    std::fs::read_to_string(upload_name_path(workspace, token))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Store an upload under `<workspace>/uploads/<category>/` with a canonical
+/// `up_` name and remember its original name, so any file — a Chinese name,
+/// spaces, no extension — can be `@`-referenced. Returns the token and path.
+pub fn save_upload(
+    workspace: &std::path::Path,
+    original_name: &str,
+    mime_type: &str,
+    data: &[u8],
+) -> std::io::Result<(String, std::path::PathBuf)> {
+    // The directory follows the token's kind letter, which is what
+    // `media_token_path` looks under.
+    let kind = kind_for_mime(mime_type, original_name);
+    let dir = workspace.join("uploads").join(category_for_kind(kind));
+    std::fs::create_dir_all(&dir)?;
+    let mut token = canonical_filename("up", mime_type, original_name);
+    for _ in 0..10 {
+        if !dir.join(&token).exists() {
+            break;
+        }
+        token = canonical_filename("up", mime_type, original_name);
+    }
+    let path = dir.join(&token);
+    std::fs::write(&path, data)?;
+    let name_path = upload_name_path(workspace, &token);
+    if let Some(parent) = name_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&name_path, original_name);
+    Ok((token, path))
+}
+
+/// Remove an upload and its recorded original name.
+pub fn remove_upload(workspace: &std::path::Path, token: &str) {
+    if let Some(path) = media_token_path(token, workspace) {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_file(upload_name_path(workspace, token));
+}
+
+/// A fresh canonical path for generated media with extension `ext`:
+/// `~/Downloads/<CLI_NAME>/<category>/dl_<kind>_<ts><abc>.<ext>`, directory
+/// created. Every tool that writes media for the user should get its path
+/// here so the result can be `@`-referenced and fetched remotely.
+pub fn generated_media_path(ext: &str) -> std::io::Result<std::path::PathBuf> {
+    let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+    let kind = kind_from_extension(&ext);
+    let dir = downloads_root().join(category_for_kind(kind));
+    std::fs::create_dir_all(&dir)?;
+    let ts = canonical_timestamp();
+    let mut path = dir.join(format!("dl_{kind}_{ts}{}.{ext}", random_suffix3()));
+    for _ in 0..10 {
+        if !path.exists() {
+            break;
+        }
+        path = dir.join(format!("dl_{kind}_{ts}{}.{ext}", random_suffix3()));
+    }
+    Ok(path)
+}
+
 /// Scan text for `@<filename>` file references and resolve them to full
 /// paths. Supported shapes:
 ///
@@ -789,44 +886,36 @@ pub struct ResolvedRefs {
 ///   `<workspace>/uploads/<category>/`
 /// * `@dl_<kind>_<suffix>.<ext>` — generated/downloaded by a plugin; lives
 ///   under `~/Downloads/rsclaw/<category>/`
+/// * `@a2a_<kind>_<suffix>.<ext>` — received from an A2A peer
 ///
-/// Image references are collected in `image_paths` so the caller can
-/// load them as vision attachments.
+/// Every resolved reference, whatever its kind, is listed in the appended
+/// `[file references]` block so the model can pass the path to a tool;
+/// uploads also carry their original file name. Image references are
+/// collected in `image_paths` so the caller can load them as vision
+/// attachments.
 pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRefs {
-    let uploads = workspace.join("uploads");
-    let a2a_root = workspace.join("a2a");
-    let downloads_root = dirs_next::download_dir()
-        .unwrap_or_else(|| {
-            dirs_next::home_dir()
-                .map(|h| h.join("Downloads"))
-                .unwrap_or_else(|| workspace.to_path_buf())
-        })
-        .join(rsclaw_brand::CLI_NAME);
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"@(up|dl|a2a)_([ivdaf])_([a-z0-9_]+)\.(\w+)").expect("valid regex")
+    });
 
-    // Three provenance buckets: up/ (channel uploads), dl/ (plugin or agent
-    // downloads), a2a/ (received from A2A peers). Filenames share the
-    // `<prefix>_<kind>_<ts><suffix>.<ext>` shape; the prefix decides which
-    // bucket the file lives under.
-    let re = regex::Regex::new(r"@(up|dl|a2a)_([ivdaf])_([a-z0-9_]+)\.(\w+)").expect("valid regex");
-
-    let mut resolved = Vec::new();
+    let mut resolved: Vec<(String, String, Option<String>)> = Vec::new();
     let mut image_paths = Vec::new();
-    for cap in re.captures_iter(text) {
-        let source = &cap[1];
-        let kind = cap[2].chars().next().unwrap_or('f');
+    for cap in RE.captures_iter(text) {
         let full_name = &cap[0][1..]; // strip the leading '@'
-        let subdir = category_for_kind(kind);
-        let path = match source {
-            "dl" => downloads_root.join(subdir).join(full_name),
-            "a2a" => a2a_root.join(subdir).join(full_name),
-            _ => uploads.join(subdir).join(full_name),
-        };
-        if path.exists() {
-            resolved.push((full_name.to_string(), path.to_string_lossy().to_string()));
-            if kind == 'i' {
-                image_paths.push(path);
-            }
+        if resolved.iter().any(|(n, _, _)| n == full_name) {
+            continue;
         }
+        let Some(path) = media_token_path(full_name, workspace) else {
+            continue;
+        };
+        let original = (&cap[1] == "up")
+            .then(|| upload_original_name(workspace, full_name))
+            .flatten()
+            .filter(|n| n != full_name);
+        if &cap[2] == "i" {
+            image_paths.push(path.clone());
+        }
+        resolved.push((full_name.to_string(), path.to_string_lossy().to_string(), original));
     }
 
     if resolved.is_empty() {
@@ -838,8 +927,11 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRef
 
     let mut result = text.to_string();
     result.push_str("\n\n[file references]\n");
-    for (name, path) in &resolved {
-        result.push_str(&format!("@{name} = {path}\n"));
+    for (name, path, original) in &resolved {
+        match original {
+            Some(orig) => result.push_str(&format!("@{name} = {path} (original name: {orig})\n")),
+            None => result.push_str(&format!("@{name} = {path}\n")),
+        }
     }
     ResolvedRefs {
         text: result,

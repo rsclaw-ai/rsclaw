@@ -147,7 +147,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
                                 "sessionKey": sk,
                                 "type": "done",
                                 "role": "assistant",
-                                "files": event.files,
+                                "files": rsclaw_events::media::files_json(&event.files),
                                 "images": event.images,
                                 "toolLog": event.tool_log,
                             })
@@ -273,7 +273,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
                             "sessionKey": sk,
                             "type": "done",
                             "role": "assistant",
-                            "files": event.files,
+                            "files": rsclaw_events::media::files_json(&event.files),
                             "images": event.images,
                             "toolLog": event.tool_log,
                         })

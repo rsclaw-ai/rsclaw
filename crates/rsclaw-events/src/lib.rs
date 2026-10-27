@@ -13,6 +13,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod media;
+
 /// Why the gateway is asking the user to restart.
 ///
 /// Multi-source: the config file watcher, the BGE auto-downloader, and any
@@ -223,7 +225,13 @@ pub struct AgentEvent {
     pub done: bool,
     /// File attachments produced this turn: (filename, mime_type,
     /// local_path_or_url). Non-empty only on the final `done = true` event.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Clients receive each as `[name, mime, path, kind, token]`; see
+    /// [`media`].
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "media::serialize_files"
+    )]
     pub files: Vec<(String, String, String)>,
     /// Image attachments (base64 data URIs or local paths). The turn's
     /// images come on the final `done = true` event; a plugin can also push

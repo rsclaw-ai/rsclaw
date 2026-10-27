@@ -688,6 +688,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/sessions/{id}/messages", get(get_session_messages))
         .route("/sessions/{id}/clear", post(clear_session))
+        .route("/media/{token}", get(get_media))
         .route("/agents", get(list_agents).post(create_agent))
         .route("/agents/{id}", patch(patch_agent).delete(delete_agent))
         .route("/agents/{id}/status", get(agent_status))
@@ -1176,7 +1177,7 @@ async fn send_message(
                             "choices": [{"index":0,"delta":{},"finish_reason":"stop"}]
                         });
                         if !event.files.is_empty() {
-                            stop["rsclaw_files"] = serde_json::json!(event.files);
+                            stop["rsclaw_files"] = rsclaw_events::media::files_json(&event.files);
                         }
                         if !event.images.is_empty() {
                             stop["rsclaw_images"] = serde_json::json!(event.images);
@@ -2736,6 +2737,9 @@ async fn health(
         return Json(serde_json::json!({
             "status": "ok",
             "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+            // Clients fetch uploads and generated files by token from
+            // `/api/v1/media/<token>` when this is set.
+            "media": true,
         }));
     }
     Json(serde_json::json!({"status": "ok"}))
@@ -5918,7 +5922,7 @@ async fn openai_chat_completions(
                             "choices": [{"index":0,"delta":{},"finish_reason":"stop"}]
                         });
                         if !event.files.is_empty() {
-                            stop["rsclaw_files"] = serde_json::json!(event.files);
+                            stop["rsclaw_files"] = rsclaw_events::media::files_json(&event.files);
                         }
                         if !event.images.is_empty() {
                             stop["rsclaw_images"] = serde_json::json!(event.images);
@@ -7613,6 +7617,60 @@ struct FileObject {
     purpose: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    /// Canonical upload name (`up_<k>_<ts><abc>.<ext>`, no `@`): what a
+    /// client puts in a message as `@<token>` and fetches from
+    /// `/api/v1/media/<token>`. Absent on files uploaded before tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    /// The name the file was uploaded under (same as `filename`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_name: Option<String>,
+    /// `image` / `video` / `audio` / `doc` / `file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    /// Where the bytes live when they are stored as an upload in the
+    /// workspace rather than next to this metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+/// Workspace uploads land in: the default agent workspace, the same one the
+/// `@`-reference resolver and `/api/v1/media` look in.
+async fn default_workspace(state: &AppState) -> std::path::PathBuf {
+    state
+        .live
+        .agents
+        .read()
+        .await
+        .defaults
+        .workspace
+        .as_deref()
+        .map(rsclaw_util::expand_tilde)
+        .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"))
+}
+
+/// GET /api/v1/media/{token} — an uploaded, generated or A2A-received file
+/// by its canonical token (`dl_i_202610271200abc.png`, no `@`), for clients
+/// that are not on the gateway's machine. Supports Range, so video can seek
+/// and audio resume, and Last-Modified / If-Modified-Since. Only names the
+/// `@`-reference resolver accepts are served, from the three media buckets;
+/// anything else is 404.
+async fn get_media(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    let workspace = default_workspace(&state).await;
+    let Some(path) = rsclaw_channel::media_token_path(&token, &workspace) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "media not found"})),
+        )
+            .into_response();
+    };
+    use tower::ServiceExt as _;
+    let Ok(res) = tower_http::services::ServeFile::new(path).oneshot(req).await;
+    res.map(axum::body::Body::new).into_response()
 }
 
 /// Generate a unique file ID: `file-{timestamp_hex}{random_hex}`.
@@ -7723,16 +7781,22 @@ async fn upload_file(State(state): State<AppState>, mut multipart: Multipart) ->
     }
 
     let file_id = generate_file_id();
-    let stored_name = format!("{file_id}_{filename}");
-    let file_path = dir.join(&stored_name);
-
-    if let Err(e) = std::fs::write(&file_path, &data) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("failed to write file: {e}")})),
-        )
-            .into_response();
-    }
+    // The bytes go to the workspace under a canonical upload name, so the
+    // file can be `@`-referenced whatever it was called; this directory
+    // keeps only the metadata that maps the id to it.
+    let mime = content_type_for(&filename);
+    let workspace = default_workspace(&state).await;
+    let (token, file_path) = match rsclaw_channel::save_upload(&workspace, &filename, mime, &data)
+    {
+        Ok(saved) => saved,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("failed to write file: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7749,13 +7813,17 @@ async fn upload_file(State(state): State<AppState>, mut multipart: Multipart) ->
         filename: filename.clone(),
         purpose,
         url: Some(url),
+        kind: Some(rsclaw_events::media::kind_label(mime, &token).to_owned()),
+        token: Some(token.clone()),
+        original_name: Some(filename.clone()),
+        path: Some(file_path.to_string_lossy().into_owned()),
     };
 
     let meta_json = serde_json::to_string_pretty(&meta).unwrap_or_default();
     let meta_path = dir.join(format!("{file_id}.meta.json"));
     if let Err(e) = std::fs::write(&meta_path, &meta_json) {
         // Clean up the data file on metadata write failure.
-        let _ = std::fs::remove_file(&file_path);
+        rsclaw_channel::remove_upload(&workspace, &token);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("failed to write metadata: {e}")})),
@@ -7835,17 +7903,24 @@ async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
     }
     let dir = files_dir();
 
-    // Find the data file matching this file_id prefix.
-    let data_file = std::fs::read_dir(&dir)
-        .ok()
-        .and_then(|entries| {
-            entries.flatten().find(|e| {
-                let name = e.file_name();
-                let name = name.to_string_lossy();
-                name.starts_with(&format!("{file_id}_")) && !name.ends_with(".meta.json")
+    // A file stored as a workspace upload is where its metadata says;
+    // older uploads sit next to the metadata as `<id>_<name>`.
+    let stored = read_file_meta_from_disk(&file_id)
+        .and_then(|m| m.path)
+        .map(PathBuf::from)
+        .filter(|p| p.is_file());
+    let data_file = stored.or_else(|| {
+        std::fs::read_dir(&dir)
+            .ok()
+            .and_then(|entries| {
+                entries.flatten().find(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(&format!("{file_id}_")) && !name.ends_with(".meta.json")
+                })
             })
-        })
-        .map(|e| e.path());
+            .map(|e| e.path())
+    });
 
     let Some(path) = data_file else {
         return (
@@ -7878,11 +7953,19 @@ async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
 }
 
 /// DELETE /v1/files/{file_id} — delete a file.
-async fn delete_file(Path(file_id): Path<String>) -> impl IntoResponse {
+async fn delete_file(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+) -> impl IntoResponse {
     if let Err(e) = validate_file_id(&file_id) {
         return e.into_response();
     }
     let dir = files_dir();
+
+    // A file stored as a workspace upload goes with its metadata.
+    if let Some(token) = read_file_meta_from_disk(&file_id).and_then(|m| m.token) {
+        rsclaw_channel::remove_upload(&default_workspace(&state).await, &token);
+    }
 
     // Remove the metadata file.
     let meta_path = dir.join(format!("{file_id}.meta.json"));

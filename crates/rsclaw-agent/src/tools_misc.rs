@@ -80,10 +80,15 @@ impl AgentRuntime {
             text
         };
 
-        let out_path = std::env::temp_dir().join(format!(
-            "rsclaw_tts_{}.wav",
-            chrono::Utc::now().timestamp_millis()
-        ));
+        // Spoken replies are media the user receives like any other, so
+        // they take a canonical name a client can fetch and reference.
+        let out_path = rsclaw_channel::generated_media_path("wav").unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "auto-tts: downloads dir unavailable, using temp");
+            std::env::temp_dir().join(format!(
+                "rsclaw_tts_{}.wav",
+                chrono::Utc::now().timestamp_millis()
+            ))
+        });
         let out_str = out_path.to_string_lossy().to_string();
 
         // Try sherpa-onnx first. Binary lives under
@@ -215,17 +220,13 @@ impl AgentRuntime {
         let ts = chrono::Utc::now().timestamp_millis();
         let tmp_dir = std::env::temp_dir();
         // Final output is always mp3 for IM platform compatibility. It lands
-        // next to other generated media (~/Downloads/rsclaw/audios) so
-        // plugins can reuse it, e.g. as a voiceover for host compose-video.
-        let out_dir = crate::security::rsclaw_downloads_dir().join("audios");
-        let out_dir = match std::fs::create_dir_all(&out_dir) {
-            Ok(()) => out_dir,
-            Err(e) => {
-                tracing::warn!(dir = %out_dir.display(), error = %e, "tts: downloads dir unavailable, using temp");
-                tmp_dir.clone()
-            }
-        };
-        let out_path = out_dir.join(format!("rsclaw_tts_{ts}.mp3"));
+        // next to other generated media (~/Downloads/rsclaw/audios) under a
+        // canonical `dl_a_` name, so plugins can reuse it (e.g. as a
+        // voiceover for host compose-video) and users can `@` it.
+        let out_path = rsclaw_channel::generated_media_path("mp3").unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "tts: downloads dir unavailable, using temp");
+            tmp_dir.join(format!("rsclaw_tts_{ts}.mp3"))
+        });
         let out_path_str = out_path.to_string_lossy().to_string();
 
         let is_macos = cfg!(target_os = "macos");

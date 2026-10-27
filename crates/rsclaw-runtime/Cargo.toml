@@ -123,7 +123,7 @@ webrtc = { version = "=0.20.0", default-features = false, features = ["runtime-t
 futures = "0.3"
 bytes = "1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 tokenizers = "0.21"
 qrcode = "0.14"
 xz2 = "0.1"

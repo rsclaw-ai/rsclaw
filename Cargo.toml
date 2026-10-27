@@ -137,7 +137,7 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 bytes = "1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 tokenizers = "0.21"
 qrcode = "0.14"
 # `static` builds liblzma into the binary instead of linking `liblzma.so.5`.

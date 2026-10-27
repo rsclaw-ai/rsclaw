@@ -197,12 +197,22 @@ pub(crate) fn apply_patch(db: &RedbStore, key: &str, body: &Value) -> Result<Ses
 /// prefix) and `sent_at` (`"YYYY-MM-DD HH:MM"` or null) to a user message.
 /// Other roles are left unchanged.
 pub(crate) fn decorate_message(mut msg: Value) -> Value {
+    // Attachments in the client shape, `[name, mime, path, kind, token]`,
+    // whatever shape the row was stored in.
+    if let Some(files) = msg.get_mut("files") {
+        rsclaw_events::media::normalize_files_json(files);
+    }
     if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
         return msg;
     }
     let text = message_text(&msg);
     let (sent_at, body) = strip_injected_context(&text);
-    let body = body.to_owned();
+    // The `[file references]` block lists `@`-referenced paths for the
+    // model; the user typed only the `@token`s, which stay in the text.
+    let body = body
+        .split_once("\n\n[file references]\n")
+        .map_or(body, |(typed, _)| typed)
+        .to_owned();
     if let Some(obj) = msg.as_object_mut() {
         obj.insert("display_text".to_owned(), Value::String(body));
         obj.insert("sent_at".to_owned(), sent_at.map(Value::String).unwrap_or(Value::Null));
@@ -344,6 +354,18 @@ mod tests {
         assert!(res[0]["snippet"].as_str().expect("snippet").contains("25 度"));
         // The injected context prefix is not searchable content.
         assert!(search(&db, "Session started", 10).expect("search").is_empty());
+    }
+
+    #[test]
+    fn sessions_api_decorate_message_files_and_refs() {
+        let m = decorate_message(json!({
+            "role": "user",
+            "content": "看看 @up_i_1abc.png\n\n[file references]\n@up_i_1abc.png = /w/uploads/images/up_i_1abc.png\n",
+            "files": [["up_i_1abc.png", "image/png", "/w/uploads/images/up_i_1abc.png"]],
+        }));
+        assert_eq!(m["display_text"], "看看 @up_i_1abc.png");
+        assert_eq!(m["files"][0][3], "image");
+        assert_eq!(m["files"][0][4], "up_i_1abc.png");
     }
 
     #[test]
