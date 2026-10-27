@@ -121,12 +121,19 @@ fn collect_missing(v: &Value, fileish: bool, out: &mut Vec<String>) {
     }
 }
 
-/// `/x/…` or `C:\…` / `C:/…`; URLs and relative names don't count.
+/// `/x/…/name.ext` or `C:\…\name.ext` / `C:/…`: an absolute path to a file
+/// with an extension. URLs, relative names and base64 data (a JPEG's base64
+/// starts with `/9j/`) don't count.
 fn is_absolute_local(s: &str) -> bool {
     let s = s.trim();
     let b = s.as_bytes();
-    (s.starts_with('/') && !s.starts_with("//"))
-        || (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'))
+    let absolute = (s.starts_with('/') && !s.starts_with("//"))
+        || (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'));
+    let name = s.rsplit(['/', '\\']).next().unwrap_or("");
+    let has_ext = name.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty() && (1..=8).contains(&ext.len()) && ext.bytes().all(|c| c.is_ascii_alphanumeric())
+    });
+    absolute && has_ext && s.len() <= 1024 && !s.contains(['+', '='])
 }
 
 /// Arguments worth showing the approver, most telling first.
@@ -241,6 +248,10 @@ mod tests {
         });
         assert_eq!(missing_files(&args), vec!["/no/such/dir/dl_v_1.mp4", r"Z:\no\cover.png"]);
         assert!(missing_files(&json!({"video": here})).is_empty());
+        // Base64 image data and folder-like values are not file paths.
+        assert!(missing_files(&json!({"cover": "/9j/4AAQSkZJRgABAQ+AAAQABAAD/2wBD="})).is_empty());
+        assert!(missing_files(&json!({"cover": "/9j/4AAQSkZJRgABAQAAAQABAAD"})).is_empty());
+        assert!(missing_files(&json!({"image_dir": "/no/such/dir"})).is_empty());
     }
 
     #[test]

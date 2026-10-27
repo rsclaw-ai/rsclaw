@@ -979,16 +979,6 @@ impl AgentRuntime {
             // (16k against an 83k request the fleet refused): take the
             // request's own estimate when it is larger.
             let total_est = total_est.max(calibrated_tokens);
-            // A stateful backend (rsclaw) also keeps earlier turns' tool
-            // steps the runtime has dropped: its own last count, plus what
-            // this call adds, is the size that hits its per-session cap.
-            let total_est = match super::server_size(&ctx.session_key) {
-                Some(server) if self.providers.resolve_model(&model).0 == "rsclaw" => {
-                    let adding = messages.last().map(crate::context_mgr::msg_tokens).unwrap_or(0);
-                    total_est.max(server + adding)
-                }
-                _ => total_est,
-            };
             // Calibrated against the provider's real count: compact once the
             // next input and reply would no longer fit. Uncalibrated: keep a
             // 20% margin for the estimate's error.
@@ -997,6 +987,37 @@ impl AgentRuntime {
             } else {
                 context_limit * 80 / 100
             };
+            // A stateful backend (rsclaw) also keeps earlier turns' tool
+            // steps the runtime has dropped: its last reported size plus what
+            // this call adds is what meets its per-session cap. When only
+            // that is too big, the history itself is fine: have the backend
+            // take it afresh, without the old steps, instead of compacting.
+            let backend = {
+                let (name, _) = self.providers.resolve_model(&model);
+                self.providers.get(name).ok()
+            };
+            if let Some(provider) = backend.as_ref()
+                && provider.holds_dropped_steps(&ctx.session_key)
+                && let Some(server) = super::server_size(&ctx.session_key)
+            {
+                let adding: usize = messages
+                    .iter()
+                    .rev()
+                    .take_while(|m| !matches!(m.role, Role::Assistant))
+                    .map(crate::context_mgr::msg_tokens)
+                    .sum();
+                if server + adding > preflight_threshold && total_est <= preflight_threshold {
+                    info!(
+                        session = %ctx.session_key,
+                        server,
+                        adding,
+                        total_est,
+                        "pre-flight: backend session full of earlier tool steps; re-sending the history"
+                    );
+                    provider.drop_session(&ctx.session_key);
+                    super::forget_server_size(&ctx.session_key);
+                }
+            }
             if total_est > preflight_threshold && preflight_compaction_stalled {
                 // The stored session has nothing left to fold; shrink this
                 // turn's older tool results instead (handles stay readable).
@@ -1041,6 +1062,7 @@ impl AgentRuntime {
                     "pre-flight: approaching context limit, forcing compaction"
                 );
                 self.compact_inner(&ctx.session_key, model, true).await;
+                super::forget_server_size(&ctx.session_key);
                 let after = self.session_token_sum(&ctx.session_key);
                 if after < session_tokens {
                     // Rebuild the request from the compacted session PLUS this
@@ -1525,8 +1547,21 @@ impl AgentRuntime {
                     StreamEvent::Done { usage } => {
                         // Update context total with real usage from LLM if available.
                         if let Some(ref u) = usage {
-                            record_token_scale(&ctx.session_key, u.input, approx_tokens);
-                            super::record_server_size(&ctx.session_key, (u.input + u.output) as usize);
+                            // A backend still holding dropped tool steps
+                            // reports the session's size, not this request's:
+                            // track it as such and keep it out of the scale.
+                            let holds = {
+                                let (name, _) = self.providers.resolve_model(&model);
+                                self.providers
+                                    .get(name)
+                                    .is_ok_and(|p| p.holds_dropped_steps(&ctx.session_key))
+                            };
+                            if holds {
+                                super::record_server_size(&ctx.session_key, (u.input + u.output) as usize);
+                            } else {
+                                record_token_scale(&ctx.session_key, u.input, approx_tokens);
+                                super::forget_server_size(&ctx.session_key);
+                            }
                             let real_tokens = (u.input + u.output) as usize;
                             if let Ok(mut map) = self.handle.session_tokens.write() {
                                 if let Some(st) = map.get_mut(&ctx.session_key) {

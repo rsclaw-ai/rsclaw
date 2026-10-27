@@ -622,6 +622,15 @@ pub trait LlmProvider: Send + Sync {
     /// history on every call, so the default does nothing.
     #[allow(unused_variables)]
     fn drop_session(&self, session_key: &str) {}
+
+    /// Whether the backend's session holds more than the runtime's history:
+    /// tool steps the runtime dropped at turn end. Its reported prompt size
+    /// is then the session's real size, not a measure of the runtime's
+    /// estimate. Stateless providers hold nothing, so the default is false.
+    #[allow(unused_variables)]
+    fn holds_dropped_steps(&self, session_key: &str) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

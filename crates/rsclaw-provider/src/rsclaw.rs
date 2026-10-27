@@ -259,21 +259,32 @@ struct SessionEntry {
     /// call (the one whose delta is the user message) and a fingerprint of
     /// the history before that message. See [`turn_scratch_dropped`].
     turn_base: Option<(usize, u64)>,
-    /// The server still holds a finished turn's tool calls and results
-    /// that the runtime has dropped from its own history. Its message
-    /// indices no longer line up with ours, so an in-place compaction
-    /// splice must not run; compaction re-sends the history instead.
+    /// Tool results were sent on this session: the server holds tool calls
+    /// and results the runtime drops from its own history at turn end. Its
+    /// message indices no longer line up with ours, so an in-place
+    /// compaction splice must not run (compaction re-sends the history),
+    /// and its reported size is larger than the runtime's history.
     scratch_kept: bool,
+    /// The last call's stream ended normally with a final reply (Done, no
+    /// tool call), so the server committed it. A turn that was cancelled,
+    /// timed out or failed leaves this false, and the next turn re-sends
+    /// the history rather than trust the server's partial state.
+    turn_finished: bool,
 }
 
-/// Whether the request's delta is a person's message (a new turn), not a
-/// batch of tool results.
+/// Whether `m` is part of a turn's tool scratch: a tool result (as a Tool
+/// message or a user message carrying results) or an assistant tool call.
+fn is_tool_step(m: &Message) -> bool {
+    matches!(m.role, Role::Tool)
+        || matches!(&m.content, MessageContent::Parts(parts)
+            if parts.iter().any(|p| matches!(p, ContentPart::ToolResult { .. } | ContentPart::ToolUse { .. })))
+}
+
+/// Whether the request starts a new turn: it ends in a person's message
+/// and carries no tool steps (the runtime keeps none across turns, so any
+/// tool step means this is a later call within a turn).
 fn starts_user_turn(msgs: &[Message]) -> bool {
-    msgs.last().is_some_and(|m| {
-        matches!(m.role, Role::User)
-            && !matches!(&m.content, MessageContent::Parts(parts)
-                if parts.iter().any(|p| matches!(p, ContentPart::ToolResult { .. })))
-    })
+    msgs.last().is_some_and(|m| matches!(m.role, Role::User)) && !msgs.iter().any(is_tool_step)
 }
 
 /// The turn base to remember for a request that starts a turn.
@@ -291,20 +302,29 @@ fn history_fingerprint(msgs: &[Message]) -> u64 {
     h.finish()
 }
 
-/// Whether a request that is shorter than the previous call only lacks the
-/// last turn's tool calls and results: it starts a new turn (ends in a user
-/// message), keeps the history before the last turn's user message
-/// unchanged, and adds at least the new user message after it. The runtime
-/// drops a finished turn's scratch from its history by design; the server
-/// keeps it, which is harmless, so this is no reason to re-send ~60k tokens.
-fn turn_scratch_dropped(entry: &SessionEntry, msgs: &[Message]) -> bool {
-    let Some((base_len, base_fp)) = entry.turn_base else {
-        return false;
-    };
-    starts_user_turn(msgs)
-        && base_len >= 1
-        && msgs.len() > base_len
-        && history_fingerprint(&msgs[..base_len - 1]) == base_fp
+/// Why a request starting a new turn can't simply be appended, or `None`
+/// when it can: the last turn ended with a reply the server committed, the
+/// history before that turn's user message is unchanged, and since then
+/// the runtime added exactly that reply and the new user message. Whatever
+/// the runtime dropped of the last turn (its tool steps) the server keeps,
+/// which is harmless; anything the runtime added that the server never saw
+/// (a failed-turn note, a background writeback) needs a replay.
+fn turn_continuation_problem(entry: &SessionEntry, msgs: &[Message]) -> Option<String> {
+    let (base_len, base_fp) = entry.turn_base?;
+    if !entry.turn_finished {
+        return Some("the last turn did not end with a reply (cancelled, timed out or failed)".to_owned());
+    }
+    if base_len == 0
+        || msgs.len() != base_len + 2
+        || !matches!(msgs[base_len].role, Role::Assistant)
+    {
+        return Some(format!(
+            "expected the last turn's reply and a new message after {base_len} messages, got {}",
+            msgs.len()
+        ));
+    }
+    (history_fingerprint(&msgs[..base_len - 1]) != base_fp)
+        .then(|| "earlier history changed (compaction, repair or reset)".to_owned())
 }
 
 impl RsclawProvider {
@@ -490,25 +510,24 @@ impl RsclawProvider {
             return Err(format!("prefix changed ({} -> {prefix_id})", entry.prefix_id));
         }
         let msgs_len = msgs.len();
-        if msgs_len < entry.last_seen_msgs_len {
-            if !turn_scratch_dropped(entry, msgs) {
-                return Err(format!(
-                    "history trimmed: {msgs_len} messages after {} (compaction, repair or \
-                     reset), not just the last turn's dropped tool steps",
-                    entry.last_seen_msgs_len
-                ));
+        let new_turn = starts_user_turn(msgs);
+        if new_turn && entry.turn_base.is_some() {
+            if let Some(problem) = turn_continuation_problem(entry, msgs) {
+                return Err(problem);
             }
-            tracing::debug!(
-                session_key,
-                msgs_len,
-                last_seen = entry.last_seen_msgs_len,
-                "rsclaw: last turn's tool steps dropped locally, server keeps them; appending"
-            );
+        } else if msgs_len < entry.last_seen_msgs_len {
+            return Err(format!(
+                "history trimmed within a turn: {msgs_len} messages after {}",
+                entry.last_seen_msgs_len
+            ));
+        }
+        if new_turn {
+            entry.turn_base = turn_base_of(msgs);
+        }
+        if msgs.last().is_some_and(is_tool_step) {
             entry.scratch_kept = true;
         }
-        if let Some(base) = turn_base_of(msgs) {
-            entry.turn_base = Some(base);
-        }
+        entry.turn_finished = false;
         entry.last_seen_msgs_len = msgs_len;
         Ok(entry.clone())
     }
@@ -863,6 +882,10 @@ impl LlmProvider for RsclawProvider {
         })
     }
 
+    fn holds_dropped_steps(&self, session_key: &str) -> bool {
+        self.lock_sessions().get(session_key).is_some_and(|e| e.scratch_kept)
+    }
+
     /// The next call on `session_key` re-opens the session by
     /// /sessions/replay from the request's history.
     fn drop_session(&self, session_key: &str) {
@@ -902,6 +925,7 @@ impl LlmProvider for RsclawProvider {
             // the duration of the splice.
             let session_id = {
                 let map = self.lock_sessions();
+                let mut map = map;
                 let entry = map.get(session_key).ok_or_else(|| {
                     anyhow::anyhow!(
                         "rsclaw compact splice: no cached session for key {session_key} — \
@@ -909,10 +933,9 @@ impl LlmProvider for RsclawProvider {
                     )
                 })?;
                 if entry.scratch_kept {
-                    drop(map);
                     // Our indices don't match the server's: re-send the
                     // compacted history instead of splicing by count.
-                    self.forget(session_key);
+                    map.remove(session_key);
                     anyhow::bail!(
                         "rsclaw compact splice: the server holds earlier turns' tool steps, \
                          so its message indices differ from ours; replaying the compacted \
@@ -1040,8 +1063,20 @@ fn invalidate_on_error(
 ) -> LlmStream {
     use futures::StreamExt;
     let mut errored = false;
+    let mut called_tool = false;
     Box::pin(inner.inspect(move |item| {
         if errored {
+            return;
+        }
+        if matches!(item, Ok(StreamEvent::ToolCall { .. })) {
+            called_tool = true;
+        }
+        // A final reply that streamed to its end: the server committed it.
+        if matches!(item, Ok(StreamEvent::Done { .. })) && !called_tool {
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = map.get_mut(&session_key) {
+                entry.turn_finished = true;
+            }
             return;
         }
         let invalidate = match item {
@@ -5414,12 +5449,20 @@ data: {"type":"block_stop","index":0}
         assert!(provider.lookup_and_bump("missing", p, &msgs("u")).is_err());
     }
 
+    fn msg(role: Role, text: &str) -> Message {
+        Message { role, content: MessageContent::Text(text.into()), rsclaw_hidden: None }
+    }
+
+    fn mark_finished(provider: &RsclawProvider, key: &str) {
+        provider.lock_sessions().get_mut(key).expect("entry").turn_finished = true;
+    }
+
     #[test]
     fn a_dropped_turn_scratch_keeps_the_server_session() {
         let provider = RsclawProvider::new("http://x", None);
-        // Turn 2 starts after "u a" and opened the session (no bump yet),
-        // then runs two tool rounds.
-        let mut turn = msgs("uau");
+        // Turn 2 starts after "u a" and opened the session, then runs two
+        // tool rounds.
+        let turn = msgs("uau");
         provider.store("k", SessionEntry {
             session_id: "rs_a".into(),
             prefix_id: "p".into(),
@@ -5427,21 +5470,120 @@ data: {"type":"block_stop","index":0}
             turn_base: turn_base_of(&turn),
             ..Default::default()
         });
-        turn.extend(msgs("atat").into_iter().skip(0));
-        assert!(provider.lookup_and_bump("k", "p", &turn).is_ok());
-        // Turn 3: the runtime kept "u a u" + final "a", dropped the scratch,
-        // and adds the new user message: shorter, but no replay.
-        let mut next = msgs("uau");
-        next.push(Message { role: Role::Assistant, content: MessageContent::Text("final".into()), rsclaw_hidden: None });
-        next.push(Message { role: Role::User, content: MessageContent::Text("发".into()), rsclaw_hidden: None });
-        let entry = provider.lookup_and_bump("k", "p", &next).expect("kept");
+        let mut call = turn.clone();
+        call.extend(msgs("at"));
+        assert!(provider.lookup_and_bump("k", "p", &call).is_ok());
+        assert!(provider.lock_sessions()["k"].scratch_kept, "tool results were sent");
+        call.extend(msgs("at"));
+        assert!(provider.lookup_and_bump("k", "p", &call).is_ok());
+        mark_finished(&provider, "k");
+        // Turn 3: the runtime kept "u a u" + the final reply, dropped the
+        // scratch, and adds the new user message: shorter, but appended.
+        let mut next = turn.clone();
+        next.push(msg(Role::Assistant, "final"));
+        next.push(msg(Role::User, "发"));
+        let entry = provider.lookup_and_bump("k", "p", &next).expect("appended");
         assert!(entry.scratch_kept);
-        // Same length but an earlier message changed (compaction) → replay.
-        let mut compacted = next.clone();
-        compacted[0] = Message { role: Role::User, content: MessageContent::Text("[summary]".into()), rsclaw_hidden: None };
-        compacted.truncate(3);
-        compacted.push(Message { role: Role::User, content: MessageContent::Text("x".into()), rsclaw_hidden: None });
+        assert!(!entry.turn_finished, "reset for the call now running");
+
+        // Turn 4 after a turn that never finished (cancelled / timed out,
+        // the runtime wrote a failed-turn note the server never saw).
+        let mut after_fail = next.clone();
+        after_fail.push(msg(Role::Assistant, "⚠️ 这一轮没有完成"));
+        after_fail.push(msg(Role::User, "继续"));
+        assert!(provider.lookup_and_bump("k", "p", &after_fail).is_err());
+    }
+
+    #[test]
+    fn only_the_last_reply_may_sit_between_turns() {
+        let provider = RsclawProvider::new("http://x", None);
+        let turn = msgs("uau");
+        provider.store("k", SessionEntry {
+            session_id: "rs_a".into(),
+            prefix_id: "p".into(),
+            last_seen_msgs_len: turn.len(),
+            turn_base: turn_base_of(&turn),
+            turn_finished: true,
+            ..Default::default()
+        });
+        // A background writeback the server never saw, between the reply
+        // and the new message.
+        let mut extra = turn.clone();
+        extra.push(msg(Role::Assistant, "final"));
+        extra.push(msg(Role::Assistant, "图片已生成：/d/images/dl_i_1a.png"));
+        extra.push(msg(Role::User, "好"));
+        assert!(provider.lookup_and_bump("k", "p", &extra).is_err());
+
+        // An earlier message changed (compaction) at the right length.
+        provider.store("k", SessionEntry {
+            session_id: "rs_a".into(),
+            prefix_id: "p".into(),
+            last_seen_msgs_len: turn.len(),
+            turn_base: turn_base_of(&turn),
+            turn_finished: true,
+            ..Default::default()
+        });
+        let mut compacted = turn.clone();
+        compacted[0] = msg(Role::User, "[summary]");
+        compacted.push(msg(Role::Assistant, "final"));
+        compacted.push(msg(Role::User, "x"));
         assert!(provider.lookup_and_bump("k", "p", &compacted).is_err());
+    }
+
+    #[test]
+    fn clear_after_a_first_turn_replays() {
+        let provider = RsclawProvider::new("http://x", None);
+        let first = msgs("u");
+        provider.store("k", SessionEntry {
+            session_id: "rs_a".into(),
+            prefix_id: "p".into(),
+            last_seen_msgs_len: 1,
+            turn_base: turn_base_of(&first),
+            turn_finished: true,
+            ..Default::default()
+        });
+        // /clear leaves a summary, then the new message.
+        let cleared = vec![msg(Role::User, "[summary of the cleared chat]"), msg(Role::User, "hi")];
+        assert!(provider.lookup_and_bump("k", "p", &cleared).is_err());
+    }
+
+    #[tokio::test]
+    async fn splice_is_skipped_once_the_server_holds_tool_steps() {
+        let provider = RsclawProvider::new("http://x", None);
+        provider.store("k", SessionEntry {
+            session_id: "rs_a".into(),
+            prefix_id: "p".into(),
+            scratch_kept: true,
+            ..Default::default()
+        });
+        assert!(provider.holds_dropped_steps("k"));
+        let err = provider.compact_splice("k", 2, "summary", 2, Some(9)).await.unwrap_err();
+        assert!(err.to_string().contains("replaying"), "{err}");
+        assert!(provider.lock_sessions().get("k").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_final_reply_marks_the_turn_finished() {
+        use futures::StreamExt;
+        let provider = RsclawProvider::new("http://x", None);
+        let store = |p: &RsclawProvider| {
+            p.store("k", SessionEntry { session_id: "rs_a".into(), prefix_id: "p".into(), ..Default::default() })
+        };
+        store(&provider);
+        let reply: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::TextDelta("ok".into())),
+            Ok(StreamEvent::Done { usage: None }),
+        ]));
+        let _: Vec<_> = invalidate_on_error(reply, Arc::clone(&provider.sessions), "k".into()).collect().await;
+        assert!(provider.lock_sessions()["k"].turn_finished);
+
+        store(&provider);
+        let tool_call: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::ToolCall { id: "t1".into(), name: "exec".into(), input: serde_json::json!({}) }),
+            Ok(StreamEvent::Done { usage: None }),
+        ]));
+        let _: Vec<_> = invalidate_on_error(tool_call, Arc::clone(&provider.sessions), "k".into()).collect().await;
+        assert!(!provider.lock_sessions()["k"].turn_finished);
     }
 
     #[test]
