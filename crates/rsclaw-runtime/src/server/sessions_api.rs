@@ -267,11 +267,21 @@ pub(crate) fn search(db: &RedbStore, query: &str, limit: usize) -> anyhow::Resul
             if role != "user" && role != "assistant" {
                 return None;
             }
+            if rsclaw_events::notice::is_hidden_message(m) {
+                return None;
+            }
             let text = message_text(m);
             if text.starts_with("[CONTEXT COMPACTION") {
                 return None;
             }
-            let body = if role == "user" { strip_injected_context(&text).1 } else { text.as_str() };
+            // Only what the user sees: no injected context, no `[file
+            // references]` / `[attachments]` blocks meant for the model.
+            let body = if role == "user" {
+                let body = strip_injected_context(&text).1;
+                body.split_once("\n\n[file references]\n").map_or(body, |(typed, _)| typed)
+            } else {
+                rsclaw_events::media::strip_attachments_note(&text)
+            };
             match_snippet(body, query, SNIPPET_CHARS)
         });
         if let Some(snippet) = snippet {
@@ -317,6 +327,9 @@ mod tests {
         db.append_message(a, &user("明天北京天气怎么样")).expect("append");
         db.append_message(a, &json!({"role": "assistant", "content": "明天晴，最高 25 度"}))
             .expect("append");
+        db.append_message(a, &json!({"role": "assistant",
+            "content": "成片好了\n\n[attachments]\n@dl_v_1a.mp4 = /d/videos/dl_v_1a.mp4"}))
+            .expect("append");
         db.append_message(b, &json!({"role": "user", "content": "Rust lifetimes question"}))
             .expect("append");
 
@@ -327,7 +340,7 @@ mod tests {
         assert_eq!(da.title.as_deref(), Some("明天北京天气怎么样"));
         assert_eq!(da.agent_id.as_deref(), Some("main"));
         assert_eq!(da.channel.as_deref(), Some("feishu"));
-        assert_eq!(da.message_count, 2);
+        assert_eq!(da.message_count, 3);
         let ja = da.to_json();
         assert_eq!(ja["title_source"], "auto");
 
@@ -365,6 +378,19 @@ mod tests {
         assert!(res[0]["snippet"].as_str().expect("snippet").contains("25 度"));
         // The injected context prefix is not searchable content.
         assert!(search(&db, "Session started", 10).expect("search").is_empty());
+    }
+
+    #[test]
+    fn sessions_api_search_skips_model_only_text() {
+        let (db, _dir) = open_db();
+        db.append_message("s", &user("看看 @up_i_1abc.png\n\n[file references]\n@up_i_1abc.png = /w/uploads/images/up_i_1abc.png"))
+            .expect("append");
+        db.append_message("s", &json!({"role": "assistant",
+            "content": "成片好了\n\n[attachments]\n@dl_v_1a.mp4 = /d/videos/dl_v_1a.mp4"}))
+            .expect("append");
+        assert!(search(&db, "/d/videos", 10).expect("search").is_empty());
+        assert!(search(&db, "/w/uploads", 10).expect("search").is_empty());
+        assert_eq!(search(&db, "成片", 10).expect("search").len(), 1);
     }
 
     #[test]
