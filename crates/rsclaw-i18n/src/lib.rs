@@ -2735,6 +2735,29 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "de" => "Nach dem Lesen verbrennen",
     );
 
+    // Async image / video jobs: the delivery that carries the result and
+    // the line written back into the session's history.
+    msg!("job_kind_image", "en" => "image", "zh" => "图片");
+    msg!("job_kind_video", "en" => "video", "zh" => "视频");
+    msg!("job_delivered", "en" => "[{kind}] {prompt}", "zh" => "[{kind}] {prompt}");
+    msg!("job_delivery_failed",
+        "en" => "[{kind} failed] {prompt}: {reason}",
+        "zh" => "[{kind}生成失败] {prompt}：{reason}",
+    );
+    msg!("job_ready",
+        "en" => "The {kind} is ready at {path} (@{token}).",
+        "zh" => "{kind}已生成：{path}（@{token}）",
+    );
+    msg!("job_ready_plain", "en" => "The {kind} is ready at {path}.", "zh" => "{kind}已生成：{path}");
+    msg!("job_failed",
+        "en" => "The {kind} generation failed: {reason}",
+        "zh" => "{kind}生成失败：{reason}",
+    );
+    msg!("job_timed_out",
+        "en" => "The {kind} generation timed out: {reason}",
+        "zh" => "{kind}生成超时：{reason}",
+    );
+
     m
 });
 

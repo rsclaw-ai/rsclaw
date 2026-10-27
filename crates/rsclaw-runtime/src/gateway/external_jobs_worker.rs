@@ -9,7 +9,7 @@
 //! and add the URL → Done outcome mapping.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -52,6 +52,22 @@ const DELIVERY_RETRY_DELAY_SECS: u64 = 30;
 /// the lease only matters if the process dies mid-cycle.
 const CLAIM_LEASE_SECS: i64 = 600;
 
+/// A session's finished jobs wake its agent once, together: the wake waits
+/// until no other job of that session is still running and none has
+/// finished for this many seconds...
+const WAKE_SETTLE_SECS: i64 = 10;
+
+/// ...or until the first of them has waited this long, so one stuck job
+/// doesn't hold back results the agent could already use.
+const WAKE_MAX_WAIT_SECS: i64 = 600;
+
+/// Finished jobs of one session waiting to wake its agent.
+struct PendingWake {
+    jobs: Vec<ExternalJob>,
+    first_at: i64,
+    last_at: i64,
+}
+
 pub struct ExternalJobsWorker {
     store: Arc<RedbStore>,
     notification_tx: broadcast::Sender<OutboundMessage>,
@@ -67,6 +83,9 @@ pub struct ExternalJobsWorker {
     /// Job ids currently being processed by a spawned task. Guards against
     /// re-spawning the same job on the next tick.
     in_flight: Arc<Mutex<HashSet<String>>>,
+    /// Finished jobs per session whose follow-up turn hasn't been queued
+    /// yet. In memory: like the wake itself, best-effort.
+    pending_wakes: Mutex<HashMap<String, PendingWake>>,
 }
 
 /// Removes a job id from the in-flight set when the processing task ends.
@@ -102,6 +121,7 @@ impl ExternalJobsWorker {
             client,
             op_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OPS)),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
+            pending_wakes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -173,6 +193,7 @@ impl ExternalJobsWorker {
                 Ok(_) => {}
                 Err(e) => error!("external jobs: due query failed: {e:#}"),
             }
+            self.flush_wakes(chrono::Utc::now().timestamp());
 
             // GC every ~12 ticks (~1 minute) — terminal rows older than the
             // retention window get dropped.
@@ -352,7 +373,7 @@ impl ExternalJobsWorker {
             self.emit_session_event(job);
             // Runs once per job: this branch is only reached while
             // `delivered_at` was still unset.
-            wake_session(job);
+            self.queue_wake(job);
         } else {
             let now = chrono::Utc::now().timestamp();
             job.next_poll_at = now + DELIVERY_RETRY_DELAY_SECS as i64;
@@ -373,7 +394,7 @@ impl ExternalJobsWorker {
     fn write_back_to_session(&self, job: &ExternalJob) -> Result<()> {
         let mut msg = json!({
             "role": "assistant",
-            "content": writeback_text(job),
+            "content": writeback_text(job, job_lang()),
             "external_job_id": job.id,
             "sent_at": chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
         });
@@ -498,15 +519,17 @@ impl ExternalJobsWorker {
     /// (`attempt_delivery`) uses the boolean to decide whether to stamp
     /// `delivered_at` or schedule another retry tick.
     async fn deliver_success(&self, job: &ExternalJob) -> bool {
-        let kind_label = match job.kind {
-            ExternalJobKind::VideoGen => "video",
-            ExternalJobKind::ImageGen => "image",
-        };
+        let lang = job_lang();
         let prompt_preview: String = job.prompt.chars().take(80).collect();
+        let text = rsclaw_i18n::t_fmt(
+            "job_delivered",
+            lang,
+            &[("kind", &kind_name(job, lang)), ("prompt", &prompt_preview)],
+        );
         let out = OutboundMessage {
             target_id: job.delivery.target_id.clone(),
             is_group: job.delivery.is_group,
-            text: format!("[{kind_label}] {prompt_preview}"),
+            text,
             reply_to: job.delivery.reply_to.clone(),
             images: vec![],
             files: result_files(job),
@@ -523,13 +546,18 @@ impl ExternalJobsWorker {
     }
 
     async fn deliver_failure(&self, job: &ExternalJob) -> bool {
-        let kind_label = match job.kind {
-            ExternalJobKind::VideoGen => "video",
-            ExternalJobKind::ImageGen => "image",
-        };
+        let lang = job_lang();
         let reason = job.error.as_deref().unwrap_or("unknown error");
         let prompt_preview: String = job.prompt.chars().take(80).collect();
-        let text = format!("[{kind_label} failed] {prompt_preview}: {reason}");
+        let text = rsclaw_i18n::t_fmt(
+            "job_delivery_failed",
+            lang,
+            &[
+                ("kind", &kind_name(job, lang)),
+                ("prompt", &prompt_preview),
+                ("reason", reason),
+            ],
+        );
         let out = OutboundMessage {
             target_id: job.delivery.target_id.clone(),
             is_group: job.delivery.is_group,
@@ -550,26 +578,46 @@ impl ExternalJobsWorker {
     }
 }
 
+/// Language for what job results say to the user and in history: the
+/// gateway's configured language (JSON mode has no sentences, so English).
+fn job_lang() -> &'static str {
+    match rsclaw_i18n::default_lang() {
+        "json" => "en",
+        lang => lang,
+    }
+}
+
+/// "image" / "video" in `lang`.
+fn kind_name(job: &ExternalJob, lang: &str) -> String {
+    let key = match job.kind {
+        ExternalJobKind::VideoGen => "job_kind_video",
+        ExternalJobKind::ImageGen => "job_kind_image",
+    };
+    rsclaw_i18n::t(key, lang)
+}
+
 /// The history line for a finished job: one sentence the model can act on
 /// in a later turn, with the path to hand to the next tool and the `@token`
-/// the user can refer to. Clients render the attachment from `files`.
-fn writeback_text(job: &ExternalJob) -> String {
-    let kind = match job.kind {
-        ExternalJobKind::VideoGen => "video",
-        ExternalJobKind::ImageGen => "image",
-    };
+/// the user can refer to. Clients render the attachment from `files`. It is
+/// shown to the user, so it speaks `lang`.
+fn writeback_text(job: &ExternalJob, lang: &str) -> String {
+    let kind = kind_name(job, lang);
     if !matches!(job.status, ExternalJobStatus::Done) {
-        let status = match job.status {
-            ExternalJobStatus::TimedOut => "timed out",
-            _ => "failed",
+        let key = match job.status {
+            ExternalJobStatus::TimedOut => "job_timed_out",
+            _ => "job_failed",
         };
         let reason = job.error.as_deref().unwrap_or("unknown error");
-        return format!("The {kind} generation {status}: {reason}");
+        return rsclaw_i18n::t_fmt(key, lang, &[("kind", &kind), ("reason", reason)]);
     }
     let path = job.result_path.as_deref().unwrap_or("");
     match rsclaw_events::media::token_for_path(path) {
-        Some(token) => format!("The {kind} is ready at {path} (@{token})."),
-        None => format!("The {kind} is ready at {path}."),
+        Some(token) => rsclaw_i18n::t_fmt(
+            "job_ready",
+            lang,
+            &[("kind", &kind), ("path", path), ("token", &token)],
+        ),
+        None => rsclaw_i18n::t_fmt("job_ready_plain", lang, &[("kind", &kind), ("path", path)]),
     }
 }
 
@@ -583,85 +631,165 @@ fn should_wake(job: &ExternalJob) -> bool {
         && !job.session_key.starts_with("cron:")
 }
 
-/// Queue one turn on the job's session so the agent can carry a multi-step
-/// request on ("make an image, then a video from it") instead of waiting
-/// for the user to speak again. Best-effort, like the history writeback.
-fn wake_session(job: &ExternalJob) {
-    if !should_wake(job) {
-        return;
+impl ExternalJobsWorker {
+    /// Hold a delivered job's wake until the session's other jobs are in.
+    fn queue_wake(&self, job: &ExternalJob) {
+        if !should_wake(job) {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp();
+        let mut wakes = self.pending_wakes.lock().unwrap_or_else(|e| e.into_inner());
+        let wake = wakes.entry(job.session_key.clone()).or_insert_with(|| PendingWake {
+            jobs: Vec::new(),
+            first_at: now,
+            last_at: now,
+        });
+        wake.jobs.push(job.clone());
+        wake.last_at = now;
     }
+
+    /// Wake each session whose finished jobs have settled: nothing else of
+    /// that session is still running and nothing finished in the last
+    /// [`WAKE_SETTLE_SECS`], or the oldest has waited [`WAKE_MAX_WAIT_SECS`].
+    fn flush_wakes(&self, now: i64) {
+        let candidates: Vec<(String, i64)> = {
+            let wakes = self.pending_wakes.lock().unwrap_or_else(|e| e.into_inner());
+            wakes
+                .iter()
+                .filter(|(_, w)| now - w.last_at >= WAKE_SETTLE_SECS)
+                .map(|(k, w)| (k.clone(), w.first_at))
+                .collect()
+        };
+        for (session_key, first_at) in candidates {
+            let running = match self.store.count_unsettled_external_jobs(&session_key) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(session = %session_key, "external jobs: unsettled count failed: {e:#}");
+                    0
+                }
+            };
+            if running > 0 && now - first_at < WAKE_MAX_WAIT_SECS {
+                continue;
+            }
+            let wake = self
+                .pending_wakes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&session_key);
+            if let Some(wake) = wake {
+                wake_session(&session_key, &wake.jobs, running);
+            }
+        }
+    }
+}
+
+/// Queue one turn on the session so the agent can carry a multi-step
+/// request on ("make an image, then a video from it") instead of waiting
+/// for the user to speak again. All of `jobs` share one turn. Best-effort,
+/// like the history writeback.
+fn wake_session(session_key: &str, jobs: &[ExternalJob], running: usize) {
+    let Some(last) = jobs.last() else {
+        return;
+    };
     let Some(tq) = super::task_queue::get_task_queue() else {
-        debug!(job_id = %job.id, "external jobs: task queue not installed, no follow-up turn");
+        debug!(session = %session_key, "external jobs: task queue not installed, no follow-up turn");
         return;
     };
     // Desktop chats run on the `ws` channel but reply through the `desktop`
     // sender, the same mapping `/goal` uses.
-    let channel = match job.delivery.channel.as_str() {
+    let channel = match last.delivery.channel.as_str() {
         "ws" => "desktop",
         other => other,
     };
     let message = QueuedMessage {
-        text: wake_text(job),
-        sender: job.delivery.target_id.clone(),
+        text: wake_text(jobs, running),
+        sender: last.delivery.target_id.clone(),
         channel: channel.to_owned(),
-        account: job.delivery.account.clone(),
-        chat_id: job.delivery.target_id.clone(),
-        is_group: job.delivery.is_group,
+        account: last.delivery.account.clone(),
+        chat_id: last.delivery.target_id.clone(),
+        is_group: last.delivery.is_group,
         reply_to: None,
         timestamp: chrono::Utc::now().timestamp(),
         images: vec![],
         files: vec![],
     };
-    match tq.submit(&job.session_key, message, Priority::System) {
+    match tq.submit(session_key, message, Priority::System) {
         Ok((task_id, merged)) => info!(
-            job_id = %job.id,
-            session = %job.session_key,
+            session = %session_key,
+            jobs = jobs.len(),
+            running,
             %task_id,
             merged,
             "external jobs: follow-up turn queued"
         ),
-        Err(e) => warn!(job_id = %job.id, "external jobs: follow-up turn not queued: {e:#}"),
+        Err(e) => warn!(session = %session_key, "external jobs: follow-up turn not queued: {e:#}"),
     }
 }
 
-/// The notice the agent wakes up to. It asks for NO_REPLY when nothing is
-/// left, which the runtime turns into an empty reply that never reaches the
-/// user. A failure must not be resubmitted, or a job that keeps failing
-/// would wake the agent forever.
-fn wake_text(job: &ExternalJob) -> String {
-    let kind = match job.kind {
-        ExternalJobKind::VideoGen => "video",
-        ExternalJobKind::ImageGen => "image",
-    };
-    let id = &job.id;
-    if matches!(job.status, ExternalJobStatus::Done) {
-        let path = job.result_path.as_deref().unwrap_or("");
-        let notice = rsclaw_events::notice::AUTO_NOTICE;
-        format!(
-            "[{kind} generation complete] job {id}: {path}\n\
-             {notice} The user has \
-             already received the {kind}. If the request you were working on has steps \
-             that need it (for example making a video from this image, or publishing \
-             it), carry them out now using the path above. Do not resend or describe \
-             the {kind}. If nothing is left to do, or you already used this result, \
-             reply with exactly NO_REPLY."
-        )
-    } else {
-        let status = match job.status {
-            ExternalJobStatus::TimedOut => "timed out",
-            _ => "failed",
+/// The notice the agent wakes up to: one line per finished job, then what
+/// to do. It asks for NO_REPLY when nothing is left, which the runtime turns
+/// into an empty reply that never reaches the user. Nothing listed may be
+/// resubmitted: a finished job would be paid for twice, and a job that keeps
+/// failing would wake the agent forever. `running` is how many of the
+/// session's jobs are still in flight.
+fn wake_text(jobs: &[ExternalJob], running: usize) -> String {
+    let mut text = String::new();
+    let mut any_done = false;
+    let mut any_failed = false;
+    for job in jobs {
+        let kind = match job.kind {
+            ExternalJobKind::VideoGen => "video",
+            ExternalJobKind::ImageGen => "image",
         };
-        let reason = job.error.as_deref().unwrap_or("unknown error");
-        let notice = rsclaw_events::notice::AUTO_NOTICE;
-        format!(
-            "[{kind} generation {status}] job {id}: {reason}\n\
-             {notice} The user has \
-             already been told. Do not resubmit this job. If the request you were \
-             working on can still finish without it, finish it; if the user needs to \
-             decide what to do next, ask them briefly. Otherwise reply with exactly \
-             NO_REPLY."
-        )
+        let id = &job.id;
+        match job.status {
+            ExternalJobStatus::Done => {
+                any_done = true;
+                let path = job.result_path.as_deref().unwrap_or("");
+                text.push_str(&format!("[{kind} generation complete] job {id}: {path}\n"));
+            }
+            ref status => {
+                any_failed = true;
+                let status = match status {
+                    ExternalJobStatus::TimedOut => "timed out",
+                    _ => "failed",
+                };
+                let reason = job.error.as_deref().unwrap_or("unknown error");
+                text.push_str(&format!("[{kind} generation {status}] job {id}: {reason}\n"));
+            }
+        }
     }
+    text.push_str(rsclaw_events::notice::AUTO_NOTICE);
+    text.push_str(
+        " The user has already received every finished result and been told of any \
+         failure. Every job listed above is over: do not resubmit any of them.",
+    );
+    if running > 0 {
+        text.push_str(&format!(
+            " {running} more job(s) from this conversation are still running; another \
+             notice will come when they finish, so wait for it instead of submitting \
+             them again."
+        ));
+    }
+    if any_done {
+        text.push_str(
+            " If the request you were working on has steps that need these results \
+             (for example making a video from an image, composing clips, or publishing), \
+             carry them out now with the paths above, once everything a step needs is \
+             here. Do not resend or describe the results.",
+        );
+    }
+    if any_failed {
+        text.push_str(
+            " If the request can still finish without what failed, finish it; if the \
+             user needs to decide what to do next, ask them briefly.",
+        );
+    }
+    text.push_str(
+        " Write in the language the user has been using. If nothing is left to do, or \
+         you already used these results, reply with exactly NO_REPLY.",
+    );
+    text
 }
 
 /// The finished artifact as a `(filename, mime, path)` attachment; empty
@@ -722,14 +850,21 @@ mod tests {
         done.status = ExternalJobStatus::Done;
         done.result_path = Some("/d/rsclaw/images/dl_i_202610271200abc.png".to_owned());
         assert_eq!(
-            writeback_text(&done),
+            writeback_text(&done, "en"),
             "The image is ready at /d/rsclaw/images/dl_i_202610271200abc.png \
              (@dl_i_202610271200abc.png)."
+        );
+        assert_eq!(
+            writeback_text(&done, "zh"),
+            "图片已生成：/d/rsclaw/images/dl_i_202610271200abc.png（@dl_i_202610271200abc.png）"
         );
         let mut failed = job("wechat", "s");
         failed.status = ExternalJobStatus::Failed;
         failed.error = Some("quota".to_owned());
-        assert_eq!(writeback_text(&failed), "The image generation failed: quota");
+        assert_eq!(writeback_text(&failed, "en"), "The image generation failed: quota");
+        failed.kind = ExternalJobKind::VideoGen;
+        failed.status = ExternalJobStatus::TimedOut;
+        assert_eq!(writeback_text(&failed, "zh"), "视频生成超时：quota");
     }
 
     #[test]
@@ -737,16 +872,33 @@ mod tests {
         let mut done = job("wechat", "s");
         done.status = ExternalJobStatus::Done;
         done.result_path = Some("/tmp/cat.png".to_owned());
-        let text = wake_text(&done);
+        let text = wake_text(std::slice::from_ref(&done), 0);
         assert!(text.starts_with("[image generation complete]"));
         assert!(text.contains("/tmp/cat.png"));
         assert!(text.contains("NO_REPLY"));
+        assert!(rsclaw_events::notice::is_auto_notice(&text));
+        assert!(!text.contains("still running"));
 
         let mut failed = job("wechat", "s");
         failed.status = ExternalJobStatus::TimedOut;
         failed.error = Some("timed out after 1800s".to_owned());
-        let text = wake_text(&failed);
+        let text = wake_text(std::slice::from_ref(&failed), 0);
         assert!(text.starts_with("[image generation timed out]"));
-        assert!(text.contains("Do not resubmit"));
+        assert!(text.contains("do not resubmit"));
+    }
+
+    #[test]
+    fn one_wake_lists_every_finished_job() {
+        let mut a = job("wechat", "s");
+        a.status = ExternalJobStatus::Done;
+        a.result_path = Some("/v/a.mp4".to_owned());
+        let mut b = job("wechat", "s");
+        b.status = ExternalJobStatus::Done;
+        b.result_path = Some("/v/b.mp4".to_owned());
+        let text = wake_text(&[a.clone(), b.clone()], 2);
+        assert!(text.contains(&format!("job {}: /v/a.mp4", a.id)));
+        assert!(text.contains(&format!("job {}: /v/b.mp4", b.id)));
+        assert!(text.contains("2 more job(s)"));
+        assert_eq!(text.matches(rsclaw_events::notice::AUTO_NOTICE).count(), 1);
     }
 }

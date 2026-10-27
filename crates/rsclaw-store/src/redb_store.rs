@@ -1807,6 +1807,29 @@ impl RedbStore {
         Ok(due)
     }
 
+    /// How many of `session_key`'s jobs are not settled yet: still being
+    /// polled, or finished but not yet delivered (with retries left).
+    pub fn count_unsettled_external_jobs(&self, session_key: &str) -> Result<usize> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(EXTERNAL_JOBS)?;
+        let mut count = 0;
+        for entry in table.iter()? {
+            let (_k, v) = entry?;
+            let job: rsclaw_types::ExternalJob = serde_json::from_str(v.value())?;
+            if job.session_key != session_key {
+                continue;
+            }
+            let active = matches!(
+                job.status,
+                rsclaw_types::ExternalJobStatus::Pending | rsclaw_types::ExternalJobStatus::Polling
+            ) || job.needs_delivery();
+            if active && job.delivery_attempts < rsclaw_types::ExternalJob::MAX_DELIVERY_ATTEMPTS {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Delete a job by id (used after delivery + retention window).
     pub fn delete_external_job(&self, job_id: &str) -> Result<()> {
         let write = self.db.begin_write()?;
