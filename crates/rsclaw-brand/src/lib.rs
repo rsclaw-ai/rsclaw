@@ -35,13 +35,19 @@ fn text_tokens() -> Vec<(&'static str, String)> {
         ("RsClaw", PRODUCT_NAME.to_owned()),
         ("~/.rsclaw", format!("~/{HOME_DIR}")),
         ("rsclaw.json5", CONFIG_FILE.to_owned()),
-        ("rsclaw.ai", WEBSITE.to_owned()),
+        (SITE_TOKEN, WEBSITE.to_owned()),
         ("🦀", EMOJI.to_owned()),
     ]
 }
 
 /// The `rsclaw ` CLI-invocation token (word-bounded, see [`rebrand`]).
 const CLI_TOKEN: &str = "rsclaw ";
+
+/// The website-domain token. Only the bare domain follows the brand: a
+/// subdomain (`hub.rsclaw.ai`, `api.rsclaw.ai`) is a service endpoint the
+/// build really talks to, and rewriting it would print a host that doesn't
+/// exist.
+const SITE_TOKEN: &str = "rsclaw.ai";
 
 static ACTIVE_TOKENS: LazyLock<Vec<(&'static str, String)>> = LazyLock::new(|| {
     let mut tokens: Vec<(&'static str, String)> = text_tokens()
@@ -124,6 +130,12 @@ fn rebrand_with<'a>(text: &'a str, tokens: &[(&'static str, String)]) -> Cow<'a,
                     !(c.is_alphanumeric() || matches!(c, '_' | '.' | '-' | '/' | '$'))
                 });
                 if !bounded {
+                    continue;
+                }
+            }
+            if *from == SITE_TOKEN {
+                let prev = text[..i].chars().next_back();
+                if prev.is_some_and(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_')) {
                     continue;
                 }
             }
@@ -425,6 +437,19 @@ mod tests {
         ] {
             assert_eq!(rebrand_with(from, &tokens), to);
         }
+    }
+
+    #[test]
+    fn service_hosts_keep_their_name() {
+        let tokens = vec![(SITE_TOKEN, "acme.example.com".to_owned())];
+        assert_eq!(
+            rebrand_with("Fetching tool manifest from https://hub.rsclaw.ai/tools/manifest.json ...", &tokens),
+            "Fetching tool manifest from https://hub.rsclaw.ai/tools/manifest.json ..."
+        );
+        assert_eq!(
+            rebrand_with("Docs: https://rsclaw.ai/docs, mail support@rsclaw.ai", &tokens),
+            "Docs: https://acme.example.com/docs, mail support@acme.example.com"
+        );
     }
 
     #[test]
