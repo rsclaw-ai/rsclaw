@@ -1316,7 +1316,12 @@ impl TaskQueueWorker {
                         channel: Some(channel_name.clone()),
                         account: account.clone(),
                     };
-                    if let Some(tx) = self.channel_tx_for(&channel_name, account.as_deref()) {
+                    if channel_name == "api" {
+                        // The HTTP API has no push channel: its clients get
+                        // the reply from /api/v1/stream and the history.
+                        tracing::debug!(task_id = %task_id, "api channel: reply left to stream and history");
+                        last_send_ok = true;
+                    } else if let Some(tx) = self.channel_tx_for(&channel_name, account.as_deref()) {
                         match tx.send(out).await {
                             Ok(_) => {
                                 last_send_ok = true;
