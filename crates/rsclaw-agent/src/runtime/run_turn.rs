@@ -3030,6 +3030,7 @@ impl AgentRuntime {
         self.compaction_state.remove(session_key);
         self.session_last_active.remove(session_key);
         self.handle.remove_session_tokens(session_key);
+        super::forget_server_size(session_key);
         if let Err(e) = self
             .store
             .db

@@ -979,6 +979,16 @@ impl AgentRuntime {
             // (16k against an 83k request the fleet refused): take the
             // request's own estimate when it is larger.
             let total_est = total_est.max(calibrated_tokens);
+            // A stateful backend (rsclaw) also keeps earlier turns' tool
+            // steps the runtime has dropped: its own last count, plus what
+            // this call adds, is the size that hits its per-session cap.
+            let total_est = match super::server_size(&ctx.session_key) {
+                Some(server) if self.providers.resolve_model(&model).0 == "rsclaw" => {
+                    let adding = messages.last().map(crate::context_mgr::msg_tokens).unwrap_or(0);
+                    total_est.max(server + adding)
+                }
+                _ => total_est,
+            };
             // Calibrated against the provider's real count: compact once the
             // next input and reply would no longer fit. Uncalibrated: keep a
             // 20% margin for the estimate's error.
@@ -1018,6 +1028,7 @@ impl AgentRuntime {
                         provider.drop_session(&ctx.session_key);
                     }
                     forget_token_scale(&ctx.session_key);
+                    super::forget_server_size(&ctx.session_key);
                 }
             }
             if !preflight_compaction_stalled && total_est > preflight_threshold {
@@ -1515,6 +1526,7 @@ impl AgentRuntime {
                         // Update context total with real usage from LLM if available.
                         if let Some(ref u) = usage {
                             record_token_scale(&ctx.session_key, u.input, approx_tokens);
+                            super::record_server_size(&ctx.session_key, (u.input + u.output) as usize);
                             let real_tokens = (u.input + u.output) as usize;
                             if let Ok(mut map) = self.handle.session_tokens.write() {
                                 if let Some(st) = map.get_mut(&ctx.session_key) {

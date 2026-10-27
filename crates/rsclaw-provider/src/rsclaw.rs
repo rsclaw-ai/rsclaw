@@ -241,7 +241,7 @@ impl SseTerminalParser {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct SessionEntry {
     /// Server-issued, format `rs_<instance>_<random>`.
     session_id: String,
@@ -255,6 +255,56 @@ struct SessionEntry {
     /// longer matches what the gateway thinks the conversation is —
     /// trigger a re-hydrate via /sessions/replay.
     last_seen_msgs_len: usize,
+    /// Where the current turn started: the request length at its first
+    /// call (the one whose delta is the user message) and a fingerprint of
+    /// the history before that message. See [`turn_scratch_dropped`].
+    turn_base: Option<(usize, u64)>,
+    /// The server still holds a finished turn's tool calls and results
+    /// that the runtime has dropped from its own history. Its message
+    /// indices no longer line up with ours, so an in-place compaction
+    /// splice must not run; compaction re-sends the history instead.
+    scratch_kept: bool,
+}
+
+/// Whether the request's delta is a person's message (a new turn), not a
+/// batch of tool results.
+fn starts_user_turn(msgs: &[Message]) -> bool {
+    msgs.last().is_some_and(|m| {
+        matches!(m.role, Role::User)
+            && !matches!(&m.content, MessageContent::Parts(parts)
+                if parts.iter().any(|p| matches!(p, ContentPart::ToolResult { .. })))
+    })
+}
+
+/// The turn base to remember for a request that starts a turn.
+fn turn_base_of(msgs: &[Message]) -> Option<(usize, u64)> {
+    starts_user_turn(msgs).then(|| (msgs.len(), history_fingerprint(&msgs[..msgs.len() - 1])))
+}
+
+/// Fingerprint of `msgs` as sent (role, content, hidden replay state).
+fn history_fingerprint(msgs: &[Message]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for m in msgs {
+        serde_json::to_string(m).unwrap_or_default().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Whether a request that is shorter than the previous call only lacks the
+/// last turn's tool calls and results: it starts a new turn (ends in a user
+/// message), keeps the history before the last turn's user message
+/// unchanged, and adds at least the new user message after it. The runtime
+/// drops a finished turn's scratch from its history by design; the server
+/// keeps it, which is harmless, so this is no reason to re-send ~60k tokens.
+fn turn_scratch_dropped(entry: &SessionEntry, msgs: &[Message]) -> bool {
+    let Some((base_len, base_fp)) = entry.turn_base else {
+        return false;
+    };
+    starts_user_turn(msgs)
+        && base_len >= 1
+        && msgs.len() > base_len
+        && history_fingerprint(&msgs[..base_len - 1]) == base_fp
 }
 
 impl RsclawProvider {
@@ -424,22 +474,43 @@ impl RsclawProvider {
     /// incoming `msgs_len` (history was trimmed under our feet). On
     /// success bumps `last_seen_msgs_len` to the new value so the next
     /// call's comparison is against the most recent state.
+    /// The cached server session for `session_key`, when it still matches
+    /// `msgs`; `Err(reason)` when the history must be re-sent (replayed).
     fn lookup_and_bump(
         &self,
         session_key: &str,
         prefix_id: &str,
-        msgs_len: usize,
-    ) -> Option<SessionEntry> {
+        msgs: &[Message],
+    ) -> std::result::Result<SessionEntry, String> {
         let mut map = self.lock_sessions();
-        let entry = map.get_mut(session_key)?;
+        let Some(entry) = map.get_mut(session_key) else {
+            return Err("no open session (first call, evicted, or dropped)".to_owned());
+        };
         if entry.prefix_id != prefix_id {
-            return None;
+            return Err(format!("prefix changed ({} -> {prefix_id})", entry.prefix_id));
         }
+        let msgs_len = msgs.len();
         if msgs_len < entry.last_seen_msgs_len {
-            return None;
+            if !turn_scratch_dropped(entry, msgs) {
+                return Err(format!(
+                    "history trimmed: {msgs_len} messages after {} (compaction, repair or \
+                     reset), not just the last turn's dropped tool steps",
+                    entry.last_seen_msgs_len
+                ));
+            }
+            tracing::debug!(
+                session_key,
+                msgs_len,
+                last_seen = entry.last_seen_msgs_len,
+                "rsclaw: last turn's tool steps dropped locally, server keeps them; appending"
+            );
+            entry.scratch_kept = true;
+        }
+        if let Some(base) = turn_base_of(msgs) {
+            entry.turn_base = Some(base);
         }
         entry.last_seen_msgs_len = msgs_len;
-        Some(entry.clone())
+        Ok(entry.clone())
     }
 
     fn store(&self, session_key: &str, entry: SessionEntry) {
@@ -631,9 +702,10 @@ impl LlmProvider for RsclawProvider {
             // when history exists we go straight to replay; an empty
             // history list takes the cheaper open() path.
             let entry =
-                match self.lookup_and_bump(&session_key, &split.prefix_id, req.messages.len()) {
-                    Some(e) => e,
-                    None => {
+                match self.lookup_and_bump(&session_key, &split.prefix_id, &req.messages) {
+                    Ok(e) => e,
+                    Err(reason) => {
+                        tracing::info!(session = %session_key, %reason, "rsclaw: (re)opening the server session");
                         self.forget(&session_key);
                         let history = history_for_replay(&req.messages);
                         let path = if history.is_empty() { "open" } else { "replay" };
@@ -675,6 +747,8 @@ impl LlmProvider for RsclawProvider {
                             // canonical here for freshness.
                             prefix_id: split.prefix_id.clone(),
                             last_seen_msgs_len: req.messages.len(),
+                            turn_base: turn_base_of(&req.messages),
+                            ..Default::default()
                         };
                         self.store(&session_key, entry.clone());
                         entry
@@ -749,6 +823,8 @@ impl LlmProvider for RsclawProvider {
                         // single-sourced.)
                         prefix_id: split.prefix_id.clone(),
                         last_seen_msgs_len: req.messages.len(),
+                        turn_base: turn_base_of(&req.messages),
+                        ..Default::default()
                     };
                     self.store(&session_key, entry.clone());
                     // Same forget-on-Err treatment as the primary
@@ -826,14 +902,24 @@ impl LlmProvider for RsclawProvider {
             // the duration of the splice.
             let session_id = {
                 let map = self.lock_sessions();
-                map.get(session_key)
-                    .map(|e| e.session_id.clone())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "rsclaw compact splice: no cached session for key {session_key} — \
-                             falling back to replay"
-                        )
-                    })?
+                let entry = map.get(session_key).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "rsclaw compact splice: no cached session for key {session_key} — \
+                         falling back to replay"
+                    )
+                })?;
+                if entry.scratch_kept {
+                    drop(map);
+                    // Our indices don't match the server's: re-send the
+                    // compacted history instead of splicing by count.
+                    self.forget(session_key);
+                    anyhow::bail!(
+                        "rsclaw compact splice: the server holds earlier turns' tool steps, \
+                         so its message indices differ from ours; replaying the compacted \
+                         history instead"
+                    );
+                }
+                entry.session_id.clone()
             };
 
             // Bounded optimistic-concurrency retry (protocol §6.3.1).
@@ -5288,6 +5374,22 @@ data: {"type":"block_stop","index":0}
         assert_eq!(body["tool_results"][0]["tool_use_id"], "toolu_1");
     }
 
+    fn msgs(roles: &str) -> Vec<Message> {
+        roles
+            .chars()
+            .enumerate()
+            .map(|(i, r)| Message {
+                role: match r {
+                    'u' => Role::User,
+                    'a' => Role::Assistant,
+                    _ => Role::Tool,
+                },
+                content: MessageContent::Text(format!("m{i}")),
+                rsclaw_hidden: None,
+            })
+            .collect()
+    }
+
     #[test]
     fn lookup_and_bump_evicts_on_history_shrink() {
         let provider = RsclawProvider::new("http://x", None);
@@ -5296,39 +5398,50 @@ data: {"type":"block_stop","index":0}
             SessionEntry {
                 session_id: "rs_w7_abc".into(),
                 prefix_id: "rsclaw/2026.5.28".into(),
-                last_seen_msgs_len: 12,
+                last_seen_msgs_len: 3,
+                ..Default::default()
             },
         );
-        // Same len → cached entry returned, last_seen unchanged.
-        assert!(
-            provider
-                .lookup_and_bump("k", "rsclaw/2026.5.28", 12)
-                .is_some()
-        );
-        // Growth → bumped, returned.
-        assert!(
-            provider
-                .lookup_and_bump("k", "rsclaw/2026.5.28", 14)
-                .is_some()
-        );
-        // Shrink (compaction trimmed history) → None, caller re-hydrates.
-        assert!(
-            provider
-                .lookup_and_bump("k", "rsclaw/2026.5.28", 8)
-                .is_none()
-        );
-        // Version drift → None even if len matches.
-        assert!(
-            provider
-                .lookup_and_bump("k", "rsclaw/2026.5.6", 14)
-                .is_none()
-        );
-        // Missing key → None.
-        assert!(
-            provider
-                .lookup_and_bump("missing", "rsclaw/2026.5.28", 14)
-                .is_none()
-        );
+        let p = "rsclaw/2026.5.28";
+        // Same len, then growth → cached entry returned.
+        assert!(provider.lookup_and_bump("k", p, &msgs("uau")).is_ok());
+        assert!(provider.lookup_and_bump("k", p, &msgs("uauat")).is_ok());
+        // Shrink that isn't a dropped scratch (compaction) → re-hydrate.
+        assert!(provider.lookup_and_bump("k", p, &msgs("u")).is_err());
+        // Version drift → Err even if len matches.
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.6", &msgs("uauat")).is_err());
+        // Missing key → Err.
+        assert!(provider.lookup_and_bump("missing", p, &msgs("u")).is_err());
+    }
+
+    #[test]
+    fn a_dropped_turn_scratch_keeps_the_server_session() {
+        let provider = RsclawProvider::new("http://x", None);
+        // Turn 2 starts after "u a" and opened the session (no bump yet),
+        // then runs two tool rounds.
+        let mut turn = msgs("uau");
+        provider.store("k", SessionEntry {
+            session_id: "rs_a".into(),
+            prefix_id: "p".into(),
+            last_seen_msgs_len: turn.len(),
+            turn_base: turn_base_of(&turn),
+            ..Default::default()
+        });
+        turn.extend(msgs("atat").into_iter().skip(0));
+        assert!(provider.lookup_and_bump("k", "p", &turn).is_ok());
+        // Turn 3: the runtime kept "u a u" + final "a", dropped the scratch,
+        // and adds the new user message: shorter, but no replay.
+        let mut next = msgs("uau");
+        next.push(Message { role: Role::Assistant, content: MessageContent::Text("final".into()), rsclaw_hidden: None });
+        next.push(Message { role: Role::User, content: MessageContent::Text("发".into()), rsclaw_hidden: None });
+        let entry = provider.lookup_and_bump("k", "p", &next).expect("kept");
+        assert!(entry.scratch_kept);
+        // Same length but an earlier message changed (compaction) → replay.
+        let mut compacted = next.clone();
+        compacted[0] = Message { role: Role::User, content: MessageContent::Text("[summary]".into()), rsclaw_hidden: None };
+        compacted.truncate(3);
+        compacted.push(Message { role: Role::User, content: MessageContent::Text("x".into()), rsclaw_hidden: None });
+        assert!(provider.lookup_and_bump("k", "p", &compacted).is_err());
     }
 
     #[test]
@@ -5346,6 +5459,7 @@ data: {"type":"block_stop","index":0}
                     session_id: format!("rs_w_{i}"),
                     prefix_id: "rsclaw/test".into(),
                     last_seen_msgs_len: 1,
+                    ..Default::default()
                 },
             );
         }
@@ -5367,6 +5481,7 @@ data: {"type":"block_stop","index":0}
                     session_id: format!("rs_{i}"),
                     prefix_id: "rsclaw/test".into(),
                     last_seen_msgs_len: 1,
+                    ..Default::default()
                 },
             );
         }
@@ -5386,6 +5501,7 @@ data: {"type":"block_stop","index":0}
                 session_id: "rs_w7_xyz".into(),
                 prefix_id: "rsclaw/test".into(),
                 last_seen_msgs_len: 5,
+                ..Default::default()
             },
         );
         let inner: LlmStream = Box::pin(futures::stream::iter(vec![
@@ -5418,6 +5534,7 @@ data: {"type":"block_stop","index":0}
                 session_id: "rs_w7_abc".into(),
                 prefix_id: "rsclaw/test".into(),
                 last_seen_msgs_len: 5,
+                ..Default::default()
             },
         );
         let inner: LlmStream = Box::pin(futures::stream::iter(vec![Ok(StreamEvent::Error(
@@ -5440,6 +5557,7 @@ data: {"type":"block_stop","index":0}
                 session_id: "rs_w7_abc".into(),
                 prefix_id: "rsclaw/test".into(),
                 last_seen_msgs_len: 5,
+                ..Default::default()
             },
         );
         let inner: LlmStream = Box::pin(futures::stream::iter(vec![
@@ -6303,6 +6421,7 @@ data: {"type":"block_stop","index":0}
                 session_id: "rs_w7_abc".to_owned(),
                 prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
                 last_seen_msgs_len: 40,
+                ..Default::default()
             },
         );
         provider.drop_session("k");
@@ -6372,6 +6491,7 @@ data: {"type":"block_stop","index":0}
                     session_id: session_id.to_owned(),
                     prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
                     last_seen_msgs_len: 50,
+                    ..Default::default()
                 },
             );
         }
@@ -6463,6 +6583,7 @@ data: {"type":"block_stop","index":0}
                     session_id: session_id.to_owned(),
                     prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
                     last_seen_msgs_len: 50,
+                    ..Default::default()
                 },
             );
         }

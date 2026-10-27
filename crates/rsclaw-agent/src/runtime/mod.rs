@@ -15,6 +15,34 @@
 //!      docs/memory-extraction-redesign.md)
 
 mod agent_loop;
+
+/// Per-session size the stateful backend last reported (prompt + reply
+/// tokens). It can exceed what the runtime's own history adds up to: the
+/// backend keeps earlier turns' tool steps that the runtime drops at turn
+/// end, so compaction has to be timed against this, not the estimate.
+fn server_sizes() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static SIZES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    SIZES.get_or_init(Default::default)
+}
+
+pub(crate) fn record_server_size(session: &str, tokens: usize) {
+    if let Ok(mut map) = server_sizes().lock() {
+        map.insert(session.to_owned(), tokens);
+    }
+}
+
+pub(crate) fn server_size(session: &str) -> Option<usize> {
+    server_sizes().lock().ok()?.get(session).copied()
+}
+
+/// The backend is about to be handed a different (compacted or re-sent)
+/// history; its next call reports the new size.
+pub(crate) fn forget_server_size(session: &str) {
+    if let Ok(mut map) = server_sizes().lock() {
+        map.remove(session);
+    }
+}
 mod dispatch;
 mod run_turn;
 mod session_title;

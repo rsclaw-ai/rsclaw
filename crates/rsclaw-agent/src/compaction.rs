@@ -746,6 +746,10 @@ impl AgentRuntime {
             sess.extend(recent_msgs);
         }
 
+        // The backend is re-sent (or spliced to) the compacted history; what
+        // it reported before no longer applies.
+        crate::runtime::forget_server_size(session_key);
+
         // Reset compaction state after successful compaction.
         self.compaction_state
             .insert(session_key.to_owned(), (std::time::Instant::now(), 0));
