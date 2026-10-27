@@ -40,6 +40,60 @@ async fn open_outbound_a2a_transport(
 }
 
 impl AgentRuntime {
+    /// Wait for a person to approve a gated call. In a chat channel the
+    /// turn's sender is asked there and may reply 同意 / 拒绝; any app
+    /// showing approvals can answer too. `Err` (the tool's error) unless
+    /// approved.
+    async fn ask_tool_approval(&self, ctx: &RunContext, tool: &str, summary: &str) -> Result<()> {
+        use crate::approvals::{APPROVAL_WAIT, Decision, broker};
+        let refused = |why: &str| {
+            anyhow!(
+                "负责人未批准：{tool} 没有执行（{why}）。This call needs the owner's approval. \
+                 Do not retry it or work around it with another tool; tell the user plainly \
+                 that this step was not done and why."
+            )
+        };
+        let local = matches!(
+            ctx.channel.as_str(),
+            "api" | "desktop" | "ws" | "webchat" | "web" | "cron" | "heartbeat" | "system"
+        );
+        let approver = (!local && !ctx.peer_id.is_empty()).then(|| ctx.peer_id.clone());
+        if approver.is_none() && !broker().has_listener() {
+            return Err(refused("没有能审批的地方：桌面端没有打开"));
+        }
+        if approver.is_some()
+            && let Some(ref ntx) = self.notification_tx
+        {
+            let lang = rsclaw_i18n::default_lang();
+            let minutes = (APPROVAL_WAIT.as_secs() / 60).to_string();
+            let _ = ntx.send(rsclaw_channel::OutboundMessage {
+                target_id: if ctx.chat_id.is_empty() { ctx.peer_id.clone() } else { ctx.chat_id.clone() },
+                is_group: false,
+                text: rsclaw_i18n::t_fmt(
+                    "tool_approval_prompt",
+                    lang,
+                    &[("tool", tool), ("summary", summary), ("minutes", &minutes)],
+                ),
+                reply_to: None,
+                images: vec![],
+                files: vec![],
+                channel: Some(ctx.channel.clone()),
+                account: ctx.account.clone(),
+            });
+        }
+        info!(tool, session = %ctx.session_key, "approvals.tools: waiting for approval");
+        let decision = broker()
+            .request_tool(&ctx.session_key, &ctx.agent_id, tool, summary, approver, APPROVAL_WAIT)
+            .await;
+        info!(tool, session = %ctx.session_key, ?decision, "approvals.tools: answered");
+        match decision {
+            Decision::Allow(_) => Ok(()),
+            Decision::Deny => Err(refused("被拒绝")),
+            Decision::TimedOut => Err(refused("没有在时限内答复")),
+            Decision::NoClient => Err(refused("没有能审批的地方：桌面端没有打开")),
+        }
+    }
+
     pub(super) fn allowed_tools_for_dispatch(&self) -> Option<std::collections::HashSet<String>> {
         let model_cfg = self.handle.config.model.as_ref()?;
         let explicit_toolset = model_cfg.toolset.as_deref();
@@ -131,6 +185,17 @@ impl AgentRuntime {
                  cannot be used in this conversation. Do not retry it; answer \
                  with the tools that are available or explain the limitation."
             ));
+        }
+
+        // Approval gate (`approvals.tools`): a listed tool runs only after a
+        // person says yes, whatever the model was told or remembers.
+        {
+            let (tool_id, call_args) = crate::tool_approval::call_identity(name, &args);
+            let gate = self.config.raw.approvals.as_ref().and_then(|a| a.tools.as_ref());
+            if crate::tool_approval::needs_approval(gate, &tool_id, &ctx.channel, &ctx.session_key) {
+                let summary = crate::tool_approval::summary(call_args);
+                self.ask_tool_approval(ctx, &tool_id, &summary).await?;
+            }
         }
 
         // Per-session filter: even when no explicit whitelist is configured,

@@ -2758,6 +2758,14 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "{kind}生成超时：{reason}",
     );
 
+    // approvals.tools: a gated tool call asks the turn's sender in the chat.
+    msg!("tool_approval_prompt",
+        "en" => "⚠️ Approval needed: the assistant wants to run {tool}\n{summary}\n\nReply \"yes\" to go ahead or \"no\" to cancel (within {minutes} min).",
+        "zh" => "⚠️ 需要你确认：智能体要执行 {tool}\n{summary}\n\n回复「同意」执行，回复「拒绝」取消（{minutes} 分钟内有效）。",
+    );
+    msg!("tool_approval_allowed", "en" => "✅ Approved, running it now.", "zh" => "✅ 已同意，正在执行。");
+    msg!("tool_approval_denied", "en" => "❌ Cancelled, it will not run.", "zh" => "❌ 已拒绝，不会执行。");
+
     m
 });
 

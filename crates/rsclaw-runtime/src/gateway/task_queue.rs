@@ -454,6 +454,35 @@ impl TaskQueueManager {
         // Parse /task prefix to extract mode + overrides.
         let (max_turns, ttl_secs) = parse_task_prefix(&mut message.text);
 
+        // A 同意 / 拒绝 to a tool approval this session is waiting on answers
+        // it; the turn that asked is still running and carries on.
+        if let Some(allow) = rsclaw_agent::approvals::broker().answer_from_chat(
+            session_key,
+            &message.sender,
+            &message.text,
+        ) {
+            tracing::info!(session_key, allow, "task_queue: message answered a tool approval");
+            let key = if allow { "tool_approval_allowed" } else { "tool_approval_denied" };
+            let ack = OutboundMessage {
+                target_id: if message.chat_id.is_empty() {
+                    message.sender.clone()
+                } else {
+                    message.chat_id.clone()
+                },
+                is_group: message.is_group,
+                text: rsclaw_i18n::t(key, rsclaw_i18n::default_lang()),
+                reply_to: None,
+                images: vec![],
+                files: vec![],
+                channel: Some(message.channel.clone()),
+                account: message.account.clone(),
+            };
+            if let Err(e) = push_outbound(&message.channel, message.account.as_deref(), ack) {
+                tracing::debug!(session_key, "task_queue: approval ack not sent: {e}");
+            }
+            return Ok(("approval".to_string(), false));
+        }
+
         let hash = compute_hash(&message.text);
 
         // Dedup: same content within short window.

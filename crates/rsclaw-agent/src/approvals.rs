@@ -55,6 +55,9 @@ pub enum ApprovalKind {
     /// A command touches a path outside the workspace (`target` is the
     /// directory the grant would cover).
     Path,
+    /// A gated tool call (`approvals.tools`): `target` is the tool,
+    /// `command` the call's key arguments. Only ever granted once.
+    Tool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +75,10 @@ pub struct ApprovalRequest {
     pub scopes: Vec<Scope>,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
+    /// Who may also answer by replying in the chat (the sender the turn
+    /// came from); `None` when only a client can answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
 }
 
 /// Outcome of [`ApprovalBroker::request`].
@@ -236,12 +243,59 @@ impl ApprovalBroker {
         if !self.has_listener() {
             return Decision::NoClient;
         }
-        let now = chrono::Utc::now().timestamp_millis();
         let scopes = match risk {
             Risk::Normal => vec![Scope::Once, Scope::Session, Scope::Always],
             // A high-risk grant never outlives the session.
             Risk::High => vec![Scope::Once, Scope::Session],
         };
+        self.ask(session_key, agent_id, kind, command, target, risk, scopes, None, wait)
+            .await
+    }
+
+    /// Ask for one gated tool call (`approvals.tools`). Unlike [`request`]
+    /// it is raised with no client listening too, since `approver` can
+    /// answer from the chat ([`answer_from_chat`]). The grant covers this
+    /// call only.
+    ///
+    /// [`request`]: Self::request
+    /// [`answer_from_chat`]: Self::answer_from_chat
+    pub async fn request_tool(
+        &self,
+        session_key: &str,
+        agent_id: &str,
+        tool: &str,
+        summary: &str,
+        approver: Option<String>,
+        wait: Duration,
+    ) -> Decision {
+        self.ask(
+            session_key,
+            agent_id,
+            ApprovalKind::Tool,
+            summary,
+            tool,
+            Risk::High,
+            vec![Scope::Once],
+            approver,
+            wait,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ask(
+        &self,
+        session_key: &str,
+        agent_id: &str,
+        kind: ApprovalKind,
+        command: &str,
+        target: &str,
+        risk: Risk,
+        scopes: Vec<Scope>,
+        approver: Option<String>,
+        wait: Duration,
+    ) -> Decision {
+        let now = chrono::Utc::now().timestamp_millis();
         let req = ApprovalRequest {
             id: uuid::Uuid::new_v4().simple().to_string(),
             session_key: session_key.to_owned(),
@@ -253,13 +307,15 @@ impl ApprovalBroker {
             scopes,
             created_at_ms: now,
             expires_at_ms: now + wait.as_millis() as i64,
+            approver,
         };
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(req.id.clone(), (req.clone(), tx));
         }
         let id = req.id.clone();
-        if self.tx.send(req).is_err() {
+        let chat_can_answer = req.approver.is_some();
+        if self.tx.send(req).is_err() && !chat_can_answer {
             let _ = self.take(&id);
             return Decision::NoClient;
         }
@@ -312,6 +368,8 @@ impl ApprovalBroker {
             let key = match req.kind {
                 ApprovalKind::Command => rule_key(&req.target),
                 ApprovalKind::Path => path_key(Path::new(&req.target)),
+                // Offered only `Once`, so nothing is ever stored for it.
+                ApprovalKind::Tool => format!("tool:{}", req.target),
             };
             match scope {
                 Scope::Once => {}
@@ -337,6 +395,26 @@ impl ApprovalBroker {
         Ok(req)
     }
 
+    /// Treat a chat message as the answer to the session's pending tool
+    /// approval: `同意` / `拒绝` (and a few synonyms) from the request's
+    /// approver. Returns the decision when the message was consumed.
+    pub fn answer_from_chat(&self, session_key: &str, sender: &str, text: &str) -> Option<bool> {
+        let allow = chat_answer(text)?;
+        let id = {
+            let pending = self.pending.lock().ok()?;
+            pending
+                .values()
+                .filter(|(req, _)| {
+                    req.kind == ApprovalKind::Tool
+                        && req.session_key == session_key
+                        && req.approver.as_deref() == Some(sender)
+                })
+                .min_by_key(|(req, _)| req.created_at_ms)
+                .map(|(req, _)| req.id.clone())?
+        };
+        self.respond(&id, allow, Scope::Once).ok().map(|_| allow)
+    }
+
     fn persist(&self) {
         let Some(path) = self.store.as_deref() else {
             return;
@@ -360,6 +438,22 @@ impl ApprovalBroker {
         if let Ok(raw) = serde_json::to_string_pretty(&data) {
             let _ = rsclaw_config::loader::write_file_atomic(path, &raw);
         }
+    }
+}
+
+/// A chat reply read as a yes / no, or `None` when it is anything else.
+fn chat_answer(text: &str) -> Option<bool> {
+    let t = text
+        .trim()
+        .trim_end_matches(['。', '！', '!', '.', '~', '～'])
+        .to_lowercase();
+    match t.as_str() {
+        "同意" | "批准" | "确认" | "可以" | "好的" | "发吧" | "yes" | "y" | "ok"
+        | "approve" => Some(true),
+        "拒绝" | "不同意" | "不行" | "取消" | "不要" | "别发" | "no" | "n" | "deny" => {
+            Some(false)
+        }
+        _ => None,
     }
 }
 
@@ -391,6 +485,32 @@ mod tests {
         let b = ApprovalBroker::new(None);
         let rx = b.subscribe();
         (b, rx)
+    }
+
+    #[tokio::test]
+    async fn tool_request_is_answered_from_the_chat_by_its_approver() {
+        let b = std::sync::Arc::new(ApprovalBroker::new(None));
+        let waiter = {
+            let b = b.clone();
+            tokio::spawn(async move {
+                b.request_tool("s", "main", "douyin.publish", "title: x", Some("u1".into()), APPROVAL_WAIT)
+                    .await
+            })
+        };
+        while b.pending(Some("s")).is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let req = &b.pending(Some("s"))[0];
+        assert_eq!(req.kind, ApprovalKind::Tool);
+        assert_eq!(req.scopes, vec![Scope::Once]);
+        // Someone else, or an unrelated message, doesn't answer it.
+        assert_eq!(b.answer_from_chat("s", "u2", "同意"), None);
+        assert_eq!(b.answer_from_chat("s", "u1", "同意吗"), None);
+        assert_eq!(b.answer_from_chat("s", "u1", "同意。"), Some(true));
+        assert_eq!(waiter.await.unwrap(), Decision::Allow(Scope::Once));
+        assert!(b.pending(Some("s")).is_empty());
+        // Nothing pending: the message is left for the agent.
+        assert_eq!(b.answer_from_chat("s", "u1", "拒绝"), None);
     }
 
     #[tokio::test]

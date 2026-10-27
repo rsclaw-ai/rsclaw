@@ -3015,6 +3015,28 @@ pub struct UiConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalsConfig {
     pub exec: Option<ExecApprovalConfig>,
+    /// Tools that only run after a person approves the call.
+    pub tools: Option<ToolApprovalConfig>,
+}
+
+/// `approvals.tools`: a hard gate in front of chosen tools (publishing,
+/// deleting). A matching call waits for the owner's answer — in the desktop
+/// app, or by replying 同意 / 拒绝 in the chat — and fails if it is refused
+/// or not answered in time.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolApprovalConfig {
+    pub enabled: Option<bool>,
+    /// Tool names to gate: `plugin.tool` or `plugin__tool` for plugin
+    /// tools, the bare name for built-in ones; `*` matches any run of
+    /// characters (`*.delete_video`).
+    #[serde(rename = "match")]
+    pub patterns: Option<Vec<String>>,
+    /// Let scheduled (cron) turns through without asking; their schedule
+    /// was already approved. Default true.
+    pub exempt_cron: Option<bool>,
+    /// Session keys (with `*`) whose calls are never gated.
+    pub exempt_sessions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

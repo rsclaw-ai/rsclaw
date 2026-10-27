@@ -25,6 +25,7 @@ pub mod model_resolution;
 pub mod model_switch;
 pub use rsclaw_memory as memory;
 pub mod approvals;
+pub mod tool_approval;
 pub mod args_sanitizer;
 pub mod memory_extractor;
 pub mod platform;
