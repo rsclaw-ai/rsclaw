@@ -78,7 +78,9 @@ pub async fn process_queued_message(
     // Progress heartbeat for the daemon watchdog (bumped once per agent-loop
     // iteration via TurnContext::progress_tick).
     let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
     let turn_ctx = crate::registry::TurnContext {
+        steps: Some(Arc::clone(&steps)),
         task_id,
         context_id,
         event_tx,
@@ -87,18 +89,24 @@ pub async fn process_queued_message(
         progress: Some(Arc::clone(&progress)),
         trust,
     };
+    let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watchdog = spawn_turn_watchdog(
         turn_token.clone(),
         progress,
+        Arc::clone(&timed_out),
         is_daemon,
         handle.id.clone(),
         session_key.clone(),
     );
+    let mut hard_cancelled = false;
     let result = tokio::select! {
         biased;
         // Hard cancel: drops the run_turn future (and every await it holds)
         // the moment the token fires.
-        _ = turn_token.cancelled() => Err(anyhow!("turn aborted")),
+        _ = turn_token.cancelled() => {
+            hard_cancelled = true;
+            Err(anyhow!("turn aborted"))
+        }
         r = runtime.run_turn(
             &session_key,
             &text,
@@ -113,6 +121,17 @@ pub async fn process_queued_message(
         ) => r,
     };
     watchdog.abort();
+    // The dropped run_turn never wrote its failed-turn note: write it here,
+    // with the steps it shared, so the session keeps what was done.
+    if hard_cancelled {
+        let error = if timed_out.load(std::sync::atomic::Ordering::Relaxed) {
+            "turn timed out (stuck-turn watchdog)"
+        } else {
+            "turn aborted"
+        };
+        let steps = steps.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        runtime.note_failed_turn(&session_key, &text, error, &steps);
+    }
     // Drop our registered token so a later abort for this session can't
     // cancel a future turn, and the map doesn't leak.
     if registered {
@@ -254,6 +273,7 @@ pub async fn process_queued_message(
 fn spawn_turn_watchdog(
     token: tokio_util::sync::CancellationToken,
     progress: Arc<std::sync::atomic::AtomicU64>,
+    timed_out: Arc<std::sync::atomic::AtomicBool>,
     is_daemon: bool,
     agent_id: String,
     session_key: String,
@@ -285,6 +305,7 @@ fn spawn_turn_watchdog(
                         "stuck-turn watchdog (daemon): no loop progress — a tool is \
                          wedged; firing cancel_token (cron will restart)"
                     );
+                    timed_out.store(true, Ordering::Relaxed);
                     token.cancel();
                     break;
                 }
@@ -301,6 +322,7 @@ fn spawn_turn_watchdog(
                     "stuck-turn watchdog: firing cancel_token — turn exceeded \
                      wall-clock limit; the agent queue must not stay dark"
                 );
+                timed_out.store(true, Ordering::Relaxed);
                 token.cancel();
             }
         }

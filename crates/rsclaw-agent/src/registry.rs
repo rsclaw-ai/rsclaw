@@ -576,6 +576,9 @@ pub struct TurnContext {
     /// advancing for a while, a tool is genuinely wedged and the turn is
     /// cancelled. `None` for non-A2A/legacy turns (no watchdog wiring).
     pub progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// The turn's steps (one line per tool call), shared with the spawner so
+    /// a turn it hard-cancels still leaves a note of what was done.
+    pub steps: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
     /// Trust level of the sender driving this turn (copied from
     /// `AgentMessage.trust`). Defaults to `User` so any path that forgets to
     /// set it fails closed.
@@ -589,6 +592,13 @@ impl TurnContext {
     pub fn progress_tick(&self) {
         if let Some(p) = &self.progress {
             p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record a step in the shared list (no-op when unset).
+    pub fn record_step(&self, line: &str) {
+        if let Some(steps) = &self.steps {
+            steps.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_owned());
         }
     }
 

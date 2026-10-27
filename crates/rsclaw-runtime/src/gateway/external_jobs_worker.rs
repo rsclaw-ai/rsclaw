@@ -776,7 +776,9 @@ fn wake_text(jobs: &[ExternalJob], running: usize) -> String {
             " If the request you were working on has steps that need these results \
              (for example making a video from an image, composing clips, or publishing), \
              carry them out now with the paths above, once everything a step needs is \
-             here. Do not resend or describe the results.",
+             here. Do not resend or describe the results. A step that needs the \
+             user's go-ahead (publishing, posting, sending to other people, paying) \
+             still needs it, as agreed earlier in this conversation: ask, don't act.",
         );
     }
     if any_failed {
@@ -876,6 +878,7 @@ mod tests {
         assert!(text.starts_with("[image generation complete]"));
         assert!(text.contains("/tmp/cat.png"));
         assert!(text.contains("NO_REPLY"));
+        assert!(text.contains("go-ahead"));
         assert!(rsclaw_events::notice::is_auto_notice(&text));
         assert!(!text.contains("still running"));
 

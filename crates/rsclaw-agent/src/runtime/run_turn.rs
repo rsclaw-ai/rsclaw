@@ -2599,30 +2599,7 @@ impl AgentRuntime {
         let reply = match outcome {
             Ok(reply) => reply,
             Err(e) => {
-                // Only the user message was persisted so far: leave a note
-                // with the steps done, or a reload shows the question alone
-                // and "继续" starts from nothing.
-                if !is_internal_session(session_key) {
-                    let note = Message {
-                        role: Role::Assistant,
-                        content: MessageContent::Text(super::failed_turn_note(
-                            text,
-                            &format!("{e:#}"),
-                            &ctx.steps,
-                        )),
-                        rsclaw_hidden: None,
-                    };
-                    if let Err(err) = self
-                        .store
-                        .db
-                        .append_message(session_key, &serde_json::to_value(&note).unwrap_or_default())
-                    {
-                        tracing::warn!("failed to persist failed-turn note: {err:#}");
-                    }
-                    if let Some(sess) = self.sessions.get_mut(session_key) {
-                        sess.push(note);
-                    }
-                }
+                self.note_failed_turn(session_key, text, &format!("{e:#}"), &ctx.steps);
                 return Err(e);
             }
         };
@@ -2939,6 +2916,37 @@ impl AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Only the user message of a turn that failed or was cancelled has been
+    /// persisted: leave a note with the steps done, or a reload shows the
+    /// question alone, "继续" starts from nothing, and a turn that picks the
+    /// session up later (a job's wake) doesn't know what was already done.
+    pub(crate) fn note_failed_turn(
+        &mut self,
+        session_key: &str,
+        user_text: &str,
+        error: &str,
+        steps: &[String],
+    ) {
+        if is_internal_session(session_key) {
+            return;
+        }
+        let note = Message {
+            role: Role::Assistant,
+            content: MessageContent::Text(super::failed_turn_note(user_text, error, steps)),
+            rsclaw_hidden: None,
+        };
+        if let Err(err) = self
+            .store
+            .db
+            .append_message(session_key, &serde_json::to_value(&note).unwrap_or_default())
+        {
+            tracing::warn!("failed to persist failed-turn note: {err:#}");
+        }
+        if let Some(sess) = self.sessions.get_mut(session_key) {
+            sess.push(note);
+        }
+    }
+
     /// Apply a queued `/clear` or `/new` to exactly one session: in-memory
     /// history, compaction state, token stats, persisted messages and the
     /// working plan. No other session is touched.

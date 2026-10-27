@@ -3248,7 +3248,9 @@ impl AgentRuntime {
                     &format!("{tool_input_str}\n{result_text}"),
                 )
                 .await;
-                ctx.steps.push(super::step_line(&tool_name, &tool_input_str));
+                let step = super::step_line(&tool_name, &tool_input_str);
+                ctx.turn_ctx.record_step(&step);
+                ctx.steps.push(step);
                 {
                     let args_str = tool_input_str;
                     let out_str = if result_text.len() > 4000 {
