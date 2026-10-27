@@ -26,6 +26,11 @@ pub(crate) fn todo_kv_key(session_key: &str) -> String {
     format!("todo:{session_key}")
 }
 
+/// redb KV key for when the plan was last written (`YYYY-MM-DD HH:MM`).
+pub(crate) fn todo_at_kv_key(session_key: &str) -> String {
+    format!("todo_at:{session_key}")
+}
+
 /// Normalize a todo status keyword. Tolerates the whitespace/case/hyphen
 /// noise the v1 block protocol introduces into string args; returns `None`
 /// for genuinely unknown values so the tool can teach the model the enum.
@@ -788,10 +793,12 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
             );
         };
         let key = todo_kv_key(&ctx.session_key);
+        let at_key = todo_at_kv_key(&ctx.session_key);
         if items.is_empty() {
             if let Err(e) = self.store.db.kv_delete(&key) {
                 tracing::warn!("todo: clear failed for {key}: {e:#}");
             }
+            let _ = self.store.db.kv_delete(&at_key);
             return Ok(json!({"plan": "(cleared)", "items": 0}));
         }
         if items.len() > MAX_ITEMS {
@@ -821,6 +828,10 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
         }
         let raw = serde_json::to_string(&clean)?;
         self.store.db.kv_set(&key, &raw)?;
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        if let Err(e) = self.store.db.kv_set(&at_key, &now) {
+            tracing::warn!("todo: timestamp write failed for {at_key}: {e:#}");
+        }
         Ok(json!({"plan": render_todo(&clean), "items": clean.len()}))
     }
 

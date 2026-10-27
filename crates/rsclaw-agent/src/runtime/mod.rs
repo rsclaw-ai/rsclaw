@@ -635,14 +635,19 @@ pub(crate) fn failed_turn_note(user_text: &str, error: &str, steps: &[String]) -
     }
     lines.extend(steps[skipped..].iter().enumerate().map(|(i, s)| format!("{}. {s}", skipped + i + 1)));
     match (chinese, steps.is_empty()) {
-        (true, true) => format!("⚠️ 这一轮没有完成（{}），还没有执行任何步骤。可以重新发送。", reason.0),
+        // Not "send it again": a later "发" (publish) read as "resend it"
+        // re-ran an instruction that was done by then.
+        (true, true) => format!("⚠️ 这一轮没有完成（{}），还没有执行任何步骤。回复「继续」可以接着做。", reason.0),
         (true, false) => format!(
             "⚠️ 这一轮没有完成（{}）。已完成的 {} 步：\n{}\n\n回复「继续」可以接着做。",
             reason.0,
             steps.len(),
             lines.join("\n")
         ),
-        (false, true) => format!("⚠️ This turn did not finish ({}) before any step ran. Send it again.", reason.1),
+        (false, true) => format!(
+            "⚠️ This turn did not finish ({}) before any step ran. Reply \"continue\" to pick it up.",
+            reason.1
+        ),
         (false, false) => format!(
             "⚠️ This turn did not finish ({}). The {} steps done:\n{}\n\nReply \"continue\" to pick up from here.",
             reason.1,
@@ -2127,7 +2132,24 @@ impl AgentRuntime {
         let mut parts = Vec::new();
         let mut left = budget.unwrap_or(usize::MAX);
         if let Some(plan) = self.load_todo_rendered(session_key) {
-            let plan = format!("[Current plan]\n{plan}");
+            // The plan is only as fresh as its last todo call: steps a later
+            // turn finished (a job's wake, say) can still read as open, and
+            // a model taking it as live re-did finished work.
+            let written = self
+                .store
+                .db
+                .kv_get(&crate::tools_misc::todo_at_kv_key(session_key))
+                .ok()
+                .flatten()
+                .map(|at| format!(" written {at}"))
+                .unwrap_or_default();
+            let plan = format!(
+                "[Plan as last written with the todo tool{written}]\n{plan}\n\
+                 It may be out of date: check the conversation since then. Items already \
+                 reported done must be marked done, not redone. Work on an open item only \
+                 when the user's latest message asks for it; if they asked for something \
+                 else, do that and clear or update the plan."
+            );
             let cost = crate::key_data::token_upper_bound(&plan) + 2;
             if cost <= left {
                 left -= cost;
@@ -3268,7 +3290,9 @@ mod failed_turn_tests {
         assert!(note.contains("…（前 3 步略）\n4. read_file 4.pdf"), "{note}");
         assert!(note.ends_with("回复「继续」可以接着做。"), "{note}");
         let note = failed_turn_note("draft it", "agent `main` turn timed out after 1800s", &[]);
-        assert!(note.contains("ran out of time") && note.contains("Send it again"), "{note}");
+        assert!(note.contains("ran out of time") && note.contains("Reply \"continue\""), "{note}");
+        let note = failed_turn_note("重做第 3 镜", "rsclaw turn failed 502", &[]);
+        assert!(note.ends_with("还没有执行任何步骤。回复「继续」可以接着做。"), "{note}");
     }
 }
 

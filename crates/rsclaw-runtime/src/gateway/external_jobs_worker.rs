@@ -778,7 +778,8 @@ fn wake_text(jobs: &[ExternalJob], running: usize) -> String {
              carry them out now with the paths above, once everything a step needs is \
              here. Do not resend or describe the results. A step that needs the \
              user's go-ahead (publishing, posting, sending to other people, paying) \
-             still needs it, as agreed earlier in this conversation: ask, don't act.",
+             still needs it, as agreed earlier in this conversation: ask, don't act. \
+             If a todo plan is open, mark the steps this finishes as done.",
         );
     }
     if any_failed {

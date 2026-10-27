@@ -3037,6 +3037,10 @@ impl AgentRuntime {
         {
             warn!("todo kv cleanup failed for {session_key}: {e:#}");
         }
+        let _ = self
+            .store
+            .db
+            .kv_delete(&crate::tools_misc::todo_at_kv_key(session_key));
         if let Err(e) = self
             .store
             .db
