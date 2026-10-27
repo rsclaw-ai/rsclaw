@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod media;
+pub mod notice;
 
 /// Why the gateway is asking the user to restart.
 ///

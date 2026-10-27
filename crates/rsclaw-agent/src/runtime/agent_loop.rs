@@ -1384,7 +1384,12 @@ impl AgentRuntime {
                         delta_buf.push_str(&delta);
                         let now = std::time::Instant::now();
                         let elapsed = now.duration_since(last_delta_flush);
-                        if delta_buf.len() >= delta_flush_chars || elapsed >= delta_flush_interval {
+                        // Hold back what may still become a NO_REPLY answer,
+                        // which must never reach the user.
+                        let holding = rsclaw_events::notice::may_become_no_reply(&text_buf);
+                        if !holding
+                            && (delta_buf.len() >= delta_flush_chars || elapsed >= delta_flush_interval)
+                        {
                             if let Some(ref bus) = self.event_bus {
                                 let _ = bus.send(AgentEvent {
                                     session_id: ctx.session_key.clone(),
@@ -1549,8 +1554,9 @@ impl AgentRuntime {
             text_buf.push_str(tag);
             delta_buf.push_str(tag);
 
-            // Flush any remaining buffered delta.
-            if !delta_buf.is_empty() {
+            // Flush any remaining buffered delta, unless the answer is
+            // NO_REPLY.
+            if !delta_buf.is_empty() && !rsclaw_events::notice::may_become_no_reply(&text_buf) {
                 if let Some(ref bus) = self.event_bus {
                     let _ = bus.send(AgentEvent {
                         session_id: ctx.session_key.clone(),
@@ -1952,10 +1958,17 @@ impl AgentRuntime {
                     // persist so replies like "HEARTBEAT_OK" don't
                     // accumulate in session history.
                     if !is_internal_session(&ctx.session_key) {
-                        if let Err(e) = self.store.db.append_message(
-                            &ctx.session_key,
-                            &serde_json::to_value(&assistant_msg).unwrap_or_default(),
-                        ) {
+                        // The row also carries the turn's attachments, so a
+                        // client reloading history can render the music or
+                        // video a tool made, and when it was sent.
+                        let mut row = serde_json::to_value(&assistant_msg).unwrap_or_default();
+                        let files = reply_attachments(&tool_files, &tool_images);
+                        if !files.is_empty() {
+                            row["files"] = rsclaw_events::media::files_json(&files);
+                        }
+                        row["sent_at"] =
+                            serde_json::json!(chrono::Local::now().format("%Y-%m-%d %H:%M").to_string());
+                        if let Err(e) = self.store.db.append_message(&ctx.session_key, &row) {
                             tracing::error!(error = %e, "failed to persist message");
                         }
                         if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
@@ -3955,7 +3968,7 @@ fn tool_target(args_json: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tool_target_tests {
-    use super::tool_target;
+    use super::{reply_attachments, tool_target};
 
     #[test]
     fn names_the_path_url_or_query() {
@@ -3966,6 +3979,47 @@ mod tool_target_tests {
         let long = "字".repeat(300);
         assert_eq!(tool_target(&format!(r#"{{"url":"{long}"}}"#)).unwrap().chars().count(), 201);
     }
+
+    #[test]
+    fn reply_attachments_keep_files_and_saved_images() {
+        let files = vec![(
+            "dl_a_1abc.mp3".to_owned(),
+            "audio/mpeg".to_owned(),
+            r"C:\d\audios\dl_a_1abc.mp3".to_owned(),
+        )];
+        let images = vec![
+            "data:image/png;base64,AAAA".to_owned(),
+            "/d/images/dl_i_1abc.jpg".to_owned(),
+        ];
+        let out = reply_attachments(&files, &images);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].0, "dl_i_1abc.jpg");
+        assert_eq!(out[1].1, "image/jpeg");
+    }
+}
+
+/// A turn's attachments as `(name, mime, path)`: the files tools made plus
+/// the images they saved to disk (inline `data:` images have no path).
+fn reply_attachments(
+    files: &[(String, String, String)],
+    images: &[String],
+) -> Vec<(String, String, String)> {
+    let mut out = files.to_vec();
+    for path in images.iter().filter(|i| !i.starts_with("data:")) {
+        if out.iter().any(|(_, _, p)| p == path) {
+            continue;
+        }
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned();
+        let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+        let mime = match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => "image/png",
+        };
+        out.push((name, mime.to_owned(), path.clone()));
+    }
+    out
 }
 
 /// Whether the end of `text` is one piece of 1–8 characters repeated for

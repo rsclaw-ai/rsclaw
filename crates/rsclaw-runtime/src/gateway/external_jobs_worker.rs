@@ -375,6 +375,7 @@ impl ExternalJobsWorker {
             "role": "assistant",
             "content": writeback_text(job),
             "external_job_id": job.id,
+            "sent_at": chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
         });
         // Same attachments as the live delivery, so a client reloading the
         // history renders the image or video rather than the sentence.
@@ -635,9 +636,10 @@ fn wake_text(job: &ExternalJob) -> String {
     let id = &job.id;
     if matches!(job.status, ExternalJobStatus::Done) {
         let path = job.result_path.as_deref().unwrap_or("");
+        let notice = rsclaw_events::notice::AUTO_NOTICE;
         format!(
             "[{kind} generation complete] job {id}: {path}\n\
-             This is an automatic notice, not a message from the user. The user has \
+             {notice} The user has \
              already received the {kind}. If the request you were working on has steps \
              that need it (for example making a video from this image, or publishing \
              it), carry them out now using the path above. Do not resend or describe \
@@ -650,9 +652,10 @@ fn wake_text(job: &ExternalJob) -> String {
             _ => "failed",
         };
         let reason = job.error.as_deref().unwrap_or("unknown error");
+        let notice = rsclaw_events::notice::AUTO_NOTICE;
         format!(
             "[{kind} generation {status}] job {id}: {reason}\n\
-             This is an automatic notice, not a message from the user. The user has \
+             {notice} The user has \
              already been told. Do not resubmit this job. If the request you were \
              working on can still finish without it, finish it; if the user needs to \
              decide what to do next, ask them briefly. Otherwise reply with exactly \

@@ -366,11 +366,12 @@ pub async fn chat_history(ctx: MethodCtx) -> MethodResult {
         .load_messages(sk)
         .map_err(|e| ErrorShape::internal(e.to_string()))?;
 
-    // Filter out compaction summary messages — they are internal-only
-    // and should not be displayed to the user.
+    // Filter out compaction summaries and the turns the runtime started
+    // itself (job notices, NO_REPLY answers) — internal-only, not for display.
     let filtered: Vec<_> = all_messages
         .into_iter()
         .filter(|v| !is_compaction_message(v))
+        .filter(|v| !rsclaw_events::notice::is_hidden_message(v))
         .map(rsclaw_provider::redact_rsclaw_hidden_value)
         .collect();
 

@@ -195,7 +195,8 @@ pub(crate) fn apply_patch(db: &RedbStore, key: &str, body: &Value) -> Result<Ses
 
 /// Add `display_text` (original text without the runtime-injected context
 /// prefix) and `sent_at` (`"YYYY-MM-DD HH:MM"` or null) to a user message.
-/// Other roles are left unchanged.
+/// Other roles get `sent_at` (stored since assistant rows carry one, else
+/// null).
 pub(crate) fn decorate_message(mut msg: Value) -> Value {
     // Attachments in the client shape, `[name, mime, path, kind, token]`,
     // whatever shape the row was stored in.
@@ -203,6 +204,9 @@ pub(crate) fn decorate_message(mut msg: Value) -> Value {
         rsclaw_events::media::normalize_files_json(files);
     }
     if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+        if let Some(obj) = msg.as_object_mut() {
+            obj.entry("sent_at").or_insert(Value::Null);
+        }
         return msg;
     }
     let text = message_text(&msg);
@@ -378,5 +382,8 @@ mod tests {
         assert!(m["sent_at"].is_null());
         let m = decorate_message(json!({"role": "assistant", "content": "x"}));
         assert!(m.get("display_text").is_none());
+        assert_eq!(m.get("sent_at"), Some(&Value::Null));
+        let m = decorate_message(json!({"role": "assistant", "content": "x", "sent_at": "2026-10-27 17:14"}));
+        assert_eq!(m["sent_at"], "2026-10-27 17:14");
     }
 }

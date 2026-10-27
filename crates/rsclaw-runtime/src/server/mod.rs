@@ -5475,10 +5475,12 @@ async fn get_session_messages(
 ) -> impl IntoResponse {
     match state.store.db.load_messages(&id) {
         Ok(messages) => {
-            // Filter out compaction summary messages — internal only.
+            // Filter out compaction summaries and the turns the runtime
+            // started itself (job notices, NO_REPLY answers) — internal only.
             let visible: Vec<_> = messages
                 .into_iter()
                 .filter(|v| !is_compaction_message(v))
+                .filter(|v| !rsclaw_events::notice::is_hidden_message(v))
                 .map(rsclaw_provider::redact_rsclaw_hidden_value)
                 .map(sessions_api::decorate_message)
                 .collect();
