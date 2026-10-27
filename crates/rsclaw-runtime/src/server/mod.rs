@@ -7678,8 +7678,9 @@ async fn get_media(
         )
             .into_response();
     };
+    let kind = rsclaw_events::media::parse_token(&token).map(|(_, k)| k);
     if let Some(w) = q.w
-        && rsclaw_events::media::parse_token(&token).is_some_and(|(_, k)| k == 'i')
+        && kind == Some('i')
     {
         let source = path.clone();
         let token = token.clone();
@@ -7687,6 +7688,22 @@ async fn get_media(
             Ok(Ok(thumb)) => path = thumb,
             Ok(Err(e)) => warn!(%e, "media: thumbnail failed, serving the original"),
             Err(e) => warn!(%e, "media: thumbnail task failed, serving the original"),
+        }
+    } else if let Some(w) = q.w
+        && kind == Some('v')
+    {
+        // A poster frame, never the video itself: a client asking for a
+        // thumbnail can't use a whole clip, so it gets an error to fall back on.
+        match video_thumbnail(&path, &token, w).await {
+            Ok(thumb) => path = thumb,
+            Err(e) => {
+                warn!(%token, "media: video thumbnail failed: {e:#}");
+                return (
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    Json(serde_json::json!({"error": format!("no thumbnail for this video: {e}")})),
+                )
+                    .into_response();
+            }
         }
     }
     use tower::ServiceExt as _;
@@ -7698,6 +7715,19 @@ async fn get_media(
 /// (clamped to 32..=2048). The cache name carries the source's mtime, so an
 /// overwritten original gets a fresh thumbnail.
 fn media_thumbnail(source: &std::path::Path, token: &str, w: u32) -> anyhow::Result<PathBuf> {
+    let (thumb, w) = thumb_cache_path(source, token, w)?;
+    if thumb.is_file() {
+        return Ok(thumb);
+    }
+    let data = std::fs::read(source)?;
+    let (bytes, _) = rsclaw_util::downscale_image_for_vision(&data, "image/jpeg", 0, w, 80)?;
+    store_thumb(&thumb, &bytes)?;
+    Ok(thumb)
+}
+
+/// Where the thumbnail of `source` at width `w` (clamped to 32..=2048) is
+/// cached, and the clamped width.
+fn thumb_cache_path(source: &std::path::Path, token: &str, w: u32) -> anyhow::Result<(PathBuf, u32)> {
     let w = w.clamp(32, 2048);
     let mtime = std::fs::metadata(source)?
         .modified()?
@@ -7705,18 +7735,72 @@ fn media_thumbnail(source: &std::path::Path, token: &str, w: u32) -> anyhow::Res
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let dir = rsclaw_config::loader::base_dir().join("var/cache/media-thumbs");
-    let thumb = dir.join(format!("{token}.{w}.{mtime}.jpg"));
+    Ok((dir.join(format!("{token}.{w}.{mtime}.jpg")), w))
+}
+
+/// Write then rename, so a concurrent request never serves half a file.
+fn store_thumb(thumb: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let dir = thumb.parent().ok_or_else(|| anyhow::anyhow!("thumbnail path has no parent"))?;
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = thumb.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, thumb)?;
+    Ok(())
+}
+
+/// Longest a frame grab may take before the video counts as unreadable.
+const VIDEO_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A cached JPEG poster for the video at `source`: the frame 1s in (past a
+/// black first frame), or the first frame of a shorter clip, scaled down to
+/// a long edge of `w`. Same cache as image thumbnails.
+async fn video_thumbnail(source: &std::path::Path, token: &str, w: u32) -> anyhow::Result<PathBuf> {
+    let (thumb, w) = thumb_cache_path(source, token, w)?;
     if thumb.is_file() {
         return Ok(thumb);
     }
-    std::fs::create_dir_all(&dir)?;
-    let data = std::fs::read(source)?;
-    let (bytes, _) = rsclaw_util::downscale_image_for_vision(&data, "image/jpeg", 0, w, 80)?;
-    // Write then rename, so a concurrent request never serves half a file.
-    let tmp = dir.join(format!("{token}.{w}.{mtime}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, &thumb)?;
+    let ffmpeg = rsclaw_platform::detect_ffmpeg().ok_or_else(|| anyhow::anyhow!("ffmpeg not found"))?;
+    let frame = match grab_frame(&ffmpeg, source, Some("1")).await {
+        Ok(frame) if !frame.is_empty() => frame,
+        _ => grab_frame(&ffmpeg, source, None).await?,
+    };
+    if frame.is_empty() {
+        anyhow::bail!("no frame could be read");
+    }
+    let target = thumb.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let (bytes, _) = rsclaw_util::downscale_image_for_vision(&frame, "image/png", 0, w, 80)?;
+        store_thumb(&target, &bytes)
+    })
+    .await??;
     Ok(thumb)
+}
+
+/// One frame of `source` as PNG bytes, `at` seconds in (or the first).
+async fn grab_frame(ffmpeg: &str, source: &std::path::Path, at: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.args(["-nostdin", "-v", "error"]);
+    if let Some(at) = at {
+        cmd.args(["-ss", at]);
+    }
+    cmd.arg("-i")
+        .arg(source)
+        .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let out = tokio::time::timeout(VIDEO_FRAME_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("frame grab timed out"))??;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("ffmpeg failed: {}", rsclaw_util::truncate_str(err.trim(), 300));
+    }
+    Ok(out.stdout)
 }
 
 /// Generate a unique file ID: `file-{timestamp_hex}{random_hex}`.
