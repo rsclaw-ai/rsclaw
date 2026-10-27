@@ -82,6 +82,44 @@ pub fn needs_approval(
         .any(|p| glob(p.trim(), session_key))
 }
 
+/// Absolute local paths in file-ish arguments (`filePath`, `imagePaths`,
+/// `video`, `cover`, …) that don't exist. Checked before asking anyone, so
+/// nobody approves a call that can only fail.
+pub fn missing_files(args: &Value) -> Vec<String> {
+    let mut missing = Vec::new();
+    collect_missing(args, false, &mut missing);
+    missing
+}
+
+fn collect_missing(v: &Value, fileish: bool, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let k = k.to_ascii_lowercase();
+                let fileish = ["path", "file", "video", "image", "cover", "audio", "music"]
+                    .iter()
+                    .any(|w| k.contains(w));
+                collect_missing(v, fileish, out);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|i| collect_missing(i, fileish, out)),
+        Value::String(s) if fileish && is_absolute_local(s) => {
+            if !std::path::Path::new(s.trim()).exists() {
+                out.push(s.trim().to_owned());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `/x/…` or `C:\…` / `C:/…`; URLs and relative names don't count.
+fn is_absolute_local(s: &str) -> bool {
+    let s = s.trim();
+    let b = s.as_bytes();
+    (s.starts_with('/') && !s.starts_with("//"))
+        || (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'))
+}
+
 /// Arguments worth showing the approver, most telling first.
 const SHOWN_KEYS: &[&str] = &[
     "title", "name", "desc", "description", "content", "text", "caption", "tags", "topic",
@@ -167,6 +205,21 @@ mod tests {
         assert!(!needs_approval(Some(&c), "douyin.publish", "wechat", "agent:ops:wechat:u1"));
         c.enabled = Some(false);
         assert!(!needs_approval(Some(&c), "douyin.publish", "wechat", "s"));
+    }
+
+    #[test]
+    fn missing_local_files_are_found_before_asking() {
+        let here = std::env::current_dir().unwrap().join("Cargo.toml");
+        let here = here.to_string_lossy().to_string();
+        let args = json!({
+            "title": "/not/a/path/but/a/title",
+            "filePath": "/no/such/dir/dl_v_1.mp4",
+            "imagePaths": [here, r"Z:\no\cover.png"],
+            "url": "https://example.com/a.mp4",
+            "video": "dl_v_1.mp4",
+        });
+        assert_eq!(missing_files(&args), vec!["/no/such/dir/dl_v_1.mp4", r"Z:\no\cover.png"]);
+        assert!(missing_files(&json!({"video": here})).is_empty());
     }
 
     #[test]

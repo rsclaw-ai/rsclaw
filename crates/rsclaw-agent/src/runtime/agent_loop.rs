@@ -1949,9 +1949,17 @@ impl AgentRuntime {
                 // Empty responses pollute history and confuse the LLM on
                 // subsequent turns (it sees its own empty reply and mimics it).
                 if !text_buf.trim().is_empty() {
+                    // The turn's tool results are dropped at turn end, so the
+                    // stored reply names the files it produced: a later turn
+                    // ("发") then uses the exact path instead of guessing one.
+                    let files = reply_attachments(&tool_files, &tool_images);
+                    let mut stored_text = text_buf.clone();
+                    if let Some(note) = rsclaw_events::media::attachments_note(&files) {
+                        stored_text.push_str(&note);
+                    }
                     let assistant_msg = Message {
                         role: Role::Assistant,
-                        content: MessageContent::Text(text_buf.clone()),
+                        content: MessageContent::Text(stored_text),
                         rsclaw_hidden: None,
                     };
                     // Internal sessions (heartbeat/cron/system): skip DB
@@ -1962,7 +1970,6 @@ impl AgentRuntime {
                         // client reloading history can render the music or
                         // video a tool made, and when it was sent.
                         let mut row = serde_json::to_value(&assistant_msg).unwrap_or_default();
-                        let files = reply_attachments(&tool_files, &tool_images);
                         if !files.is_empty() {
                             row["files"] = rsclaw_events::media::files_json(&files);
                         }

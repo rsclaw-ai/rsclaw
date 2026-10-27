@@ -193,6 +193,18 @@ impl AgentRuntime {
             let (tool_id, call_args) = crate::tool_approval::call_identity(name, &args);
             let gate = self.config.raw.approvals.as_ref().and_then(|a| a.tools.as_ref());
             if crate::tool_approval::needs_approval(gate, &tool_id, &ctx.channel, &ctx.session_key) {
+                // A call naming a file that isn't there can only fail:
+                // send it back to the model instead of asking anyone.
+                let missing = crate::tool_approval::missing_files(call_args);
+                if !missing.is_empty() {
+                    return Err(anyhow!(
+                        "{tool_id} was not run: these files do not exist: {}. Do not guess \
+                         file names. Use the exact path from the earlier result or the \
+                         [attachments] list in the conversation, or list the folder, then \
+                         call again.",
+                        missing.join(", ")
+                    ));
+                }
                 let summary = crate::tool_approval::summary(call_args);
                 self.ask_tool_approval(ctx, &tool_id, &summary).await?;
             }

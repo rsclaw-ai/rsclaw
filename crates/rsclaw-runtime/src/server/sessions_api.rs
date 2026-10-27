@@ -204,6 +204,13 @@ pub(crate) fn decorate_message(mut msg: Value) -> Value {
         rsclaw_events::media::normalize_files_json(files);
     }
     if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+        // The attachments block is for the model; people see `files`.
+        if let Some(Value::String(text)) = msg.get_mut("content") {
+            let body = rsclaw_events::media::strip_attachments_note(text);
+            if body.len() != text.len() {
+                *text = body.to_owned();
+            }
+        }
         if let Some(obj) = msg.as_object_mut() {
             obj.entry("sent_at").or_insert(Value::Null);
         }
@@ -385,5 +392,7 @@ mod tests {
         assert_eq!(m.get("sent_at"), Some(&Value::Null));
         let m = decorate_message(json!({"role": "assistant", "content": "x", "sent_at": "2026-10-27 17:14"}));
         assert_eq!(m["sent_at"], "2026-10-27 17:14");
+        let m = decorate_message(json!({"role": "assistant", "content": "成片好了\n\n[attachments]\n@dl_v_1a.mp4 = /d/videos/dl_v_1a.mp4"}));
+        assert_eq!(m["content"], "成片好了");
     }
 }

@@ -120,6 +120,33 @@ pub fn normalize_files_json(files: &mut serde_json::Value) {
     }
 }
 
+/// Header of the block an assistant message carries for the model, listing
+/// the files its turn produced; history shown to people drops it
+/// ([`strip_attachments_note`]).
+pub const ATTACHMENTS_HEADER: &str = "\n\n[attachments]\n";
+
+/// The block naming each produced file by `@token` (or name) and path, so a
+/// later turn — whose tool results are gone — can still use the exact path.
+/// `None` when there are no files.
+pub fn attachments_note(files: &[(String, String, String)]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = files
+        .iter()
+        .map(|(name, _, path)| match token_for_path(path) {
+            Some(token) => format!("@{token} = {path}"),
+            None => format!("{name} = {path}"),
+        })
+        .collect();
+    Some(format!("{ATTACHMENTS_HEADER}{}", lines.join("\n")))
+}
+
+/// `text` without its trailing attachments block.
+pub fn strip_attachments_note(text: &str) -> &str {
+    text.split_once(ATTACHMENTS_HEADER).map_or(text, |(body, _)| body)
+}
+
 /// serde `serialize_with` for an event's `files`.
 pub fn serialize_files<S: Serializer>(
     files: &[(String, String, String)],
@@ -166,6 +193,22 @@ mod tests {
             token_for_path(r"C:\Users\u\Downloads\rsclaw\images\dl_i_1abc.png").as_deref(),
             Some("dl_i_1abc.png")
         );
+    }
+
+    #[test]
+    fn attachments_note_names_tokens_and_paths() {
+        let files = vec![
+            ("dl_v_1abc.mp4".to_owned(), "video/mp4".to_owned(), r"C:\d\videos\dl_v_1abc.mp4".to_owned()),
+            ("out.txt".to_owned(), "text/plain".to_owned(), "/w/out.txt".to_owned()),
+        ];
+        let note = attachments_note(&files).expect("note");
+        assert_eq!(
+            note,
+            "\n\n[attachments]\n@dl_v_1abc.mp4 = C:\\d\\videos\\dl_v_1abc.mp4\nout.txt = /w/out.txt"
+        );
+        let text = format!("成片已发给你{note}");
+        assert_eq!(strip_attachments_note(&text), "成片已发给你");
+        assert_eq!(attachments_note(&[]), None);
     }
 
     #[test]

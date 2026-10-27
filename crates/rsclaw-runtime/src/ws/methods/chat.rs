@@ -373,6 +373,16 @@ pub async fn chat_history(ctx: MethodCtx) -> MethodResult {
         .filter(|v| !is_compaction_message(v))
         .filter(|v| !rsclaw_events::notice::is_hidden_message(v))
         .map(rsclaw_provider::redact_rsclaw_hidden_value)
+        .map(|mut v| {
+            // The attachments block is for the model; people see `files`.
+            if let Some(serde_json::Value::String(text)) = v.get_mut("content") {
+                let body = rsclaw_events::media::strip_attachments_note(text);
+                if body.len() != text.len() {
+                    *text = body.to_owned();
+                }
+            }
+            v
+        })
         .collect();
 
     let messages: Vec<_> = if filtered.len() > limit {
