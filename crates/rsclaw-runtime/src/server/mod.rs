@@ -5004,9 +5004,21 @@ fn git_workdir(path: Option<&str>) -> PathBuf {
     }
 }
 
+/// 404 when the folder isn't a git repository, which clients read as "no
+/// git here"; 500 for any other failure.
+fn git_error_status(error: &str) -> StatusCode {
+    if error.contains("not a git repository") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 fn run_cmd(dir: &std::path::Path, program: &str, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(dir);
+    // English messages, so failures can be told apart (git_error_status).
+    cmd.env("LC_ALL", "C");
     #[cfg(windows)]
     {
         cmd.creation_flags(0x08000000);
@@ -5029,7 +5041,7 @@ async fn git_status(Query(q): Query<GitQuery>) -> Response {
         Ok(value) => value,
         Err(error) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                git_error_status(&error),
                 Json(serde_json::json!({"error": error})),
             )
                 .into_response();
@@ -5090,7 +5102,7 @@ async fn git_diff(Query(q): Query<GitQuery>) -> Response {
     match run_cmd(&dir, "git", &args) {
         Ok(diff) => (StatusCode::OK, diff).into_response(),
         Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            git_error_status(&error),
             Json(serde_json::json!({"error": error})),
         )
             .into_response(),
@@ -5115,7 +5127,7 @@ async fn git_log(Query(q): Query<GitQuery>) -> Response {
             Json(serde_json::json!({"commits": commits})).into_response()
         }
         Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            git_error_status(&error),
             Json(serde_json::json!({"error": error})),
         )
             .into_response(),
@@ -5127,7 +5139,7 @@ async fn git_commit(Json(body): Json<GitCommitRequest>) -> Response {
     for file in &body.files {
         if let Err(error) = run_cmd(&dir, "git", &["add", "--", file]) {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                git_error_status(&error),
                 Json(serde_json::json!({"error": error})),
             )
                 .into_response();
@@ -5136,7 +5148,7 @@ async fn git_commit(Json(body): Json<GitCommitRequest>) -> Response {
     match run_cmd(&dir, "git", &["commit", "-m", &body.message]) {
         Ok(output) => Json(serde_json::json!({"ok": true, "output": output})).into_response(),
         Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            git_error_status(&error),
             Json(serde_json::json!({"error": error})),
         )
             .into_response(),
@@ -5185,7 +5197,7 @@ async fn git_pr_get(Path(number): Path<u64>, Query(q): Query<GitQuery>) -> Respo
                 .into_response(),
         },
         Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            git_error_status(&error),
             Json(serde_json::json!({"error": error})),
         )
             .into_response(),
@@ -5207,7 +5219,7 @@ async fn git_pr_review(Path(number): Path<u64>, Json(body): Json<GitReviewReques
     ) {
         Ok(output) => Json(serde_json::json!({"ok": true, "output": output})).into_response(),
         Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            git_error_status(&error),
             Json(serde_json::json!({"error": error})),
         )
             .into_response(),
@@ -8850,3 +8862,18 @@ async fn owners_remove(
     }
 }
 
+#[cfg(test)]
+mod git_api_tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_without_git_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = run_cmd(dir.path(), "git", &["status", "--porcelain=v1"]).expect_err("no repo");
+        assert_eq!(git_error_status(&error), StatusCode::NOT_FOUND, "{error}");
+        assert_eq!(
+            git_error_status("fatal: bad revision"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}
