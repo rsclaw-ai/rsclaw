@@ -2013,6 +2013,12 @@ pub struct CronDelivery {
     /// If true, silently ignore delivery failures.
     #[serde(default)]
     pub best_effort: Option<bool>,
+    /// Session to add the result to, as an assistant message that is also
+    /// pushed to the session's `/api/v1/stream` subscribers. Set for jobs
+    /// created in a session with no channel to send on (the app's HTTP
+    /// chat); wins over `channel` / `to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

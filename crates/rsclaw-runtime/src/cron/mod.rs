@@ -88,6 +88,22 @@ const KB_PREFETCH_HIT_BYTES: usize = 1200;
 const KB_PREFETCH_QUERY_BYTES: usize = 600;
 const KB_PREFETCH_TIMEOUT_SECS: u64 = 10;
 
+/// How long a run's delivery may take before it counts as failed.
+const DELIVERY_TIMEOUT_SECS: u64 = 60;
+
+/// What became of a run's delivery: `None` when it had nothing to deliver,
+/// `Ok(false)` when no recipient was set or found, `Ok(true)` when sent,
+/// `Err` with why it failed.
+type DeliveryOutcome = Option<std::result::Result<bool, String>>;
+
+/// Where deliveries addressed to a session go: its history and its
+/// `/api/v1/stream` subscribers.
+#[derive(Clone)]
+pub struct SessionSink {
+    pub db: Arc<rsclaw_store::redb_store::RedbStore>,
+    pub event_bus: broadcast::Sender<rsclaw_events::AgentEvent>,
+}
+
 // ---------------------------------------------------------------------------
 // CronRunner
 // ---------------------------------------------------------------------------
@@ -112,6 +128,8 @@ pub struct CronRunner {
     default_delivery: Option<CronDelivery>,
     reload_tx: broadcast::Sender<()>,
     ws_conns: Arc<crate::ws::ConnRegistry>,
+    /// Deliveries addressed to a session; see [`SessionSink`].
+    session_sink: Option<SessionSink>,
     /// Optional graceful-shutdown coordinator. When draining, the scheduler
     /// loop exits at the next iteration without firing further jobs. Tests
     /// that don't care about graceful shutdown can pass `None`.
@@ -179,10 +197,19 @@ impl CronRunner {
             default_delivery: config.default_delivery.clone(),
             reload_tx,
             ws_conns,
+            session_sink: None,
             shutdown,
             parse_failed,
             daemon_agent_ids: Vec::new(),
         }
+    }
+
+    /// Deliver results addressed to a session (jobs made in the app's HTTP
+    /// chat) into that session.
+    #[must_use]
+    pub fn with_session_sink(mut self, sink: SessionSink) -> Self {
+        self.session_sink = Some(sink);
+        self
     }
 
     /// Agent IDs that run as long-lived daemon loops — their cron-triggered
@@ -395,6 +422,7 @@ impl CronRunner {
             let channels = Arc::clone(&self.channels);
             let agents = Arc::clone(&self.agents);
             let default_delivery = self.default_delivery.clone();
+            let sink = self.session_sink.clone();
             tokio::spawn(async move {
                 let name = job.name.clone().unwrap_or_else(|| job.id.clone());
                 let text = rsclaw_i18n::t_fmt(
@@ -402,8 +430,15 @@ impl CronRunner {
                     rsclaw_i18n::default_lang(),
                     &[("name", &name)],
                 );
-                if let Err(e) =
-                    send_delivery(&channels, &agents, &job, &default_delivery, &text).await
+                if let Err(e) = send_delivery(
+                    &channels,
+                    &agents,
+                    sink.as_ref(),
+                    &job,
+                    &default_delivery,
+                    &text,
+                )
+                .await
                 {
                     warn!(job_id = %job.id, %e, "cron: missed-run notice delivery failed");
                 }
@@ -488,8 +523,14 @@ impl CronRunner {
         mut reload_rx: broadcast::Receiver<()>,
     ) {
         // Channel for collecting job results asynchronously.
-        let (result_tx, mut result_rx) =
-            tokio::sync::mpsc::channel::<(String, bool, u64, u64, Option<String>)>(64);
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<(
+            String,
+            bool,
+            u64,
+            u64,
+            Option<String>,
+            DeliveryOutcome,
+        )>(64);
 
         // Cancel flags for running jobs — set to true to signal abort on deletion.
         let mut cancel_flags: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = HashMap::new();
@@ -723,7 +764,7 @@ impl CronRunner {
             // This is critical: if we skip try_recv when due.is_empty(), runningAtMs
             // will never be cleared, causing the job to be stuck forever.
             let mut collected_count = 0;
-            while let Ok((job_id, success, duration_ms, started_at, error_msg)) =
+            while let Ok((job_id, success, duration_ms, started_at, error_msg, delivered)) =
                 result_rx.try_recv()
             {
                 collected_count += 1;
@@ -734,6 +775,22 @@ impl CronRunner {
                         state.running_at_ms = None;
                         state.last_run_at_ms = Some(current_timestamp_ms());
                         state.last_duration_ms = Some(duration_ms);
+                        // Recorded apart from the run's own status: a reminder
+                        // that fired but reached nobody still ran.
+                        match &delivered {
+                            Some(Ok(true)) => {
+                                state.last_delivery_status = Some("ok".to_string());
+                                state.last_delivery_error = None;
+                            }
+                            Some(Err(e)) => {
+                                state.last_delivery_status = Some("error".to_string());
+                                state.last_delivery_error = Some(e.clone());
+                            }
+                            _ => {
+                                state.last_delivery_status = None;
+                                state.last_delivery_error = None;
+                            }
+                        }
 
                         let completion_time = started_at + duration_ms;
 
@@ -960,6 +1017,7 @@ impl CronRunner {
                 let channels = Arc::clone(&self.channels);
                 let run_log_dir = self.run_log_dir.clone();
                 let default_delivery = self.default_delivery.clone();
+                let session_sink = self.session_sink.clone();
                 let ws_conns = Arc::clone(&self.ws_conns);
                 // Track this job in the gateway's inflight count so a graceful
                 // restart waits for it (until drain timeout) before exiting.
@@ -1157,26 +1215,34 @@ impl CronRunner {
                     // separate direct broadcast here (would double-deliver).
                     let _ = &ws_conns; // kept in scope for future direct use
 
-                    // Spawn delivery as a detached task so it doesn't block.
-                    // The result is logged but we don't wait for it.
-                    if let Some(delivery_text) = delivery_text {
-                        let delivery_channels = Arc::clone(&channels);
-                        let delivery_agents = Arc::clone(&agents);
-                        let delivery_job = job.clone();
-                        let delivery_default = default_delivery.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = send_delivery(
-                                &delivery_channels,
-                                &delivery_agents,
-                                &delivery_job,
-                                &delivery_default,
-                                &delivery_text,
+                    // Awaited (bounded) so the job's state can say whether
+                    // the result reached anyone.
+                    let delivered: DeliveryOutcome = match delivery_text {
+                        Some(delivery_text) => Some(
+                            match tokio::time::timeout(
+                                Duration::from_secs(DELIVERY_TIMEOUT_SECS),
+                                send_delivery(
+                                    &channels,
+                                    &agents,
+                                    session_sink.as_ref(),
+                                    &job,
+                                    &default_delivery,
+                                    &delivery_text,
+                                ),
                             )
                             .await
                             {
-                                warn!(job_id = %delivery_job.id, %e, "delivery failed");
-                            }
-                        });
+                                Ok(Ok(sent)) => Ok(sent),
+                                Ok(Err(e)) => Err(format!("{e:#}")),
+                                Err(_) => Err(format!(
+                                    "delivery timed out after {DELIVERY_TIMEOUT_SECS}s"
+                                )),
+                            },
+                        ),
+                        None => None,
+                    };
+                    if let Some(Err(e)) = &delivered {
+                        warn!(job_id = %job.id, error = %e, "cron: delivery failed");
                     }
 
                     let entry = build_run_log_entry(
@@ -1195,6 +1261,7 @@ impl CronRunner {
                         duration_ms,
                         job_started_at,
                         error_msg,
+                        delivered,
                     )
                 });
 
@@ -1219,6 +1286,7 @@ impl CronRunner {
                                 duration_ms,
                                 started_at,
                                 Some(format!("cron job task aborted: {e}")),
+                                None,
                             )
                         }
                     };
@@ -1330,6 +1398,7 @@ impl CronRunner {
         if let Err(e) = send_delivery(
             &self.channels,
             &self.agents,
+            self.session_sink.as_ref(),
             job,
             &self.default_delivery,
             &delivery_text,
@@ -1442,6 +1511,7 @@ impl Clone for CronRunner {
             default_delivery: self.default_delivery.clone(),
             reload_tx: self.reload_tx.clone(),
             ws_conns: Arc::clone(&self.ws_conns),
+            session_sink: self.session_sink.clone(),
             shutdown: self.shutdown.clone(),
             parse_failed: self.parse_failed,
         }
@@ -2306,31 +2376,51 @@ pub(crate) fn resolve_delivery_targets(
     targets
 }
 
+/// Send a run's result where the job delivers. `Ok(true)` once it went out,
+/// `Ok(false)` when there was no recipient to send to.
 async fn send_delivery(
     channels: &ChannelManager,
     agents: &AgentRegistry,
+    sink: Option<&SessionSink>,
     job: &CronJob,
     default_delivery: &Option<CronDelivery>,
     output_text: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let delivery = match job.delivery.as_ref().or(default_delivery.as_ref()) {
         Some(d) => d,
         None => {
             info!(job_id = %job.id, name = ?job.name, "cron: no delivery configured, result discarded. Set delivery on the job or configure default_delivery in cron config.");
-            return Ok(());
+            return Ok(false);
         }
     };
 
     let mode = delivery.mode.as_deref().unwrap_or("none");
     if mode == "none" {
         debug!(job_id = %job.id, "cron: delivery mode is 'none', skipping");
-        return Ok(());
+        return Ok(false);
     }
 
     let text = output_text.trim();
     if text.is_empty() && default_delivery.is_none() && job.delivery.is_none() {
         debug!(job_id = %job.id, "cron: output text is empty and no delivery configured");
-        return Ok(());
+        return Ok(false);
+    }
+
+    // A job made in a session with no channel of its own (the app's HTTP
+    // chat) delivers into that session.
+    if let Some(session_key) = delivery.session_key.as_deref().filter(|k| !k.is_empty()) {
+        if text.is_empty() {
+            return Ok(false);
+        }
+        let sink = sink.ok_or_else(|| anyhow!("no session delivery wired up"))?;
+        rsclaw_agent::tools_cron::post_to_session(
+            &sink.db,
+            Some(&sink.event_bus),
+            session_key,
+            text,
+        )?;
+        info!(job_id = %job.id, session = %session_key, "cron delivery added to the session");
+        return Ok(true);
     }
 
     let thread = delivery.thread_id.clone();
@@ -2341,12 +2431,13 @@ async fn send_delivery(
     // sentinel, and the no-`to` "reply to recent conversation" fallback.
     let targets = resolve_delivery_targets(agents, &job.agent_id, delivery);
     if targets.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     info!(job_id = %job.id, recipients = targets.len(), text_len = text.len(), "cron: sending delivery");
 
     // Send in concurrent batches of DELIVERY_BATCH.
+    let mut sent = false;
     for chunk in targets.chunks(DELIVERY_BATCH) {
         let futs = chunk.iter().map(|(channel_name, account, to, is_group)| {
             // Back-compat: legacy jobs carry channel="ws"; the desktop
@@ -2380,23 +2471,23 @@ async fn send_delivery(
                     },
                     None => {
                         warn!(job_id = %job_id, channel = %resolved_channel, "cron: channel not found in ChannelManager");
-                        Ok(())
+                        Err(anyhow!("channel {resolved_channel} is not connected"))
                     }
                 }
             }
         });
         let results = futures::future::join_all(futs).await;
         for r in results {
-            if let Err(e) = r {
-                if best_effort {
+            match r {
+                Ok(()) => sent = true,
+                Err(e) if best_effort => {
                     warn!(job_id = %job.id, error = %e, "cron delivery failed (best_effort)");
-                } else {
-                    return Err(e);
                 }
+                Err(e) => return Err(e),
             }
         }
     }
-    Ok(())
+    Ok(sent)
 }
 
 /// Execute a command directly without agent, returning real output.
@@ -2704,4 +2795,66 @@ pub async fn read_jobs_from_file(cron_dir: PathBuf) -> Result<Vec<CronJob>> {
     jobs.sort_by_key(|j| j.created_at_ms.unwrap_or(0));
 
     Ok(jobs)
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    fn job(delivery: serde_json::Value) -> CronJob {
+        serde_json::from_value(serde_json::json!({
+            "id": "j1",
+            "agentId": "main",
+            "enabled": true,
+            "schedule": "* * * * *",
+            "payload": {"kind": "systemEvent", "text": "该喝水啦"},
+            "delivery": delivery,
+        }))
+        .expect("job")
+    }
+
+    #[tokio::test]
+    async fn a_session_job_delivers_into_its_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            rsclaw_store::redb_store::RedbStore::open(
+                &dir.path().join("t.redb"),
+                crate::MemoryTier::Low,
+            )
+            .expect("open redb"),
+        );
+        let (event_bus, mut rx) = broadcast::channel(8);
+        let sink = SessionSink {
+            db: Arc::clone(&db),
+            event_bus,
+        };
+        let channels = ChannelManager::new(crate::MemoryTier::Low);
+        let agents = AgentRegistry::new();
+        let job = job(serde_json::json!({"mode": "always", "sessionKey": "desktop:main:048643"}));
+
+        let sent = send_delivery(&channels, &agents, Some(&sink), &job, &None, "该喝水啦").await;
+        assert!(sent.expect("delivered"));
+        let stored = db.load_messages("desktop:main:048643").expect("load");
+        assert_eq!(stored.last().expect("message")["content"], "该喝水啦");
+        assert_eq!(rx.try_recv().expect("text").delta, "该喝水啦");
+        assert!(rx.try_recv().expect("done").done);
+
+        // Without a sink nothing can take it: a failure, not a quiet success.
+        assert!(
+            send_delivery(&channels, &agents, None, &job, &None, "该喝水啦")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_channel_is_a_failed_delivery() {
+        let channels = ChannelManager::new(crate::MemoryTier::Low);
+        let agents = AgentRegistry::new();
+        let job = job(serde_json::json!({"mode": "always", "channel": "api", "to": "api-client"}));
+        let err = send_delivery(&channels, &agents, None, &job, &None, "该喝水啦")
+            .await
+            .expect_err("no such channel");
+        assert!(err.to_string().contains("api"), "{err}");
+    }
 }

@@ -4,7 +4,7 @@
 //! `impl AgentRuntime` via the split-impl pattern (same struct, different
 //! file).
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -22,6 +22,52 @@ use rsclaw_cron::CRON_FILE_LOCK as CRON_RMW_LOCK;
 /// `desktop` sink).
 fn delivery_channel_for(channel: &str) -> &str {
     if channel == "ws" { "desktop" } else { channel }
+}
+
+/// Add `text` to a session as an assistant message and push it to the
+/// session's `/api/v1/stream` subscribers as a turn of its own: the text,
+/// then `done`. Stored first, so a client that settles on `done` finds it
+/// in the history. How reminders reach a session with no channel to send
+/// on (the app's HTTP chat).
+pub fn post_to_session(
+    db: &rsclaw_store::redb_store::RedbStore,
+    event_bus: Option<&tokio::sync::broadcast::Sender<rsclaw_events::AgentEvent>>,
+    session_key: &str,
+    text: &str,
+) -> Result<()> {
+    let msg = json!({
+        "role": "assistant",
+        "content": text,
+        "sent_at": chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+    });
+    db.append_message(session_key, &msg)
+        .map_err(|e| anyhow!("adding the message to session {session_key}: {e:#}"))?;
+    if let Some(tx) = event_bus {
+        let event = |delta: &str, done: bool| rsclaw_events::AgentEvent {
+            session_id: session_key.to_owned(),
+            delta: delta.to_owned(),
+            done,
+            ..Default::default()
+        };
+        let _ = tx.send(event(text, false));
+        let _ = tx.send(event("", true));
+    }
+    Ok(())
+}
+
+/// Where a job made in this turn delivers: back to the session when the
+/// turn's channel has nothing to send on (`api`), else to the channel and
+/// peer the turn came from. `None` for turns with no one to deliver to.
+fn origin_delivery(ctx: &super::runtime::RunContext) -> Option<Value> {
+    let channel = ctx.channel.as_str();
+    if rsclaw_channel::is_sync_only_channel(channel) {
+        return (!ctx.session_key.is_empty())
+            .then(|| json!({"mode": "always", "sessionKey": ctx.session_key}));
+    }
+    if channel.is_empty() || channel == "system" || channel == "cron" || ctx.peer_id.is_empty() {
+        return None;
+    }
+    Some(json!({"channel": delivery_channel_for(channel), "to": ctx.peer_id, "mode": "always"}))
 }
 
 /// Whether the caller may see / change every job: owners on local entry
@@ -214,18 +260,32 @@ impl super::runtime::AgentRuntime {
                         let msg_text = message.to_owned();
                         let notif_tx = self.notification_tx.clone();
                         let peer_id = ctx.peer_id.clone();
-                        let origin_channel = ctx.channel.clone();
-                        let delivery_channel: String = if origin_channel == "ws" {
-                            "desktop".to_owned()
-                        } else {
-                            origin_channel
-                        };
+                        let delivery_channel = delivery_channel_for(&ctx.channel).to_owned();
+                        // A turn with no channel to send on gets the reminder
+                        // in its session instead.
+                        let to_session =
+                            rsclaw_channel::is_sync_only_channel(&ctx.channel).then(|| {
+                                (
+                                    ctx.session_key.clone(),
+                                    Arc::clone(&self.store),
+                                    self.event_bus.clone(),
+                                )
+                            });
                         let delay_dur = Duration::from_millis(delay);
                         let timer_name = name.unwrap_or("reminder").to_owned();
                         debug!(delay_ms = delay, name = %timer_name, channel = %delivery_channel, "cron: using in-memory timer (short delay)");
                         tokio::spawn(async move {
                             tokio::time::sleep(delay_dur).await;
-                            if let Some(tx) = notif_tx {
+                            if let Some((session_key, store, event_bus)) = to_session {
+                                if let Err(e) = post_to_session(
+                                    &store.db,
+                                    event_bus.as_ref(),
+                                    &session_key,
+                                    &msg_text,
+                                ) {
+                                    tracing::warn!(error = %e, "cron in-memory timer: reminder not delivered");
+                                }
+                            } else if let Some(tx) = notif_tx {
                                 let msg = rsclaw_channel::OutboundMessage {
                                     target_id: peer_id,
                                     is_group: false,
@@ -358,32 +418,10 @@ impl super::runtime::AgentRuntime {
                     job["iter"] = json!({"items": items, "cursor": 0});
                 }
 
-                // Auto-set delivery to the originating channel+peer when not explicitly
-                // specified. Special case: WS chat transport uses
-                // ctx.channel="ws", but the delivery sink registered in
-                // ChannelManager is "desktop" (DesktopChannel broadcasts to all
-                // connected WS clients). Remap so send_delivery can route.
-                let channel = &ctx.channel;
-                let peer_id = &ctx.peer_id;
-                if !channel.is_empty()
-                    && channel != "system"
-                    && channel != "cron"
-                    && !peer_id.is_empty()
-                {
-                    let delivery_channel: &str = if channel == "ws" {
-                        "desktop"
-                    } else {
-                        channel.as_str()
-                    };
-                    job["delivery"] = json!({
-                        "channel": delivery_channel,
-                        "to": peer_id,
-                        "mode": "always"
-                    });
-                    debug!(
-                        channel = delivery_channel,
-                        peer_id, "cron add: auto-set delivery to originating channel"
-                    );
+                // Deliver to where the job was asked for (see origin_delivery).
+                if let Some(delivery) = origin_delivery(ctx) {
+                    debug!(delivery = %delivery, "cron add: delivery set to the job's origin");
+                    job["delivery"] = delivery;
                 }
 
                 {
@@ -705,4 +743,33 @@ pub async fn write_cron_jobs(path: &std::path::Path, jobs: &[Value]) -> Result<(
         .await
         .map_err(|e| anyhow!("cron: failed to rename jobs file: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsclaw_store::redb_store::RedbStore;
+
+    #[test]
+    fn a_reminder_is_stored_before_its_turn_is_streamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = RedbStore::open(&dir.path().join("t.redb"), rsclaw_platform::MemoryTier::Low)
+            .expect("open redb");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        post_to_session(&db, Some(&tx), "desktop:main:1", "该喝水啦").expect("post");
+
+        let stored = db.load_messages("desktop:main:1").expect("load");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0]["role"], "assistant");
+        assert_eq!(stored[0]["content"], "该喝水啦");
+        assert!(stored[0]["sent_at"].is_string());
+
+        let text = rx.try_recv().expect("text event");
+        assert_eq!(
+            (text.session_id.as_str(), text.delta.as_str(), text.done),
+            ("desktop:main:1", "该喝水啦", false)
+        );
+        let done = rx.try_recv().expect("done event");
+        assert!(done.done && done.delta.is_empty());
+    }
 }

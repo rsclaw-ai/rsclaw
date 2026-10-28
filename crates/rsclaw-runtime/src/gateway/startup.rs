@@ -1207,7 +1207,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 Some(shutdown.clone()),
             )
             .with_daemon_agent_ids(config.agents.daemon_agent_ids())
-            .with_wasm_plugins(Arc::clone(&wasm_plugins_live));
+            .with_wasm_plugins(Arc::clone(&wasm_plugins_live))
+            .with_session_sink(crate::cron::SessionSink {
+                db: Arc::clone(&store.db),
+                event_bus: event_tx.clone(),
+            });
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
                     error!("cron runner error: {e:#}");

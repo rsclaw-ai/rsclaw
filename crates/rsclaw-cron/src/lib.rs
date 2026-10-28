@@ -304,8 +304,13 @@ pub struct CronJobState {
     pub last_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_duration_ms: Option<u64>,
+    /// `ok` or `error` for the last run's delivery; unset when the run had
+    /// nothing to deliver or nowhere to deliver it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_delivery_status: Option<String>,
+    /// Why the last run's delivery failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delivery_error: Option<String>,
     #[serde(default)]
     pub consecutive_errors: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]

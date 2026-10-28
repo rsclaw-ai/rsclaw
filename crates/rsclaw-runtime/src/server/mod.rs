@@ -4699,6 +4699,7 @@ pub(crate) async fn trigger_cron_job(
             let ws_conns = state.ws_conns.clone();
             let job_name = job["name"].as_str().unwrap_or(&id).to_owned();
             let wasm_plugins = state.wasm_plugins.clone();
+            let session_sink = (Arc::clone(&state.store), state.event_bus.clone());
             tokio::spawn(async move {
                 let reply = reply_rx.await;
                 // The turn has ended (or its reply channel dropped): let the
@@ -4724,7 +4725,20 @@ pub(crate) async fn trigger_cron_job(
 
                     if !reply.text.is_empty() {
                         if let Some(delivery) = delivery {
-                            if delivery.mode.as_deref() != Some("none") {
+                            let to_session =
+                                delivery.session_key.as_deref().filter(|k| !k.is_empty());
+                            if let Some(session_key) = to_session {
+                                // Made in a session with no channel to send on.
+                                let (store, event_bus) = &session_sink;
+                                if let Err(e) = rsclaw_agent::tools_cron::post_to_session(
+                                    &store.db,
+                                    Some(event_bus),
+                                    session_key,
+                                    &reply.text,
+                                ) {
+                                    tracing::warn!(job_id = %job_id, error = %e, "cron trigger: reply not added to the session");
+                                }
+                            } else if delivery.mode.as_deref() != Some("none") {
                                 let thread = delivery.thread_id.clone();
                                 let targets = crate::cron::resolve_delivery_targets(
                                     &agents,
