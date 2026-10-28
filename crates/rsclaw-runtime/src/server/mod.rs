@@ -1170,6 +1170,9 @@ async fn send_message(
                 async move {
                     let event = msg.ok()?;
                     if event.session_id != sid { return None; }
+                    // A cron delivery posted into this session isn't part
+                    // of this turn: its text and done would end up in it.
+                    if event.origin.is_some() { return None; }
                     if event.done {
                         let mut stop = serde_json::json!({
                             "id": cid, "object": "chat.completion.chunk",
@@ -5940,6 +5943,9 @@ async fn openai_chat_completions(
                     // Lagged receivers yield Err; skip and keep streaming.
                     let event = msg.ok()?;
                     if event.session_id != sid { return None; }
+                    // A cron delivery posted into this session isn't part
+                    // of this turn: its text and done would end up in it.
+                    if event.origin.is_some() { return None; }
                     if event.done {
                         match reply_acc.lock() {
                             Ok(acc) => oai_index_register(request_hasher, &acc, &index_key),

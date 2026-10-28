@@ -142,6 +142,11 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
                         if event.session_id != sk {
                             continue;
                         }
+                        // A cron delivery posted into this session isn't part of
+                        // this turn: its done would end the relay.
+                        if event.origin.is_some() {
+                            continue;
+                        }
                         let conn_seq = conn.write().await.next_seq();
                         let payload = if event.done {
                             serde_json::json!({
@@ -264,6 +269,11 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
                         None => break,
                     };
                     if event.session_id != sk {
+                        continue;
+                    }
+                    // A cron delivery posted into this session isn't part of
+                    // this turn: its done would end the relay.
+                    if event.origin.is_some() {
                         continue;
                     }
 
