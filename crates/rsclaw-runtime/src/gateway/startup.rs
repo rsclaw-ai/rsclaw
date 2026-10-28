@@ -2162,22 +2162,60 @@ fn propagate_user_env(config: &RuntimeConfig) {
     apply_user_env_map(&env_map.0);
 }
 
+/// Names of the variables a previous start exported from the config file.
+/// `gateway restart` re-execs the process with its environment, so without
+/// this record a value exported last time would look shell-provided and an
+/// edited config value would never take effect.
+const CONFIG_ENV_KEYS_VAR: &str = "RSCLAW_CONFIG_ENV_KEYS";
+
 /// Inner helper, separated from `propagate_user_env` so it can be unit-tested
 /// without constructing a full `RuntimeConfig`.
 fn apply_user_env_map(env_map: &std::collections::HashMap<String, String>) {
+    let owned: std::collections::HashSet<String> = std::env::var(CONFIG_ENV_KEYS_VAR)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|k| !k.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut now_owned = apply_user_env_map_owned(env_map, &owned);
+    now_owned.sort();
+    // SAFETY: pre-async-runtime, single-threaded.
+    unsafe { std::env::set_var(CONFIG_ENV_KEYS_VAR, now_owned.join(",")) };
+}
+
+/// Export `env_map`. Variables in `owned` came from the config on an earlier
+/// start: they follow the config (updated, or removed once the config drops
+/// them). Any other variable already set came from the shell / launchd /
+/// systemd and wins. Returns the variables the config now owns.
+fn apply_user_env_map_owned(
+    env_map: &std::collections::HashMap<String, String>,
+    owned: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut now_owned = Vec::new();
     for (key, raw_val) in env_map {
-        if key.is_empty() {
+        if key.is_empty() || key == CONFIG_ENV_KEYS_VAR {
             continue;
         }
-        if std::env::var(key).is_ok() {
+        if std::env::var(key).is_ok() && !owned.contains(key) {
             // Already set by shell / launchd / systemd — don't clobber.
             continue;
         }
         let expanded = rsclaw_config::loader::expand_env_vars(raw_val);
-        // SAFETY: pre-async-runtime, single-threaded.
-        unsafe { std::env::set_var(key, &expanded) };
-        info!(key = %key, "exported user env var from {}", rsclaw_brand::CONFIG_FILE);
+        if std::env::var(key).ok().as_deref() != Some(expanded.as_str()) {
+            // SAFETY: pre-async-runtime, single-threaded.
+            unsafe { std::env::set_var(key, &expanded) };
+            info!(key = %key, "exported user env var from {}", rsclaw_brand::CONFIG_FILE);
+        }
+        now_owned.push(key.clone());
     }
+    for key in owned {
+        if !env_map.contains_key(key) {
+            // SAFETY: pre-async-runtime, single-threaded.
+            unsafe { std::env::remove_var(key) };
+            info!(key = %key, "removed user env var dropped from {}", rsclaw_brand::CONFIG_FILE);
+        }
+    }
+    now_owned
 }
 
 /// Read `skill_registries.<name>.{apiKey,baseUrl}` from the resolved
@@ -3186,7 +3224,7 @@ mod user_env_tests {
             "RSCLAW_TEST_USER_ENV_NEW".to_owned(),
             "from-config".to_owned(),
         );
-        apply_user_env_map(&map);
+        apply_user_env_map_owned(&map, &Default::default());
         assert_eq!(
             std::env::var("RSCLAW_TEST_USER_ENV_NEW").as_deref(),
             Ok("from-config")
@@ -3202,13 +3240,41 @@ mod user_env_tests {
             "RSCLAW_TEST_USER_ENV_KEEP".to_owned(),
             "from-config".to_owned(),
         );
-        apply_user_env_map(&map);
+        apply_user_env_map_owned(&map, &Default::default());
         assert_eq!(
             std::env::var("RSCLAW_TEST_USER_ENV_KEEP").as_deref(),
             Ok("from-shell"),
             "shell-provided value must not be overwritten"
         );
         unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_KEEP") };
+    }
+
+    #[test]
+    fn config_owned_value_follows_config_on_restart() {
+        unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_OWNED", "old-config") };
+        unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_DROPPED", "old-config") };
+        let owned: std::collections::HashSet<String> = [
+            "RSCLAW_TEST_USER_ENV_OWNED".to_owned(),
+            "RSCLAW_TEST_USER_ENV_DROPPED".to_owned(),
+        ]
+        .into();
+        let mut map = HashMap::new();
+        map.insert(
+            "RSCLAW_TEST_USER_ENV_OWNED".to_owned(),
+            "new-config".to_owned(),
+        );
+        let now = apply_user_env_map_owned(&map, &owned);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_OWNED").as_deref(),
+            Ok("new-config"),
+            "a value the config exported earlier must follow the edited config"
+        );
+        assert!(
+            std::env::var("RSCLAW_TEST_USER_ENV_DROPPED").is_err(),
+            "a value the config no longer lists must be removed"
+        );
+        assert_eq!(now, vec!["RSCLAW_TEST_USER_ENV_OWNED".to_owned()]);
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_OWNED") };
     }
 
     #[test]
@@ -3220,7 +3286,7 @@ mod user_env_tests {
             "RSCLAW_TEST_USER_ENV_TARGET".to_owned(),
             "${RSCLAW_TEST_USER_ENV_REF}/app.log".to_owned(),
         );
-        apply_user_env_map(&map);
+        apply_user_env_map_owned(&map, &Default::default());
         assert_eq!(
             std::env::var("RSCLAW_TEST_USER_ENV_TARGET").as_deref(),
             Ok("/var/log/foo/app.log")
