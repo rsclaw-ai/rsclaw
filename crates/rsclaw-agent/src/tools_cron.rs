@@ -25,15 +25,17 @@ fn delivery_channel_for(channel: &str) -> &str {
 }
 
 /// Add `text` to a session as an assistant message and push it to the
-/// session's `/api/v1/stream` subscribers as a turn of its own: the text,
-/// then `done`. Stored first, so a client that settles on `done` finds it
-/// in the history. How reminders reach a session with no channel to send
-/// on (the app's HTTP chat).
+/// session's `/api/v1/stream` subscribers as a message of its own: the
+/// text, then `done`, both marked with the cron job `job_id` as their
+/// origin. Stored first, so a client that settles on `done` finds it in
+/// the history. How reminders reach a session with no channel to send on
+/// (the app's HTTP chat).
 pub fn post_to_session(
     db: &rsclaw_store::redb_store::RedbStore,
     event_bus: Option<&tokio::sync::broadcast::Sender<rsclaw_events::AgentEvent>>,
     session_key: &str,
     text: &str,
+    job_id: &str,
 ) -> Result<()> {
     let msg = json!({
         "role": "assistant",
@@ -47,6 +49,10 @@ pub fn post_to_session(
             session_id: session_key.to_owned(),
             delta: delta.to_owned(),
             done,
+            origin: Some(rsclaw_events::EventOrigin {
+                kind: "cron".to_owned(),
+                id: job_id.to_owned(),
+            }),
             ..Default::default()
         };
         let _ = tx.send(event(text, false));
@@ -266,6 +272,7 @@ impl super::runtime::AgentRuntime {
                         let to_session =
                             rsclaw_channel::is_sync_only_channel(&ctx.channel).then(|| {
                                 (
+                                    id.clone(),
                                     ctx.session_key.clone(),
                                     Arc::clone(&self.store),
                                     self.event_bus.clone(),
@@ -276,12 +283,13 @@ impl super::runtime::AgentRuntime {
                         debug!(delay_ms = delay, name = %timer_name, channel = %delivery_channel, "cron: using in-memory timer (short delay)");
                         tokio::spawn(async move {
                             tokio::time::sleep(delay_dur).await;
-                            if let Some((session_key, store, event_bus)) = to_session {
+                            if let Some((timer_id, session_key, store, event_bus)) = to_session {
                                 if let Err(e) = post_to_session(
                                     &store.db,
                                     event_bus.as_ref(),
                                     &session_key,
                                     &msg_text,
+                                    &timer_id,
                                 ) {
                                     tracing::warn!(error = %e, "cron in-memory timer: reminder not delivered");
                                 }
@@ -756,7 +764,7 @@ mod tests {
         let db = RedbStore::open(&dir.path().join("t.redb"), rsclaw_platform::MemoryTier::Low)
             .expect("open redb");
         let (tx, mut rx) = tokio::sync::broadcast::channel(8);
-        post_to_session(&db, Some(&tx), "desktop:main:1", "该喝水啦").expect("post");
+        post_to_session(&db, Some(&tx), "desktop:main:1", "该喝水啦", "j1").expect("post");
 
         let stored = db.load_messages("desktop:main:1").expect("load");
         assert_eq!(stored.len(), 1);
@@ -769,7 +777,13 @@ mod tests {
             (text.session_id.as_str(), text.delta.as_str(), text.done),
             ("desktop:main:1", "该喝水啦", false)
         );
+        assert_eq!(
+            text.origin
+                .as_ref()
+                .map(|o| (o.kind.as_str(), o.id.as_str())),
+            Some(("cron", "j1"))
+        );
         let done = rx.try_recv().expect("done event");
-        assert!(done.done && done.delta.is_empty());
+        assert!(done.done && done.delta.is_empty() && done.origin.is_some());
     }
 }

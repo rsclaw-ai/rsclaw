@@ -259,4 +259,19 @@ pub struct AgentEvent {
     /// don't need to be updated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<TextChannel>,
+    /// Set when the event is not part of the session's agent turn: a cron
+    /// job's delivery, posted as a message of its own (its text, then
+    /// `done`). Clients show it apart from a turn streaming at the same
+    /// time, and its `done` doesn't end that turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<EventOrigin>,
+}
+
+/// What posted an [`AgentEvent`] outside the session's agent turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventOrigin {
+    /// `cron`: a cron job's delivery, or a short reminder's.
+    pub kind: String,
+    /// The job's id (a short reminder's id, as the cron tool returned it).
+    pub id: String,
 }

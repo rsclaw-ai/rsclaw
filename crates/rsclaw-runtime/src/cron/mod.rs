@@ -2418,6 +2418,7 @@ async fn send_delivery(
             Some(&sink.event_bus),
             session_key,
             text,
+            &job.id,
         )?;
         info!(job_id = %job.id, session = %session_key, "cron delivery added to the session");
         return Ok(true);

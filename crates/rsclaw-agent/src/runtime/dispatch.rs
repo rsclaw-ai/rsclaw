@@ -941,6 +941,7 @@ impl AgentRuntime {
                                             tool_log: vec![],
                                             question: None,
                                             channel: None,
+                                            origin: None,
                                         });
                                     }
                                 }

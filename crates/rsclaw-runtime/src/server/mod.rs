@@ -4735,6 +4735,7 @@ pub(crate) async fn trigger_cron_job(
                                     Some(event_bus),
                                     session_key,
                                     &reply.text,
+                                    &job_id,
                                 ) {
                                     tracing::warn!(job_id = %job_id, error = %e, "cron trigger: reply not added to the session");
                                 }

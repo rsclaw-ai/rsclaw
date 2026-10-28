@@ -206,6 +206,7 @@ pub async fn process_queued_message(
                     tool_log: vec![],
                     question: None,
                     channel: None,
+                    origin: None,
                 })
                 .is_err()
         {
@@ -222,6 +223,7 @@ pub async fn process_queued_message(
                 tool_log: vec![],
                 question: None,
                 channel: None,
+                origin: None,
             })
             .is_err()
         {

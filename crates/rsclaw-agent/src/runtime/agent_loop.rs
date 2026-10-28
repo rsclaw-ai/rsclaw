@@ -417,6 +417,7 @@ impl AgentRuntime {
                         tool_log: vec![],
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -452,6 +453,7 @@ impl AgentRuntime {
                         tool_log: vec![],
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -496,6 +498,7 @@ impl AgentRuntime {
                         tool_log: tool_log.clone(),
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -570,6 +573,7 @@ impl AgentRuntime {
                         tool_log: tool_log.clone(),
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -614,6 +618,7 @@ impl AgentRuntime {
                         tool_log: tool_log.clone(),
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -1434,6 +1439,7 @@ impl AgentRuntime {
                                     tool_log: vec![],
                                     question: None,
                                     channel: None,
+                                    origin: None,
                                 });
                             }
                             last_delta_flush = now;
@@ -1615,6 +1621,7 @@ impl AgentRuntime {
                         tool_log: vec![],
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
             }
@@ -2046,6 +2053,7 @@ impl AgentRuntime {
                         tool_log: tool_log.clone(),
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
 
@@ -2411,6 +2419,7 @@ impl AgentRuntime {
                                     tool_log: tool_log.clone(),
                                     question: None,
                                     channel: None,
+                                    origin: None,
                                 });
                             }
                             return Ok(AgentReply {
@@ -2516,6 +2525,7 @@ impl AgentRuntime {
                                 tool_log: tool_log.clone(),
                                 question: None,
                                 channel: None,
+                                origin: None,
                             });
                         }
                         return Ok(AgentReply {
@@ -2792,6 +2802,7 @@ impl AgentRuntime {
                                             tool_log: vec![],
                                             question: None,
                                             channel: None,
+                                            origin: None,
                                         });
                                     }
                                 }
@@ -2914,6 +2925,7 @@ impl AgentRuntime {
                                 tool_log: vec![],
                                 question: None,
                                 channel: None,
+                                origin: None,
                             });
                         }
                         (idx, timed)

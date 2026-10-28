@@ -1117,6 +1117,7 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
                 tool_log: vec![],
                 question: Some(prompt),
                 channel: None,
+                origin: None,
             });
         }
 
