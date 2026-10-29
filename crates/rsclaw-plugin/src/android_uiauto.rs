@@ -2274,10 +2274,13 @@ fn contact_badge_probe(
 
     // The second item in WeChat's four-column bottom navigation is Contacts.
     // Ratios keep the probe independent of Android resolution and pixel density.
+    // A screenshot without the system navigation bar puts the tab bar at the
+    // very bottom (an Honor's Contacts badge sits at 94-96%), so the region
+    // runs to 98%.
     let left = width.saturating_mul(34) / 100;
     let right = width.saturating_mul(47) / 100;
     let top = height.saturating_mul(85) / 100;
-    let bottom = height.saturating_mul(94) / 100;
+    let bottom = height.saturating_mul(98) / 100;
     let roi_width = right.saturating_sub(left).max(1);
     let roi_height = bottom.saturating_sub(top).max(1);
     let mask_len = usize::try_from(roi_width)
@@ -3729,6 +3732,21 @@ mod tests {
         assert!(!probe.badge);
         assert_eq!(probe.red_pixels, 100);
         assert_eq!(probe.largest_cluster_pixels, 100);
+    }
+
+    #[test]
+    fn contact_badge_probe_finds_a_badge_on_a_tab_bar_at_the_bottom_edge() {
+        // Honor, 720x1600, no navigation bar in the screenshot.
+        let mut pixels = vec![[20, 20, 20, 255]; 720 * 1_600];
+        for y in 1_509..1_540 {
+            for x in 281..312 {
+                pixels[y * 720 + x] = [249, 146, 146, 255];
+            }
+        }
+
+        let probe = contact_badge_probe(720, 1_600, |x, y| pixels[y as usize * 720 + x as usize]);
+        assert!(probe.badge);
+        assert_eq!(probe.red_pixels, 31 * 31);
     }
 
     #[test]
