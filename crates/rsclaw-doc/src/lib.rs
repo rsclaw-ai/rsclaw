@@ -1500,9 +1500,11 @@ pub fn legacy_office_text(path: &Path) -> Result<String> {
     Ok(out)
 }
 
-/// Text of a legacy binary Word file (.doc). There is no pure-Rust reader,
-/// so use what the system has: macOS textutil, antiword or catdoc, Word
-/// itself on Windows, else LibreOffice converting to .docx.
+/// Text of a legacy binary Word file (.doc). Word 97–2003 files are read
+/// directly from their piece table; anything that reader rejects (Word 6/95,
+/// encrypted, damaged) falls back to what the system has: macOS textutil,
+/// antiword or catdoc, Word itself on Windows, else LibreOffice converting
+/// to .docx.
 fn read_legacy_doc(path: &Path) -> Result<Value> {
     use std::process::Command;
 
@@ -1515,6 +1517,11 @@ fn read_legacy_doc(path: &Path) -> Result<Value> {
             "via": via,
         })
     };
+    match read_word97_text(path) {
+        Ok(text) if !text.is_empty() => return Ok(done(text, "native")),
+        Ok(_) => {}
+        Err(e) => tracing::debug!(path = %path.display(), "native .doc reader declined: {e}"),
+    }
     let readers: &[(&str, &[&str])] = &[
         ("textutil", &["-convert", "txt", "-stdout"]),
         ("antiword", &["-w", "0"]),
@@ -1581,6 +1588,286 @@ fn read_legacy_doc(path: &Path) -> Result<Value> {
          (textutil, antiword, catdoc, Word or LibreOffice). Ask the user for a .docx or PDF copy.",
         path.display()
     ))
+}
+
+/// Main-document text of a Word 97–2003 file ([MS-DOC]): the FIB names the
+/// table stream and the Clx, whose piece table maps character positions to
+/// runs of UTF-16LE or 8-bit text in the WordDocument stream.
+fn read_word97_text(path: &Path) -> Result<String> {
+    use std::io::Read;
+
+    // Some writers (macOS textutil among them) leave allocation tables that
+    // even cfb's permissive mode refuses; read those by following the chains.
+    let stream = |name: &str| -> Result<Vec<u8>> {
+        match cfb::open(path) {
+            Ok(mut file) => {
+                let mut buf = Vec::new();
+                file.open_stream(format!("/{name}"))
+                    .map_err(|e| anyhow!("no {name} stream: {e}"))?
+                    .read_to_end(&mut buf)?;
+                Ok(buf)
+            }
+            Err(_) => read_cfb_stream_lenient(&std::fs::read(path)?, name),
+        }
+    };
+    let word = stream("WordDocument")?;
+
+    let u16_at = |b: &[u8], o: usize| -> Result<usize> {
+        b.get(o..o + 2)
+            .map(|s| u16::from_le_bytes([s[0], s[1]]) as usize)
+            .ok_or_else(|| anyhow!("truncated at {o}"))
+    };
+    let u32_at = |b: &[u8], o: usize| -> Result<usize> {
+        b.get(o..o + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+            .ok_or_else(|| anyhow!("truncated at {o}"))
+    };
+
+    if u16_at(&word, 0)? != 0xA5EC {
+        return Err(anyhow!("not a Word 97+ document"));
+    }
+    let flags = u16_at(&word, 0x0A)?;
+    if flags & 0x0100 != 0 {
+        return Err(anyhow!("encrypted"));
+    }
+    let table_name = if flags & 0x0200 != 0 {
+        "1Table"
+    } else {
+        "0Table"
+    };
+
+    // FibBase is 32 bytes, then three length-prefixed arrays: fibRgW (u16s),
+    // fibRgLw (u32s; ccpText is its fourth entry) and fibRgFcLcb (fc/lcb pairs;
+    // the Clx is pair 33).
+    let csw = u16_at(&word, 32)?;
+    let rg_lw = 34 + csw * 2 + 2;
+    let cslw = u16_at(&word, 34 + csw * 2)?;
+    let ccp_text = u32_at(&word, rg_lw + 12)?;
+    let rg_fclcb = rg_lw + cslw * 4 + 2;
+    let fc_clx = u32_at(&word, rg_fclcb + 33 * 8)?;
+    let lcb_clx = u32_at(&word, rg_fclcb + 33 * 8 + 4)?;
+
+    let table = stream(table_name)?;
+    let clx = table
+        .get(fc_clx..fc_clx + lcb_clx)
+        .ok_or_else(|| anyhow!("Clx outside the table stream"))?;
+
+    // Skip the Prc entries (0x01, cb, grpprl) to reach the Pcdt (0x02).
+    let mut pos = 0;
+    while clx.get(pos) == Some(&0x01) {
+        pos += 3 + u16_at(clx, pos + 1)?;
+    }
+    if clx.get(pos) != Some(&0x02) {
+        return Err(anyhow!("no piece table"));
+    }
+    let lcb = u32_at(clx, pos + 1)?;
+    let plc = clx
+        .get(pos + 5..pos + 5 + lcb)
+        .ok_or_else(|| anyhow!("piece table truncated"))?;
+    if lcb < 4 || (lcb - 4) % 12 != 0 {
+        return Err(anyhow!("malformed piece table"));
+    }
+    let pieces = (lcb - 4) / 12;
+
+    let mut raw = String::new();
+    for i in 0..pieces {
+        let cp_start = u32_at(plc, i * 4)?;
+        if cp_start >= ccp_text {
+            break;
+        }
+        let cp_end = u32_at(plc, (i + 1) * 4)?.min(ccp_text);
+        let chars = cp_end.saturating_sub(cp_start);
+        let fc = u32_at(plc, (pieces + 1) * 4 + i * 8 + 2)?;
+        if fc & 0x4000_0000 != 0 {
+            let off = (fc & 0x3FFF_FFFF) / 2;
+            let bytes = word
+                .get(off..off + chars)
+                .ok_or_else(|| anyhow!("piece {i} outside the document"))?;
+            raw.extend(bytes.iter().map(|&b| cp1252_char(b)));
+        } else {
+            let bytes = word
+                .get(fc..fc + chars * 2)
+                .ok_or_else(|| anyhow!("piece {i} outside the document"))?;
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            raw.extend(char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')));
+        }
+    }
+    Ok(clean_word_text(&raw))
+}
+
+/// One root-level stream of a compound file ([MS-CFB]), read by following
+/// its sector chain without validating the allocation tables. Chains are
+/// bounded by the file size, so a cycle cannot loop forever.
+fn read_cfb_stream_lenient(data: &[u8], name: &str) -> Result<Vec<u8>> {
+    // Sector numbers above this are markers (end of chain, free, FAT, DIFAT).
+    const MAX_SECT: u32 = 0xFFFF_FFFA;
+    fn chain<'a>(
+        start: u32,
+        table: &[u32],
+        max_bytes: usize,
+        read: &dyn Fn(u32) -> Option<&'a [u8]>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut s = start;
+        while s <= MAX_SECT && out.len() < max_bytes {
+            match read(s) {
+                Some(bytes) => out.extend_from_slice(bytes),
+                None => break,
+            }
+            s = table.get(s as usize).copied().unwrap_or(u32::MAX);
+        }
+        out
+    }
+    let u16_at = |o: usize| data.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]));
+    let u32_at = |o: usize| {
+        data.get(o..o + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let short = || anyhow!("compound file truncated");
+
+    if data.get(0..8) != Some(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1][..]) {
+        return Err(anyhow!("not an OLE compound file"));
+    }
+    let shift = u16_at(0x1E).ok_or_else(short)?;
+    if !(7..=12).contains(&shift) {
+        return Err(anyhow!("bad sector size"));
+    }
+    let size = 1usize << shift;
+    let sector = |s: u32| 512usize.max(size) + s as usize * size;
+    let limit = data.len() / size + 1;
+
+    // The FAT's own sectors: 109 in the header, the rest in DIFAT sectors.
+    let fat_count = u32_at(0x2C).ok_or_else(short)? as usize;
+    let mut fat_sectors = Vec::new();
+    for i in 0..109 {
+        let s = u32_at(0x4C + i * 4).ok_or_else(short)?;
+        if s <= MAX_SECT {
+            fat_sectors.push(s);
+        }
+    }
+    let mut difat = u32_at(0x44).ok_or_else(short)?;
+    while difat <= MAX_SECT && fat_sectors.len() < fat_count && fat_sectors.len() < limit {
+        let base = sector(difat);
+        for i in 0..size / 4 - 1 {
+            let s = u32_at(base + i * 4).ok_or_else(short)?;
+            if s <= MAX_SECT {
+                fat_sectors.push(s);
+            }
+        }
+        difat = u32_at(base + size - 4).ok_or_else(short)?;
+    }
+    let mut fat = Vec::new();
+    for s in fat_sectors {
+        let base = sector(s);
+        for i in 0..size / 4 {
+            fat.push(u32_at(base + i * 4).unwrap_or(u32::MAX));
+        }
+    }
+    // The last sector may be cut short when the file was not padded out.
+    let big = |s: u32| {
+        let at = sector(s);
+        data.get(at..(at + size).min(data.len()))
+            .filter(|b| !b.is_empty())
+    };
+
+    let dir = chain(u32_at(0x30).ok_or_else(short)?, &fat, data.len(), &big);
+    let entry = |i: usize| dir.get(i * 128..i * 128 + 128);
+    let root = entry(0).ok_or_else(|| anyhow!("no root directory entry"))?;
+    let field_u32 = |e: &[u8], o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
+    let wanted: Vec<u16> = name.encode_utf16().collect();
+    let found = (1..dir.len() / 128).filter_map(entry).find(|e| {
+        let len = (u16::from_le_bytes([e[64], e[65]]) as usize / 2).saturating_sub(1);
+        let units: Vec<u16> = e[..len.min(32) * 2]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        e[66] == 2 && units == wanted
+    });
+    let e = found.ok_or_else(|| anyhow!("no {name} stream"))?;
+    let start = field_u32(e, 116);
+    let len = field_u32(e, 120) as usize;
+    let cutoff = u32_at(0x38).ok_or_else(short)? as usize;
+
+    let mut bytes = if len < cutoff {
+        // Small streams live in 64-byte mini sectors inside the root's stream.
+        let mini_stream = chain(field_u32(root, 116), &fat, data.len(), &big);
+        let minifat_bytes = chain(u32_at(0x3C).ok_or_else(short)?, &fat, data.len(), &big);
+        let minifat: Vec<u32> = minifat_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mini = |s: u32| mini_stream.get(s as usize * 64..s as usize * 64 + 64);
+        chain(start, &minifat, len, &mini)
+    } else {
+        chain(start, &fat, len, &big)
+    };
+    if bytes.len() < len {
+        return Err(anyhow!("{name} stream truncated"));
+    }
+    bytes.truncate(len);
+    Ok(bytes)
+}
+
+/// Windows-1252 for the 8-bit ("compressed") pieces of a Word file.
+fn cp1252_char(b: u8) -> char {
+    const HIGH: [u16; 32] = [
+        0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x8D, 0x017D, 0x8F, 0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013,
+        0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178,
+    ];
+    match b {
+        0x80..=0x9F => char::from_u32(HIGH[(b - 0x80) as usize] as u32).unwrap_or('\u{FFFD}'),
+        _ => b as char,
+    }
+}
+
+/// Turn Word's in-text control characters into plain text: paragraph and
+/// line breaks become newlines, table cell marks tabs, field codes keep only
+/// their displayed result, and object anchors are dropped.
+fn clean_word_text(raw: &str) -> String {
+    // Each open field: true once its separator (0x14) has been seen.
+    let mut fields: Vec<bool> = Vec::new();
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\u{13}' => fields.push(false),
+            '\u{14}' => {
+                if let Some(sep) = fields.last_mut() {
+                    *sep = true;
+                }
+            }
+            '\u{15}' => {
+                fields.pop();
+            }
+            _ if fields.iter().any(|sep| !sep) => {}
+            '\r' | '\u{0B}' | '\u{0C}' => out.push('\n'),
+            '\u{07}' => out.push('\t'),
+            '\u{1E}' => out.push('-'),
+            '\u{A0}' => out.push(' '),
+            '\t' | '\n' => out.push(c),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    let mut text = String::with_capacity(out.len());
+    let mut blank = 0;
+    for line in out.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    text.trim().to_owned()
 }
 
 fn read_docx(path: &Path) -> Result<Value> {
@@ -1899,9 +2186,37 @@ mod legacy_doc_tests {
             .status()
             .unwrap();
         assert!(made.success());
+        let native = super::read_word97_text(&doc).unwrap();
+        assert!(native.starts_with("证据目录\n证据一"), "{native:?}");
         let v = super::read_legacy_doc(&doc).unwrap();
         assert_eq!(v["format"], "doc");
+        assert_eq!(v["via"], "native", "{v}");
         assert!(v["text"].as_str().unwrap().contains("中标结果公告"), "{v}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod word97_text_tests {
+    use super::{clean_word_text, cp1252_char};
+
+    #[test]
+    fn breaks_cells_and_fields_become_plain_text() {
+        let raw = "证据目录\r序号\u{07}名称\u{07}\u{07}\r\u{13} PAGE \u{14}3\u{15}\u{01}页\u{0B}末行\r\r\r\r";
+        assert_eq!(clean_word_text(raw), "证据目录\n序号\t名称\n3页\n末行");
+    }
+
+    #[test]
+    fn nested_field_keeps_only_the_outer_result() {
+        let raw = "a\u{13}IF \u{13}PAGE\u{14}1\u{15} = 1\u{14}yes\u{15}b";
+        assert_eq!(clean_word_text(raw), "ayesb");
+    }
+
+    #[test]
+    fn eight_bit_pieces_decode_as_windows_1252() {
+        assert_eq!(cp1252_char(b'A'), 'A');
+        assert_eq!(cp1252_char(0x93), '\u{201C}');
+        assert_eq!(cp1252_char(0x80), '\u{20AC}');
+        assert_eq!(cp1252_char(0xE9), 'é');
     }
 }

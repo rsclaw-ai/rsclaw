@@ -11,6 +11,8 @@ anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 calamine = "0.36"
+# OLE compound files: the container of legacy Word (.doc) documents.
+cfb = "0.15"
 docx-rs = "0.4.22"
 krilla = "0.7"
 lopdf = "0.42"
