@@ -820,6 +820,11 @@ pub fn build_router(state: AppState) -> Router {
         let max_doc_bytes = k.max_doc_bytes();
         api = api.nest("/knowledge", knowledge::routes(max_doc_bytes).with_state(k));
     }
+    // Routes added by extension crates of a custom build (none in the stock
+    // binary). They are complete routers, so give them this router's state type.
+    for routes in crate::ext::api_routes() {
+        api = api.merge(routes.with_state::<AppState>(()));
+    }
 
     Router::new()
         .nest("/api/v1", api)

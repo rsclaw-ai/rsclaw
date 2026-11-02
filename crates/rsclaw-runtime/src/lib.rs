@@ -86,6 +86,7 @@ pub mod a2a;
 pub mod bundled_plugins;
 pub mod cmd;
 pub mod cron;
+pub mod ext;
 pub mod gateway;
 pub mod hooks;
 pub mod server;
