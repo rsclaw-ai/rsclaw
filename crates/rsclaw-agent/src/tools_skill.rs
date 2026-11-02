@@ -4,7 +4,59 @@ use anyhow::{Result, anyhow};
 use rsclaw_skill::SkillManifest;
 use serde_json::{Value, json};
 
-use super::runtime::AgentRuntime;
+use super::runtime::{AgentRuntime, RunContext};
+
+/// Off-allowlist skill installs awaiting the user's answer, keyed by
+/// `(session, skill)`, holding a hash of the user message that was being
+/// handled when confirmation was requested.
+///
+/// On remote channels the `confirmed` flag alone is not trusted — the LLM
+/// sets it, and prompt-injected content can make it do so. A confirmed
+/// install is accepted only after a confirmation request for the same
+/// skill in an EARLIER turn (i.e. a new user message has arrived since).
+static PENDING_SKILL_CONFIRM: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String), (u64, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// How long a confirmation request stays valid.
+const SKILL_CONFIRM_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn user_text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Record a confirmation request for `(session, name)` in the current turn.
+fn record_skill_confirm_request(session: &str, name: &str, user_text: &str) {
+    let mut g = match PENDING_SKILL_CONFIRM.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    g.retain(|_, (_, at)| at.elapsed() < SKILL_CONFIRM_TTL);
+    g.insert(
+        (session.to_owned(), name.to_owned()),
+        (user_text_hash(user_text), std::time::Instant::now()),
+    );
+}
+
+/// True (and consumes the entry) when a confirmation for `(session, name)`
+/// was requested in an earlier turn that is still fresh.
+fn take_skill_confirmation(session: &str, name: &str, user_text: &str) -> bool {
+    let mut g = match PENDING_SKILL_CONFIRM.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let key = (session.to_owned(), name.to_owned());
+    let ok = g.get(&key).is_some_and(|(hash, at)| {
+        at.elapsed() < SKILL_CONFIRM_TTL && *hash != user_text_hash(user_text)
+    });
+    if ok {
+        g.remove(&key);
+    }
+    ok
+}
 
 pub(crate) fn paginate_skill_list<'a, I>(skills: I, args: &Value) -> Value
 where
@@ -176,7 +228,7 @@ impl AgentRuntime {
     /// skills dir. Usable the same turn via `skill_use` (disk fallback); it
     /// folds into the system-prompt skill list on the next compaction/clear/new
     /// reload.
-    pub(crate) async fn tool_skill_install(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_skill_install(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let name = args["name"]
             .as_str()
             .or_else(|| args["slug"].as_str())
@@ -195,15 +247,26 @@ impl AgentRuntime {
         // plain question) whether they trust it, and only on a clear yes retry
         // with confirmed=true.
         let Some(entry) = rsclaw_skill::allowlist::snapshot().lookup_skill(&name) else {
-            let confirmed = args["confirmed"].as_bool().unwrap_or(false);
+            let mut confirmed = args["confirmed"].as_bool().unwrap_or(false);
+            // Remote channels: `confirmed` must follow a confirmation request
+            // made in an earlier turn (a real user reply in between).
+            if !crate::trust::is_local_channel(&ctx.channel) {
+                if confirmed && !take_skill_confirmation(&ctx.session_key, &name, &ctx.user_text) {
+                    confirmed = false;
+                }
+                if !confirmed {
+                    record_skill_confirm_request(&ctx.session_key, &name, &ctx.user_text);
+                }
+            }
             if !confirmed {
                 return Ok(json!({
                     "error": format!("'{name}' is not on the audited auto-install allowlist"),
                     "needs_confirmation": true,
                     "guidance": format!(
                         "'{name}' is not pre-audited. Ask the user explicitly whether they trust \
-                         and want to install it. ONLY if they clearly say yes, call skill_install \
-                         again with confirmed=true. Do not set confirmed=true on your own."
+                         and want to install it, then END this turn. ONLY if they clearly say yes \
+                         in their next message, call skill_install again with confirmed=true. \
+                         Do not set confirmed=true on your own."
                     ),
                 }));
             }
@@ -239,7 +302,9 @@ impl AgentRuntime {
                 if let Err(e) =
                     rsclaw_skill::allowlist::verify_skill_content(&locked.install_dir, &entry, true)
                 {
-                    let _ = std::fs::remove_dir_all(&locked.install_dir);
+                    if let Err(rm) = std::fs::remove_dir_all(&locked.install_dir) {
+                        tracing::warn!(dir = %locked.install_dir.display(), error = %rm, "skill_install: cleanup after failed verification");
+                    }
                     return Ok(json!({ "error": e.to_string(), "name": name }));
                 }
                 Ok(json!({

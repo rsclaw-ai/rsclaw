@@ -83,7 +83,7 @@ pub fn build_agent_card(state: &AppState, _extended: bool) -> AgentCard {
     AgentCard {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         name: "rsclaw".to_owned(),
-        description: Some("AI Agent Engine Compatible with OpenClaw".to_owned()),
+        description: Some(rsclaw_brand::TAGLINE.to_owned()),
         url: base_url.clone(),
         provider: Some(AgentProvider {
             organization: "rsclaw".to_owned(),
@@ -120,9 +120,10 @@ pub fn build_agent_card(state: &AppState, _extended: bool) -> AgentCard {
 // ---------------------------------------------------------------------------
 
 /// A2A §7.5 access control: a caller may touch a task only if it owns it.
-/// A `None` caller (auth disabled / dev pass-through) is unscoped; the unified
-/// `gateway-auth` operator token sees everything; a task with no recorded owner
-/// (legacy or dev-created) is unscoped. Fails closed on a store error.
+/// A `None` caller (auth disabled / dev pass-through) is unscoped, and the
+/// unified `gateway-auth` operator token sees everything. Named principals are
+/// denied access to existing ownerless tasks so enabling auth cannot expose
+/// legacy dev-mode data. Missing tasks and store errors also fail closed.
 pub(crate) fn caller_owns(
     store: &crate::a2a::store::TaskStore,
     caller: &Option<crate::a2a::auth::A2aIdentity>,
@@ -133,10 +134,69 @@ pub(crate) fn caller_owns(
         Some(c) if c.id == "gateway-auth" => true,
         Some(c) => match store.get_owner(task_id) {
             Ok(Some(owner)) => owner == c.id,
-            Ok(None) => true,
-            Err(_) => false,
+            Ok(None) | Err(_) => false,
         },
     }
+}
+
+/// True when `task_id` is already reserved (task row or owner entry). Store
+/// errors count as reserved so ownership checks fail closed.
+fn task_reserved(store: &crate::a2a::store::TaskStore, task_id: &str) -> bool {
+    !matches!(
+        (store.get(task_id), store.get_owner(task_id)),
+        (Ok(None), Ok(None))
+    )
+}
+
+/// Session-key prefixes used by non-A2A entry points. A caller-supplied
+/// `contextId` must never start with one of these.
+const RESERVED_CONTEXT_PREFIXES: &[&str] = &[
+    "agent:",
+    "webhook:",
+    "cron:",
+    "heartbeat:",
+    "system:",
+    "subagent:",
+    "task:",
+    "ws:",
+    "desktop:",
+    "cli:",
+    "api:",
+    "acp:",
+    "oai:",
+];
+
+/// Maximum accepted length of a caller-supplied `contextId`.
+const MAX_CONTEXT_ID_LEN: usize = 256;
+
+/// Derive the agent session key for an A2A request.
+///
+/// The key is always namespaced by the authenticated principal
+/// (`a2a:{principal}:{contextId}`) so a caller can never join another
+/// principal's session or an internal channel session. A contextId that was
+/// previously returned to the same principal (already carrying the
+/// `a2a:{principal}:` prefix) is reused verbatim so follow-ups stay in the
+/// same session. When no contextId is supplied a fresh one is generated.
+/// Returns `Err` with a client-facing reason for rejected contextIds.
+pub(crate) fn a2a_session_key(
+    caller: &Option<crate::a2a::auth::A2aIdentity>,
+    context_id: Option<&str>,
+) -> Result<String, String> {
+    let principal = caller.as_ref().map(|c| c.id.as_str()).unwrap_or("anon");
+    let own_prefix = format!("a2a:{principal}:");
+    let Some(ctx) = context_id.map(str::trim).filter(|c| !c.is_empty()) else {
+        return Ok(format!("{own_prefix}{}", Uuid::new_v4()));
+    };
+    if ctx.len() > MAX_CONTEXT_ID_LEN || ctx.chars().any(char::is_control) {
+        return Err("invalid contextId".to_owned());
+    }
+    if ctx.starts_with(&own_prefix) {
+        return Ok(ctx.to_owned());
+    }
+    if RESERVED_CONTEXT_PREFIXES.iter().any(|p| ctx.starts_with(p)) {
+        return Err("contextId uses a reserved prefix".to_owned());
+    }
+    Ok(format!("{own_prefix}{ctx}"))
 }
 
 pub async fn a2a_rpc_handler(
@@ -282,11 +342,15 @@ async fn handle_send_message(
         }
     };
 
-    let session_key = params
-        .message
-        .context_id
-        .clone()
-        .unwrap_or_else(|| format!("a2a:{}", Uuid::new_v4()));
+    let session_key = match a2a_session_key(&caller, params.message.context_id.as_deref()) {
+        Ok(k) => k,
+        Err(reason) => {
+            return Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::invalid_argument(reason, "message.contextId"),
+            ));
+        }
+    };
 
     let task_id = params
         .message
@@ -298,7 +362,9 @@ async fn handle_send_message(
     // Check ownership BEFORE consuming the suspended entry. Task ownership is
     // immutable after atomic creation, so a different principal cannot steal a
     // resume handle by supplying another caller's task ID.
-    if !caller_owns(&state.task_store, &caller, &task_id) {
+    if task_reserved(&state.task_store, &task_id)
+        && !caller_owns(&state.task_store, &caller, &task_id)
+    {
         return Json(JsonRpcResponse::err_struct(
             id,
             a2a_errors::not_found(format!("tasks/{task_id}")),
@@ -500,6 +566,7 @@ async fn handle_send_message(
 
     let (reply_tx, reply_rx) = oneshot::channel::<AgentReply>();
     let msg = AgentMessage {
+        trust: rsclaw_agent::SenderTrust::User,
         session_key: session_key.clone(),
         text,
         channel: "a2a".to_owned(),
@@ -913,10 +980,26 @@ async fn handle_create_push_config(
             ));
         }
     };
-    if !caller_owns(&state.task_store, &caller, &params.task_id) {
+    // Push configs may only be attached to an existing task the caller owns
+    // (existence is checked explicitly because the operator token is
+    // unscoped in `caller_owns`).
+    if !matches!(state.task_store.get(&params.task_id), Ok(Some(_)))
+        || !caller_owns(&state.task_store, &caller, &params.task_id)
+    {
         return Json(JsonRpcResponse::err_struct(
             id,
             a2a_errors::not_found(format!("tasks/{}", params.task_id)),
+        ));
+    }
+    // Refuse webhook URLs that point at private / loopback / link-local
+    // hosts up front; delivery re-validates every hop as well.
+    if let Err(e) = rsclaw_util::net::resolve_public(&params.push_notification_config.url).await {
+        return Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::invalid_argument(
+                format!("push notification url rejected: {e}"),
+                "pushNotificationConfig.url",
+            ),
         ));
     }
     params.push_notification_config.task_id = params.task_id.clone();
@@ -1322,6 +1405,34 @@ mod tests {
     }
 
     #[test]
+    fn a2a_session_key_is_namespaced_by_principal() {
+        let alice = ident("alice");
+        assert_eq!(
+            a2a_session_key(&alice, Some("ctx-1")).unwrap(),
+            "a2a:alice:ctx-1"
+        );
+        // A key previously returned to the same principal is reused verbatim.
+        assert_eq!(
+            a2a_session_key(&alice, Some("a2a:alice:ctx-1")).unwrap(),
+            "a2a:alice:ctx-1"
+        );
+        // Another principal's key is re-namespaced, never joined.
+        assert_eq!(
+            a2a_session_key(&ident("bob"), Some("a2a:alice:ctx-1")).unwrap(),
+            "a2a:bob:a2a:alice:ctx-1"
+        );
+        // Internal session keys are refused.
+        assert!(a2a_session_key(&alice, Some("agent:main:telegram:direct:42")).is_err());
+        assert!(a2a_session_key(&alice, Some("cron:job")).is_err());
+        // Missing contextId gets a fresh namespaced one.
+        assert!(
+            a2a_session_key(&None::<A2aIdentity>, None)
+                .unwrap()
+                .starts_with("a2a:anon:")
+        );
+    }
+
+    #[test]
     fn caller_owns_enforces_section_7_5_access() {
         let tmp = tempfile::tempdir().unwrap();
         let store = TaskStore::open(&tmp.path().join("tasks.redb")).unwrap();
@@ -1334,7 +1445,30 @@ mod tests {
         // The operator token and dev/no-auth mode are unscoped.
         assert!(caller_owns(&store, &ident("gateway-auth"), "task-1"));
         assert!(caller_owns(&store, &None::<A2aIdentity>, "task-1"));
-        // A task with no recorded owner (legacy / dev-created) is unscoped.
-        assert!(caller_owns(&store, &ident("bob"), "no-such-task"));
+
+        let legacy_task = A2aTask {
+            id: "legacy-task".to_owned(),
+            context_id: Some("legacy-context".to_owned()),
+            status: A2aTaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            history: vec![],
+            artifacts: vec![],
+            metadata: None,
+        };
+        store.put(&legacy_task).unwrap();
+
+        // Named principals cannot access a real legacy task that has no owner.
+        assert!(!caller_owns(&store, &ident("bob"), "legacy-task"));
+        // Administrative and no-auth access remain available for migration.
+        assert!(caller_owns(&store, &ident("gateway-auth"), "legacy-task"));
+        assert!(caller_owns(&store, &None::<A2aIdentity>, "legacy-task"));
+        // New IDs remain unreserved so authenticated callers can create tasks;
+        // missing IDs are never treated as owned existing tasks.
+        assert!(!task_reserved(&store, "no-such-task"));
+        assert!(task_reserved(&store, "legacy-task"));
+        assert!(!caller_owns(&store, &ident("bob"), "no-such-task"));
     }
 }

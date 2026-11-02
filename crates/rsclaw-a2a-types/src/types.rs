@@ -617,6 +617,21 @@ mod durable_tests {
     }
 
     #[test]
+    fn push_notification_config_debug_is_redacted() {
+        let cfg = PushNotificationConfig {
+            id: "cfg-1".into(),
+            task_id: "task-1".into(),
+            url: "https://example.com/hook".into(),
+            token: "super-secret-hmac".into(),
+            authentication: Some(serde_json::json!({"credentials": "basic-secret"})),
+        };
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("super-secret-hmac"));
+        assert!(!debug.contains("basic-secret"));
+        assert!(debug.contains("cfg-1"));
+    }
+
+    #[test]
     fn lease_token_debug_is_redacted() {
         let token = LeaseToken::new("secret-lease-token");
         let debug = format!("{token:?}");
@@ -691,7 +706,7 @@ pub struct SendMessageParams {
 // Push notification config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PushNotificationConfig {
     #[serde(default)]
@@ -703,4 +718,21 @@ pub struct PushNotificationConfig {
     pub token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authentication: Option<Value>,
+}
+
+/// Manual `Debug` so the signing secret and any authentication credentials
+/// never land in logs.
+impl std::fmt::Debug for PushNotificationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushNotificationConfig")
+            .field("id", &self.id)
+            .field("task_id", &self.task_id)
+            .field("url", &self.url)
+            .field("token", &"REDACTED")
+            .field(
+                "authentication",
+                &self.authentication.as_ref().map(|_| "REDACTED"),
+            )
+            .finish()
+    }
 }

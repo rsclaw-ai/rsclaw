@@ -13,6 +13,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod media;
+pub mod notice;
+
 /// Why the gateway is asking the user to restart.
 ///
 /// Multi-source: the config file watcher, the BGE auto-downloader, and any
@@ -121,6 +124,29 @@ impl RestartRequest {
     }
 }
 
+/// Why a latched restart / reload offer was withdrawn.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartClearReason {
+    /// The gateway applied the offered change itself (e.g. the file-watcher
+    /// bridge auto-applied a channel reload), so nothing is left to offer.
+    AutoApplied,
+    /// A client dismissed the pending offer via `POST /api/v1/restart-dismiss`.
+    Dismissed,
+}
+
+/// Published when the `pending_restart` latch is cleared, so open UIs drop a
+/// banner they are already showing. Relayed to WebSocket clients as a
+/// `restart.cleared` event frame (counterpart of `restart.required`).
+#[derive(Debug, Clone, Serialize)]
+pub struct RestartCleared {
+    /// `at_ms` of the [`RestartRequest`] that was withdrawn. `None` when the
+    /// latch was already empty; clients then drop whatever banner they show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
+    pub reason: RestartClearReason,
+}
+
 /// One option in an `AskUserPrompt`.
 ///
 /// Wire format is camelCase (`label`, `description`) — UI consumes via WS
@@ -200,10 +226,17 @@ pub struct AgentEvent {
     pub done: bool,
     /// File attachments produced this turn: (filename, mime_type,
     /// local_path_or_url). Non-empty only on the final `done = true` event.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Clients receive each as `[name, mime, path, kind, token]`; see
+    /// [`media`].
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "media::serialize_files"
+    )]
     pub files: Vec<(String, String, String)>,
-    /// Image attachments (base64 data URIs or local paths).
-    /// Non-empty only on the final `done = true` event.
+    /// Image attachments (base64 data URIs or local paths). The turn's
+    /// images come on the final `done = true` event; a plugin can also push
+    /// one mid-turn (a login QR code), on an event with `done = false`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
     /// Tool call log for this turn: (name, args_json, output_text).
@@ -226,4 +259,19 @@ pub struct AgentEvent {
     /// don't need to be updated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<TextChannel>,
+    /// Set when the event is not part of the session's agent turn: a cron
+    /// job's delivery, posted as a message of its own (its text, then
+    /// `done`). Clients show it apart from a turn streaming at the same
+    /// time, and its `done` doesn't end that turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<EventOrigin>,
+}
+
+/// What posted an [`AgentEvent`] outside the session's agent turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventOrigin {
+    /// `cron`: a cron job's delivery, or a short reminder's.
+    pub kind: String,
+    /// The job's id (a short reminder's id, as the cron tool returned it).
+    pub id: String,
 }

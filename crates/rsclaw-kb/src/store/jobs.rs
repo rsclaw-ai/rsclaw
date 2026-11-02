@@ -152,6 +152,28 @@ fn verify_claim_token(wtx: &WriteTransaction, job_id: &str, expected: &str) -> R
     Ok(())
 }
 
+/// Extend an active claim's expiry to `new_expires_at` (lease renewal for
+/// long-running jobs). Returns `false` when the claim is gone or held under
+/// a different token — the caller lost the job and should stop renewing.
+pub fn renew_claim(
+    wtx: &WriteTransaction,
+    job_id: &str,
+    token: &str,
+    new_expires_at: i64,
+) -> Result<bool> {
+    let mut claims = wtx.open_table(KB_JOB_CLAIMS)?;
+    let mut active: ClaimToken = match claims.get(job_id)? {
+        Some(v) => decode(v.value())?,
+        None => return Ok(false),
+    };
+    if active.token != token {
+        return Ok(false);
+    }
+    active.expires_at = active.expires_at.max(new_expires_at);
+    claims.insert(job_id, encode(&active)?.as_slice())?;
+    Ok(true)
+}
+
 /// Reset a job back to Ready.
 pub fn requeue(wtx: &WriteTransaction, job_id: &str) -> Result<()> {
     let (mut job, old_key) = read_and_old_key(wtx, job_id)?;

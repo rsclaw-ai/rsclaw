@@ -75,6 +75,18 @@ pub trait Operator: Send + Sync {
     /// driver map model coords back to logical click positions.
     fn screenshot(&self) -> ScreenshotFut<'_>;
 
+    /// Validate a mapped action before execution. Implementations may reject
+    /// platform-specific unsafe or malformed model output; the default accepts
+    /// every action so existing operators retain their current behavior.
+    fn validate_action(
+        &self,
+        _parsed: &super::action::ParsedAction,
+        _action: &Action,
+        _ctx: &ExecCtx,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Execute one action. The `ctx` carries screen dims and
     /// model-coordinate factors so the operator can scale box/point
     /// coords to its native input space.

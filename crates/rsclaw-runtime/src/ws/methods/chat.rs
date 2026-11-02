@@ -1,7 +1,4 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::Ordering;
 
 use rsclaw_agent::AgentMessage;
 use rsclaw_events::AgentEvent;
@@ -32,6 +29,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| ErrorShape::bad_request("missing required param: message"))?
         .to_owned();
+    crate::ws::types::check_message_length(&text)?;
 
     let session_key = params
         .get("sessionKey")
@@ -80,7 +78,16 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
     // client as standard `chat` frames — identical wire format to a real
     // agent reply, so the frontend renders it the same way.
     if let Some(reply) =
-        try_preparse_locally(&text, &agent, "ws", "ws-client", PreparseOrigin::User).await
+        try_preparse_locally(
+            &text,
+            &agent,
+            "ws",
+            "ws-client",
+            Some(session_key.as_str()),
+            PreparseOrigin::User,
+            rsclaw_agent::SenderTrust::Owner,
+        )
+        .await
     {
         // Synthesize delta + done. We publish before returning so the relay
         // task (spawned below) is already subscribed when these arrive.
@@ -94,6 +101,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
             tool_log: vec![],
             question: None,
             channel: None,
+            origin: None,
         });
         let _ = ctx.state.event_bus.send(AgentEvent {
             session_id: session_key.clone(),
@@ -105,6 +113,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
             tool_log: vec![],
             question: None,
             channel: None,
+            origin: None,
         });
 
         // Same relay spawn shape as the agent-dispatch path — the events
@@ -120,8 +129,22 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
                 tokio::select! {
                     () = shutdown_for_relay.notified() => break,
                     next = stream.next() => {
-                        let Some(Ok(event)) = next else { break };
+                        let event = match next {
+                            Some(Ok(event)) => event,
+                            // Lagged: some events were dropped; keep relaying
+                            // so the client still receives `done`.
+                            Some(Err(e)) => {
+                                tracing::warn!(session = %sk, error = %e, "chat relay lagged");
+                                continue;
+                            }
+                            None => break,
+                        };
                         if event.session_id != sk {
+                            continue;
+                        }
+                        // A cron delivery posted into this session isn't part of
+                        // this turn: its done would end the relay.
+                        if event.origin.is_some() {
                             continue;
                         }
                         let conn_seq = conn.write().await.next_seq();
@@ -131,7 +154,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
                                 "sessionKey": sk,
                                 "type": "done",
                                 "role": "assistant",
-                                "files": event.files,
+                                "files": rsclaw_events::media::files_json(&event.files),
                                 "images": event.images,
                                 "toolLog": event.tool_log,
                             })
@@ -174,6 +197,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
     // Dispatch message to agent.
     let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
+        trust: rsclaw_agent::SenderTrust::Owner,
         session_key: session_key.clone(),
         text,
         channel: "ws".to_owned(),
@@ -234,8 +258,22 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
             tokio::select! {
                 () = shutdown_for_relay.notified() => break,
                 next = stream.next() => {
-                    let Some(Ok(event)) = next else { break };
+                    let event = match next {
+                        Some(Ok(event)) => event,
+                        // Lagged: some events were dropped; keep relaying so
+                        // the client still receives `done`.
+                        Some(Err(e)) => {
+                            tracing::warn!(session = %sk, error = %e, "chat relay lagged");
+                            continue;
+                        }
+                        None => break,
+                    };
                     if event.session_id != sk {
+                        continue;
+                    }
+                    // A cron delivery posted into this session isn't part of
+                    // this turn: its done would end the relay.
+                    if event.origin.is_some() {
                         continue;
                     }
 
@@ -247,7 +285,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
                             "sessionKey": sk,
                             "type": "done",
                             "role": "assistant",
-                            "files": event.files,
+                            "files": rsclaw_events::media::files_json(&event.files),
                             "images": event.images,
                             "toolLog": event.tool_log,
                         })
@@ -340,12 +378,23 @@ pub async fn chat_history(ctx: MethodCtx) -> MethodResult {
         .load_messages(sk)
         .map_err(|e| ErrorShape::internal(e.to_string()))?;
 
-    // Filter out compaction summary messages — they are internal-only
-    // and should not be displayed to the user.
+    // Filter out compaction summaries and the turns the runtime started
+    // itself (job notices, NO_REPLY answers) — internal-only, not for display.
     let filtered: Vec<_> = all_messages
         .into_iter()
         .filter(|v| !is_compaction_message(v))
+        .filter(|v| !rsclaw_events::notice::is_hidden_message(v))
         .map(rsclaw_provider::redact_rsclaw_hidden_value)
+        .map(|mut v| {
+            // The attachments block is for the model; people see `files`.
+            if let Some(serde_json::Value::String(text)) = v.get_mut("content") {
+                let body = rsclaw_events::media::strip_attachments_note(text);
+                if body.len() != text.len() {
+                    *text = body.to_owned();
+                }
+            }
+            v
+        })
         .collect();
 
     let messages: Vec<_> = if filtered.len() > limit {
@@ -372,22 +421,28 @@ pub async fn chat_abort(ctx: MethodCtx) -> MethodResult {
     //   1. abort_flag — cooperative, polled at stream/tool boundaries.
     //   2. cancel_token — hard cancel, drops a wedged turn immediately so the
     //      single-threaded queue isn't blocked behind a stalled await.
+    //
+    // Only flags that already exist (a turn registered them) are set. Minting
+    // a fresh `true` flag for an idle session made the NEXT turn abort
+    // instantly.
+    let mut aborted = false;
     for agent in ctx.state.agents.all() {
-        if let Ok(mut flags) = agent.abort_flags.write() {
-            let flag = flags
-                .entry(sk.to_string())
-                .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        if let Ok(flags) = agent.abort_flags.read()
+            && let Some(flag) = flags.get(sk)
+        {
             flag.store(true, Ordering::SeqCst);
+            aborted = true;
         }
         if let Ok(tokens) = agent.cancel_tokens.read() {
             if let Some(token) = tokens.get(sk) {
                 token.cancel();
+                aborted = true;
             }
         }
     }
 
     Ok(serde_json::json!({
-        "aborted": true,
+        "aborted": aborted,
         "sessionKey": sk
     }))
 }

@@ -18,6 +18,9 @@ pub async fn sessions_list(ctx: MethodCtx) -> MethodResult {
     let sessions: Vec<serde_json::Value> = keys
         .into_iter()
         .map(|k| {
+            if let Err(e) = ctx.state.store.db.ensure_session_title(&k) {
+                tracing::warn!(session = %k, error = %e, "session title backfill failed");
+            }
             let meta = ctx.state.store.db.get_session_meta(&k).ok().flatten();
             let (updated_ts, created_ts, msg_count, tokens) = match &meta {
                 Some(m) => {
@@ -52,7 +55,9 @@ pub async fn sessions_list(ctx: MethodCtx) -> MethodResult {
                             }
                         })
                         .sum();
-                    (updated, created, m.message_count, (total_chars / 4).max(1))
+                    // Active message count (`m.message_count` is a monotonic
+                    // seq allocator that does not drop after compaction).
+                    (updated, created, msgs.len() as u64, (total_chars / 4).max(1))
                 }
                 None => (String::new(), String::new(), 0, 0),
             };
@@ -68,7 +73,20 @@ pub async fn sessions_list(ctx: MethodCtx) -> MethodResult {
             } else {
                 created_ts.clone().into()
             };
+            let title = meta.as_ref().and_then(|m| m.title.clone());
+            let title_source = meta.as_ref().and_then(|m| m.title_source).map(|s| match s {
+                rsclaw_store::redb_store::TitleSource::Auto => "auto",
+                rsclaw_store::redb_store::TitleSource::User => "user",
+            });
+            let (agent_id, channel) = crate::gateway::session::parse_session_key(&k);
             serde_json::json!({
+                // session title (auto from first message, or user-renamed)
+                "title": title,
+                "titleSource": title_source,
+                "channel": channel,
+                "peerName": meta.as_ref().and_then(|m| m.peer_name.clone()),
+                "pinned": meta.as_ref().is_some_and(|m| m.pinned),
+                "archived": meta.as_ref().is_some_and(|m| m.archived),
                 // primary key — openclaw UI reads "sessionKey"
                 "key": k,
                 "sessionKey": k,
@@ -85,8 +103,8 @@ pub async fn sessions_list(ctx: MethodCtx) -> MethodResult {
                 "estimatedTokens": tokens,
                 "tokens": tokens,
                 // openclaw compat — label, agentId, model
-                "label": serde_json::Value::Null,
-                "agentId": "main",
+                "label": title,
+                "agentId": agent_id.unwrap_or_else(|| "main".to_owned()),
                 "model": serde_json::Value::Null,
             })
         })
@@ -117,6 +135,7 @@ pub async fn sessions_send(ctx: MethodCtx) -> MethodResult {
             ))
         })?
         .to_owned();
+    crate::ws::types::check_message_length(&text)?;
 
     let session_key = params
         .get("key")
@@ -155,6 +174,7 @@ pub async fn sessions_send(ctx: MethodCtx) -> MethodResult {
     // Build and send AgentMessage.
     let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
+        trust: rsclaw_agent::SenderTrust::Owner,
         session_key: session_key.clone(),
         text,
         channel: "ws".to_owned(),
@@ -234,8 +254,10 @@ pub async fn sessions_send(ctx: MethodCtx) -> MethodResult {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(session = %sk, error = %e, "ws relay: broadcast recv error");
-                    break;
+                    // Lagged: events were dropped, but the stream is alive.
+                    // Keep relaying so the client still receives `done`.
+                    tracing::warn!(session = %sk, error = %e, "ws relay: broadcast lagged");
+                    continue;
                 }
             }
         }
@@ -305,7 +327,12 @@ pub async fn sessions_messages_subscribe(ctx: MethodCtx) -> MethodResult {
         }
     }
 
-    // Spawn a long-lived relay task that forwards events for this session.
+    // Spawn a long-lived relay task that forwards events for this session —
+    // at most one per (connection, session key). A repeated subscribe reuses
+    // the live relay instead of duplicating every frame.
+    if !ctx.conn.write().await.session_relays.insert(key.clone()) {
+        return Ok(serde_json::json!({ "subscribed": true, "key": key }));
+    }
     let rx = ctx.state.event_bus.subscribe();
     let event_tx = ctx.conn.read().await.event_tx.clone();
     let conn = ctx.conn.clone();
@@ -314,14 +341,26 @@ pub async fn sessions_messages_subscribe(ctx: MethodCtx) -> MethodResult {
     tokio::spawn(async move {
         use futures::StreamExt;
         let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
-        while let Some(Ok(event)) = stream.next().await {
+        while let Some(result) = stream.next().await {
+            let event = match result {
+                Ok(event) => event,
+                Err(e) => {
+                    tracing::warn!(session = %sk, error = %e, "ws subscribe relay lagged");
+                    continue;
+                }
+            };
             if event.session_id != sk {
                 continue;
             }
-            // Check if still subscribed.
-            let still_subscribed = conn.read().await.subscribed_sessions.contains(&sk);
-            if !still_subscribed {
-                break;
+            // Check if still subscribed; deregister the relay under the same
+            // lock so a concurrent resubscribe either sees it live or spawns
+            // a fresh one.
+            {
+                let mut c = conn.write().await;
+                if !c.subscribed_sessions.contains(&sk) {
+                    c.session_relays.remove(&sk);
+                    return;
+                }
             }
             let seq = conn.write().await.next_seq();
             let payload = serde_json::json!({
@@ -338,6 +377,7 @@ pub async fn sessions_messages_subscribe(ctx: MethodCtx) -> MethodResult {
                 break;
             }
         }
+        conn.write().await.session_relays.remove(&sk);
     });
 
     Ok(serde_json::json!({ "subscribed": true, "key": key }))
@@ -373,6 +413,11 @@ pub async fn sessions_reset(ctx: MethodCtx) -> MethodResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| ErrorShape::bad_request("missing required param: key"))?;
 
+    crate::server::reset_agent_session_cache(
+        &ctx.state,
+        key,
+        rsclaw_agent::registry::SessionResetKind::Clear,
+    );
     ctx.state
         .store
         .db
@@ -394,6 +439,11 @@ pub async fn sessions_delete(ctx: MethodCtx) -> MethodResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| ErrorShape::bad_request("missing required param: key"))?;
 
+    crate::server::reset_agent_session_cache(
+        &ctx.state,
+        key,
+        rsclaw_agent::registry::SessionResetKind::Delete,
+    );
     ctx.state
         .store
         .db
@@ -442,13 +492,34 @@ pub async fn sessions_patch(ctx: MethodCtx) -> MethodResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| ErrorShape::bad_request("missing required param: key or sessionKey"))?;
 
-    // Accept metadata updates (title, tags, etc.) — store is append-only
-    // so we acknowledge but metadata storage is not yet implemented.
-    Ok(serde_json::json!({
-        "patched": true,
-        "key": key,
-        "sessionKey": key,
-    }))
+    // Same semantics as HTTP `PATCH /api/v1/sessions/{id}`: `title`
+    // (string | null; empty/null clears the user title), `pinned`, `archived`.
+    let mut body = serde_json::Map::new();
+    for field in ["title", "pinned", "archived"] {
+        if let Some(v) = params.get(field) {
+            body.insert(field.to_owned(), v.clone());
+        }
+    }
+    let body = serde_json::Value::Object(body);
+    let db = std::sync::Arc::clone(&ctx.state.store.db);
+    let key = key.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::server::sessions_api::apply_patch(&db, &key, &body)
+    })
+    .await
+    .map_err(|e| ErrorShape::internal(format!("session task failed: {e}")))?;
+    match result {
+        Ok(detail) => Ok(detail.to_ws_json()),
+        Err(crate::server::sessions_api::PatchError::BadRequest(msg)) => {
+            Err(ErrorShape::bad_request(msg))
+        }
+        Err(crate::server::sessions_api::PatchError::NotFound) => {
+            Err(ErrorShape::not_found("session not found"))
+        }
+        Err(crate::server::sessions_api::PatchError::Internal(msg)) => {
+            Err(ErrorShape::internal(msg))
+        }
+    }
 }
 
 pub async fn sessions_compact(ctx: MethodCtx) -> MethodResult {
@@ -463,12 +534,11 @@ pub async fn sessions_compact(ctx: MethodCtx) -> MethodResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| ErrorShape::bad_request("missing required param: key"))?;
 
-    // Compaction is triggered automatically by the agent runtime.
-    // This method can be used to request an immediate compaction.
-    Ok(serde_json::json!({
-        "compacted": true,
-        "key": key,
-    }))
+    // Compaction is triggered automatically by the agent runtime; an
+    // on-demand compaction request is not implemented.
+    Err(ErrorShape::not_implemented(format!(
+        "sessions.compact is not implemented; session `{key}` is compacted automatically by the agent runtime"
+    )))
 }
 
 pub async fn sessions_usage(ctx: MethodCtx) -> MethodResult {

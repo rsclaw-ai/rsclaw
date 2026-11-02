@@ -20,7 +20,8 @@ use std::pin::Pin;
 use anyhow::Result;
 
 /// Default User-Agent for all LLM provider HTTP requests.
-pub const DEFAULT_USER_AGENT: &str = concat!("rsclaw/", env!("CARGO_PKG_VERSION"));
+pub const DEFAULT_USER_AGENT: &str =
+    concat!(rsclaw_brand::brand_user_agent!(), "/", env!("CARGO_PKG_VERSION"));
 
 /// Install the rustls aws-lc-rs crypto provider once before any test runs.
 ///
@@ -138,6 +139,60 @@ pub(crate) async fn send_with_transport_retry(
     }
 }
 
+/// Incrementally decode a streamed byte chunk as UTF-8.
+///
+/// `pending` carries bytes left over from the previous chunk. The function
+/// appends `bytes`, returns every fully decodable character, and stashes an
+/// INCOMPLETE trailing multi-byte sequence back into `pending` so a CJK /
+/// emoji character split across two TCP chunks decodes intact. Bytes that
+/// can never become valid (`Utf8Error::error_len() == Some(n)`) are replaced
+/// with U+FFFD and skipped — without that advance, a single stray invalid
+/// byte would be re-stitched onto every later chunk, the remainder would
+/// grow without bound and the stream would stall forever.
+pub(crate) fn decode_utf8_chunk(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
+    let buf: Vec<u8> = if pending.is_empty() {
+        bytes.to_vec()
+    } else {
+        let mut combined = std::mem::take(pending);
+        combined.extend_from_slice(bytes);
+        combined
+    };
+    let mut out = String::with_capacity(buf.len());
+    let mut start = 0usize;
+    while start < buf.len() {
+        match std::str::from_utf8(&buf[start..]) {
+            Ok(s) => {
+                out.push_str(s);
+                break;
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                out.push_str(
+                    std::str::from_utf8(&buf[start..start + valid_up_to])
+                        .expect("valid_up_to guarantees valid UTF-8"),
+                );
+                match e.error_len() {
+                    // Incomplete sequence at the tail: wait for the next chunk.
+                    None => {
+                        *pending = buf[start + valid_up_to..].to_vec();
+                        break;
+                    }
+                    // Invalid bytes: they will never decode, skip past them.
+                    Some(n) => {
+                        tracing::warn!(
+                            invalid_bytes = n,
+                            "stream: skipping invalid UTF-8 bytes in provider response"
+                        );
+                        out.push('\u{FFFD}');
+                        start += valid_up_to + n;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Build a `reqwest::Client` with a custom or default User-Agent.
 ///
 /// Tuning notes:
@@ -229,7 +284,32 @@ pub enum ContentPart {
     },
     Reasoning {
         text: String,
+        /// Provider signature of this reasoning block (Anthropic `thinking`
+        /// blocks). Required to replay the block unchanged inside a tool
+        /// loop. Providers other than Anthropic ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        /// Opaque payload of an Anthropic `redacted_thinking` block. When
+        /// set, `text` is empty and the part replays as `redacted_thinking`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redacted: Option<String>,
+        /// Model that produced `signature` / `redacted`. Signed blocks are
+        /// bound to the model family that produced them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
+}
+
+impl ContentPart {
+    /// Plain reasoning text without replay metadata.
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self::Reasoning {
+            text: text.into(),
+            signature: None,
+            redacted: None,
+            model: None,
+        }
+    }
 }
 
 /// A tool definition passed to the LLM.
@@ -429,6 +509,20 @@ pub enum StreamEvent {
     /// Reasoning/thinking delta (collected separately, used as fallback if
     /// content is empty)
     ReasoningDelta(String),
+    /// A finished, replayable reasoning block (Anthropic `thinking` /
+    /// `redacted_thinking`). Its text was already streamed as
+    /// `ReasoningDelta`; this event only adds the replay metadata, so
+    /// consumers that merely display reasoning can ignore it.
+    ReasoningBlock {
+        /// Full thinking text of the block (empty for redacted blocks).
+        text: String,
+        /// Block signature (`thinking` blocks).
+        signature: Option<String>,
+        /// Opaque `data` of a `redacted_thinking` block.
+        redacted: Option<String>,
+        /// Model that produced the block.
+        model: String,
+    },
     /// Tool call requested by the model
     ToolCall {
         id: String,
@@ -517,6 +611,26 @@ pub trait LlmProvider: Send + Sync {
         let name = self.name().to_owned();
         Box::pin(async move { anyhow::bail!("compact splice not supported by provider {name}") })
     }
+
+    /// Forget the server-side copy of `session_key`'s history, so the next
+    /// call re-sends the history as the request now carries it.
+    ///
+    /// A stateful provider (rsclaw kvCacheMode=2) keeps every message it
+    /// was sent and is then sent only what is new: shrinking messages the
+    /// server already holds changes nothing there, and its copy keeps
+    /// growing to the session cap. Stateless providers re-send the whole
+    /// history on every call, so the default does nothing.
+    #[allow(unused_variables)]
+    fn drop_session(&self, session_key: &str) {}
+
+    /// Whether the backend's session holds more than the runtime's history:
+    /// tool steps the runtime dropped at turn end. Its reported prompt size
+    /// is then the session's real size, not a measure of the runtime's
+    /// estimate. Stateless providers hold nothing, so the default is false.
+    #[allow(unused_variables)]
+    fn holds_dropped_steps(&self, session_key: &str) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +691,25 @@ mod tests {
             d1 < d2,
             "attempt 1 ({d1:?}) should be less than attempt 2 ({d2:?})"
         );
+    }
+
+    #[test]
+    fn decode_utf8_chunk_stitches_split_cjk_and_skips_invalid() {
+        let mut pending = Vec::new();
+        let bytes = "中文".as_bytes();
+        // Split the first 3-byte char across two chunks.
+        let a = decode_utf8_chunk(&mut pending, &bytes[..2]);
+        assert_eq!(a, "");
+        assert_eq!(pending.len(), 2);
+        let b = decode_utf8_chunk(&mut pending, &bytes[2..]);
+        assert_eq!(b, "中文");
+        assert!(pending.is_empty());
+        // A stray invalid byte must not wedge the remainder.
+        let c = decode_utf8_chunk(&mut pending, &[b'a', 0xFF, b'b']);
+        assert_eq!(c, "a\u{FFFD}b");
+        assert!(pending.is_empty());
+        let d = decode_utf8_chunk(&mut pending, b"c");
+        assert_eq!(d, "c");
     }
 
     #[test]

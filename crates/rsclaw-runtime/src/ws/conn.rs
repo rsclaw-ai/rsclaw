@@ -34,6 +34,10 @@ pub struct ConnHandle {
     pub id: ConnId,
     pub event_tx: OutboundTx,
     pub subscribed_sessions: HashSet<String>,
+    /// Session keys with a live `sessions.messages.subscribe` relay task.
+    /// Prevents a second subscribe (or unsubscribe + resubscribe before the
+    /// old relay noticed) from spawning a duplicate relay.
+    pub session_relays: HashSet<String>,
     pub seq: u64,
     /// Client metadata from the WS connect handshake.
     pub client_info: Option<super::types::ClientInfo>,
@@ -50,6 +54,7 @@ impl ConnHandle {
             id,
             event_tx,
             subscribed_sessions: HashSet::new(),
+            session_relays: HashSet::new(),
             seq: 0,
             client_info: None,
             connected_at: std::time::Instant::now(),

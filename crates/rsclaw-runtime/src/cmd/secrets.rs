@@ -32,7 +32,7 @@ pub async fn cmd_secrets(sub: SecretsCommand) -> Result<()> {
                 "rsclaw secrets configure v{}",
                 option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
             ));
-            println!("  Add a secrets provider to rsclaw.json5:");
+            println!("  Add a secrets provider to {}:", rsclaw_brand::CONFIG_FILE);
             println!();
             println!("  {}", dim(r#"secrets: {"#));
             println!("  {}", dim(r#"  providers: {"#));
@@ -44,7 +44,10 @@ pub async fn cmd_secrets(sub: SecretsCommand) -> Result<()> {
             println!("  {}", dim(r#"    // file: reads from a JSON/dotenv file"#));
             println!(
                 "  {}",
-                dim(r#"    file: { type: "file", file: "~/.rsclaw/secrets.json" },"#)
+                dim(&format!(
+                    r#"    file: {{ type: "file", file: "~/{}/secrets.json" }},"#,
+                    rsclaw_brand::HOME_DIR
+                ))
             );
             println!("  {}", dim(r#"  }"#));
             println!("  {}", dim(r#"}"#));

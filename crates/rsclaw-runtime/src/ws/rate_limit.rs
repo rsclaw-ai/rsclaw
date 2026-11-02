@@ -1,6 +1,48 @@
 //! Simple token-bucket rate limiter for WS write operations.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{LazyLock, Mutex},
+    time::{Duration, Instant},
+};
+
+/// Write methods allowed per minute per client.
+pub const WRITE_LIMIT_PER_MINUTE: u32 = 30;
+
+/// Bound on remote peers tracked by the shared limiter.
+const MAX_TRACKED_PEERS: usize = 10_000;
+
+/// Write buckets shared by every connection from the same remote IP, so
+/// reconnecting does not reset the budget.
+static PEER_LIMITERS: LazyLock<Mutex<HashMap<IpAddr, RateLimiter>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Consume one write token from the bucket shared by all connections of
+/// `ip`. Returns `true` if allowed.
+pub fn check_peer(ip: IpAddr) -> bool {
+    let Ok(mut map) = PEER_LIMITERS.lock() else {
+        tracing::warn!("ws rate limiter lock poisoned; allowing request");
+        return true;
+    };
+    if !map.contains_key(&ip) && map.len() >= MAX_TRACKED_PEERS {
+        // Buckets idle for a full refill interval are back at capacity and
+        // carry no state worth keeping.
+        map.retain(|_, l| l.last_refill.elapsed() < l.refill_interval);
+        if map.len() >= MAX_TRACKED_PEERS {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, l)| l.last_refill)
+                .map(|(k, _)| *k);
+            if let Some(k) = oldest {
+                map.remove(&k);
+            }
+        }
+    }
+    map.entry(ip)
+        .or_insert_with(RateLimiter::default_write_limiter)
+        .check()
+}
 
 /// Per-connection token bucket rate limiter.
 ///
@@ -29,9 +71,9 @@ impl RateLimiter {
         }
     }
 
-    /// Default limiter: 30 writes per minute.
+    /// Default limiter: [`WRITE_LIMIT_PER_MINUTE`] writes per minute.
     pub fn default_write_limiter() -> Self {
-        Self::new(30, Duration::from_secs(60))
+        Self::new(WRITE_LIMIT_PER_MINUTE, Duration::from_secs(60))
     }
 
     /// Try to consume one token.  Returns `true` if allowed, `false` if
@@ -105,6 +147,17 @@ mod tests {
         assert!(rl.check());
         assert!(rl.check());
         assert!(!rl.check());
+    }
+
+    #[test]
+    fn peer_bucket_survives_reconnect() {
+        // Documentation-range address, unique to this test.
+        let ip: IpAddr = "198.51.100.77".parse().expect("ip");
+        for _ in 0..WRITE_LIMIT_PER_MINUTE {
+            assert!(check_peer(ip));
+        }
+        // A new connection from the same IP shares the exhausted bucket.
+        assert!(!check_peer(ip));
     }
 
     #[test]

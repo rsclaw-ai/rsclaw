@@ -110,6 +110,12 @@ pub fn resolve_base_url(provider: &str) -> (String, &'static str) {
     (builtin_url.to_owned(), auth)
 }
 
+/// True when `name` is a provider known to the builtin table or to
+/// `defaults.toml`.
+pub(crate) fn is_known_provider(name: &str) -> bool {
+    !builtin_base_url(name).0.is_empty() || toml_providers().contains_key(name)
+}
+
 /// Check if a base_url already ends with a version path segment
 /// (e.g. `/v1`, `/v4`, `/v1beta`).
 pub fn has_version_suffix(url: &str) -> bool {

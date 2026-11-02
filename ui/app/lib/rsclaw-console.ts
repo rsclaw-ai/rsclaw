@@ -185,7 +185,7 @@ export async function applyInstalledKey(
     if (!merged.agents) merged.agents = {};
     if (!merged.agents.defaults) merged.agents.defaults = {};
     if (!merged.agents.defaults.model) merged.agents.defaults.model = {};
-    merged.agents.defaults.model.primary = "rsclaw/rsclaw-agent-v1";
+    merged.agents.defaults.model.primary = "rsclaw/rsclaw-agent-v2";
   };
 
   try {
@@ -198,12 +198,19 @@ export async function applyInstalledKey(
         /* tolerate — config may already be there */
       }
 
+      // Missing config reads back as "" → start from empty. A config that
+      // exists but can't be read/parsed must abort: merging into `{}` and
+      // writing would wipe the user's whole rsclaw.json5.
+      const raw = (await invoke("read_config_file")) as string;
       let existing: any = {};
-      try {
-        const raw = (await invoke("read_config_file")) as string;
-        existing = JSON5.parse(raw || "{}");
-      } catch {
-        /* missing config → start from empty */
+      if (raw && raw.trim()) {
+        try {
+          existing = JSON5.parse(raw);
+        } catch (e) {
+          throw new Error(
+            `rsclaw.json5 is not valid JSON5, refusing to overwrite it: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
       }
       const merged = deepMerge(existing, patch);
       // RsClaw's baseUrl is hardcoded in the gateway
@@ -240,12 +247,18 @@ export async function applyInstalledKey(
     }
 
     // Browser dev mode: write via the HTTP gateway config endpoint.
+    // Abort (don't fall back to `{}`) when the current config can't be
+    // fetched or parsed — saving the merge would wipe it.
+    const cfg = await getConfig();
     let existing: any = {};
-    try {
-      const cfg = await getConfig();
-      existing = JSON5.parse(cfg.raw || "{}");
-    } catch {
-      /* empty config */
+    if (cfg?.raw && cfg.raw.trim()) {
+      try {
+        existing = JSON5.parse(cfg.raw);
+      } catch (e) {
+        throw new Error(
+          `rsclaw.json5 is not valid JSON5, refusing to overwrite it: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
     }
     const merged = deepMerge(existing, patch);
     if (merged?.models?.providers?.rsclaw) {
@@ -326,7 +339,7 @@ export async function readAccountState(): Promise<RsclawAccountState> {
 }
 
 /**
- * Flip `agents.defaults.model.primary` back to `rsclaw/rsclaw-agent-v1`
+ * Flip `agents.defaults.model.primary` back to `rsclaw/rsclaw-agent-v2`
  * without disturbing anything else in the config. Used when the user has
  * already connected an rsclaw key but then switched primary to another
  * provider — the rsclaw card surfaces a "set as default" action that
@@ -349,7 +362,7 @@ export async function setRsclawAsPrimary(): Promise<{
     if (!parsed.agents) parsed.agents = {};
     if (!parsed.agents.defaults) parsed.agents.defaults = {};
     if (!parsed.agents.defaults.model) parsed.agents.defaults.model = {};
-    parsed.agents.defaults.model.primary = "rsclaw/rsclaw-agent-v1";
+    parsed.agents.defaults.model.primary = "rsclaw/rsclaw-agent-v2";
     const next = JSON.stringify(parsed, null, 2);
     if (isTauri) {
       await invoke("write_config", { content: next });

@@ -81,6 +81,10 @@ pub async fn agents_files_list(ctx: MethodCtx) -> MethodResult {
         .or_else(|| params.and_then(|p| p.get("id")))
         .and_then(|v| v.as_str())
         .unwrap_or("main");
+    // `workspace-{id}` is a path component: reject traversal (`../..`).
+    if !rsclaw_util::fs_guard::is_safe_slug(agent_id) {
+        return Err(ErrorShape::bad_request(format!("invalid agent id: {agent_id}")));
+    }
 
     let base = rsclaw_config::loader::base_dir();
     let workspace = base.join(format!("workspace-{agent_id}"));
@@ -119,6 +123,12 @@ pub async fn agents_create(ctx: MethodCtx) -> MethodResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| ErrorShape::bad_request("missing required param: id"))?
         .to_owned();
+    // Agent ids become path components (`workspace-{id}`, agent dirs).
+    if !rsclaw_util::fs_guard::is_safe_slug(&id) {
+        return Err(ErrorShape::bad_request(format!(
+            "invalid agent id `{id}` (allowed: letters, digits, '_', '-', '.'; max 64 chars)"
+        )));
+    }
 
     let (path, mut config) = crate::cmd::config_json::load_config_json()
         .map_err(|e| ErrorShape::internal(e.to_string()))?;

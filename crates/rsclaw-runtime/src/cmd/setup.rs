@@ -149,12 +149,13 @@ fn confirm_step(prompt: &str, default: bool) -> StepResult<bool> {
 fn default_config(lang: &str) -> String {
     let lang_name = lang_code_to_name(lang);
     let auth_token = generate_auth_token();
+    let port = rsclaw_brand::DEFAULT_PORT;
     format!(
         r#"// rsclaw configuration (JSON5)
 // Docs: https://github.com/rsclaw-ai/rsclaw
 {{
   gateway: {{
-    port: 18888,
+    port: {port},
     bind: "loopback",
     language: "{lang_name}",
     auth: {{ token: "{auth_token}" }},
@@ -176,7 +177,7 @@ fn default_config(lang: &str) -> String {
   }},
   agents: {{
     defaults: {{
-      model: {{ primary: "rsclaw/rsclaw-agent-v1" }},
+      model: {{ primary: "rsclaw/rsclaw-agent-v2" }},
       contextTokens: 128000,         // max context window tokens
       stripThinkTags: false,         // strip <think> tags (auto when thinking disabled)
       frequencyPenalty: 0.3,         // reduce repetition (0.0-2.0)
@@ -258,21 +259,25 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::R
 }
 
 fn header(title: &str) {
+    let title = &*rsclaw_brand::rebrand(title);
     println!();
     println!("  {title}");
     println!("  {}", "-".repeat(title.len()));
 }
 
 fn step(icon: &str, msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!("  {icon} {msg}");
 }
 
 fn done(msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!();
     println!("  [ok] {msg}");
 }
 
 fn hint(msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!("       {msg}");
 }
 
@@ -513,7 +518,7 @@ fn load_existing_defaults(defs: &Defaults) -> ExistingConfig {
         api_key_display: String::new(),
         base_url: String::new(),
         model: String::new(),
-        port: 18888,
+        port: rsclaw_brand::DEFAULT_PORT,
         bind_idx: 0,
         enabled_channels: vec![],
         provider_models: std::collections::HashMap::new(),
@@ -664,7 +669,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     if args.non_interactive {
         let base = rsclaw_config::loader::base_dir();
         std::fs::create_dir_all(&base)?;
-        let config_path = base.join("rsclaw.json5");
+        let config_path = base.join(rsclaw_brand::CONFIG_FILE);
         if !config_path.exists() {
             let token = generate_auth_token();
             let body =
@@ -686,13 +691,17 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         ] {
             let _ = std::fs::create_dir_all(base.join(dir));
         }
+        crate::bundled_plugins::install_all(&base.join("plugins"));
         let defaults_path = base.join("defaults.toml");
         if !defaults_path.exists() {
             let _ = std::fs::write(&defaults_path, &builtin_defaults());
         }
         // Seed workspace with default SOUL.md, AGENTS.md, USER.md
         let workspace = base.join("workspace");
-        let _ = rsclaw_agent::bootstrap::seed_workspace(&workspace);
+        let _ = rsclaw_agent::bootstrap::seed_workspace_with_lang(
+            &workspace,
+            initial_language().as_deref(),
+        );
         // Seed tool prompts + embedded knowledge trees (web_browser
         // site-rules + computer_use app-rules). Previously skipped on
         // the non-interactive path, leaving the per-host skill library
@@ -810,6 +819,13 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         std::fs::create_dir_all(&path)?;
         step("+", &format!("{}", path.display()));
     }
+    for (name, outcome) in crate::bundled_plugins::install_all(&base.join("plugins")) {
+        if let crate::bundled_plugins::Outcome::Installed { version }
+        | crate::bundled_plugins::Outcome::Upgraded { to: version, .. } = outcome
+        {
+            step("+", &format!("plugin {name} v{version}"));
+        }
+    }
 
     // Import data from OpenClaw when user chose Import mode.
     // Delegates to the unified import_data() in cmd/migrate.rs.
@@ -843,7 +859,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     }
 
     let config_path = {
-        let p = base.join("rsclaw.json5");
+        let p = base.join(rsclaw_brand::CONFIG_FILE);
         if !p.exists() {
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -1411,18 +1427,28 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     };
 
     // Load existing config or start fresh.
+    // An existing config that can't be read or parsed must not be silently
+    // replaced by a fresh one (that would wipe the user's settings).
     let mut val: serde_json::Value = if config_path.exists() {
-        std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|raw| json5::from_str(&raw).ok())
-            .unwrap_or_else(|| json!({}))
+        let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+            anyhow::anyhow!("cannot read existing config {}: {e}", config_path.display())
+        })?;
+        json5::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "existing config {} is not valid JSON5 ({e}); fix or move it away before running setup",
+                config_path.display()
+            )
+        })?
     } else {
         json!({})
     };
 
     // Ensure top-level is an object.
     if !val.is_object() {
-        val = json!({});
+        anyhow::bail!(
+            "existing config {} is not a JSON object; fix or move it away before running setup",
+            config_path.display()
+        );
     }
 
     // -- gateway --
@@ -1603,7 +1629,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     }
 
     let workspace = base.join("workspace");
-    let _ = agent::seed_workspace(&workspace);
+    let _ = agent::seed_workspace_with_lang(&workspace, initial_language().as_deref());
 
     // Summary
     header(&rsclaw_i18n::t("cli_onboard_complete", lang));
@@ -1894,14 +1920,17 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
             && std::fs::read_to_string(&pid_file)
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
-                .is_some_and(|pid| rsclaw_platform::process_alive(pid));
+                .is_some_and(rsclaw_platform::process_is_rsclaw);
 
         if gateway_running {
             hint(&rsclaw_i18n::t("cli_restarting_gateway", lang));
             if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
                 && let Ok(pid) = pid_str.trim().parse::<u32>()
             {
-                let _ = rsclaw_platform::process_terminate(pid);
+                // process_terminate re-verifies the pid names an rsclaw process.
+                if let Err(e) = rsclaw_platform::process_terminate(pid) {
+                    tracing::warn!("gateway restart: terminate failed: {e}");
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             match crate::cmd::gateway::spawn_gateway_bg_pub() {
@@ -3757,7 +3786,7 @@ fn resolve_config_path_for_write() -> std::path::PathBuf {
         return existing;
     }
     // Nothing exists -> new file in base_dir (RSCLAW_BASE_DIR or ~/.rsclaw/).
-    rsclaw_config::loader::base_dir().join("rsclaw.json5")
+    rsclaw_config::loader::base_dir().join(rsclaw_brand::CONFIG_FILE)
 }
 
 fn rotate_backups(path: &std::path::Path) {
@@ -3909,4 +3938,53 @@ mod account_helper_tests {
         let v3 = json!({ "channels": { "feishu": { "enabled": true } } });
         assert!(!channel_is_configured(&v3, "feishu"));
     }
+}
+
+/// Language for a fresh install's workspace templates: the brand default
+/// when the brand sets one, else Chinese on a Chinese-language system.
+/// Without the fallback a Chinese desktop install got the English
+/// templates and the assistant introduced itself by its English name.
+fn initial_language() -> Option<String> {
+    brand_default_language().or_else(|| system_prefers_chinese().then(|| "Chinese".to_owned()))
+}
+
+/// Whether the user's preferred UI language is Chinese.
+fn system_prefers_chinese() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // GUI-launched processes carry no LANG; the first AppleLanguages
+        // entry is the language the user picked, e.g. `"zh-Hans-CN"`.
+        if let Ok(out) = std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleLanguages"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(first) = text
+                .split([',', '(', ')', '\n'])
+                .map(|s| s.trim().trim_matches('"'))
+                .find(|s| !s.is_empty())
+            {
+                return first.to_ascii_lowercase().starts_with("zh");
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Primary language id 0x04 is Chinese (any region or script).
+        let lang = unsafe { winapi::um::winnls::GetUserDefaultUILanguage() };
+        return lang & 0x3ff == 0x04;
+    }
+    #[allow(unreachable_code)]
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|v| !v.is_empty() && v != "C" && v != "POSIX")
+        .is_some_and(|v| v.to_ascii_lowercase().starts_with("zh"))
+}
+
+fn brand_default_language() -> Option<String> {
+    rsclaw_config::brand_layers::apply(serde_json::json!({}))
+        .pointer("/gateway/language")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }

@@ -251,6 +251,7 @@ mod tests {
         AgentEntry {
             id: id.to_owned(),
             daemon: false,
+            kb: None,
             description: None,
             default: if default { Some(true) } else { None },
             workspace: None,
@@ -262,6 +263,7 @@ mod tests {
             channels: channels.map(|v| v.into_iter().map(str::to_owned).collect()),
             commands: None,
             allowed_commands: None,
+            non_owner_tools: None,
             name: None,
             opencode: None,
             claudecode: None,

@@ -52,6 +52,31 @@ const SHARED_BROWSER_PROFILE: &str = "rsclaw";
 
 type HostTrapResult<T> = std::result::Result<T, wasmtime::Error>;
 
+// Manifest `capabilities` names gating sensitive host functions. Names follow
+// the existing manifest style (`http`, `device`, `pushOutbound`, ...). A
+// plugin that calls a gated function without declaring the capability gets
+// an error result instead of the side effect.
+
+/// `host-http.request` (outbound HTTP to public addresses).
+const CAP_HTTP: &str = "http";
+/// `host-device.*` (per-plugin device identity key + signatures).
+const CAP_DEVICE: &str = "device";
+/// `host-background.cron-register`.
+const CAP_CRON: &str = "cron";
+/// `host-background.sse-*`.
+const CAP_SSE: &str = "sse";
+/// `host-background.push-outbound` (send messages to arbitrary peers).
+const CAP_PUSH_OUTBOUND: &str = "pushOutbound";
+/// `host-background.submit-agent-turn` (inject prompts into agent sessions).
+const CAP_SUBMIT_AGENT_TURN: &str = "submitAgentTurn";
+/// `host-desktop.*` (screen capture, clipboard, mouse / keyboard synthesis).
+const CAP_DESKTOP: &str = "desktop";
+/// `*-vlm-drive` host-side GUI agent loops (desktop / android).
+const CAP_VLM_DRIVE: &str = "vlmDrive";
+/// Lets `*-vlm-drive` act on apps other than the one the plugin named
+/// (skips the per-app consent check). Must be granted explicitly.
+const CAP_VLM_DRIVE_BYPASS: &str = "vlmDriveBypass";
+
 static HOST_HTTP_TLS_PROVIDER: OnceLock<()> = OnceLock::new();
 static HOST_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -108,6 +133,8 @@ pub struct WasmPlugin {
     plugin_config: serde_json::Value,
     /// Requested host capabilities from the manifest.
     pub capabilities: Vec<String>,
+    /// Shared copy of `capabilities` handed to every per-call `HostState`.
+    capabilities_arc: Arc<Vec<String>>,
     /// Slash command metadata from the manifest.
     pub slash_commands: Vec<crate::manifest::PluginSlashCommand>,
     /// Trusted tool aliases from plugin tool name to first-class host tool
@@ -164,6 +191,30 @@ pub struct WasmNotifyCtx {
     /// it a multi-account feishu setup sends with an arbitrary app's token and
     /// Feishu rejects open_id targets with 99992361 "open_id cross app".
     pub account: Option<String>,
+    /// The agent's event bus. A sync-only chat (the HTTP API the desktop app
+    /// uses) has no notification sender, so plugin messages for it are
+    /// streamed into the running reply here instead.
+    pub event_bus: Option<tokio::sync::broadcast::Sender<rsclaw_events::AgentEvent>>,
+}
+
+impl WasmNotifyCtx {
+    /// Streams `text` (and `images`) into the reply of a sync-only chat.
+    /// `None` when this chat is not sync-only or nobody is listening.
+    fn stream_to_sync_chat(&self, text: &str, images: Vec<String>) -> Option<&'static str> {
+        if !rsclaw_channel::is_sync_only_channel(&self.channel) {
+            return None;
+        }
+        let bus = self.event_bus.as_ref()?;
+        bus.send(rsclaw_events::AgentEvent {
+            session_id: self.session_key.clone(),
+            agent_id: self.agent_id.clone(),
+            delta: format!("\n\n{text}\n\n"),
+            images,
+            ..Default::default()
+        })
+        .ok()
+        .map(|_| "dispatched")
+    }
 }
 
 /// State passed into the wasmtime `Store`, available to host functions.
@@ -182,7 +233,7 @@ struct HostState {
     plugin_config: serde_json::Value,
     /// Desktop session for host-desktop interface (input synthesis,
     /// screenshots).
-    desktop: Box<dyn rsclaw_desktop::DesktopSession>,
+    desktop: Arc<dyn rsclaw_desktop::DesktopSession>,
     /// Optional provider registry for host-vlm interface.
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     /// Default vision model name for host-vlm interface.
@@ -190,6 +241,9 @@ struct HostState {
     /// WDA session URL (`RSCLAW_IOS_WDA_URL` env var, default
     /// `http://localhost:8100`). Set when `ios-connect` succeeds.
     wda_url: Option<String>,
+    /// Capability names declared in the plugin manifest. Sensitive host
+    /// functions check this at entry (see `require_capability`).
+    capabilities: Arc<Vec<String>>,
 }
 
 fn new_host_state(
@@ -200,6 +254,7 @@ fn new_host_state(
     plugin_config: serde_json::Value,
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
+    capabilities: Arc<Vec<String>>,
 ) -> HostState {
     HostState {
         browser,
@@ -212,10 +267,11 @@ fn new_host_state(
         cdn_rules,
         plugin_name,
         plugin_config,
-        desktop: rsclaw_desktop::create_session(),
+        desktop: Arc::from(rsclaw_desktop::create_session()),
         providers,
         vision_model,
         wda_url: None,
+        capabilities,
     }
 }
 
@@ -230,6 +286,7 @@ fn new_sandboxed_store(
     plugin_config: serde_json::Value,
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
+    capabilities: Arc<Vec<String>>,
 ) -> Store<HostState> {
     let mut store = Store::new(
         engine,
@@ -241,6 +298,7 @@ fn new_sandboxed_store(
             plugin_config,
             providers,
             vision_model,
+            capabilities,
         ),
     );
     store.limiter(|s| &mut s.limits);
@@ -261,75 +319,107 @@ impl wasmtime_wasi::WasiView for HostState {
 // Host trait implementations
 // ---------------------------------------------------------------------------
 
+/// `~/Downloads/rsclaw`, the root of every `allocate-artifact` path.
+fn plugin_downloads_root() -> PathBuf {
+    dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(rsclaw_config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join(rsclaw_brand::CLI_NAME)
+}
+
+/// Private per-plugin data dir `~/.rsclaw/var/plugins/<plugin>`. `None`
+/// (JS runtime, which has no per-call identity and full filesystem access
+/// by design) widens it to the whole `var/plugins` tree.
+fn plugin_var_root(plugin_name: Option<&str>) -> PathBuf {
+    let root = rsclaw_config::loader::base_dir().join("var").join("plugins");
+    match plugin_name {
+        Some(name) => root.join(name),
+        None => root,
+    }
+}
+
+/// Roots a plugin may write to or read its own artifacts from: workspace,
+/// its own `var/plugins/<plugin>` dir, and `Downloads/rsclaw`.
+fn plugin_artifact_roots(plugin_name: Option<&str>) -> Vec<PathBuf> {
+    vec![
+        rsclaw_config::loader::base_dir().join("workspace"),
+        plugin_var_root(plugin_name),
+        plugin_downloads_root(),
+    ]
+}
+
+/// Expand `~`, resolve relative paths against the workspace, then confine
+/// the result to `roots` following symlinks of every existing ancestor.
+fn resolve_plugin_path_in_roots(
+    input: &str,
+    roots: &[PathBuf],
+    context: &str,
+) -> Result<PathBuf, String> {
+    let workspace = rsclaw_config::loader::base_dir().join("workspace");
+    let expanded = rsclaw_util::canonicalize_external_path(input, &workspace);
+    let root_refs: Vec<&std::path::Path> = roots.iter().map(PathBuf::as_path).collect();
+    rsclaw_util::fs_guard::resolve_within_any(&root_refs, &expanded.to_string_lossy()).map_err(
+        |_| {
+            let allowed: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+            format!(
+                "{context} path '{input}' resolves outside allowed dirs ({})",
+                allowed.join(", ")
+            )
+        },
+    )
+}
+
 /// Canonicalize a filesystem path from a WASM plugin and reject anything that
 /// resolves outside the plugin workspace. `~` expansion and absolute paths
 /// in the input are tolerated *only* if the canonical result still lives
 /// under the workspace dir — otherwise the call is rejected.
 fn canonicalize_plugin_path(input: &str) -> Result<PathBuf, String> {
     let workspace = rsclaw_config::loader::base_dir().join("workspace");
-    let canonical = rsclaw_util::canonicalize_external_path(input, &workspace);
-    if !canonical.starts_with(&workspace) {
-        return Err(format!(
-            "plugin path '{}' resolves outside workspace ({})",
-            input,
-            workspace.display()
-        ));
-    }
-    Ok(canonical)
+    resolve_plugin_path_in_roots(input, &[workspace], "plugin")
 }
 
-/// Same as `canonicalize_plugin_path` but also permits paths under
-/// `~/.rsclaw/var/plugins/` and host-allocated artifact paths so plugins can
-/// persist databases/config and write files returned by `allocate-artifact`.
-fn canonicalize_writable_path(input: &str) -> Result<PathBuf, String> {
-    let base = rsclaw_config::loader::base_dir();
-    let workspace = base.join("workspace");
-    let plugins_var = base.join("var").join("plugins");
-    let downloads_rsclaw = dirs_next::download_dir()
-        .unwrap_or_else(|| {
-            dirs_next::home_dir()
-                .unwrap_or_else(rsclaw_config::loader::base_dir)
-                .join("Downloads")
-        })
-        .join("rsclaw");
-    let canonical = rsclaw_util::canonicalize_external_path(input, &workspace);
-    if canonical.starts_with(&workspace)
-        || canonical.starts_with(&plugins_var)
-        || canonical.starts_with(&downloads_rsclaw)
-    {
-        return Ok(canonical);
+/// Same as `canonicalize_plugin_path` but also permits paths under the
+/// calling plugin's own `~/.rsclaw/var/plugins/<plugin>/` dir and
+/// host-allocated artifact paths so plugins can persist databases/config and
+/// write files returned by `allocate-artifact`.
+fn canonicalize_writable_path(plugin_name: &str, input: &str) -> Result<PathBuf, String> {
+    // Create the plugin's own var dir up front so the root canonicalizes to
+    // the same form as the resolved path even when `~/.rsclaw` is a symlink.
+    let var_root = plugin_var_root(Some(plugin_name));
+    if let Err(e) = std::fs::create_dir_all(&var_root) {
+        tracing::warn!(dir = %var_root.display(), error = %e, "cannot create plugin var dir");
     }
-    Err(format!(
-        "writable path '{}' resolves outside allowed dirs (workspace, var/plugins, or Downloads/rsclaw)",
-        input
-    ))
+    resolve_plugin_path_in_roots(input, &plugin_artifact_roots(Some(plugin_name)), "writable")
 }
 
-/// Canonicalize a saved plugin artifact path for read-only document
-/// extraction. In addition to workspace/plugin-var paths, this permits
-/// `~/Downloads/rsclaw`, which is where `allocate-artifact` stores files.
-fn canonicalize_plugin_artifact_path(input: &str) -> Result<PathBuf, String> {
-    let base = rsclaw_config::loader::base_dir();
-    let workspace = base.join("workspace");
-    let plugins_var = base.join("var").join("plugins");
-    let downloads_rsclaw = dirs_next::download_dir()
-        .unwrap_or_else(|| {
-            dirs_next::home_dir()
-                .unwrap_or_else(rsclaw_config::loader::base_dir)
-                .join("Downloads")
-        })
-        .join("rsclaw");
-    let canonical = rsclaw_util::canonicalize_external_path(input, &workspace);
-    if canonical.starts_with(&workspace)
-        || canonical.starts_with(&plugins_var)
-        || canonical.starts_with(&downloads_rsclaw)
-    {
-        return Ok(canonical);
-    }
-    Err(format!(
-        "artifact path '{}' resolves outside allowed dirs (workspace, var/plugins, or Downloads/rsclaw)",
-        input
-    ))
+/// Canonicalize a saved plugin artifact path for read-only access (document
+/// extraction, attachments, media input). Permits workspace, the plugin's
+/// own var dir (or all of `var/plugins` for `None`), and `~/Downloads/rsclaw`,
+/// which is where `allocate-artifact` stores files.
+fn canonicalize_plugin_artifact_path(
+    plugin_name: Option<&str>,
+    input: &str,
+) -> Result<PathBuf, String> {
+    resolve_plugin_path_in_roots(input, &plugin_artifact_roots(plugin_name), "artifact")
+}
+
+/// Like `canonicalize_plugin_artifact_path` but also requires an existing
+/// regular file. Used before handing a path to another process or channel.
+fn canonicalize_existing_plugin_artifact(
+    plugin_name: &str,
+    input: &str,
+    context: &str,
+) -> Result<PathBuf, String> {
+    let workspace = rsclaw_config::loader::base_dir().join("workspace");
+    canonicalize_existing_file_in_roots(
+        input,
+        &workspace,
+        &plugin_artifact_roots(Some(plugin_name)),
+        context,
+    )
 }
 
 fn canonicalize_browser_upload_path(plugin_name: &str, input: &str) -> Result<PathBuf, String> {
@@ -342,7 +432,7 @@ fn canonicalize_browser_upload_path(plugin_name: &str, input: &str) -> Result<Pa
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw");
+        .join(rsclaw_brand::CLI_NAME);
     canonicalize_existing_file_in_roots(
         input,
         &workspace,
@@ -375,14 +465,19 @@ fn canonicalize_existing_file_in_roots(
         }
     }
     Err(format!(
-        "{context}: path '{}' resolves outside allowed dirs (workspace, plugin artifacts, or Downloads/rsclaw)",
-        input
+        "{context}: path '{}' resolves outside allowed dirs (workspace, plugin artifacts, or Downloads/{})",
+        input,
+        rsclaw_brand::CLI_NAME
     ))
 }
 
-/// Extract readable text from a plugin-saved artifact.
-pub(crate) async fn extract_text_from_plugin_file(path: &str) -> Result<String, String> {
-    let canonical = canonicalize_plugin_artifact_path(path)?;
+/// Extract readable text from a plugin-saved artifact. `plugin_name` scopes
+/// the `var/plugins` root to the caller's own dir (`None` for JS plugins).
+pub(crate) async fn extract_text_from_plugin_file(
+    plugin_name: Option<&str>,
+    path: &str,
+) -> Result<String, String> {
+    let canonical = canonicalize_plugin_artifact_path(plugin_name, path)?;
     let bytes = tokio::fs::read(&canonical)
         .await
         .map_err(|e| format!("failed to read {}: {e}", canonical.display()))?;
@@ -475,12 +570,12 @@ impl rsclaw::plugin::host_browser::Host for HostState {
     }
 
     async fn browser_click(&mut self, ref_str: String) -> HostTrapResult<Result<String, String>> {
-        Ok(self.browser_action("click", json!({"ref": ref_str})).await)
+        Ok(self.click_following_new_tab("click", json!({"ref": ref_str})).await)
     }
 
     async fn browser_click_at(&mut self, x: u32, y: u32) -> HostTrapResult<Result<String, String>> {
         Ok(self
-            .browser_action("click_at", json!({"x": x, "y": y}))
+            .click_following_new_tab("click_at", json!({"x": x, "y": y}))
             .await)
     }
 
@@ -585,15 +680,17 @@ impl rsclaw::plugin::host_browser::Host for HostState {
             Some(t) => t,
             None => return Ok(Err("list_tabs returned no tabs array".to_string())),
         };
-        let last = match tabs.last() {
+        // Chrome lists the most recently active tab first, and a tab a page
+        // just opened is the active one.
+        let latest = match tabs.first() {
             Some(t) => t,
             None => return Ok(Err("no tabs to switch to".to_string())),
         };
-        let tid = match last.get("id").and_then(|t| t.as_str()) {
+        let tid = match latest.get("id").and_then(|t| t.as_str()) {
             Some(s) => s,
-            None => return Ok(Err("last tab has no id".to_string())),
+            None => return Ok(Err("latest tab has no id".to_string())),
         };
-        let url = last.get("url").and_then(|u| u.as_str()).unwrap_or("?");
+        let url = latest.get("url").and_then(|u| u.as_str()).unwrap_or("?");
         match session
             .execute("switch_tab", &json!({"target_id": tid}))
             .await
@@ -612,7 +709,14 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         ref_str: String,
         filename: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let mut args = json!({"ref": ref_str, "path": filename});
+        // The destination comes from the plugin: confine it to the plugin's
+        // writable roots so a download cannot land in e.g. LaunchAgents or
+        // ~/.ssh/authorized_keys.
+        let dest = match canonicalize_writable_path(&self.plugin_name, &filename) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(format!("browser_download: {e}"))),
+        };
+        let mut args = json!({"ref": ref_str, "path": dest.to_string_lossy()});
         // If the ref looks like a URL, consult the calling plugin's CDN
         // rules and attach a Referer when one matches. The host itself has
         // no domain knowledge — Bytedance / Douyin / future-platform quirks
@@ -734,6 +838,13 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
 
     async fn notify(&mut self, message: String) -> HostTrapResult<Result<String, String>> {
         tracing::info!(target: "wasm_plugin_notify", "{message}");
+        if let Some(sent) = self
+            .notify_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.stream_to_sync_chat(&message, vec![]))
+        {
+            return Ok(Ok(sent.to_string()));
+        }
         if let Some(ctx) = &self.notify_ctx {
             let _ = ctx.tx.send(rsclaw_channel::OutboundMessage {
                 target_id: ctx.target_id.clone(),
@@ -757,6 +868,24 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         image_data_uri: String,
     ) -> HostTrapResult<Result<String, String>> {
         tracing::info!(target: "wasm_plugin_notify", "{message}");
+        // A sync-only chat (the HTTP API the desktop app uses) has no
+        // notification sender: stream the image into the running reply, or,
+        // with no listener, say so, so the plugin returns the image with its
+        // result and it reaches the user with the reply.
+        if let Some(sent) = self
+            .notify_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.stream_to_sync_chat(&message, vec![image_data_uri.clone()]))
+        {
+            return Ok(Ok(sent.to_string()));
+        }
+        if self
+            .notify_ctx
+            .as_ref()
+            .is_some_and(|ctx| rsclaw_channel::is_sync_only_channel(&ctx.channel))
+        {
+            return Ok(Ok("sync_only".to_string()));
+        }
         if let Some(ctx) = &self.notify_ctx {
             match ctx.tx.send(rsclaw_channel::OutboundMessage {
                 target_id: ctx.target_id.clone(),
@@ -787,16 +916,14 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
             // Enforce workspace allowlist on the supplied path. Plugins
             // can only attach files that already live under the workspace
             // dir — same containment rule used by `read_file`.
-            let canonical = match canonicalize_plugin_artifact_path(&file_path) {
+            let canonical = match canonicalize_existing_plugin_artifact(
+                &self.plugin_name,
+                &file_path,
+                "notify_with_file",
+            ) {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e)),
             };
-            if !canonical.exists() {
-                return Ok(Err(format!(
-                    "notify_with_file: file does not exist: {}",
-                    canonical.display()
-                )));
-            }
             let filename = canonical
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -842,7 +969,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
     }
 
     async fn extract_file_text(&mut self, path: String) -> HostTrapResult<Result<String, String>> {
-        Ok(extract_text_from_plugin_file(&path).await)
+        Ok(extract_text_from_plugin_file(Some(&self.plugin_name), &path).await)
     }
 
     async fn write_file(
@@ -850,7 +977,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         path: String,
         contents: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let canonical = match canonicalize_writable_path(&path) {
+        let canonical = match canonicalize_writable_path(&self.plugin_name, &path) {
             Ok(p) => p,
             Err(e) => return Ok(Err(e)),
         };
@@ -869,7 +996,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
     }
 
     async fn ensure_dir(&mut self, path: String) -> HostTrapResult<Result<String, String>> {
-        let canonical = match canonicalize_writable_path(&path) {
+        let canonical = match canonicalize_writable_path(&self.plugin_name, &path) {
             Ok(p) => p,
             Err(e) => return Ok(Err(e)),
         };
@@ -1158,6 +1285,9 @@ impl rsclaw::plugin::host_http::Host for HostState {
         body: String,
         timeout_ms: u32,
     ) -> HostTrapResult<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_HTTP, "host_http.request") {
+            return Ok(Err(e));
+        }
         let headers: serde_json::Map<String, serde_json::Value> = if headers_json.trim().is_empty()
         {
             serde_json::Map::new()
@@ -1177,19 +1307,26 @@ impl rsclaw::plugin::host_http::Host for HostState {
         } else {
             Duration::from_millis(u64::from(timeout_ms))
         };
-        let client = match host_http_client() {
-            Ok(c) => c,
-            Err(e) => return Ok(Err(format!("host_http.request: client build failed: {e}"))),
-        };
         let method = match reqwest::Method::from_bytes(method.as_bytes()) {
             Ok(m) => m,
             Err(e) => return Ok(Err(format!("host_http.request: invalid method: {e}"))),
         };
-        let url = match validate_host_http_url(&url).await {
-            Ok(u) => u,
+        let (url, addrs) = match validate_host_http_url(&url).await {
+            Ok(v) => v,
             Err(e) => return Ok(Err(format!("host_http.request: blocked URL: {e}"))),
         };
-        let mut rb = client.request(method, url).timeout(timeout);
+        // Pin the connection to the addresses vetted above so a second DNS
+        // answer (DNS rebinding) cannot redirect the request to a private
+        // address. Redirects stay disabled; the plugin sees the 3xx.
+        let builder = match host_http_client_builder() {
+            Ok(b) => b,
+            Err(e) => return Ok(Err(format!("host_http.request: client build failed: {e}"))),
+        };
+        let client = match rsclaw_util::net::pinned_client(builder, &url, &addrs, timeout) {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(format!("host_http.request: client build failed: {e}"))),
+        };
+        let mut rb = client.request(method, url);
         for (k, v) in headers {
             let Some(s) = v.as_str() else {
                 return Ok(Err(format!(
@@ -1245,20 +1382,26 @@ fn ensure_host_http_tls_provider() -> std::result::Result<(), String> {
     }
 }
 
-fn host_http_client() -> std::result::Result<reqwest::Client, String> {
+/// Base builder shared by the host HTTP clients: no proxy (so address
+/// pinning is effective), rustls with built-in roots.
+fn host_http_client_builder() -> std::result::Result<reqwest::ClientBuilder, String> {
     ensure_host_http_tls_provider()?;
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(true))
+}
+
+fn host_http_client() -> std::result::Result<reqwest::Client, String> {
     if let Some(client) = HOST_HTTP_CLIENT.get() {
         return Ok(client.clone());
     }
-    let client = reqwest::Client::builder()
+    let client = host_http_client_builder()?
         .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
         // A dead device tunnel must not consume the whole WASM epoch. Calls
         // that legitimately need more time set an explicit per-request
         // timeout; WDA/Uiautomator probes inherit this bounded fallback.
         .timeout(Duration::from_secs(20))
-        .use_rustls_tls()
-        .tls_built_in_root_certs(true)
         .build()
         .map_err(|e| e.to_string())?;
     let _ = HOST_HTTP_CLIENT.set(client);
@@ -1268,7 +1411,11 @@ fn host_http_client() -> std::result::Result<reqwest::Client, String> {
         .ok_or_else(|| "host HTTP client init failed".to_owned())
 }
 
-async fn validate_host_http_url(raw: &str) -> std::result::Result<reqwest::Url, String> {
+/// Validate a plugin-supplied URL and return it with the vetted socket
+/// addresses the request must be pinned to.
+async fn validate_host_http_url(
+    raw: &str,
+) -> std::result::Result<(reqwest::Url, Vec<std::net::SocketAddr>), String> {
     let url = reqwest::Url::parse(raw).map_err(|e| format!("invalid URL: {e}"))?;
     match url.scheme() {
         "http" | "https" => {}
@@ -1286,31 +1433,41 @@ async fn validate_host_http_url(raw: &str) -> std::result::Result<reqwest::Url, 
     let port = url
         .port_or_known_default()
         .ok_or_else(|| "URL port could not be resolved".to_owned())?;
-    validate_host_http_endpoint(host, port).await?;
-    Ok(url)
+    let addrs = validate_host_http_endpoint(host, port).await?;
+    Ok((url, addrs))
 }
 
-async fn validate_host_http_endpoint(host: &str, port: u16) -> std::result::Result<(), String> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return validate_host_http_ip(ip);
+async fn validate_host_http_endpoint(
+    host: &str,
+    port: u16,
+) -> std::result::Result<Vec<std::net::SocketAddr>, String> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        validate_host_http_ip(ip)?;
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
     }
 
-    let mut addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("DNS lookup failed for `{host}`: {e}"))?;
-    let mut resolved = false;
-    for addr in addrs.by_ref() {
-        resolved = true;
-        validate_host_http_ip(addr.ip())?;
-    }
-    if !resolved {
+    let addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| format!("DNS lookup timed out for `{host}`"))?
+    .map_err(|e| format!("DNS lookup failed for `{host}`: {e}"))?
+    .collect();
+    if addrs.is_empty() {
         return Err(format!("DNS lookup returned no addresses for `{host}`"));
     }
-    Ok(())
+    for addr in &addrs {
+        validate_host_http_ip(addr.ip())?;
+    }
+    Ok(addrs)
 }
 
 fn validate_host_http_ip(ip: IpAddr) -> std::result::Result<(), String> {
-    if is_forbidden_host_http_ip(ip) && !unsafe_allow_private_host_http_for_debug() {
+    if (is_forbidden_host_http_ip(ip) || !rsclaw_util::net::is_public_ip(&ip))
+        && !unsafe_allow_private_host_http_for_debug()
+    {
         return Err(format!("IP `{ip}` is not allowed"));
     }
     Ok(())
@@ -1382,14 +1539,20 @@ impl rsclaw::plugin::host_kv::Host for HostState {
 
 impl rsclaw::plugin::host_device::Host for HostState {
     async fn device_public_key(&mut self) -> HostTrapResult<Result<String, String>> {
-        match load_device_signing_key().await {
+        if let Err(e) = self.require_capability(CAP_DEVICE, "device_public_key") {
+            return Ok(Err(e));
+        }
+        match load_plugin_signing_key(&self.plugin_name).await {
             Ok(key) => Ok(Ok(device_public_key_json(&key))),
             Err(e) => Ok(Err(e)),
         }
     }
 
     async fn device_sign(&mut self, payload: String) -> HostTrapResult<Result<String, String>> {
-        match load_device_signing_key().await {
+        if let Err(e) = self.require_capability(CAP_DEVICE, "device_sign") {
+            return Ok(Err(e));
+        }
+        match load_plugin_signing_key(&self.plugin_name).await {
             Ok(key) => {
                 let sig = key.sign(payload.as_bytes());
                 Ok(Ok(json!({
@@ -1410,6 +1573,9 @@ impl rsclaw::plugin::host_background::Host for HostState {
         name: String,
         schedule_json: String,
     ) -> HostTrapResult<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_CRON, "cron_register") {
+            return Ok(Err(e));
+        }
         Ok(crate::cron_register(
             self.plugin_name.clone(),
             name,
@@ -1426,6 +1592,9 @@ impl rsclaw::plugin::host_background::Host for HostState {
         headers_json: String,
         resume_key: String,
     ) -> HostTrapResult<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_SSE, "sse_subscribe") {
+            return Ok(Err(e));
+        }
         Ok(crate::sse_subscribe(
             self.plugin_name.clone(),
             name,
@@ -1438,10 +1607,16 @@ impl rsclaw::plugin::host_background::Host for HostState {
     }
 
     async fn sse_status(&mut self, name: String) -> HostTrapResult<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_SSE, "sse_status") {
+            return Ok(Err(e));
+        }
         Ok(crate::sse_status(self.plugin_name.clone(), name, self.invocation_context()).await)
     }
 
     async fn sse_unsubscribe(&mut self, name: String) -> HostTrapResult<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_SSE, "sse_unsubscribe") {
+            return Ok(Err(e));
+        }
         Ok(crate::sse_unsubscribe(self.plugin_name.clone(), name, self.invocation_context()).await)
     }
 
@@ -1451,6 +1626,16 @@ impl rsclaw::plugin::host_background::Host for HostState {
         peer_id: String,
         message_json: String,
     ) -> HostTrapResult<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_PUSH_OUTBOUND, "push_outbound") {
+            return Ok(Err(e));
+        }
+        // Attachments are read from disk and sent to a peer: apply the same
+        // containment rule as `notify_with_file` so a plugin cannot mail out
+        // rsclaw.json5, device keys or other plugins' data.
+        let message_json = match confine_outbound_attachments(&self.plugin_name, &message_json) {
+            Ok(m) => m,
+            Err(e) => return Ok(Err(format!("push_outbound: {e}"))),
+        };
         Ok(crate::push_outbound(channel, peer_id, message_json, self.invocation_context()).await)
     }
 
@@ -1460,11 +1645,72 @@ impl rsclaw::plugin::host_background::Host for HostState {
         prompt: String,
         route_json: String,
     ) -> HostTrapResult<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_SUBMIT_AGENT_TURN, "submit_agent_turn") {
+            return Ok(Err(e));
+        }
         Ok(
             crate::submit_agent_turn(session_key, prompt, route_json, self.invocation_context())
                 .await,
         )
     }
+}
+
+/// Validate and canonicalize local attachment paths in a `push_outbound`
+/// message. `files[]` entries (string or `{path, ...}`) must be existing
+/// files inside the plugin's artifact roots; `images[]` entries that are not
+/// `data:` / `http(s)://` URIs are treated as local paths under the same rule.
+fn confine_outbound_attachments(plugin_name: &str, message_json: &str) -> Result<String, String> {
+    let mut message: Value = serde_json::from_str(message_json)
+        .map_err(|e| format!("message JSON invalid: {e}"))?;
+    if let Some(files) = message.get_mut("files").and_then(Value::as_array_mut) {
+        for entry in files.iter_mut() {
+            let slot = if entry.is_string() {
+                Some(entry)
+            } else {
+                entry.get_mut("path")
+            };
+            if let Some(Value::String(path)) = slot {
+                let canonical = canonicalize_existing_plugin_artifact(plugin_name, path, "files")?;
+                *path = canonical.to_string_lossy().into_owned();
+            }
+        }
+    }
+    if let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) {
+        for entry in images.iter_mut() {
+            if let Value::String(img) = entry {
+                let lower = img.trim_start().to_ascii_lowercase();
+                if lower.starts_with("data:")
+                    || lower.starts_with("http://")
+                    || lower.starts_with("https://")
+                {
+                    continue;
+                }
+                let canonical = canonicalize_existing_plugin_artifact(plugin_name, img, "images")?;
+                *img = canonical.to_string_lossy().into_owned();
+            }
+        }
+    }
+    Ok(message.to_string())
+}
+
+/// Derive a plugin-specific ed25519 key from the shared device key so one
+/// plugin cannot obtain signatures that verify under another plugin's
+/// identity (HMAC-SHA256 keyed by the device secret, domain-separated by
+/// plugin name).
+fn derive_plugin_signing_key(device: &SigningKey, plugin_name: &str) -> Result<SigningKey, String> {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&device.to_bytes())
+        .map_err(|e| format!("host_device: key derivation init failed: {e}"))?;
+    mac.update(b"rsclaw/plugin-device-key/v1\0");
+    mac.update(plugin_name.as_bytes());
+    let seed: [u8; 32] = mac.finalize().into_bytes().into();
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+/// Load the device key and derive the calling plugin's signing key.
+async fn load_plugin_signing_key(plugin_name: &str) -> Result<SigningKey, String> {
+    let device = load_device_signing_key().await?;
+    derive_plugin_signing_key(&device, plugin_name)
 }
 
 /// Return the SQLite database path for a given plugin name.
@@ -1664,28 +1910,114 @@ async fn plugin_kv_delete(
     }
 }
 
-fn resolve_plugin_config(raw: &serde_json::Value) -> serde_json::Value {
-    fn walk(v: &serde_json::Value) -> serde_json::Value {
-        match v {
-            serde_json::Value::Object(map) => {
-                let source = map.get("source").and_then(|v| v.as_str());
-                let id = map.get("id").and_then(|v| v.as_str());
-                if source == Some("env")
-                    && let Some(id) = id
-                {
-                    return std::env::var(id)
-                        .map(serde_json::Value::String)
-                        .unwrap_or(serde_json::Value::Null);
-                }
-                serde_json::Value::Object(map.iter().map(|(k, v)| (k.clone(), walk(v))).collect())
+/// Plugin name upper-cased with every non-alphanumeric character mapped to
+/// `_` (e.g. `wechat-ios` -> `WECHAT_IOS`).
+fn plugin_env_name(plugin_name: &str) -> String {
+    plugin_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
             }
-            serde_json::Value::Array(arr) => {
-                serde_json::Value::Array(arr.iter().map(walk).collect())
-            }
-            other => other.clone(),
-        }
+        })
+        .collect()
+}
+
+/// Env-var prefix a plugin manifest may always read through `{source:"env"}`
+/// references: `RSCLAW_PLUGIN_<NAME>_`.
+fn plugin_env_prefix(plugin_name: &str) -> String {
+    format!("RSCLAW_PLUGIN_{}_", plugin_env_name(plugin_name))
+}
+
+/// Env-var namespaces owned by the host or by well-known providers. A plugin
+/// whose name maps onto one of these (e.g. a plugin called `openai`) does not
+/// get the bare `<NAME>_*` namespace, only `RSCLAW_PLUGIN_<NAME>_*`.
+const RESERVED_ENV_NAMESPACES: &[&str] = &[
+    "RSCLAW", "OPENAI", "ANTHROPIC", "CLAUDE", "AWS", "AZURE", "GOOGLE", "GEMINI", "GCP",
+    "GITHUB", "GH", "GITLAB", "DEEPSEEK", "DOUBAO", "ARK", "VOLC", "QWEN", "DASHSCOPE",
+    "MOONSHOT", "KIMI", "ZHIPU", "MINIMAX", "GROQ", "MISTRAL", "XAI", "OPENROUTER", "HF",
+    "HUGGINGFACE", "SSH", "GPG", "NPM", "CARGO", "DOCKER", "KUBE", "DATABASE", "PG", "MYSQL",
+    "REDIS", "HOME", "PATH", "USER", "LD", "DYLD",
+];
+
+/// Bare `<NAME>_` env prefix owned by the plugin (e.g. `ASTOCK_` for
+/// `astock`), or `None` when the name maps onto a reserved namespace.
+/// Plugin identity is the validated install dir name (see
+/// `check_wasm_plugin_identity`), so a plugin cannot pick another's name.
+fn plugin_own_env_prefix(plugin_name: &str) -> Option<String> {
+    let name = plugin_env_name(plugin_name);
+    let head = name.split('_').next().unwrap_or_default();
+    if name.is_empty()
+        || RESERVED_ENV_NAMESPACES.contains(&name.as_str())
+        || RESERVED_ENV_NAMESPACES.contains(&head)
+    {
+        return None;
     }
-    walk(raw)
+    Some(format!("{name}_"))
+}
+
+/// True when a plugin manifest may read env var `id`: either
+/// `RSCLAW_PLUGIN_<NAME>_*` or the plugin's own `<NAME>_*` namespace.
+fn plugin_env_allowed(plugin_name: &str, id: &str) -> bool {
+    if id.starts_with(&plugin_env_prefix(plugin_name)) {
+        return true;
+    }
+    plugin_own_env_prefix(plugin_name).is_some_and(|p| id.starts_with(&p))
+}
+
+/// Resolve `{source:"env", id:"VAR"}` references in a config tree.
+/// `allow_env` decides which variable names may be read; a denied reference
+/// resolves to `null` and is logged.
+fn resolve_config_env_refs(
+    raw: &serde_json::Value,
+    plugin_name: &str,
+    allow_env: &dyn Fn(&str) -> bool,
+) -> serde_json::Value {
+    match raw {
+        serde_json::Value::Object(map) => {
+            let source = map.get("source").and_then(|v| v.as_str());
+            let id = map.get("id").and_then(|v| v.as_str());
+            if source == Some("env")
+                && let Some(id) = id
+            {
+                if !allow_env(id) {
+                    tracing::warn!(
+                        plugin = %plugin_name,
+                        env = %id,
+                        allowed_prefix = %plugin_env_prefix(plugin_name),
+                        own_prefix = %plugin_own_env_prefix(plugin_name).unwrap_or_default(),
+                        "plugin manifest env reference denied; set the value in \
+                         plugins.entries.<name>.config or use an allowed prefix \
+                         (RSCLAW_PLUGIN_<NAME>_* or <NAME>_*)"
+                    );
+                    return serde_json::Value::Null;
+                }
+                return std::env::var(id)
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null);
+            }
+            serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), resolve_config_env_refs(v, plugin_name, allow_env)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter()
+                .map(|v| resolve_config_env_refs(v, plugin_name, allow_env))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Resolve the manifest's `config` block. The manifest is plugin-authored,
+/// so it may only read env vars in its own `RSCLAW_PLUGIN_<NAME>_*` or
+/// `<NAME>_*` namespace (not e.g. `OPENAI_API_KEY`).
+fn resolve_plugin_config(raw: &serde_json::Value, plugin_name: &str) -> serde_json::Value {
+    resolve_config_env_refs(raw, plugin_name, &|id: &str| plugin_env_allowed(plugin_name, id))
 }
 
 impl rsclaw::plugin::host_storage::Host for HostState {
@@ -1715,45 +2047,11 @@ impl rsclaw::plugin::host_media::Host for HostState {
         &mut self,
         input_path: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let ffmpeg_bin = match rsclaw_platform::detect_ffmpeg() {
-            Some(p) => p,
-            None => {
-                return Ok(Err(
-                    "ffmpeg not found. Run: rsclaw tools install ffmpeg".to_string()
-                ));
-            }
-        };
-
-        let out_path = match allocate_dl_paths("audio.wav", 1) {
-            Ok(mut p) => p.pop().unwrap_or_default(),
+        let input = match confine_media_input(&self.plugin_name, &input_path, "extract_audio") {
+            Ok(p) => p,
             Err(e) => return Ok(Err(e)),
         };
-
-        let output = tokio::process::Command::new(&ffmpeg_bin)
-            .args([
-                "-y",
-                "-i",
-                &input_path,
-                "-vn",
-                "-acodec",
-                "pcm_s16le",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                &out_path,
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(o) if o.status.success() => Ok(Ok(out_path)),
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                Ok(Err(format!("ffmpeg failed: {stderr}")))
-            }
-            Err(e) => Ok(Err(format!("ffmpeg spawn error: {e}"))),
-        }
+        Ok(media_extract_audio(&input, true).await)
     }
 
     async fn transcribe(
@@ -1761,24 +2059,11 @@ impl rsclaw::plugin::host_media::Host for HostState {
         audio_path: String,
         _language: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let bytes = match tokio::fs::read(&audio_path).await {
-            Ok(b) => b,
-            Err(e) => return Ok(Err(format!("read audio file failed: {e}"))),
+        let input = match confine_media_input(&self.plugin_name, &audio_path, "transcribe") {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(e)),
         };
-
-        let mime = if audio_path.to_lowercase().ends_with(".wav") {
-            "audio/wav"
-        } else {
-            "audio/mpeg"
-        };
-
-        let client = reqwest::Client::new();
-        match rsclaw_channel::transcription::transcribe_audio(&client, &bytes, &audio_path, mime)
-            .await
-        {
-            Ok(text) => Ok(Ok(text)),
-            Err(e) => Ok(Err(format!("transcription failed: {e:#}"))),
-        }
+        Ok(media_transcribe(&input).await)
     }
 
     async fn extract_keyframes(
@@ -1786,71 +2071,648 @@ impl rsclaw::plugin::host_media::Host for HostState {
         video_path: String,
         count: u32,
     ) -> HostTrapResult<Result<Vec<String>, String>> {
-        let ffmpeg_bin = match rsclaw_platform::detect_ffmpeg() {
-            Some(p) => p,
-            None => {
-                return Ok(Err(
-                    "ffmpeg not found. Run: rsclaw tools install ffmpeg".to_string()
-                ));
-            }
-        };
-
-        let count = count.max(1).min(20) as usize;
-        let out_paths = match allocate_dl_paths("frame.png", count) {
+        let input = match confine_media_input(&self.plugin_name, &video_path, "extract_keyframes")
+        {
             Ok(p) => p,
             Err(e) => return Ok(Err(e)),
         };
+        Ok(media_extract_keyframes(&input, count as usize, true).await)
+    }
 
-        // Get video duration via ffprobe
-        let duration_secs: f64 = {
-            let probe = tokio::process::Command::new(&ffmpeg_bin)
-                .args([
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    &video_path,
-                ])
-                .output()
-                .await;
-            match probe {
-                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse()
-                    .unwrap_or(0.0),
-                _ => 0.0,
+    async fn compose_video(&mut self, spec_json: String) -> HostTrapResult<Result<String, String>> {
+        Ok(media_compose_video(&self.plugin_name, &spec_json).await)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ComposeCaption {
+    text: String,
+    /// Seconds from the start. When any caption omits `start`/`end`, all
+    /// captions are re-timed across the voiceover (or the clips) in
+    /// proportion to their length.
+    start: Option<f64>,
+    end: Option<f64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ComposeSpec {
+    clips: Vec<String>,
+    voiceover: Option<String>,
+    bgm: Option<String>,
+    bgm_volume: Option<f64>,
+    #[serde(default)]
+    captions: Vec<ComposeCaption>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+const COMPOSE_MAX_CLIPS: usize = 60;
+const COMPOSE_TIMEOUT_SECS: u64 = 900;
+
+/// Font used for burned-in captions: a CJK-capable system font per OS.
+fn caption_font() -> (&'static str, &'static str) {
+    if cfg!(target_os = "macos") {
+        ("/System/Library/Fonts", "Hiragino Sans GB")
+    } else if cfg!(target_os = "windows") {
+        ("C:/Windows/Fonts", "Microsoft YaHei")
+    } else {
+        ("/usr/share/fonts", "Noto Sans CJK SC")
+    }
+}
+
+fn srt_timestamp(t: f64) -> String {
+    let ms = (t.max(0.0) * 1000.0).round() as u64;
+    format!(
+        "{:02}:{:02}:{:02},{:03}",
+        ms / 3_600_000,
+        (ms / 60_000) % 60,
+        (ms / 1000) % 60,
+        ms % 1000
+    )
+}
+
+/// Quote a path for an ffmpeg filter option value.
+fn filter_quote_path(path: &std::path::Path) -> String {
+    let p = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('\'', "\\'")
+        .replace(':', "\\:");
+    format!("'{p}'")
+}
+
+/// H.264 encoders in preference order with their rate-control flags. LGPL
+/// ffmpeg builds (common on Windows) ship without libx264 but carry
+/// OpenH264 and Media Foundation.
+const H264_ENCODERS: &[(&str, &[&str])] = &[
+    ("libx264", &["-preset", "veryfast", "-crf", "20"]),
+    ("libopenh264", &["-b:v", "6M"]),
+    ("h264_mf", &["-b:v", "6M"]),
+    ("h264_videotoolbox", &["-b:v", "6M"]),
+];
+
+/// Pick the first available encoder from `ffmpeg -encoders` output.
+fn pick_h264_encoder(encoders_listing: &str) -> Option<(&'static str, &'static [&'static str])> {
+    let available: Vec<&str> = encoders_listing
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace();
+            let flags = parts.next()?;
+            // Codec rows start with a 6-char capability field like `V....D`.
+            if flags.len() == 6 && flags.starts_with('V') {
+                parts.next()
+            } else {
+                None
             }
-        };
+        })
+        .collect();
+    H264_ENCODERS
+        .iter()
+        .find(|(name, _)| available.contains(name))
+        .map(|(name, args)| (*name, *args))
+}
 
-        if duration_secs <= 0.0 {
-            return Ok(Err("could not determine video duration".to_string()));
+async fn ffmpeg_h264_encoder(ffmpeg_bin: &str) -> Option<(&'static str, &'static [&'static str])> {
+    let mut cmd = media_command(std::ffi::OsStr::new(ffmpeg_bin), false);
+    cmd.args(["-hide_banner", "-encoders"]);
+    let out = cmd.output().await.ok()?;
+    pick_h264_encoder(&String::from_utf8_lossy(&out.stdout))
+}
+
+async fn ffmpeg_has_filter(ffmpeg_bin: &str, name: &str) -> bool {
+    let mut cmd = media_command(std::ffi::OsStr::new(ffmpeg_bin), false);
+    cmd.args(["-hide_banner", "-filters"]);
+    match cmd.output().await {
+        Ok(o) => {
+            let needle = format!(" {name} ");
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.contains(&needle))
         }
+        Err(_) => false,
+    }
+}
 
-        let interval = duration_secs / count as f64;
-        let out_pattern = out_paths[0].replace(".png", "_%03d.png");
+/// Build the ffmpeg filter graph for [`media_compose_video`]. `audio_inputs`
+/// is (voice index, bgm index, silent-source index).
+fn compose_filter_graph(
+    clip_count: usize,
+    width: u32,
+    height: u32,
+    subtitles: Option<&std::path::Path>,
+    audio_inputs: (Option<usize>, Option<usize>, Option<usize>),
+    bgm_volume: f64,
+) -> String {
+    let (w, h) = (width, height);
+    let mut graph = String::new();
+    for i in 0..clip_count {
+        graph.push_str(&format!(
+            "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps=30,format=yuv420p[v{i}];\n"
+        ));
+    }
+    for i in 0..clip_count {
+        graph.push_str(&format!("[v{i}]"));
+    }
+    graph.push_str(&format!("concat=n={clip_count}:v=1:a=0[vc];\n"));
+    match subtitles {
+        Some(srt) => {
+            let (fonts_dir, font_name) = caption_font();
+            // ASS sizes are relative to a 288-line canvas: 11 ≈ 73px at 1920.
+            graph.push_str(&format!(
+                "[vc]subtitles=filename={}:charenc=UTF-8:fontsdir={}:force_style='FontName={font_name},FontSize=11,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.6,Shadow=0,Alignment=2,MarginV=80'[v];\n",
+                filter_quote_path(srt),
+                filter_quote_path(std::path::Path::new(fonts_dir)),
+            ));
+        }
+        None => graph.push_str("[vc]null[v];\n"),
+    }
+    let stereo = "aresample=48000,aformat=channel_layouts=stereo";
+    match audio_inputs {
+        (Some(vi), Some(bi), _) => graph.push_str(&format!(
+            "[{vi}:a]{stereo}[va];[{bi}:a]{stereo},volume={bgm_volume}[ba];[va][ba]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,apad[a]"
+        )),
+        (Some(vi), None, _) => graph.push_str(&format!("[{vi}:a]{stereo},apad[a]")),
+        (None, Some(bi), _) => {
+            graph.push_str(&format!("[{bi}:a]{stereo},volume={bgm_volume}[a]"))
+        }
+        (None, None, Some(si)) => graph.push_str(&format!("[{si}:a]anull[a]")),
+        (None, None, None) => graph.push_str("anullsrc=r=48000:cl=stereo[a]"),
+    }
+    graph
+}
 
-        let output = tokio::process::Command::new(&ffmpeg_bin)
-            .args([
-                "-y",
-                "-i",
-                &video_path,
-                "-vf",
-                &format!("fps=1/{interval},scale=480:-1"),
-                &out_pattern,
-            ])
-            .output()
-            .await;
+/// Resolve caption timing to (text, start, end). Fully timed captions are
+/// kept as given; otherwise every caption is laid out back to back across
+/// the voiceover (or the clips' total length) by character count, so the
+/// caller never has to measure audio itself.
+async fn compose_caption_timeline(
+    ffmpeg_bin: &str,
+    captions: &[ComposeCaption],
+    voice: Option<&str>,
+    clips: &[String],
+) -> Vec<(String, f64, f64)> {
+    let items: Vec<&ComposeCaption> = captions
+        .iter()
+        .filter(|c| !c.text.trim().is_empty())
+        .collect();
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let timed = items.iter().all(|c| {
+        matches!((c.start, c.end), (Some(a), Some(b)) if a.is_finite() && b.is_finite() && b > a)
+    });
+    if timed {
+        return items
+            .iter()
+            .map(|c| (c.text.clone(), c.start.unwrap_or(0.0), c.end.unwrap_or(0.0)))
+            .collect();
+    }
+    let mut total = match voice {
+        Some(v) => probe_media_duration(ffmpeg_bin, v, true)
+            .await
+            .unwrap_or(0.0),
+        None => 0.0,
+    };
+    if total <= 0.0 {
+        for c in clips {
+            total += probe_media_duration(ffmpeg_bin, c, true)
+                .await
+                .unwrap_or(0.0);
+        }
+    }
+    if total <= 0.0 {
+        total = 3.0 * items.len() as f64;
+    }
+    let weights: Vec<f64> = items
+        .iter()
+        .map(|c| {
+            c.text
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .count()
+                .max(1) as f64
+        })
+        .collect();
+    let sum: f64 = weights.iter().sum();
+    let mut t = 0.0;
+    items
+        .iter()
+        .zip(weights)
+        .map(|(c, w)| {
+            let start = t;
+            t += total * w / sum;
+            (c.text.clone(), start, t)
+        })
+        .collect()
+}
 
-        match output {
-            Ok(o) if o.status.success() => Ok(Ok(out_paths)),
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                Ok(Err(format!("ffmpeg failed: {stderr}")))
+/// Concatenate clips, mix voiceover / BGM and burn captions into one mp4.
+/// All inputs are confined to the plugin's artifact roots.
+pub(crate) async fn media_compose_video(
+    plugin_name: &str,
+    spec_json: &str,
+) -> Result<String, String> {
+    let spec: ComposeSpec =
+        serde_json::from_str(spec_json).map_err(|e| format!("compose_video: invalid spec: {e}"))?;
+    if spec.clips.is_empty() {
+        return Err("compose_video: clips is empty".to_string());
+    }
+    if spec.clips.len() > COMPOSE_MAX_CLIPS {
+        return Err(format!("compose_video: at most {COMPOSE_MAX_CLIPS} clips"));
+    }
+    let width = spec.width.unwrap_or(1080);
+    let height = spec.height.unwrap_or(1920);
+    if !(240..=4096).contains(&width) || !(240..=4096).contains(&height) {
+        return Err(format!(
+            "compose_video: frame size {width}x{height} out of range"
+        ));
+    }
+    // libx264 + yuv420p needs even dimensions.
+    let (width, height) = (width & !1, height & !1);
+    let confine = |p: &String| confine_media_input(plugin_name, p, "compose_video");
+    let clips = spec
+        .clips
+        .iter()
+        .map(confine)
+        .collect::<Result<Vec<_>, _>>()?;
+    let voice = spec
+        .voiceover
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .map(confine)
+        .transpose()?;
+    let bgm = spec
+        .bgm
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .map(confine)
+        .transpose()?;
+    let bgm_volume = spec
+        .bgm_volume
+        .filter(|v| v.is_finite())
+        .unwrap_or(if voice.is_some() { 0.12 } else { 0.6 })
+        .clamp(0.0, 1.0);
+
+    let Some(ffmpeg_bin) = rsclaw_platform::detect_ffmpeg() else {
+        return Err(concat!(
+            "ffmpeg not found. Run: ",
+            rsclaw_brand::brand_cli_name!(),
+            " tools install ffmpeg"
+        )
+        .to_string());
+    };
+    let out_path = allocate_dl_paths("compose.mp4", 1)?
+        .pop()
+        .ok_or_else(|| "allocate_artifact returned no path".to_string())?;
+    let out = PathBuf::from(&out_path);
+    let srt_path = out.with_extension("srt");
+    let graph_path = out.with_extension("filter.txt");
+
+    if let Some(v) = &voice {
+        if let Some(d) = probe_media_duration(&ffmpeg_bin, v, true).await {
+            if d < 0.5 {
+                return Err(format!(
+                    "compose_video: voiceover is only {d:.2}s long, it looks empty (TTS produced silence?): {v}"
+                ));
             }
-            Err(e) => Ok(Err(format!("ffmpeg spawn error: {e}"))),
         }
+    }
+    let mut warnings: Vec<String> = Vec::new();
+    let captions =
+        compose_caption_timeline(&ffmpeg_bin, &spec.captions, voice.as_deref(), &clips).await;
+    let burn = !captions.is_empty() && ffmpeg_has_filter(&ffmpeg_bin, "subtitles").await;
+    if !captions.is_empty() && !burn {
+        warnings
+            .push("ffmpeg has no libass (subtitles filter); captions were not burned".to_string());
+    }
+    if burn {
+        let mut srt = String::new();
+        for (i, c) in captions.iter().enumerate() {
+            let text: Vec<&str> =
+                c.0.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+            srt.push_str(&format!(
+                "{}\n{} --> {}\n{}\n\n",
+                i + 1,
+                srt_timestamp(c.1),
+                srt_timestamp(c.2),
+                text.join("\n")
+            ));
+        }
+        tokio::fs::write(&srt_path, srt)
+            .await
+            .map_err(|e| format!("compose_video: write captions: {e}"))?;
+    }
+
+    let Some((encoder, encoder_args)) = ffmpeg_h264_encoder(&ffmpeg_bin).await else {
+        return Err(format!(
+            "compose_video: this ffmpeg has no H.264 encoder (tried {})",
+            H264_ENCODERS
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    let mut cmd = media_command(std::ffi::OsStr::new(&ffmpeg_bin), false);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    for clip in &clips {
+        cmd.args(["-protocol_whitelist", "file", "-i", clip]);
+    }
+    let mut next = clips.len();
+    let mut voice_idx = None;
+    let mut bgm_idx = None;
+    let mut silent_idx = None;
+    if let Some(v) = &voice {
+        cmd.args(["-protocol_whitelist", "file", "-i", v]);
+        voice_idx = Some(next);
+        next += 1;
+    }
+    if let Some(b) = &bgm {
+        cmd.args(["-protocol_whitelist", "file", "-stream_loop", "-1", "-i", b]);
+        bgm_idx = Some(next);
+        next += 1;
+    }
+    if voice_idx.is_none() && bgm_idx.is_none() {
+        cmd.args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]);
+        silent_idx = Some(next);
+    }
+    let graph = compose_filter_graph(
+        clips.len(),
+        width,
+        height,
+        burn.then_some(srt_path.as_path()),
+        (voice_idx, bgm_idx, silent_idx),
+        bgm_volume,
+    );
+    tokio::fs::write(&graph_path, &graph)
+        .await
+        .map_err(|e| format!("compose_video: write filter graph: {e}"))?;
+    cmd.arg("-filter_complex_script").arg(&graph_path);
+    cmd.args(["-map", "[v]", "-map", "[a]", "-c:v", encoder]);
+    cmd.args(encoder_args);
+    cmd.args([
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        "30",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-ar",
+        "48000",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+    ]);
+    cmd.arg(&out_path);
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(COMPOSE_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await;
+    let _ = tokio::fs::remove_file(&graph_path).await;
+    let _ = tokio::fs::remove_file(&srt_path).await;
+    match result {
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&out_path).await;
+            return Err(format!(
+                "compose_video: ffmpeg timed out after {COMPOSE_TIMEOUT_SECS}s"
+            ));
+        }
+        Ok(Err(e)) => return Err(format!("compose_video: ffmpeg spawn error: {e}")),
+        Ok(Ok(o)) if !o.status.success() => {
+            let _ = tokio::fs::remove_file(&out_path).await;
+            return Err(format!(
+                "compose_video: ffmpeg failed: {}",
+                rsclaw_util::truncate_str(&String::from_utf8_lossy(&o.stderr), 2000)
+            ));
+        }
+        Ok(Ok(_)) => {}
+    }
+    let duration = probe_media_duration(&ffmpeg_bin, &out_path, true).await;
+    Ok(serde_json::json!({
+        "path": out_path,
+        "durationSec": duration,
+        "captionsBurned": burn,
+        "encoder": encoder,
+        "warnings": warnings,
+    })
+    .to_string())
+}
+
+/// Confine a wasm plugin's media input to an existing local file inside its
+/// artifact roots. Protocol-style inputs (`http:`, `concat:`, `file:`, ...)
+/// are rejected up front so ffmpeg cannot be used as a network client or to
+/// read arbitrary files.
+fn confine_media_input(plugin_name: &str, input: &str, context: &str) -> Result<String, String> {
+    if has_protocol_prefix(input) {
+        return Err(format!("{context}: protocol inputs are not allowed: {input}"));
+    }
+    let canonical = canonicalize_existing_plugin_artifact(plugin_name, input, context)?;
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+/// True when `input` starts with `<scheme>:` (ffmpeg / URL protocol syntax).
+/// A single ASCII letter followed by `:` is a Windows drive letter, not a
+/// protocol.
+fn has_protocol_prefix(input: &str) -> bool {
+    let Some((scheme, _)) = input.split_once(':') else {
+        return false;
+    };
+    if scheme.len() == 1 && scheme.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.' | '_'))
+}
+
+/// Hide the console window of a helper process on Windows.
+pub(crate) fn hide_console(_cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        _cmd.as_std_mut().creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+}
+
+/// Build an ffmpeg-family command with the shared hardening flags. When
+/// `local_only` is set, inputs may only be read through the `file` protocol
+/// (blocks playlists / concat lists that point at network URLs).
+fn media_command(bin: &std::ffi::OsStr, local_only: bool) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.kill_on_drop(true).stdin(std::process::Stdio::null());
+    hide_console(&mut cmd);
+    if local_only {
+        cmd.args(["-protocol_whitelist", "file"]);
+    }
+    cmd
+}
+
+/// Extract 16 kHz mono WAV audio from `input` into a fresh artifact path.
+pub(crate) async fn media_extract_audio(input: &str, local_only: bool) -> Result<String, String> {
+    let Some(ffmpeg_bin) = rsclaw_platform::detect_ffmpeg() else {
+        return Err(concat!(
+            "ffmpeg not found. Run: ",
+            rsclaw_brand::brand_cli_name!(),
+            " tools install ffmpeg"
+        )
+        .to_string());
+    };
+    let out_path = allocate_dl_paths("audio.wav", 1)?
+        .pop()
+        .ok_or_else(|| "allocate_artifact returned no path".to_string())?;
+    let mut cmd = media_command(std::ffi::OsStr::new(&ffmpeg_bin), local_only);
+    cmd.args([
+        "-y", "-i", input, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", &out_path,
+    ]);
+    match cmd.output().await {
+        Ok(o) if o.status.success() => Ok(out_path),
+        Ok(o) => Err(format!(
+            "ffmpeg failed: {}",
+            rsclaw_util::truncate_str(&String::from_utf8_lossy(&o.stderr), 2000)
+        )),
+        Err(e) => Err(format!("ffmpeg spawn error: {e}")),
+    }
+}
+
+/// Transcribe a local audio file with the host STT engine.
+pub(crate) async fn media_transcribe(audio_path: &str) -> Result<String, String> {
+    let bytes = tokio::fs::read(audio_path)
+        .await
+        .map_err(|e| format!("read audio file failed: {e}"))?;
+    let mime = if audio_path.to_lowercase().ends_with(".wav") {
+        "audio/wav"
+    } else {
+        "audio/mpeg"
+    };
+    let client = reqwest::Client::new();
+    rsclaw_channel::transcription::transcribe_audio(&client, &bytes, audio_path, mime)
+        .await
+        .map_err(|e| format!("transcription failed: {e:#}"))
+}
+
+/// Locate `ffprobe` next to `ffmpeg` or on PATH.
+fn detect_ffprobe(ffmpeg_bin: &str) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+    if let Some(dir) = std::path::Path::new(ffmpeg_bin).parent() {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    which::which("ffprobe").ok()
+}
+
+/// Parse `Duration: HH:MM:SS.ss` from ffmpeg's input banner (stderr).
+fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
+    let rest = stderr.split("Duration: ").nth(1)?;
+    let stamp = rest.split(',').next()?.trim();
+    let mut parts = stamp.split(':');
+    let h: f64 = parts.next()?.trim().parse().ok()?;
+    let m: f64 = parts.next()?.trim().parse().ok()?;
+    let sec: f64 = parts.next()?.trim().parse().ok()?;
+    let total = h * 3600.0 + m * 60.0 + sec;
+    (total.is_finite() && total > 0.0).then_some(total)
+}
+
+/// Media duration in seconds: ffprobe when available, else ffmpeg's banner.
+async fn probe_media_duration(ffmpeg_bin: &str, input: &str, local_only: bool) -> Option<f64> {
+    if let Some(ffprobe) = detect_ffprobe(ffmpeg_bin) {
+        let mut cmd = media_command(ffprobe.as_os_str(), local_only);
+        cmd.args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            input,
+        ]);
+        match cmd.output().await {
+            Ok(o) if o.status.success() => {
+                if let Ok(d) = String::from_utf8_lossy(&o.stdout).trim().parse::<f64>()
+                    && d.is_finite()
+                    && d > 0.0
+                {
+                    return Some(d);
+                }
+            }
+            Ok(o) => tracing::debug!(status = %o.status, "ffprobe duration probe failed"),
+            Err(e) => tracing::debug!(error = %e, "ffprobe spawn failed"),
+        }
+    }
+    // `ffmpeg -i <input>` with no output exits non-zero but still prints
+    // the input banner with the duration.
+    let mut cmd = media_command(std::ffi::OsStr::new(ffmpeg_bin), local_only);
+    cmd.args(["-hide_banner", "-i", input]);
+    let out = cmd.output().await.ok()?;
+    parse_ffmpeg_duration(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// ffmpeg output pattern matching `allocate_dl_paths` group naming
+/// (`<base>_1.png`, `<base>_2.png`, ...). `%` in the base is escaped.
+fn keyframe_output_pattern(first_path: &str) -> Option<String> {
+    let base = first_path.strip_suffix("_1.png")?;
+    Some(format!("{}_%d.png", base.replace('%', "%%")))
+}
+
+/// Extract up to `count` (1..=20) evenly spaced keyframes (480px wide PNG).
+/// Returns the paths that ffmpeg actually wrote.
+pub(crate) async fn media_extract_keyframes(
+    input: &str,
+    count: usize,
+    local_only: bool,
+) -> Result<Vec<String>, String> {
+    let Some(ffmpeg_bin) = rsclaw_platform::detect_ffmpeg() else {
+        return Err(concat!(
+            "ffmpeg not found. Run: ",
+            rsclaw_brand::brand_cli_name!(),
+            " tools install ffmpeg"
+        )
+        .to_string());
+    };
+    let count = count.clamp(1, 20);
+    let duration_secs = probe_media_duration(&ffmpeg_bin, input, local_only)
+        .await
+        .ok_or_else(|| "could not determine video duration".to_string())?;
+    let out_paths = allocate_dl_paths("frame.png", count)?;
+    let interval = duration_secs / count as f64;
+    let frames = count.to_string();
+    let filter = format!("fps=1/{interval},scale=480:-1");
+    let mut cmd = media_command(std::ffi::OsStr::new(&ffmpeg_bin), local_only);
+    cmd.args(["-y", "-i", input, "-vf", &filter, "-frames:v", &frames]);
+    if count == 1 {
+        cmd.args(["-update", "1", &out_paths[0]]);
+    } else {
+        let pattern = keyframe_output_pattern(&out_paths[0])
+            .ok_or_else(|| format!("unexpected artifact name: {}", out_paths[0]))?;
+        cmd.args(["-start_number", "1", &pattern]);
+    }
+    match cmd.output().await {
+        Ok(o) if o.status.success() => {
+            let written: Vec<String> = out_paths
+                .into_iter()
+                .filter(|p| std::path::Path::new(p).is_file())
+                .collect();
+            if written.is_empty() {
+                Err("ffmpeg produced no frames".to_string())
+            } else {
+                Ok(written)
+            }
+        }
+        Ok(o) => Err(format!(
+            "ffmpeg failed: {}",
+            rsclaw_util::truncate_str(&String::from_utf8_lossy(&o.stderr), 2000)
+        )),
+        Err(e) => Err(format!("ffmpeg spawn error: {e}")),
     }
 }
 
@@ -1880,7 +2742,7 @@ pub(crate) fn allocate_dl_paths(filename: &str, count: usize) -> Result<Vec<Stri
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw")
+        .join(rsclaw_brand::CLI_NAME)
         .join(category);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Err(format!("allocate_artifact: create_dir: {e}"));
@@ -1914,6 +2776,28 @@ pub(crate) fn allocate_dl_paths(filename: &str, count: usize) -> Result<Vec<Stri
 }
 
 impl HostState {
+    /// True when the plugin manifest declares capability `cap`.
+    fn has_capability(&self, cap: &str) -> bool {
+        self.capabilities.iter().any(|c| c == cap)
+    }
+
+    /// Gate a sensitive host function on a declared manifest capability.
+    fn require_capability(&self, cap: &str, func: &str) -> Result<(), String> {
+        if self.has_capability(cap) {
+            return Ok(());
+        }
+        tracing::warn!(
+            plugin = %self.plugin_name,
+            capability = cap,
+            function = func,
+            "plugin called a host function without declaring the capability"
+        );
+        Err(format!(
+            "{func}: plugin `{}` must declare capability \"{cap}\" in plugin.json5",
+            self.plugin_name
+        ))
+    }
+
     fn invocation_context(&self) -> Option<crate::PluginInvocationContext> {
         self.notify_ctx
             .as_ref()
@@ -1928,14 +2812,15 @@ impl HostState {
             })
     }
 
-    /// Execute a browser action by locking the shared browser session.
-    /// Auto-starts Chrome if no session exists.
-    async fn run_android_vlm_drive(
+    /// Execute a host-side VLM action loop with the supplied platform operator.
+    async fn run_plugin_vlm_drive(
         &mut self,
         instruction: String,
         max_steps: u32,
         action_spaces: Option<Vec<String>>,
-        operator: crate::android_vlm::AndroidUiautoOperator,
+        operator: &dyn rsclaw_computer::operator::Operator,
+        label: &str,
+        app: &str,
     ) -> Result<String, String> {
         use std::sync::atomic::AtomicBool;
 
@@ -1946,10 +2831,29 @@ impl HostState {
             permission::{CheckFut, PermissionDecision, PermissionStore, RecordFut},
         };
 
-        struct PluginPermission;
+        self.require_capability(CAP_VLM_DRIVE, label)?;
+
+        /// Consent for host-side plugin GUI loops: the plugin may drive only
+        /// the app it named, unless it declares `vlmDriveBypass`.
+        struct PluginPermission {
+            target_app: String,
+            bypass: bool,
+        }
         impl PermissionStore for PluginPermission {
-            fn check<'a>(&'a self, _agent_id: &'a str, _app: &'a str) -> CheckFut<'a> {
-                Box::pin(async { Ok(Some(PermissionDecision::AllowOnce)) })
+            fn check<'a>(&'a self, _agent_id: &'a str, app: &'a str) -> CheckFut<'a> {
+                let allowed = self.bypass
+                    || (!self.target_app.trim().is_empty()
+                        && rsclaw_computer::operators::native::app_labels_match(
+                            &self.target_app,
+                            app,
+                        ));
+                Box::pin(async move {
+                    Ok(Some(if allowed {
+                        PermissionDecision::AllowOnce
+                    } else {
+                        PermissionDecision::Deny
+                    }))
+                })
             }
             fn record<'a>(
                 &'a self,
@@ -1963,27 +2867,28 @@ impl HostState {
                 Box::pin(async { Ok(()) })
             }
             fn bypass_all(&self) -> bool {
-                true
+                self.bypass
             }
         }
+        let bypass = self.has_capability(CAP_VLM_DRIVE_BYPASS);
 
         let registry = self
             .providers
             .clone()
-            .ok_or_else(|| "android-vlm-drive: provider registry unavailable".to_string())?;
+            .ok_or_else(|| format!("{label}: provider registry unavailable"))?;
         let model_name = self
             .vision_model
             .clone()
-            .ok_or_else(|| "android-vlm-drive: vision model unavailable".to_string())?;
+            .ok_or_else(|| format!("{label}: vision model unavailable"))?;
         let (provider_name, _) = registry.resolve_model(&model_name);
         let provider = registry
             .get(provider_name)
-            .map_err(|error| format!("android-vlm-drive: {error}"))?;
+            .map_err(|error| format!("{label}: {error}"))?;
         let rules = AppRuleSet::default();
         let action_spaces_override =
             action_spaces.map(|specs| specs.into_iter().map(ActionSpec::new).collect());
         let driver = VlmDriver {
-            operator: &operator,
+            operator,
             provider,
             model_name: model_name.clone(),
             coord_format: CoordFormat::Auto,
@@ -1991,19 +2896,22 @@ impl HostState {
             max_loop: max_steps.clamp(1, 30) as usize,
             abort: Arc::new(AtomicBool::new(false)),
             app_rules: &rules,
-            permission: Arc::new(PluginPermission),
+            permission: Arc::new(PluginPermission {
+                target_app: app.to_string(),
+                bypass,
+            }),
             agent_id: format!("plugin:{}", self.plugin_name),
-            app: "WeChat Android".to_string(),
+            app: app.to_string(),
             permission_emit: None,
             headless_auto_allow: true,
             status_emit: None,
-            run_id: format!("android-vlm-drive-{}", uuid::Uuid::new_v4().simple()),
+            run_id: format!("{label}-{}", uuid::Uuid::new_v4().simple()),
             action_spaces_override,
         };
         let outcome = driver
             .run(&instruction)
             .await
-            .map_err(|error| format!("android-vlm-drive: {error:#}"))?;
+            .map_err(|error| format!("{label}: {error:#}"))?;
         let value = match outcome {
             DriverOutcome::Finished { content, steps } => {
                 json!({"kind":"finished","content":content,"steps":steps})
@@ -2022,26 +2930,83 @@ impl HostState {
     }
 
     /// Execute a browser action by locking the shared browser session.
-    /// Auto-starts Chrome if no session exists.
+    /// Auto-starts a browser if no session exists.
+    /// Clicks, then moves onto any tab the click opened (`window.open`,
+    /// `target=_blank`), as a person's browser would. Without this the
+    /// session stays on the old page and every later call reads a page the
+    /// user has left.
+    async fn click_following_new_tab(&mut self, action: &str, args: Value) -> Result<String, String> {
+        let before = self.page_tab_ids().await;
+        let clicked = self.browser_action(action, args).await?;
+        let Some(before) = before else {
+            return Ok(clicked);
+        };
+        // The new tab shows up a moment after the click's handler runs.
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut guard = self.browser.lock().await;
+            let Some(session) = guard.as_mut() else {
+                break;
+            };
+            let Ok(listed) = session.execute("list_tabs", &json!({})).await else {
+                break;
+            };
+            let opened = listed["tabs"].as_array().and_then(|tabs| {
+                tabs.iter().find(|t| {
+                    t["id"].as_str().is_some_and(|id| !before.contains(id))
+                        && !t["url"].as_str().unwrap_or("").starts_with("devtools:")
+                })
+            });
+            if let Some(tab) = opened {
+                let id = tab["id"].as_str().unwrap_or_default().to_string();
+                let url = tab["url"].as_str().unwrap_or("?").to_string();
+                return match session.execute("switch_tab", &json!({"target_id": id})).await {
+                    Ok(_) => Ok(format!("{clicked}\nthe click opened a new tab; now on it: {url}")),
+                    Err(e) => Ok(format!(
+                        "{clicked}\nthe click opened a new tab ({url}) but switching to it failed: {e:#}"
+                    )),
+                };
+            }
+        }
+        Ok(clicked)
+    }
+
+    /// Ids of the open page tabs, or `None` before the browser has started.
+    async fn page_tab_ids(&mut self) -> Option<std::collections::HashSet<String>> {
+        let mut guard = self.browser.lock().await;
+        let listed = guard.as_mut()?.execute("list_tabs", &json!({})).await.ok()?;
+        Some(
+            listed["tabs"]
+                .as_array()?
+                .iter()
+                .filter_map(|t| t["id"].as_str().map(str::to_string))
+                .collect(),
+        )
+    }
+
     async fn browser_action(&mut self, action: &str, args: Value) -> Result<String, String> {
         let mut guard = self.browser.lock().await;
 
         // Auto-start browser if not initialized.
         if guard.is_none() {
             tracing::info!("WASM plugin: auto-starting browser session");
-            let chrome_path = rsclaw_platform::detect_chrome()
+            let browser_path = rsclaw_platform::detect_chrome()
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Chrome not found; run: rsclaw tools install chrome")
+                    anyhow::anyhow!(concat!(
+                        "No supported Chromium browser found; install Chrome for Testing with: ",
+                        rsclaw_brand::brand_cli_name!(),
+                        " tools install chrome"
+                    ))
                 })
-                .map_err(|e| format!("failed to obtain Chrome: {e:#}"))?;
+                .map_err(|e| format!("failed to obtain browser executable: {e:#}"))?;
             // All plugins share one Chrome profile so that auth state
             // (cookies, localStorage) is reused across the session — e.g.
             // a single login to Bytedance covers jimeng + douyin + xianyu,
             // a single Taobao login covers travel + jimeng. Callers should
             // treat this as an opaque shared identifier.
-            let session = BrowserSession::start(&chrome_path, true, Some(SHARED_BROWSER_PROFILE))
+            let session = BrowserSession::start(&browser_path, true, Some(SHARED_BROWSER_PROFILE))
                 .await
-                .map_err(|e| format!("failed to start Chrome: {e:#}"))?;
+                .map_err(|e| format!("failed to start browser at {browser_path}: {e:#}"))?;
             *guard = Some(session);
         }
 
@@ -2067,11 +3032,71 @@ impl HostState {
 // host-desktop trait implementation
 // ---------------------------------------------------------------------------
 
+fn is_windows_wechat_app(app: &str) -> bool {
+    matches!(
+        app.trim().to_ascii_lowercase().as_str(),
+        "com.tencent.xinwechat" | "wechat" | "weixin" | "wechat.exe" | "weixin.exe"
+    )
+}
+
+#[test]
+fn visual_focus_dispatch_accepts_plugin_bundle_without_substring_matching() {
+    for app in [
+        "com.tencent.xinWeChat",
+        "WeChat",
+        "Weixin",
+        "WeChat.exe",
+        "Weixin.exe",
+    ] {
+        assert!(is_windows_wechat_app(app));
+    }
+    for app in ["", "explorer", "fake-wechat", "wechat.exe.evil"] {
+        assert!(!is_windows_wechat_app(app));
+    }
+}
+
+struct HostVisualFocusObserver<'a> {
+    state: &'a mut HostState,
+}
+
+impl crate::desktop_focus::VisualFocusObserver for HostVisualFocusObserver<'_> {
+    fn locate_safe_patch(
+        &mut self,
+        image_data_uri: String,
+        prompt: String,
+    ) -> futures::future::BoxFuture<'_, Result<String, String>> {
+        Box::pin(async move {
+            <HostState as rsclaw::plugin::host_vlm::Host>::vlm_parse(
+                self.state,
+                image_data_uri,
+                prompt,
+                256,
+            )
+            .await
+            .map_err(|error| format!("visual focus vision call failed: {error}"))?
+        })
+    }
+}
+
 impl rsclaw::plugin::host_desktop::Host for HostState {
     async fn desktop_activate_app(
         &mut self,
         bundle_id: String,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_activate_app") {
+            return Ok(Err(e));
+        }
+        if cfg!(target_os = "windows") && is_windows_wechat_app(&bundle_id) {
+            let session =
+                crate::desktop_focus::DesktopVisualFocusSession::new(Arc::clone(&self.desktop));
+            let mut observer = HostVisualFocusObserver { state: self };
+            return Ok(crate::desktop_focus::focus_windows_wechat(
+                &session,
+                &mut observer,
+                &bundle_id,
+            )
+            .await);
+        }
         Ok(self.desktop.activate_app(&bundle_id).await)
     }
 
@@ -2079,6 +3104,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         &mut self,
         bundle_id: String,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_list_windows") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.list_windows(&bundle_id).await)
     }
 
@@ -2087,6 +3115,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         bundle_id: String,
         window_idx: u32,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_close_window") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.close_window(&bundle_id, window_idx).await)
     }
 
@@ -2094,6 +3125,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         &mut self,
         bundle_id: String,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_get_main_window") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.get_main_window(&bundle_id).await)
     }
 
@@ -2101,6 +3135,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         &mut self,
         bundle_id: String,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_screenshot_window") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.screenshot_window(&bundle_id).await)
     }
 
@@ -2108,6 +3145,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         &mut self,
         bundle_id: String,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_ocr_window") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.ocr_window(&bundle_id).await)
     }
 
@@ -2118,6 +3158,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         w: u32,
         h: u32,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_screenshot_region") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.screenshot_region(x, y, w, h).await)
     }
 
@@ -2134,6 +3177,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         tolerance: u32,
         min_count: u32,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_region_has_color") {
+            return Ok(Err(e));
+        }
         Ok(self
             .desktop
             .region_has_color(x, y, w, h, r, g, b, tolerance, min_count)
@@ -2145,6 +3191,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         x: u32,
         y: u32,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_mouse_move") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.mouse_move(x, y).await)
     }
 
@@ -2153,6 +3202,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         x: u32,
         y: u32,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_mouse_click") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.mouse_click(x, y).await)
     }
 
@@ -2161,6 +3213,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         x: u32,
         y: u32,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_mouse_double_click") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.mouse_double_click(x, y).await)
     }
 
@@ -2171,6 +3226,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         x2: u32,
         y2: u32,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_mouse_drag") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.mouse_drag(x1, y1, x2, y2).await)
     }
 
@@ -2178,6 +3236,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         &mut self,
         clicks: i32,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_mouse_scroll") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.mouse_scroll(clicks).await)
     }
 
@@ -2186,6 +3247,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         key: String,
         modifiers: Vec<String>,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_key_press") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.key_press(&key, &modifiers).await)
     }
 
@@ -2193,10 +3257,16 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         &mut self,
         text: String,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_clipboard_set") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.clipboard_set(&text).await)
     }
 
     async fn desktop_clipboard_get(&mut self) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_clipboard_get") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.clipboard_get().await)
     }
 
@@ -2204,10 +3274,16 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         &mut self,
         file_path: String,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_clipboard_set_file") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.clipboard_set_file(&file_path).await)
     }
 
     async fn desktop_clipboard_get_image(&mut self) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_clipboard_get_image") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.clipboard_get_image().await)
     }
 
@@ -2216,6 +3292,9 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         x: u32,
         y: u32,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_mouse_right_click") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.mouse_right_click(x, y).await)
     }
 
@@ -2224,7 +3303,36 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         title: String,
         filters: Vec<String>,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(e) = self.require_capability(CAP_DESKTOP, "desktop_file_dialog_open") {
+            return Ok(Err(e));
+        }
         Ok(self.desktop.file_dialog_open(&title, &filters).await)
+    }
+
+    async fn desktop_vlm_drive(
+        &mut self,
+        expected_app: String,
+        instruction: String,
+        max_steps: u32,
+        action_spaces: Option<Vec<String>>,
+    ) -> wasmtime::Result<Result<String, String>> {
+        let operator = match crate::desktop_vlm::DesktopSessionOperator::new(
+            Arc::clone(&self.desktop),
+            expected_app.clone(),
+        ) {
+            Ok(operator) => operator,
+            Err(error) => return Ok(Err(format!("desktop-vlm-drive: {error}"))),
+        };
+        Ok(self
+            .run_plugin_vlm_drive(
+                instruction,
+                max_steps,
+                action_spaces,
+                &operator,
+                "desktop-vlm-drive",
+                &expected_app,
+            )
+            .await)
     }
 }
 
@@ -2369,6 +3477,8 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
                 match event {
                     Ok(rsclaw_provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
                     Ok(rsclaw_provider::StreamEvent::ReasoningDelta(d)) => reasoning.push_str(&d),
+                    // Replay metadata only; its text already arrived as deltas.
+                    Ok(rsclaw_provider::StreamEvent::ReasoningBlock { .. }) => {}
                     Ok(rsclaw_provider::StreamEvent::Done { .. }) => break,
                     Ok(rsclaw_provider::StreamEvent::ToolCall { .. }) => {}
                     Ok(rsclaw_provider::StreamEvent::Error(e)) => {
@@ -2402,7 +3512,10 @@ impl rsclaw::plugin::host_ocr::Host for HostState {
     ) -> wasmtime::Result<Result<String, String>> {
         let Some(client) = rsclaw_kb::OcrClient::from_config() else {
             return Ok(Err(
-                "ocr-image: no OCR endpoint configured (set kb.ocr in rsclaw.json5)".to_string(),
+                format!(
+                    "ocr-image: no OCR endpoint configured (set kb.ocr in {})",
+                    rsclaw_brand::CONFIG_FILE
+                ),
             ));
         };
         let result = tokio::task::spawn_blocking(move || {
@@ -2444,7 +3557,7 @@ impl rsclaw::plugin::host_android::Host for HostState {
         local_path: String,
         media_kind: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let canonical = match canonicalize_plugin_artifact_path(&local_path) {
+        let canonical = match canonicalize_plugin_artifact_path(Some(&self.plugin_name), &local_path) {
             Ok(path) => path,
             Err(error) => return Ok(Err(error)),
         };
@@ -2457,12 +3570,15 @@ impl rsclaw::plugin::host_android::Host for HostState {
         max_steps: u32,
         action_spaces: Option<Vec<String>>,
     ) -> HostTrapResult<Result<String, String>> {
+        let operator = crate::android_vlm::AndroidUiautoOperator::legacy();
         Ok(self
-            .run_android_vlm_drive(
+            .run_plugin_vlm_drive(
                 instruction,
                 max_steps,
                 action_spaces,
-                crate::android_vlm::AndroidUiautoOperator::legacy(),
+                &operator,
+                "android-vlm-drive",
+                "WeChat Android",
             )
             .await)
     }
@@ -2480,12 +3596,15 @@ impl rsclaw::plugin::host_android::Host for HostState {
                 Ok(options) => options,
                 Err(error) => return Ok(Err(error)),
             };
+        let operator = crate::android_vlm::AndroidUiautoOperator::with_options(options);
         Ok(self
-            .run_android_vlm_drive(
+            .run_plugin_vlm_drive(
                 instruction,
                 max_steps,
                 action_spaces,
-                crate::android_vlm::AndroidUiautoOperator::with_options(options),
+                &operator,
+                "android-vlm-drive",
+                "WeChat Android",
             )
             .await)
     }
@@ -2589,7 +3708,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         selector_type: String,
         selector_value: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         let payload = serde_json::json!({"using": selector_type, "value": selector_value});
         let resp = match cli
             .post(format!("{base}/element"))
@@ -2616,7 +3738,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         selector_type: String,
         selector_value: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         // 1. Find the element
         let payload = serde_json::json!({"using": selector_type, "value": selector_value});
         let resp = match cli
@@ -2679,7 +3804,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
     }
 
     async fn ios_tap(&mut self, x: f64, y: f64) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         // Use the sessionless `/wda/tap` with the coordinates in the JSON body —
         // the `/wda/tap/{x}/{y}` path form returns 404 on this WDA build.
         let payload = serde_json::json!({"x": x, "y": y});
@@ -2703,7 +3831,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
     }
 
     async fn ios_type(&mut self, text: String) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         let payload = serde_json::json!({"value": [text]});
         let resp = match cli
             .post(format!("{base}/wda/keys"))
@@ -2732,7 +3863,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         y2: f64,
         duration_ms: u32,
     ) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         let payload = serde_json::json!({
             "fromX": x1, "fromY": y1,
             "toX": x2, "toY": y2,
@@ -2755,7 +3889,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
     }
 
     async fn ios_get_labels(&mut self) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         // WDA's session-scoped `/source` can wedge after a reconnect even
         // though the sessionless endpoint is healthy. Source is read-only and
         // does not need a session, so always probe the root endpoint.
@@ -2790,7 +3927,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
     }
 
     async fn ios_screenshot(&mut self) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         let resp = match tokio::time::timeout(
             Duration::from_secs(12),
             cli.get(format!("{base}/screenshot")).send(),
@@ -2818,7 +3958,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
     }
 
     async fn ios_screen_size(&mut self) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         let resp = match cli.get(format!("{base}/window/size")).send().await {
             Ok(r) => r,
             Err(e) => return Ok(Err(format!("WDA window size: {e}"))),
@@ -2838,7 +3981,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
     }
 
     async fn ios_press_button(&mut self, name: String) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         let payload = serde_json::json!({"name": name});
         let resp = match cli
             .post(format!("{base}/wda/pressButton"))
@@ -2861,7 +4007,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         content_type: String,
         base64_content: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         let payload = serde_json::json!({"contentType": content_type, "content": base64_content});
         let resp = match cli
             .post(format!("{base}/wda/setPasteboard"))
@@ -2882,7 +4031,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
     }
 
     async fn ios_current_app(&mut self) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         let resp = match cli.get(format!("{base}/wda/activeAppInfo")).send().await {
             Ok(r) => r,
             Err(e) => return Ok(Err(format!("WDA activeApp: {e}"))),
@@ -2905,7 +4057,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         &mut self,
         bundle_id: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         let payload = serde_json::json!({"bundleId": bundle_id});
         let resp = match cli
             .post(format!("{base}/wda/apps/launch"))
@@ -2927,7 +4082,10 @@ impl rsclaw::plugin::host_ios::Host for HostState {
         &mut self,
         bundle_id: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let (base, cli) = self.wda_base_and_client();
+        let (base, cli) = match self.wda_base_and_client() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
         let payload = serde_json::json!({"bundleId": bundle_id});
         let resp = match cli
             .post(format!("{base}/wda/apps/terminate"))
@@ -2947,7 +4105,7 @@ impl rsclaw::plugin::host_ios::Host for HostState {
 }
 
 impl HostState {
-    fn wda_base_and_client(&self) -> (String, reqwest::Client) {
+    fn wda_base_and_client(&self) -> Result<(String, reqwest::Client), String> {
         let base = self
             .wda_url
             .as_ref()
@@ -2959,12 +4117,8 @@ impl HostState {
                     .and_then(|cached| cached.clone())
             })
             .unwrap_or_else(|| "http://localhost:8100".to_string());
-        let cli = host_http_client().unwrap_or_else(|_| {
-            reqwest::Client::builder()
-                .build()
-                .expect("failed to build reqwest client")
-        });
-        (base, cli)
+        let cli = host_http_client().map_err(|e| format!("WDA HTTP client unavailable: {e}"))?;
+        Ok((base, cli))
     }
 }
 
@@ -3131,8 +4285,9 @@ pub async fn load_wasm_plugin(
         linker,
         browser,
         browser_cdn_rules: manifest.browser_cdn.download_rules.clone(),
-        plugin_config: resolve_plugin_config(&manifest.config),
+        plugin_config: resolve_plugin_config(&manifest.config, &manifest.name),
         capabilities: manifest.capabilities.clone(),
+        capabilities_arc: Arc::new(manifest.capabilities.clone()),
         slash_commands: manifest.slash_commands.clone(),
         tool_aliases: manifest.tool_aliases.clone(),
         min_call_interval: Duration::from_millis(u64::from(manifest.min_call_interval_ms)),
@@ -3171,6 +4326,27 @@ fn sha256_hex(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 impl WasmPlugin {
+    /// Overlay operator-provided config (`plugins.entries.<name>.config` in
+    /// rsclaw.json5) on top of the manifest config. The operator is trusted,
+    /// so its `{source:"env"}` references may read any variable. Top-level
+    /// keys of `user_config` replace the manifest's.
+    pub fn apply_user_config(&mut self, user_config: &serde_json::Value) {
+        let serde_json::Value::Object(user) =
+            resolve_config_env_refs(user_config, &self.name, &|_: &str| true)
+        else {
+            tracing::warn!(plugin = %self.name, "plugins.entries.<name>.config must be an object; ignored");
+            return;
+        };
+        if !self.plugin_config.is_object() {
+            self.plugin_config = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let serde_json::Value::Object(base) = &mut self.plugin_config {
+            for (k, v) in user {
+                base.insert(k, v);
+            }
+        }
+    }
+
     /// Dispatch a tool call to this WASM plugin.
     ///
     /// The tool name must match one of the plugin's declared tools.
@@ -3231,34 +4407,53 @@ impl WasmPlugin {
             self.plugin_config.clone(),
             self.providers.clone(),
             self.vision_model.clone(),
+            Arc::clone(&self.capabilities_arc),
         );
-
-        let instance = self
-            .linker
-            .instantiate_async(&mut store, &self.component)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to instantiate component for tool call: {e}"))?;
-
-        // Drill into the plugin-api interface to find handle-tool.
-        let iface_idx = instance
-            .get_export_index(&mut store, None, "rsclaw:plugin/plugin-api")
-            .with_context(|| "plugin-api interface not found")?;
-
-        let handle_tool_idx = instance
-            .get_export_index(&mut store, Some(&iface_idx), "handle-tool")
-            .with_context(|| "handle-tool export not found")?;
-
-        let handle_tool_fn = instance
-            .get_typed_func::<(&str, &str), (Result<String, String>,)>(&mut store, &handle_tool_idx)
-            .map_err(|e| anyhow::anyhow!("handle-tool has unexpected type: {e}"))?;
 
         let args_json =
             serde_json::to_string(&args).context("failed to serialize tool arguments")?;
 
-        let (result,) = handle_tool_fn
-            .call_async(&mut store, (tool_name, &args_json))
+        // Run the call on its own task. A caller that stops waiting (an HTTP
+        // client that hung up, a preflight timeout) would otherwise drop the
+        // call at whatever host await it had reached: the plugin never cleans
+        // up, so device locks and half-finished UI steps stay behind. The task
+        // runs the tool to its end even when nobody reads the result.
+        let linker = self.linker.clone();
+        let component = self.component.clone();
+        let tool = tool_name.to_string();
+        let call = tokio::spawn(async move {
+            let instance = linker
+                .instantiate_async(&mut store, &component)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to instantiate component for tool call: {e}")
+                })?;
+
+            // Drill into the plugin-api interface to find handle-tool.
+            let iface_idx = instance
+                .get_export_index(&mut store, None, "rsclaw:plugin/plugin-api")
+                .with_context(|| "plugin-api interface not found")?;
+
+            let handle_tool_idx = instance
+                .get_export_index(&mut store, Some(&iface_idx), "handle-tool")
+                .with_context(|| "handle-tool export not found")?;
+
+            let handle_tool_fn = instance
+                .get_typed_func::<(&str, &str), (Result<String, String>,)>(
+                    &mut store,
+                    &handle_tool_idx,
+                )
+                .map_err(|e| anyhow::anyhow!("handle-tool has unexpected type: {e}"))?;
+
+            let (result,) = handle_tool_fn
+                .call_async(&mut store, (tool.as_str(), args_json.as_str()))
+                .await
+                .map_err(|e| anyhow::anyhow!("handle-tool call failed for '{tool}': {e}"))?;
+            anyhow::Ok(result)
+        });
+        let result = call
             .await
-            .map_err(|e| anyhow::anyhow!("handle-tool call failed for '{tool_name}': {e}"))?;
+            .map_err(|e| anyhow::anyhow!("WASM tool task for '{tool_name}' failed: {e}"))??;
 
         match result {
             Ok(json_str) => {
@@ -3555,5 +4750,135 @@ mod android_helper_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_isolation_media_input_protocols_are_detected() {
+        for bad in ["http://x/a.mp4", "concat:a|b", "file:/etc/passwd", "tcp://1.2.3.4:1"] {
+            assert!(has_protocol_prefix(bad), "{bad}");
+        }
+        for ok in ["/tmp/a.mp4", "C:\\Users\\a.mp4", "c:/x.wav", "rel/a.mp4", "a.mp4"] {
+            assert!(!has_protocol_prefix(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn plugin_isolation_ffmpeg_duration_and_frame_names() {
+        let banner = "Input #0, mov,mp4\n  Duration: 00:01:02.50, start: 0.000000, bitrate: 1 kb/s";
+        assert_eq!(parse_ffmpeg_duration(banner), Some(62.5));
+        assert_eq!(parse_ffmpeg_duration("  Duration: N/A, start"), None);
+        assert_eq!(
+            keyframe_output_pattern("/d/dl_image_202609301200abc_1.png").as_deref(),
+            Some("/d/dl_image_202609301200abc_%d.png")
+        );
+        assert_eq!(keyframe_output_pattern("/d/x.png"), None);
+    }
+
+    #[test]
+    fn plugin_isolation_manifest_env_refs_are_scoped() {
+        let raw = json!({
+            "own": {"source": "env", "id": "RSCLAW_PLUGIN_MY_PLUGIN_TOKEN"},
+            "foreign": {"source": "env", "id": "OPENAI_API_KEY"},
+        });
+        assert_eq!(plugin_env_prefix("my-plugin"), "RSCLAW_PLUGIN_MY_PLUGIN_");
+        let resolved = resolve_plugin_config(&raw, "my-plugin");
+        assert_eq!(resolved["foreign"], Value::Null);
+    }
+
+    #[test]
+    fn plugin_isolation_own_namespace_env_refs_allowed() {
+        assert!(plugin_env_allowed("astock", "ASTOCK_API_KEY"));
+        assert!(plugin_env_allowed("astock", "ASTOCK_BASE_URL"));
+        assert!(plugin_env_allowed("astock", "RSCLAW_PLUGIN_ASTOCK_TOKEN"));
+        assert!(!plugin_env_allowed("astock", "OPENAI_API_KEY"));
+        assert!(!plugin_env_allowed("astock", "ASTOCKX_API_KEY"));
+        assert!(plugin_env_allowed("wechat-ios", "WECHAT_IOS_X"));
+        assert!(!plugin_env_allowed("wechat-ios", "WECHAT_API_KEY"));
+        // Names that map onto host / provider namespaces get no bare prefix.
+        assert!(!plugin_env_allowed("openai", "OPENAI_API_KEY"));
+        assert!(!plugin_env_allowed("rsclaw", "RSCLAW_AUTH_TOKEN"));
+        assert!(!plugin_env_allowed("aws-tools", "AWS_TOOLS_SECRET"));
+        assert!(plugin_env_allowed("openai", "RSCLAW_PLUGIN_OPENAI_KEY"));
+    }
+
+    #[test]
+    fn plugin_isolation_device_keys_are_per_plugin() {
+        let device = SigningKey::from_bytes(&[7u8; 32]);
+        let a = derive_plugin_signing_key(&device, "astock").expect("derive a");
+        let a2 = derive_plugin_signing_key(&device, "astock").expect("derive a2");
+        let b = derive_plugin_signing_key(&device, "broadcast").expect("derive b");
+        assert_eq!(a.to_bytes(), a2.to_bytes());
+        assert_ne!(a.to_bytes(), b.to_bytes());
+        assert_ne!(a.to_bytes(), device.to_bytes());
+    }
+
+    #[test]
+    fn plugin_isolation_outbound_attachments_are_confined() {
+        let msg = json!({"text": "x", "files": [{"path": "/etc/hosts"}]}).to_string();
+        assert!(confine_outbound_attachments("demo", &msg).is_err());
+        let msg = json!({"text": "x", "files": ["/etc/hosts"]}).to_string();
+        assert!(confine_outbound_attachments("demo", &msg).is_err());
+        let msg = json!({"text": "x", "images": ["data:image/png;base64,AA"]}).to_string();
+        assert!(confine_outbound_attachments("demo", &msg).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod compose_tests {
+    use super::*;
+
+    #[test]
+    fn srt_timestamps_round_to_millis() {
+        assert_eq!(srt_timestamp(0.0), "00:00:00,000");
+        assert_eq!(srt_timestamp(3661.2345), "01:01:01,235");
+        assert_eq!(srt_timestamp(-1.0), "00:00:00,000");
+    }
+
+    #[test]
+    fn filter_paths_escape_quotes_and_colons() {
+        assert_eq!(
+            filter_quote_path(std::path::Path::new("/a/b's.srt")),
+            "'/a/b\\'s.srt'"
+        );
+        assert_eq!(
+            filter_quote_path(std::path::Path::new("C:\\x\\y.srt")),
+            "'C\\:/x/y.srt'"
+        );
+    }
+
+    #[test]
+    fn picks_best_available_h264_encoder() {
+        let lgpl = " V....D libopenh264          OpenH264 H.264\n V....D h264_mf              H264 via MediaFoundation\n A....D aac                  AAC\n";
+        assert_eq!(pick_h264_encoder(lgpl).map(|e| e.0), Some("libopenh264"));
+        let gpl = " V....D h264_mf  MF\n V....D libx264  libx264 H.264\n";
+        assert_eq!(pick_h264_encoder(gpl).map(|e| e.0), Some("libx264"));
+        let mf_only = " V....D h264_mf  MF\n";
+        assert_eq!(pick_h264_encoder(mf_only).map(|e| e.0), Some("h264_mf"));
+        assert_eq!(pick_h264_encoder(" A....D aac AAC\n"), None);
+        // Header lines and the legend must not count as encoders.
+        assert_eq!(
+            pick_h264_encoder("Encoders:\n V..... = Video\n ------\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn filter_graph_audio_branches() {
+        let g = compose_filter_graph(2, 1080, 1920, None, (Some(2), Some(3), None), 0.12);
+        assert!(g.contains("[v0][v1]concat=n=2:v=1:a=0[vc]"));
+        assert!(g.contains("[vc]null[v]"));
+        assert!(g.contains("amix=inputs=2:duration=first"));
+        assert!(g.contains("volume=0.12"));
+
+        let g = compose_filter_graph(1, 720, 1280, None, (Some(1), None, None), 0.6);
+        assert!(g.contains("[1:a]aresample=48000,aformat=channel_layouts=stereo,apad[a]"));
+
+        let g = compose_filter_graph(1, 720, 1280, None, (None, None, Some(1)), 0.6);
+        assert!(g.ends_with("[1:a]anull[a]"));
+
+        let srt = std::path::Path::new("/tmp/x.srt");
+        let g = compose_filter_graph(1, 1080, 1920, Some(srt), (None, Some(1), None), 0.6);
+        assert!(g.contains("[vc]subtitles=filename='/tmp/x.srt'"));
+        assert!(g.contains("[1:a]aresample=48000,aformat=channel_layouts=stereo,volume=0.6[a]"));
     }
 }

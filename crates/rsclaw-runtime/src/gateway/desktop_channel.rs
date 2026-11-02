@@ -83,7 +83,7 @@ impl Channel for DesktopChannel {
             }
             if !msg.files.is_empty() {
                 if let Some(obj) = payload.as_object_mut() {
-                    obj.insert("files".to_string(), serde_json::json!(msg.files));
+                    obj.insert("files".to_string(), rsclaw_events::media::files_json(&msg.files));
                 }
             }
             let frame = EventFrame::new("notification", payload, 0);

@@ -7,7 +7,6 @@ import {
   ChatMessageTool,
   ChatMessage,
   ModelType,
-  useAccessStore,
   useChatStore,
 } from "../store";
 import { ChatGPTApi, DalleRequestPayload } from "./platforms/openai";
@@ -187,7 +186,6 @@ export function validString(x: string): boolean {
 }
 
 export function getHeaders(ignoreHeaders: boolean = false) {
-  const accessStore = useAccessStore.getState();
   let headers: Record<string, string> = {};
   if (!ignoreHeaders) {
     headers = {
@@ -197,7 +195,10 @@ export function getHeaders(ignoreHeaders: boolean = false) {
   }
 
   // RsClaw: use auth token for gateway auth
-  // Priority: rsclaw-api runtime token > localStorage cache > accessStore
+  // Priority: rsclaw-api runtime token (from config gateway.auth.token /
+  // RSCLAW_AUTH_TOKEN via get_gateway_port) > localStorage cache. Never fall
+  // back to a provider API key (accessStore.openaiApiKey) — that would send
+  // an upstream secret to the gateway as a bearer token.
   let gatewayToken = "";
   try {
     const { getAuthToken } = require("../lib/rsclaw-api");
@@ -205,9 +206,6 @@ export function getHeaders(ignoreHeaders: boolean = false) {
   } catch {}
   if (!gatewayToken) {
     try { gatewayToken = localStorage.getItem("rsclaw-auth-token") || ""; } catch {}
-  }
-  if (!gatewayToken) {
-    gatewayToken = accessStore.openaiApiKey || "";
   }
   if (gatewayToken) {
     headers["Authorization"] = `Bearer ${gatewayToken.trim()}`;

@@ -39,15 +39,16 @@ pub mod discord;
 pub mod feishu;
 pub mod line;
 pub mod matrix;
+pub mod peer_names;
 pub mod qq;
 // retry helpers extracted to rsclaw-retry (crate-split); re-exported so
 // crate::retry::{SendRetry, send_with_retry} keeps resolving.
 pub use rsclaw_retry as retry;
 pub mod signal;
 pub mod slack;
+pub mod status;
 pub mod telegram;
 pub mod transcription;
-pub mod tts;
 pub mod wechat;
 pub mod wecom;
 pub mod whatsapp;
@@ -97,6 +98,18 @@ pub mod outbound_kind {
 // existing `crate::OutboundMessage` paths keep resolving.
 pub use rsclaw_types::OutboundMessage;
 
+/// Channels whose replies go back to the caller through their own transport
+/// (the HTTP `/api/v1/message` reply and its SSE stream), with no sender on
+/// the notification bus: an outbound message sent to one of them reaches
+/// nobody. Future sync-only entry points (stdio MCP, in-process embeds)
+/// belong here too.
+pub const SYNC_ONLY_CHANNELS: &[&str] = &["api"];
+
+/// Whether `name` is a [`SYNC_ONLY_CHANNELS`] channel.
+pub fn is_sync_only_channel(name: &str) -> bool {
+    SYNC_ONLY_CHANNELS.contains(&name)
+}
+
 // ---------------------------------------------------------------------------
 // Channel trait
 // ---------------------------------------------------------------------------
@@ -120,8 +133,11 @@ pub trait Channel: Send + Sync {
 // DmPolicy enforcer
 // ---------------------------------------------------------------------------
 
-/// Maximum number of pending pairing requests per channel.
-const MAX_PENDING_PAIRINGS: usize = 3;
+/// Maximum number of pending pairing requests per channel. Each peer holds at
+/// most one pending code (repeat requests reuse it) and codes expire after
+/// [`PAIRING_TTL`], so a handful of strangers can no longer lock everyone else
+/// out of pairing.
+const MAX_PENDING_PAIRINGS: usize = 50;
 /// How long a pairing code is valid.
 const PAIRING_TTL: Duration = Duration::from_secs(3600);
 
@@ -191,6 +207,23 @@ impl PairingStore {
     /// Revoke a previously approved peer.
     pub fn revoke(&mut self, peer_id: &str) {
         self.approved.remove(peer_id);
+    }
+
+    /// Drop a pending pairing request matched by `code` (case-insensitive)
+    /// or by `peer_id`. Returns `(code, peer_id)` of the removed request.
+    /// The peer is not blocked: a later DM simply mints a fresh code.
+    pub fn reject(&mut self, code: Option<&str>, peer_id: Option<&str>) -> Option<(String, String)> {
+        self.pending
+            .retain(|e| e.created_at.elapsed() < PAIRING_TTL);
+        let code_upper = code.map(str::to_uppercase);
+        let pos = self.pending.iter().position(|e| {
+            code_upper
+                .as_deref()
+                .is_some_and(|c| e.code.to_uppercase() == c)
+                || peer_id.is_some_and(|p| e.peer_id == p)
+        })?;
+        let entry = self.pending.remove(pos);
+        Some((entry.code, entry.peer_id))
     }
 
     /// List pending pairing requests (not yet approved). Returns (code,
@@ -324,6 +357,20 @@ impl DmPolicyEnforcer {
         }
     }
 
+    /// Side-effect-free variant of [`Self::check`]: `true` only when the peer
+    /// would be `Allow`ed right now. Never creates pairing codes. Used by
+    /// channels to skip expensive media downloads for unauthorised senders.
+    pub async fn is_allowed(&self, peer_id: &str) -> bool {
+        match &self.policy {
+            DmPolicy::Disabled => false,
+            DmPolicy::Open => true,
+            DmPolicy::Allowlist => {
+                self.allow_from.contains(peer_id) || self.allow_from.contains("*")
+            }
+            DmPolicy::Pairing => self.pairing.lock().await.is_approved(peer_id),
+        }
+    }
+
     /// Approve a pairing code, returning the peer_id if the code was valid.
     pub async fn approve_pairing(&self, code: &str) -> Option<String> {
         let peer = self.pairing.lock().await.approve(code);
@@ -348,6 +395,17 @@ impl DmPolicyEnforcer {
         }
     }
 
+    /// Drop a pending pairing request by code or peer id. Returns the removed
+    /// `(code, peer_id)`. Pending requests are in-memory only, so nothing is
+    /// persisted.
+    pub async fn reject_pairing(
+        &self,
+        code: Option<&str>,
+        peer_id: Option<&str>,
+    ) -> Option<(String, String)> {
+        self.pairing.lock().await.reject(code, peer_id)
+    }
+
     /// List pending pairing requests for this channel.
     pub async fn list_pending(&self) -> Vec<(String, String, u64)> {
         self.pairing.lock().await.list_pending()
@@ -362,6 +420,153 @@ impl DmPolicyEnforcer {
     pub fn channel_name(&self) -> &str {
         &self.channel_name
     }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound hardening helpers — shared by all channels
+// ---------------------------------------------------------------------------
+
+/// Cheap policy pre-check a channel runs BEFORE downloading / transcribing
+/// inbound media: `(sender_id, chat_id, is_group) -> allowed`. Must be free
+/// of side effects (no pairing codes); the authoritative check still runs in
+/// the gateway on the dispatched message.
+pub type MediaGate =
+    Arc<dyn Fn(String, String, bool) -> BoxFuture<'static, bool> + Send + Sync>;
+
+/// Placeholder text dispatched instead of media from a sender the
+/// [`MediaGate`] rejected, so the gateway still runs its policy flow (e.g.
+/// replies with a pairing code) without the media ever being fetched.
+pub const GATED_MEDIA_PLACEHOLDER: &str = "[attachment]";
+
+/// Upper bound for any inbound media / attachment download (bytes).
+pub const MAX_INBOUND_MEDIA_BYTES: usize = 50 * 1024 * 1024;
+
+/// Read an inbound media response body, failing once it exceeds
+/// [`MAX_INBOUND_MEDIA_BYTES`].
+pub async fn read_media_body(resp: reqwest::Response) -> Result<Vec<u8>> {
+    rsclaw_util::net::read_body_limited(resp, MAX_INBOUND_MEDIA_BYTES).await
+}
+
+/// How long an inbound platform message id is remembered for dedup.
+const INBOUND_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
+/// Maximum number of remembered inbound message ids (all channels combined).
+const INBOUND_DEDUP_CAP: usize = 20_000;
+
+/// Time- and size-bounded dedup set for inbound platform message ids.
+///
+/// Unlike a `HashSet` that is `clear()`ed when full, entries age out one by
+/// one (oldest first), so a redelivery that arrives right after a purge is
+/// still recognised.
+#[derive(Debug)]
+pub struct InboundDedup {
+    ttl: Duration,
+    cap: usize,
+    inner: std::sync::Mutex<DedupInner>,
+}
+
+#[derive(Debug, Default)]
+struct DedupInner {
+    seen: HashMap<String, Instant>,
+    order: std::collections::VecDeque<(String, Instant)>,
+}
+
+impl InboundDedup {
+    /// Create a dedup set remembering ids for `ttl`, holding at most `cap`.
+    pub fn new(ttl: Duration, cap: usize) -> Self {
+        Self {
+            ttl,
+            cap: cap.max(1),
+            inner: std::sync::Mutex::new(DedupInner::default()),
+        }
+    }
+
+    /// Record `id`; returns `true` when it was NOT seen within the TTL (i.e.
+    /// the message should be processed) and `false` for a duplicate.
+    /// Empty ids are never treated as duplicates.
+    pub fn first_seen(&self, id: &str) -> bool {
+        if id.is_empty() {
+            return true;
+        }
+        let now = Instant::now();
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Evict expired / overflow entries from the front (oldest first).
+        while let Some((front_id, ts)) = inner.order.front().cloned() {
+            if now.duration_since(ts) < self.ttl && inner.order.len() < self.cap {
+                break;
+            }
+            inner.order.pop_front();
+            if inner.seen.get(&front_id) == Some(&ts) {
+                inner.seen.remove(&front_id);
+            }
+        }
+        if let Some(ts) = inner.seen.get(id)
+            && now.duration_since(*ts) < self.ttl
+        {
+            return false;
+        }
+        inner.seen.insert(id.to_owned(), now);
+        inner.order.push_back((id.to_owned(), now));
+        true
+    }
+}
+
+static INBOUND_DEDUP: std::sync::LazyLock<InboundDedup> =
+    std::sync::LazyLock::new(|| InboundDedup::new(INBOUND_DEDUP_TTL, INBOUND_DEDUP_CAP));
+
+/// Process-wide inbound dedup keyed by `(channel, platform message id)`.
+/// Returns `true` when the message is a redelivery that must be dropped.
+pub fn is_duplicate_inbound(channel: &str, message_id: &str) -> bool {
+    if message_id.is_empty() {
+        return false;
+    }
+    !INBOUND_DEDUP.first_seen(&format!("{channel}:{message_id}"))
+}
+
+/// In-band control markers the gateway/agent interpret specially. They are
+/// produced by channel code only; user-typed copies must be removed so a
+/// sender cannot forge them.
+const INBOUND_SENTINELS: &[&str] = &["__DIRECT_REPLY__", "[__VOICE_INPUT__]"];
+
+/// Strip in-band control sentinels from user-supplied inbound text.
+pub fn strip_inbound_sentinels(text: &str) -> String {
+    let mut out = text.to_owned();
+    for s in INBOUND_SENTINELS {
+        if out.contains(s) {
+            out = out.replace(s, "");
+        }
+    }
+    out
+}
+
+/// Constant-time byte comparison for webhook signature checks.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Compute `HMAC-SHA256(key, data)`.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    // HMAC accepts keys of any length, so construction cannot fail.
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Lower-case hex SHA-256 digest of the concatenation of `parts`.
+pub fn sha256_hex(parts: &[&[u8]]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    for p in parts {
+        hasher.update(p);
+    }
+    hex::encode(hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -506,16 +711,20 @@ pub fn canonical_filename(prefix: &str, mime_type: &str, original_filename: &str
     let kind = kind_for_mime(mime_type, original_filename);
     let ts = canonical_timestamp();
     let abc = random_suffix3();
+    // Only a short ASCII extension survives: the name has to stay a valid
+    // `@` token whatever the user's file was called.
     let ext = std::path::Path::new(original_filename)
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or(match kind {
-            'i' => "png",
-            'v' => "mp4",
-            'a' => "mp3",
-            'd' => "pdf",
-            _ => "bin",
-        });
+        .filter(|e| e.len() <= 10 && e.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(str::to_ascii_lowercase);
+    let ext = ext.as_deref().unwrap_or(match kind {
+        'i' => "png",
+        'v' => "mp4",
+        'a' => "mp3",
+        'd' => "pdf",
+        _ => "bin",
+    });
     format!("{prefix}_{kind}_{ts}{abc}.{ext}")
 }
 
@@ -544,13 +753,7 @@ pub fn kind_from_extension(ext: &str) -> char {
 /// Subdirectory under `~/Downloads/rsclaw/` (or `<workspace>/uploads/`)
 /// for a given canonical kind letter.
 pub fn category_for_kind(kind: char) -> &'static str {
-    match kind {
-        'i' => "images",
-        'v' => "videos",
-        'a' => "audios",
-        'd' => "docs",
-        _ => "files",
-    }
+    rsclaw_events::media::category_for_kind(kind)
 }
 
 fn canonical_timestamp() -> String {
@@ -577,6 +780,105 @@ pub struct ResolvedRefs {
     pub image_paths: Vec<std::path::PathBuf>,
 }
 
+/// Root of the `dl` bucket: `~/Downloads/<CLI_NAME>/`, where generated and
+/// downloaded media land.
+pub fn downloads_root() -> std::path::PathBuf {
+    dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .map(|h| h.join("Downloads"))
+                .unwrap_or_else(rsclaw_config::loader::base_dir)
+        })
+        .join(rsclaw_brand::CLI_NAME)
+}
+
+/// Where the file named by a media token lives, if the token is canonical
+/// and the file exists. The token alone picks the place (bucket by prefix,
+/// directory by kind), so nothing outside the three buckets is reachable.
+pub fn media_token_path(token: &str, workspace: &std::path::Path) -> Option<std::path::PathBuf> {
+    let (source, kind) = rsclaw_events::media::parse_token(token)?;
+    let root = match source {
+        "dl" => downloads_root(),
+        "a2a" => workspace.join("a2a"),
+        _ => workspace.join("uploads"),
+    };
+    let path = root.join(category_for_kind(kind)).join(token);
+    path.is_file().then_some(path)
+}
+
+/// Sidecar holding an upload's original file name, next to the uploads
+/// tree rather than inside a category directory the agent lists.
+fn upload_name_path(workspace: &std::path::Path, token: &str) -> std::path::PathBuf {
+    workspace.join("uploads").join(".names").join(token)
+}
+
+/// The original file name recorded for an uploaded token, if any.
+pub fn upload_original_name(workspace: &std::path::Path, token: &str) -> Option<String> {
+    std::fs::read_to_string(upload_name_path(workspace, token))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Store an upload under `<workspace>/uploads/<category>/` with a canonical
+/// `up_` name and remember its original name, so any file — a Chinese name,
+/// spaces, no extension — can be `@`-referenced. Returns the token and path.
+pub fn save_upload(
+    workspace: &std::path::Path,
+    original_name: &str,
+    mime_type: &str,
+    data: &[u8],
+) -> std::io::Result<(String, std::path::PathBuf)> {
+    // The directory follows the token's kind letter, which is what
+    // `media_token_path` looks under.
+    let kind = kind_for_mime(mime_type, original_name);
+    let dir = workspace.join("uploads").join(category_for_kind(kind));
+    std::fs::create_dir_all(&dir)?;
+    let mut token = canonical_filename("up", mime_type, original_name);
+    for _ in 0..10 {
+        if !dir.join(&token).exists() {
+            break;
+        }
+        token = canonical_filename("up", mime_type, original_name);
+    }
+    let path = dir.join(&token);
+    std::fs::write(&path, data)?;
+    let name_path = upload_name_path(workspace, &token);
+    if let Some(parent) = name_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&name_path, original_name);
+    Ok((token, path))
+}
+
+/// Remove an upload and its recorded original name.
+pub fn remove_upload(workspace: &std::path::Path, token: &str) {
+    if let Some(path) = media_token_path(token, workspace) {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_file(upload_name_path(workspace, token));
+}
+
+/// A fresh canonical path for generated media with extension `ext`:
+/// `~/Downloads/<CLI_NAME>/<category>/dl_<kind>_<ts><abc>.<ext>`, directory
+/// created. Every tool that writes media for the user should get its path
+/// here so the result can be `@`-referenced and fetched remotely.
+pub fn generated_media_path(ext: &str) -> std::io::Result<std::path::PathBuf> {
+    let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+    let kind = kind_from_extension(&ext);
+    let dir = downloads_root().join(category_for_kind(kind));
+    std::fs::create_dir_all(&dir)?;
+    let ts = canonical_timestamp();
+    let mut path = dir.join(format!("dl_{kind}_{ts}{}.{ext}", random_suffix3()));
+    for _ in 0..10 {
+        if !path.exists() {
+            break;
+        }
+        path = dir.join(format!("dl_{kind}_{ts}{}.{ext}", random_suffix3()));
+    }
+    Ok(path)
+}
+
 /// Scan text for `@<filename>` file references and resolve them to full
 /// paths. Supported shapes:
 ///
@@ -584,44 +886,36 @@ pub struct ResolvedRefs {
 ///   `<workspace>/uploads/<category>/`
 /// * `@dl_<kind>_<suffix>.<ext>` — generated/downloaded by a plugin; lives
 ///   under `~/Downloads/rsclaw/<category>/`
+/// * `@a2a_<kind>_<suffix>.<ext>` — received from an A2A peer
 ///
-/// Image references are collected in `image_paths` so the caller can
-/// load them as vision attachments.
+/// Every resolved reference, whatever its kind, is listed in the appended
+/// `[file references]` block so the model can pass the path to a tool;
+/// uploads also carry their original file name. Image references are
+/// collected in `image_paths` so the caller can load them as vision
+/// attachments.
 pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRefs {
-    let uploads = workspace.join("uploads");
-    let a2a_root = workspace.join("a2a");
-    let downloads_root = dirs_next::download_dir()
-        .unwrap_or_else(|| {
-            dirs_next::home_dir()
-                .map(|h| h.join("Downloads"))
-                .unwrap_or_else(|| workspace.to_path_buf())
-        })
-        .join("rsclaw");
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"@(up|dl|a2a)_([ivdaf])_([a-z0-9_]+)\.(\w+)").expect("valid regex")
+    });
 
-    // Three provenance buckets: up/ (channel uploads), dl/ (plugin or agent
-    // downloads), a2a/ (received from A2A peers). Filenames share the
-    // `<prefix>_<kind>_<ts><suffix>.<ext>` shape; the prefix decides which
-    // bucket the file lives under.
-    let re = regex::Regex::new(r"@(up|dl|a2a)_([ivdaf])_([a-z0-9_]+)\.(\w+)").expect("valid regex");
-
-    let mut resolved = Vec::new();
+    let mut resolved: Vec<(String, String, Option<String>)> = Vec::new();
     let mut image_paths = Vec::new();
-    for cap in re.captures_iter(text) {
-        let source = &cap[1];
-        let kind = cap[2].chars().next().unwrap_or('f');
+    for cap in RE.captures_iter(text) {
         let full_name = &cap[0][1..]; // strip the leading '@'
-        let subdir = category_for_kind(kind);
-        let path = match source {
-            "dl" => downloads_root.join(subdir).join(full_name),
-            "a2a" => a2a_root.join(subdir).join(full_name),
-            _ => uploads.join(subdir).join(full_name),
-        };
-        if path.exists() {
-            resolved.push((full_name.to_string(), path.to_string_lossy().to_string()));
-            if kind == 'i' {
-                image_paths.push(path);
-            }
+        if resolved.iter().any(|(n, _, _)| n == full_name) {
+            continue;
         }
+        let Some(path) = media_token_path(full_name, workspace) else {
+            continue;
+        };
+        let original = (&cap[1] == "up")
+            .then(|| upload_original_name(workspace, full_name))
+            .flatten()
+            .filter(|n| n != full_name);
+        if &cap[2] == "i" {
+            image_paths.push(path.clone());
+        }
+        resolved.push((full_name.to_string(), path.to_string_lossy().to_string(), original));
     }
 
     if resolved.is_empty() {
@@ -633,8 +927,11 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRef
 
     let mut result = text.to_string();
     result.push_str("\n\n[file references]\n");
-    for (name, path) in &resolved {
-        result.push_str(&format!("@{name} = {path}\n"));
+    for (name, path, original) in &resolved {
+        match original {
+            Some(orig) => result.push_str(&format!("@{name} = {path} (original name: {orig})\n")),
+            None => result.push_str(&format!("@{name} = {path}\n")),
+        }
     }
     ResolvedRefs {
         text: result,
@@ -911,6 +1208,27 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn reject_pairing_drops_pending_by_code_or_peer() {
+        let enforcer = DmPolicyEnforcer::new(DmPolicy::Pairing, vec![]);
+        let code = match enforcer.check("user_1").await {
+            PolicyResult::SendPairingCode(c) => c,
+            other => panic!("expected code, got {other:?}"),
+        };
+        assert!(matches!(enforcer.check("user_2").await, PolicyResult::SendPairingCode(_)));
+
+        let removed = enforcer
+            .reject_pairing(Some(&code.to_lowercase()), None)
+            .await;
+        assert_eq!(removed, Some((code.clone(), "user_1".to_owned())));
+        // A rejected code can no longer be approved.
+        assert!(enforcer.approve_pairing(&code).await.is_none());
+
+        assert!(enforcer.reject_pairing(None, Some("user_2")).await.is_some());
+        assert!(enforcer.list_pending().await.is_empty());
+        assert!(enforcer.reject_pairing(None, Some("nobody")).await.is_none());
+    }
+
+    #[tokio::test]
     async fn pairing_policy_generates_code() {
         let enforcer = DmPolicyEnforcer::new(DmPolicy::Pairing, vec![]);
         let result = enforcer.check("user_1").await;
@@ -956,6 +1274,26 @@ mod tests {
             enforcer.check("overflow_user").await,
             PolicyResult::PairingQueueFull
         );
+    }
+
+    #[test]
+    fn inbound_dedup_detects_redelivery() {
+        let d = InboundDedup::new(Duration::from_secs(60), 2);
+        assert!(d.first_seen("a"));
+        assert!(!d.first_seen("a"));
+        assert!(d.first_seen("b"));
+        // Capacity 2: inserting "c" evicts "a" (oldest), never clears "b".
+        assert!(d.first_seen("c"));
+        assert!(!d.first_seen("c"));
+        assert!(d.first_seen(""));
+        assert!(d.first_seen(""));
+    }
+
+    #[test]
+    fn strip_sentinels_removes_forged_markers() {
+        assert_eq!(strip_inbound_sentinels("__DIRECT_REPLY__hi"), "hi");
+        assert_eq!(strip_inbound_sentinels("[__VOICE_INPUT__]\nx"), "\nx");
+        assert_eq!(strip_inbound_sentinels("plain"), "plain");
     }
 
     #[test]

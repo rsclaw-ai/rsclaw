@@ -57,9 +57,104 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Best-effort executable name of process `pid` (lowercased), or `None`
+/// when it cannot be determined (process gone, permission denied, tool
+/// missing).
+fn process_exe_name(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            && let Some(name) = exe.file_name()
+        {
+            return Some(name.to_string_lossy().to_lowercase());
+        }
+        // `exe` is unreadable for other users' processes; `comm` is not.
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // `comm` is the full executable path on macOS/BSD.
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if s.is_empty() {
+            return None;
+        }
+        let base = std::path::Path::new(&s)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or(s);
+        Some(base.to_lowercase())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .creation_flags(0x08000000)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let pid_field = format!("\"{pid}\"");
+        text.lines()
+            .find(|l| l.contains(&pid_field))
+            .and_then(|l| l.split(',').next())
+            .map(|name| name.trim_matches('"').to_lowercase())
+            .filter(|s| !s.is_empty())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// True when `pid` is alive AND its executable name contains `rsclaw` or
+/// this build's CLI name (a branded build's binary is not called rsclaw).
+///
+/// Guards against PID reuse: a stale pid file may point at an unrelated
+/// process that inherited the number. Returns `false` when the identity
+/// cannot be verified. Use this before signalling or killing a pid read
+/// from a pid file.
+pub fn process_is_rsclaw(pid: u32) -> bool {
+    if pid == 0 || !process_alive(pid) {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    match process_exe_name(pid) {
+        Some(name) => {
+            name.contains("rsclaw") || name.contains(&rsclaw_brand::CLI_NAME.to_lowercase())
+        }
+        None => false,
+    }
+}
+
 /// Send a termination signal to the process (SIGTERM on Unix, taskkill on
 /// Windows).
+///
+/// Refuses (returns `Err`) when `pid` is not a live rsclaw process — see
+/// [`process_is_rsclaw`] — so a stale pid file cannot kill an unrelated
+/// process (on Windows, an unrelated process TREE via `taskkill /T`).
 pub fn process_terminate(pid: u32) -> Result<()> {
+    if !process_is_rsclaw(pid) {
+        tracing::warn!(
+            pid,
+            "refusing to terminate process: not a running rsclaw process (stale pid?)"
+        );
+        anyhow::bail!("process {pid} is not a running rsclaw process; refusing to terminate");
+    }
     #[cfg(unix)]
     {
         if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
@@ -93,6 +188,7 @@ pub fn process_terminate(pid: u32) -> Result<()> {
     }
 }
 
+/// Build the main tokio runtime.
 pub fn build_runtime(_tier: MemoryTier) -> Result<tokio::runtime::Runtime> {
     // Use multi_thread with 1 worker and larger stack to avoid stack overflow
     // in debug builds with large code size.
@@ -163,7 +259,7 @@ pub fn detect_chrome() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        // Registry (most reliable for system + per-user installs).
+        // Registry (most reliable for system + per-user Google Chrome installs).
         for key_path in &[
             r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
             r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
@@ -186,36 +282,40 @@ pub fn detect_chrome() -> Option<String> {
                 }
             }
         }
-        let candidates = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-            r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-        ];
-        for path in &candidates {
-            if std::path::Path::new(path).exists() {
-                return Some((*path).to_string());
+
+        // Prefer any real Google Chrome discoverable on PATH before our managed
+        // build, but do not let Edge/Brave/Chromium outrank managed Chrome.
+        for name in &["google-chrome-stable", "google-chrome", "chrome"] {
+            if let Ok(path) = which::which(name) {
+                return Some(path.to_string_lossy().to_string());
             }
         }
-        // Per-user installs under %LOCALAPPDATA%.
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let user_candidates = [
-                format!(r"{local}\Google\Chrome\Application\chrome.exe"),
-                format!(r"{local}\Microsoft\Edge\Application\msedge.exe"),
-                format!(r"{local}\BraveSoftware\Brave-Browser\Application\brave.exe"),
-            ];
-            for path in &user_candidates {
-                if std::path::Path::new(path).exists() {
-                    return Some(path.clone());
-                }
+
+        let local = std::env::var("LOCALAPPDATA").ok();
+        let managed = managed_chrome();
+        for path in windows_browser_candidates(local.as_deref(), managed.as_deref()) {
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+
+        // Other Chromium-family browsers on PATH are the final Windows fallback.
+        for name in &[
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "microsoft-edge",
+            "microsoft-edge-stable",
+        ] {
+            if let Ok(path) = which::which(name) {
+                return Some(path.to_string_lossy().to_string());
             }
         }
     }
 
-    // PATH lookup (all platforms; primary path on Linux). Includes the
-    // distro-specific binary names apt/dnf/snap install under.
+    // PATH lookup (primary path on Unix). Includes the distro-specific binary
+    // names apt/dnf/snap install under.
+    #[cfg(not(target_os = "windows"))]
     for name in &[
         "google-chrome-stable",
         "google-chrome",
@@ -265,6 +365,33 @@ pub fn detect_chrome() -> Option<String> {
     None
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_browser_candidates(local: Option<&str>, managed: Option<&str>) -> Vec<String> {
+    let mut candidates = vec![
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_owned(),
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".to_owned(),
+    ];
+    if let Some(local) = local {
+        candidates.push(format!(r"{local}\Google\Chrome\Application\chrome.exe"));
+    }
+    if let Some(managed) = managed {
+        candidates.push(managed.to_owned());
+    }
+    candidates.extend([
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe".to_owned(),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".to_owned(),
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe".to_owned(),
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe".to_owned(),
+    ]);
+    if let Some(local) = local {
+        candidates.extend([
+            format!(r"{local}\Microsoft\Edge\Application\msedge.exe"),
+            format!(r"{local}\BraveSoftware\Brave-Browser\Application\brave.exe"),
+        ]);
+    }
+    candidates
+}
+
 /// Path to the rsclaw-managed Chrome for Testing under
 /// `~/.rsclaw/tools/chrome`, if a usable binary is present. Returns `None` when
 /// the dir is absent.
@@ -294,22 +421,25 @@ fn managed_chrome() -> Option<String> {
 
 /// Detect ffmpeg binary path.
 ///
-/// Priority: `~/.rsclaw/tools/ffmpeg/ffmpeg` > system PATH.
-/// Local-first because the bundled build is pinned to a known-good version
-/// and ships every codec we need; system ffmpeg may be a stripped distro
-/// build missing libopus/libx264.
+/// Priority: `~/.rsclaw/tools/ffmpeg/ffmpeg` > `tools/ffmpeg/bin/ffmpeg` >
+/// system PATH. Local-first because the bundled build is pinned to a
+/// known-good version and ships every codec we need; system ffmpeg may be a
+/// stripped distro build missing libopus/libx264. The `bin/` layout is what
+/// the Windows zip unpacks to (`tools install ffmpeg`).
 pub fn detect_ffmpeg() -> Option<String> {
     let tools_dir = rsclaw_config::loader::base_dir().join("tools/ffmpeg");
-    #[cfg(target_os = "windows")]
-    {
-        let local_win = tools_dir.join("ffmpeg.exe");
-        if local_win.exists() {
-            return Some(local_win.to_string_lossy().to_string());
+    let names: &[&str] = if cfg!(target_os = "windows") {
+        &["ffmpeg.exe", "ffmpeg"]
+    } else {
+        &["ffmpeg"]
+    };
+    for dir in [tools_dir.clone(), tools_dir.join("bin")] {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
         }
-    }
-    let local = tools_dir.join("ffmpeg");
-    if local.exists() {
-        return Some(local.to_string_lossy().to_string());
     }
     if let Ok(path) = which::which("ffmpeg") {
         return Some(path.to_string_lossy().to_string());
@@ -318,3 +448,35 @@ pub fn detect_ffmpeg() -> Option<String> {
 }
 pub mod capture;
 pub mod install_hints;
+
+#[cfg(test)]
+mod tests {
+    use super::windows_browser_candidates;
+
+    #[test]
+    fn windows_managed_chrome_precedes_edge_and_brave() {
+        let managed = r"C:\Users\test\.rsclaw\tools\chrome\chrome.exe";
+        let candidates =
+            windows_browser_candidates(Some(r"C:\Users\test\AppData\Local"), Some(managed));
+        let managed_index = candidates.iter().position(|path| path == managed).unwrap();
+        let first_alternative = candidates
+            .iter()
+            .position(|path| path.contains("Microsoft\\Edge") || path.contains("BraveSoftware"))
+            .unwrap();
+
+        assert!(managed_index < first_alternative);
+        assert!(
+            candidates[..managed_index]
+                .iter()
+                .all(|path| path.contains("Google\\Chrome"))
+        );
+    }
+
+    #[test]
+    fn process_terminate_refuses_non_rsclaw_pid() {
+        // pid 0 is never an rsclaw process; terminate must refuse rather
+        // than signal the process group / system idle process.
+        assert!(!super::process_is_rsclaw(0));
+        assert!(super::process_terminate(0).is_err());
+    }
+}

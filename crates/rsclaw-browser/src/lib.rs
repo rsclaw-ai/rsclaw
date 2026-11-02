@@ -26,6 +26,11 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+/// Upper bound for `download` in URL mode. The body is buffered in memory
+/// before being written, so cap it (1 GiB covers long videos) to keep a
+/// hostile or endless response from exhausting RAM.
+const MAX_URL_DOWNLOAD_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Minimum available memory (bytes) required to launch a new Chrome instance.
 const MIN_AVAILABLE_MEMORY: u64 = 200 * 1024 * 1024; // 200 MB
 
@@ -180,6 +185,8 @@ pub(crate) struct ChromeProcess {
     child: tokio::process::Child,
     ws_url: String,
     _tmp_dir: Option<tempfile::TempDir>,
+    /// Launched with a visible window (user-facing; never idle-reaped).
+    pub(crate) headed: bool,
 }
 
 impl ChromeProcess {
@@ -204,15 +211,31 @@ impl ChromeProcess {
                 .join("browser-profiles")
                 .join(profile_name);
             std::fs::create_dir_all(&profile_dir).ok();
+            // A Chrome still running on this profile (e.g. left over from a
+            // gateway restart) is asked to exit cleanly first so it flushes
+            // cookies; pkill below only catches one that doesn't respond.
+            close_profile_chrome_gracefully(profile_name, Duration::from_secs(5)).await;
             // Kill stale Chrome processes using this profile (e.g. after gateway restart).
             let profile_str = profile_dir.to_string_lossy().to_string();
             #[cfg(unix)]
             {
-                let _ = std::process::Command::new("pkill")
-                    .args(["-9", "-f", &format!("user-data-dir={}", profile_str)])
-                    .output();
-                // Brief pause for processes to exit.
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Anchor the pattern so profile `rsclaw` does not also kill
+                // Chrome instances of profile `rsclaw2` (pkill -f is an
+                // unanchored extended regex over the full command line).
+                let pattern = format!("user-data-dir={}( |$)", regex_escape_ere(&profile_str));
+                match tokio::process::Command::new("pkill")
+                    .args(["-9", "-f", &pattern])
+                    .output()
+                    .await
+                {
+                    Ok(out) => {
+                        // Exit 0 = killed something; wait briefly for exit.
+                        if out.status.success() {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "pkill for stale Chrome profile failed"),
+                }
             }
             // Remove stale lock files from previous Chrome instances.
             for lock_file in &["SingletonLock", "SingletonSocket", "SingletonCookie"] {
@@ -260,6 +283,12 @@ impl ChromeProcess {
             args.push("--headless=new");
         }
 
+        info!(
+            executable = chrome_path,
+            headed,
+            profile = ?profile,
+            "launching Chromium browser"
+        );
         let mut child = tokio::process::Command::new(chrome_path)
             .args(&args)
             .arg(format!("--user-data-dir={}", user_data_dir.display()))
@@ -267,48 +296,110 @@ impl ChromeProcess {
             .stdout(std::process::Stdio::null())
             .stdin(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| anyhow!("failed to launch Chrome at {chrome_path}: {e}"))?;
+            .map_err(|e| anyhow!("failed to launch browser at {chrome_path}: {e}"))?;
 
         // Read stderr until we find the DevTools WebSocket URL.
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| anyhow!("no stderr from Chrome process"))?;
+            .ok_or_else(|| anyhow!("no stderr from browser process at {chrome_path}"))?;
         let mut reader = BufReader::new(stderr).lines();
 
         let ws_url = time::timeout(Duration::from_secs(30), async {
             while let Some(line) = reader.next_line().await? {
-                debug!(line = %line, "chrome stderr");
+                debug!(executable = chrome_path, line = %line, "browser stderr");
                 if let Some(pos) = line.find("ws://") {
                     return Ok::<String, anyhow::Error>(line[pos..].trim().to_owned());
                 }
             }
-            Err(anyhow!("Chrome exited without printing DevTools URL"))
+            Err(anyhow!(
+                "browser at {chrome_path} exited without printing DevTools URL"
+            ))
         })
         .await
         .map_err(|e| {
-            // Chrome launched but didn't give us a WebSocket URL — kill it.
+            // The browser launched but didn't give us a WebSocket URL — kill it.
             let _ = child.start_kill();
-            anyhow!("timed out waiting for Chrome DevTools URL: {}", e)
+            anyhow!("timed out waiting for browser DevTools URL from {chrome_path}: {e}")
         })??;
 
-        debug!(ws_url = %ws_url, "Chrome DevTools URL discovered");
+        debug!(executable = chrome_path, ws_url = %ws_url, "browser DevTools URL discovered");
         ACTIVE_INSTANCES.fetch_add(1, Ordering::Relaxed);
         let active = ACTIVE_INSTANCES.load(Ordering::Relaxed);
         let max = max_instances();
-        info!(active, max, "Chrome instance launched");
+        info!(
+            executable = chrome_path,
+            active, max, "browser instance launched"
+        );
 
         Ok(Self {
             child,
             ws_url,
             _tmp_dir: tmp_dir,
+            headed,
         })
+    }
+
+    /// Ask Chrome to exit cleanly via the browser-level CDP `Browser.close`
+    /// and wait up to `timeout` for the process to exit. A clean exit lets
+    /// Chrome flush cookies / session storage to the profile; the hard kill
+    /// in `Drop` (used as the fallback) can lose the last ~30s of writes and
+    /// leaves a stale SingletonLock behind.
+    pub(crate) async fn close_gracefully(&mut self, timeout: Duration) {
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return; // already exited
+        }
+        match tokio::time::timeout(Duration::from_secs(3), CdpClient::connect(&self.ws_url)).await
+        {
+            Ok(Ok(browser)) => {
+                // The connection usually drops before a reply arrives once
+                // Chrome starts shutting down, so an error here is expected.
+                if let Err(e) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    browser.send("Browser.close", json!({})),
+                )
+                .await
+                .map_err(|_| anyhow!("timeout"))
+                .and_then(|r| r)
+                {
+                    debug!("Browser.close returned: {e:#}");
+                }
+            }
+            Ok(Err(e)) => debug!("graceful close: CDP connect failed: {e:#}"),
+            Err(_) => debug!("graceful close: CDP connect timed out"),
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                debug!("Chrome exited cleanly");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        warn!("Chrome did not exit within {timeout:?} after Browser.close; killing");
     }
 
     /// Extract the debugging port from the ws URL.
     pub(crate) fn port(&self) -> Result<u16> {
         parse_port_from_ws_url(&self.ws_url)
     }
+}
+
+/// Escape POSIX extended-regex metacharacters so a filesystem path can be
+/// embedded literally in a `pkill -f` pattern.
+#[cfg(unix)]
+fn regex_escape_ere(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '[' | ']' | '(' | ')' | '{' | '}' | '*' | '+' | '?' | '^' | '$' | '|' | '\\'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl Drop for ChromeProcess {
@@ -382,6 +473,13 @@ fn parse_port_from_ws_url(url: &str) -> Result<u16> {
     port_str
         .parse::<u16>()
         .map_err(|e| anyhow!("invalid port in ws URL: {e}"))
+}
+
+/// True when two URLs point at the same page, ignoring only a trailing `/`
+/// (so `https://a.com` == `https://a.com/`, but `https://a.com/` !=
+/// `https://a.com/s?wd=x`).
+fn same_page_url(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/')
 }
 
 /// True if two URLs share the same origin (scheme + host, ignoring port).
@@ -596,6 +694,17 @@ pub(crate) struct CdpClient {
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Value>>>>,
     events_rx: Mutex<mpsc::UnboundedReceiver<Value>>,
     next_id: AtomicU32,
+    /// Reader task handle. Aborted on drop so a replaced client (tab switch)
+    /// does not keep its WebSocket connection alive forever.
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for CdpClient {
+    fn drop(&mut self) {
+        // The writer task exits by itself once `ws_tx` is dropped; the reader
+        // holds the socket's read half and must be aborted explicitly.
+        self.reader.abort();
+    }
 }
 
 impl CdpClient {
@@ -635,7 +744,7 @@ impl CdpClient {
         });
 
         // Reader task.
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             while let Some(Ok(frame)) = ws_source.next().await {
                 let text = match frame {
                     tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
@@ -647,13 +756,22 @@ impl CdpClient {
                 if let Some(id) = val.get("id").and_then(|v| v.as_u64()) {
                     let mut map = pending_reader.lock().await;
                     if let Some(tx) = map.remove(&(id as u32)) {
-                        let _ = tx.send(val);
+                        if tx.send(val).is_err() {
+                            debug!(id, "CDP response arrived after the caller gave up");
+                        }
                     }
-                } else {
-                    // It is an event.
-                    let _ = events_tx.send(val);
+                } else if events_tx.send(val).is_err() {
+                    // It is an event, but nobody listens any more.
+                    break;
                 }
             }
+            // Socket closed: drop every pending waiter so callers fail fast
+            // with "channel closed" instead of waiting out the 180s budget.
+            let mut map = pending_reader.lock().await;
+            if !map.is_empty() {
+                warn!(pending = map.len(), "CDP WebSocket closed with pending requests");
+            }
+            map.clear();
         });
 
         Ok(Self {
@@ -662,6 +780,7 @@ impl CdpClient {
             pending,
             events_rx: Mutex::new(events_rx),
             next_id: AtomicU32::new(1),
+            reader,
         })
     }
 
@@ -684,9 +803,10 @@ impl CdpClient {
             map.insert(id, tx);
         }
 
-        self.ws_tx
-            .send(msg.to_string())
-            .map_err(|_| anyhow!("CDP WebSocket closed"))?;
+        if self.ws_tx.send(msg.to_string()).is_err() {
+            self.pending.lock().await.remove(&id);
+            bail!("CDP WebSocket closed");
+        }
 
         // 180s response budget. Most CDP messages return instantly; the
         // budget is for Runtime.evaluate-with-awaitPromise calls that
@@ -695,10 +815,15 @@ impl CdpClient {
         // plugin-side `await new Promise(setTimeout, ...)` waits, so the
         // host cut their JS short and surfaced "CDP response timeout for
         // Runtime.evaluate" as a fake publish failure.
-        let resp = time::timeout(Duration::from_secs(180), rx)
-            .await
-            .map_err(|_| anyhow!("CDP response timeout for {method}"))?
-            .map_err(|_| anyhow!("CDP response channel closed for {method}"))?;
+        let resp = match time::timeout(Duration::from_secs(180), rx).await {
+            Ok(r) => r.map_err(|_| anyhow!("CDP response channel closed for {method}"))?,
+            Err(_) => {
+                // Forget the waiter so a late response is dropped instead of
+                // leaking the entry forever.
+                self.pending.lock().await.remove(&id);
+                bail!("CDP response timeout for {method}");
+            }
+        };
 
         if let Some(err) = resp.get("error") {
             bail!("CDP error for {method}: {err}");
@@ -810,6 +935,19 @@ pub struct BrowserSession {
     /// `connect_existing` so Drop can close it, preventing tab leaks in the
     /// shared Chrome instance.
     owned_external_tab: Option<String>,
+    /// Target IDs of tabs rsclaw created (or was handed at attach time).
+    /// `cmd_open` only reuses these for same-origin navigation so it never
+    /// hijacks the user's own tabs in an attached external Chrome.
+    rsclaw_tabs: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Last http(s) URL the session was on. Restored after a crash restart
+    /// so callers (e.g. plugins working inside a logged-in portal) don't land
+    /// on about:blank.
+    last_url: Option<String>,
+    /// Attached to a Chrome rsclaw launched earlier on `profile` (e.g. one
+    /// left running across a gateway restart). Liveness is probed via the
+    /// debug port, and a dead adopted Chrome is relaunched on the same
+    /// profile instead of being re-acquired from the shared pool.
+    adopted: bool,
 }
 
 impl Drop for BrowserSession {
@@ -884,7 +1022,70 @@ async fn find_chrome_by_profile(profile_name: &str) -> Option<String> {
     Some(ws.to_string())
 }
 
+/// If a Chrome with a live DevTools endpoint is running on rsclaw profile
+/// `profile_name`, send it `Browser.close` and wait up to `timeout` for the
+/// endpoint to go away. Best-effort: callers still hard-kill leftovers.
+async fn close_profile_chrome_gracefully(profile_name: &str, timeout: Duration) {
+    let Some(ws_url) = find_chrome_by_profile(profile_name).await else {
+        return;
+    };
+    info!(profile = profile_name, "closing leftover Chrome on profile gracefully");
+    match tokio::time::timeout(Duration::from_secs(3), CdpClient::connect(&ws_url)).await {
+        Ok(Ok(browser)) => {
+            if let Err(e) = tokio::time::timeout(
+                Duration::from_secs(3),
+                browser.send("Browser.close", json!({})),
+            )
+            .await
+            .map_err(|_| anyhow!("timeout"))
+            .and_then(|r| r)
+            {
+                debug!("Browser.close returned: {e:#}");
+            }
+        }
+        Ok(Err(e)) => debug!("graceful close: CDP connect failed: {e:#}"),
+        Err(_) => debug!("graceful close: CDP connect timed out"),
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if find_chrome_by_profile(profile_name).await.is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    warn!(profile = profile_name, "leftover Chrome did not exit after Browser.close");
+}
+
+/// WebSocket URL of a live Chrome running on rsclaw profile `profile_name`,
+/// if any (see `find_chrome_by_profile`).
+pub(crate) async fn running_profile_chrome(profile_name: &str) -> Option<String> {
+    find_chrome_by_profile(profile_name).await
+}
+
 impl BrowserSession {
+    /// Remember a tab rsclaw created so `cmd_open` may reuse it later.
+    fn note_rsclaw_tab(&self, target_id: &str) {
+        if target_id.is_empty() {
+            return;
+        }
+        self.rsclaw_tabs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(target_id.to_owned());
+    }
+
+    /// True when `target_id` belongs to rsclaw: every tab of a Chrome we
+    /// launched ourselves (dedicated profile), or a tab we created/attached
+    /// to in an external Chrome.
+    fn is_rsclaw_tab(&self, target_id: &str) -> bool {
+        self.chrome.is_some()
+            || self
+                .rsclaw_tabs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(target_id)
+    }
+
     /// Open a Chrome session. Decision tree (most-preferred first):
     ///
     /// 1. **CDP attach to any debug-enabled chrome** on 9222 / 9223 — if the
@@ -925,48 +1126,74 @@ impl BrowserSession {
             return Self::connect_existing_reuse(&ws_url).await;
         }
 
-        // 2. rsclaw's named profile already has a chrome alive on it?
-        if let Some(profile_name) = profile {
+        // System Chrome launches on rsclaw's persistent "default" profile
+        // (resolved to ~/.rsclaw/browser-profiles/default by
+        // ChromeProcess::launch). That dir is debuggable under Chrome 136+
+        // (which blocks debugging on the browser's own default profile) and
+        // lives in its own user-data-dir, so it coexists with the user's daily
+        // Chrome. Login state is entered once and persists across restarts.
+        //
+        // An explicitly requested profile always wins: plugins share the
+        // "rsclaw" profile so one portal login covers all of them, and
+        // swapping it for "default" both split their cookie jar between two
+        // dirs and collided with web_browser's pool Chrome on "default".
+        let chosen_profile = match profile {
+            Some(p) => Some(p),
+            None if is_system_chrome(chrome_path) => Some("default"),
+            None => None,
+        };
+
+        // 2. A Chrome rsclaw started earlier is still alive on the profile we
+        //    would use (typically left running across a gateway restart):
+        //    adopt it and keep its open page and login state instead of
+        //    killing it and starting over on about:blank.
+        let mut candidates: Vec<&str> = Vec::new();
+        for p in [chosen_profile, profile].into_iter().flatten() {
+            if !candidates.contains(&p) {
+                candidates.push(p);
+            }
+        }
+        for profile_name in candidates {
             if let Some(ws_url) = find_chrome_by_profile(profile_name).await {
                 info!(
                     profile = profile_name,
-                    "BrowserSession: reusing existing chrome on rsclaw profile"
+                    "BrowserSession: adopting running chrome on rsclaw profile"
                 );
-                return Self::connect_existing_reuse(&ws_url).await;
+                let mut session = Self::connect_existing_reuse(&ws_url).await?;
+                session.chrome_path = chrome_path.to_owned();
+                session.headed = headed;
+                session.profile = Some(profile_name.to_owned());
+                session.adopted = true;
+                return Ok(session);
             }
         }
 
-        // 3. System Chrome: launch it against rsclaw's persistent "default" profile
-        //    (resolved to ~/.rsclaw/browser-profiles/default by ChromeProcess::launch).
-        //    That dir is debuggable under Chrome 136+ (which blocks debugging on the
-        //    browser's own default profile) AND lives in its own user-data-dir, so it
-        //    coexists with the user's daily Chrome — no need to refuse or ask them to
-        //    quit. Login state is entered once and persists across restarts.
-        let mut chosen_profile = profile;
-        if is_system_chrome(chrome_path) {
+        if chosen_profile != profile {
             info!(
-                "BrowserSession: launching system Chrome with rsclaw's persistent 'default' profile"
+                executable = chrome_path,
+                "BrowserSession: launching system Chromium browser with rsclaw's persistent 'default' profile"
             );
-            chosen_profile = Some("default");
         }
 
-        // 5. Launch (either user's profile via "default" or rsclaw isolated). If the
-        //    path-3 attempt with the user's profile fails (broken Chrome install /
-        //    corrupted local profile / OS sandbox issue — symptom is "Chrome quit
-        //    unexpectedly"), fall back to rsclaw's isolated profile so the gateway
-        //    stays usable instead of returning an error to every tool call.
-        let (chrome, port, cdp) = match Self::try_launch(chrome_path, headed, chosen_profile).await
-        {
-            Ok(triple) => triple,
-            Err(e) if chosen_profile == Some("default") && profile.is_some() => {
-                warn!(
-                    "BrowserSession: launching user's Chrome failed ({e:#}); \
-                     falling back to rsclaw isolated profile"
-                );
-                Self::try_launch(chrome_path, headed, profile).await?
-            }
-            Err(e) => return Err(e),
-        };
+        // 3. Launch. If the system-Chrome attempt on "default" fails (broken
+        //    install / corrupted local profile / OS sandbox issue — symptom is
+        //    "Chrome quit unexpectedly"), fall back to the requested profile so
+        //    the gateway stays usable. Remember the profile actually used so a
+        //    later restart reopens the SAME cookie jar (restarting on a
+        //    different profile looked exactly like being logged out).
+        let (chrome, port, cdp, used_profile) =
+            match Self::try_launch(chrome_path, headed, chosen_profile).await {
+                Ok((c, p, d)) => (c, p, d, chosen_profile),
+                Err(e) if chosen_profile == Some("default") && profile.is_none() => {
+                    warn!(
+                        "BrowserSession: launching user's Chrome failed ({e:#}); \
+                         falling back to rsclaw isolated profile"
+                    );
+                    let (c, p, d) = Self::try_launch(chrome_path, headed, profile).await?;
+                    (c, p, d, profile)
+                }
+                Err(e) => return Err(e),
+            };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -981,7 +1208,7 @@ impl BrowserSession {
             ref_counter: 0,
             chrome_path: chrome_path.to_owned(),
             headed,
-            profile: profile.map(str::to_owned),
+            profile: used_profile.map(str::to_owned),
             pending_dialog: None,
             blocked_urls: Vec::new(),
             intercept_rules: Vec::new(),
@@ -989,6 +1216,9 @@ impl BrowserSession {
             before_screenshot: None,
             recording: None,
             owned_external_tab: None,
+            rsclaw_tabs: std::sync::Mutex::new(std::collections::HashSet::new()),
+            last_url: None,
+            adopted: false,
         })
     }
 
@@ -1033,8 +1263,11 @@ impl BrowserSession {
             None
         };
 
-        let (tab_ws_url, owned_tab_id) = if let Some((url, _id)) = reused {
+        let mut initial_tabs = std::collections::HashSet::new();
+        let (tab_ws_url, owned_tab_id) = if let Some((url, id)) = reused {
             debug!("reusing existing tab — will NOT close on drop");
+            // The session drives this tab from now on, so treat it as ours.
+            initial_tabs.insert(id);
             (url, None)
         } else {
             // Create a new tab — we own it and must close it on drop.
@@ -1103,7 +1336,15 @@ impl BrowserSession {
             last_activity: Arc::new(AtomicU64::new(now)),
             before_screenshot: None,
             recording: None,
-            owned_external_tab: owned_tab_id,
+            owned_external_tab: owned_tab_id.clone(),
+            rsclaw_tabs: std::sync::Mutex::new({
+                if let Some(id) = owned_tab_id {
+                    initial_tabs.insert(id);
+                }
+                initial_tabs
+            }),
+            last_url: None,
+            adopted: false,
         })
     }
 
@@ -1175,12 +1416,27 @@ impl BrowserSession {
     pub fn is_alive(&mut self) -> bool {
         match self.chrome {
             Some(ref mut chrome) => matches!(chrome.child.try_wait(), Ok(None)),
+            // An adopted Chrome has no child handle; probe its debug port.
+            None if self.adopted => std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], self.debug_port)),
+                Duration::from_millis(300),
+            )
+            .is_ok(),
             None => true,
         }
     }
 
     /// Check idle timeout: returns true if session has been idle too long.
+    ///
+    /// Only throwaway sessions (headless, no named profile) expire. Headed
+    /// sessions and sessions on a persistent profile hold user-visible state
+    /// — open pages and logins in a portal — that an idle restart would
+    /// destroy (back to about:blank, session cookies lost), so they never
+    /// idle-expire; they are restarted only when Chrome actually dies.
     pub fn is_idle_expired(&self) -> bool {
+        if self.headed || self.profile.is_some() {
+            return false;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1194,12 +1450,17 @@ impl BrowserSession {
     /// Resets `last_activity` to "now" before returning so the very next
     /// execute() doesn't immediately re-trigger idle-expiry on the same
     /// stale timestamp (caused a tight restart loop that ended in
-    /// "Chrome exited without printing DevTools URL" — see
+    /// "browser exited without printing DevTools URL" — see
     /// browser/mod.rs::execute checks 1 and 2).
     async fn restart(&mut self) -> Result<()> {
         warn!("restarting Chrome browser session");
-        if self.chrome.is_some() {
-            // Drop old chrome (kills process via Drop) and launch new one.
+        if self.chrome.is_some() || self.adopted {
+            // Let the old Chrome exit cleanly first so the profile's cookies
+            // and session state are flushed; Drop hard-kills whatever is left.
+            if let Some(mut old) = self.chrome.take() {
+                old.close_gracefully(Duration::from_secs(5)).await;
+                drop(old);
+            }
             let new_chrome =
                 ChromeProcess::launch(&self.chrome_path, self.headed, self.profile.as_deref())
                     .await?;
@@ -1208,6 +1469,8 @@ impl BrowserSession {
             self.debug_port = port;
             self.chrome = Some(new_chrome);
             self.cdp = new_cdp;
+            self.adopted = false;
+            self.owned_external_tab = None;
         } else {
             // External Chrome: create a fresh tab (don't hijack user's existing tabs).
             let browser_ws = format!("ws://127.0.0.1:{}/devtools/browser", self.debug_port);
@@ -1261,6 +1524,7 @@ impl BrowserSession {
                 .to_owned();
             // Mark the new tab as owned so Drop closes it and prevents leaks.
             self.owned_external_tab = Some(target_id.clone());
+            self.note_rsclaw_tab(&target_id);
             // browser_cdp intentionally dropped here — we only needed it for
             // Target.closeTarget and Target.createTarget.
             drop(browser_cdp);
@@ -1298,10 +1562,19 @@ impl BrowserSession {
 
     /// Main dispatch: execute a browser action.
     pub async fn execute(&mut self, action: &str, args: &Value) -> Result<Value> {
-        // Check liveness: if Chrome died, restart
+        // Check liveness: if Chrome died, restart and return to the page we
+        // were on, so a crash doesn't strand the caller on about:blank.
         if !self.is_alive() {
             warn!("Chrome process not alive, restarting");
             self.restart().await?;
+            if let Some(url) = self.last_url.clone()
+                && !matches!(action, "open" | "navigate")
+            {
+                info!(url = %url, "restoring last page after Chrome restart");
+                if let Err(e) = self.cmd_open(&json!({ "url": url })).await {
+                    warn!("failed to restore last page after restart: {e:#}");
+                }
+            }
         }
 
         // Check idle timeout: if expired, restart for fresh state
@@ -1451,6 +1724,25 @@ impl BrowserSession {
             other => Err(anyhow!("web_browser: unsupported action `{other}`")),
         };
 
+        // Remember where we are so a crash restart can come back here.
+        if let Ok(ref val) = result {
+            let url = val
+                .get("url")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    if matches!(action, "open" | "navigate") {
+                        args.get("url").and_then(|v| v.as_str())
+                    } else {
+                        None
+                    }
+                });
+            if let Some(u) = url
+                && (u.starts_with("http://") || u.starts_with("https://"))
+            {
+                self.last_url = Some(u.to_owned());
+            }
+        }
+
         // Record operation if recording is active.
         if let Ok(ref _val) = result {
             if let Some(ref mut entries) = self.recording {
@@ -1512,7 +1804,7 @@ impl BrowserSession {
         // This prevents redundant reloads when plugins call browser_open in a loop.
         if let Ok(current_val) = self.cmd_get_url().await {
             if let Some(current) = current_val.get("url").and_then(|v| v.as_str()) {
-                if current == url || current.starts_with(url) || url.starts_with(current) {
+                if same_page_url(current, url) {
                     let skills = rsclaw_config::loader::applicable_site_rules(&url);
                     let mut result = json!({
                         "action": "open",
@@ -1547,6 +1839,7 @@ impl BrowserSession {
             if let Ok(targets) = resp.json::<Vec<Value>>().await {
                 if let Some(existing) = targets.iter().find(|t| {
                     t["type"].as_str() == Some("page")
+                        && t["id"].as_str().is_some_and(|id| self.is_rsclaw_tab(id))
                         && t["url"]
                             .as_str()
                             .map(|u| same_origin(u, url))
@@ -2552,7 +2845,9 @@ impl BrowserSession {
                 "Page.setDownloadBehavior",
                 json!({
                     "behavior": "allow",
-                    "downloadPath": "/tmp/rsclaw-downloads",
+                    "downloadPath": std::env::temp_dir()
+                        .join("rsclaw-downloads")
+                        .to_string_lossy(),
                 }),
             )
             .await?;
@@ -2578,11 +2873,6 @@ impl BrowserSession {
         timeout_secs: u64,
         referer: Option<&str>,
     ) -> Result<Value> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| anyhow!("download(url): build client: {e}"))?;
-
         // Pull session cookies for this URL from the browser via CDP and
         // build a Cookie header. This lets the request piggyback on the
         // user's logged-in session for CDN-auth-gated URLs.
@@ -2608,34 +2898,51 @@ impl BrowserSession {
             Err(_) => String::new(),
         };
 
-        let mut req = client.get(url);
+        use reqwest::header::{COOKIE, HeaderMap, HeaderValue, REFERER, USER_AGENT};
+        let mut headers = HeaderMap::new();
         if let Some(r) = referer {
             if !r.is_empty() {
-                req = req.header("Referer", r);
+                match HeaderValue::from_str(r) {
+                    Ok(v) => {
+                        headers.insert(REFERER, v);
+                    }
+                    Err(e) => warn!(error = %e, "download(url): invalid referer ignored"),
+                }
             }
         }
         if !cookie_header.is_empty() {
-            req = req.header("Cookie", cookie_header);
+            match HeaderValue::from_str(&cookie_header) {
+                Ok(v) => {
+                    headers.insert(COOKIE, v);
+                }
+                Err(e) => warn!(error = %e, "download(url): invalid cookie header ignored"),
+            }
         }
         // Mimic Safari rather than Chrome — some Bytedance CDNs (jimeng,
         // douyin) treat Chrome UA strings differently (or block them).
         // Safari is what the user's normal browser session would send.
-        req = req.header(
-            "User-Agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+            ),
         );
-        let resp = req
-            .send()
+        // The URL comes from a plugin / page, so fetch it SSRF-safely: only
+        // public http(s) targets, DNS pinned, every redirect hop re-checked
+        // (cookies are dropped on cross-origin hops).
+        let mut sreq = rsclaw_util::net::SafeRequest::get(url);
+        sreq.headers = headers;
+        sreq.timeout = Duration::from_secs(timeout_secs);
+        let resp = rsclaw_util::net::safe_send(reqwest::Client::builder, sreq)
             .await
-            .map_err(|e| anyhow!("download(url): send: {e}"))?;
+            .map_err(|e| anyhow!("download(url): send: {e:#}"))?;
         let status = resp.status();
         if !status.is_success() {
             bail!("download(url): HTTP {status}");
         }
-        let bytes = resp
-            .bytes()
+        let bytes = rsclaw_util::net::read_body_limited(resp, MAX_URL_DOWNLOAD_BYTES)
             .await
-            .map_err(|e| anyhow!("download(url): read body: {e}"))?;
+            .map_err(|e| anyhow!("download(url): read body: {e:#}"))?;
 
         let dest = std::path::PathBuf::from(dest_path);
         if let Some(parent) = dest.parent() {
@@ -2691,7 +2998,7 @@ impl BrowserSession {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let stage_dir = std::path::PathBuf::from(format!("/tmp/rsclaw-dl-{nanos:x}"));
+        let stage_dir = std::env::temp_dir().join(format!("rsclaw-dl-{nanos:x}"));
         std::fs::create_dir_all(&stage_dir)
             .map_err(|e| anyhow!("download: create stage dir: {e}"))?;
 
@@ -2995,9 +3302,17 @@ impl BrowserSession {
     }
 
     async fn cmd_reload(&self) -> Result<Value> {
+        // Drop stale events first so a load event left over from an earlier
+        // navigation does not satisfy the wait below immediately.
+        {
+            let mut rx = self.cdp.events_rx.lock().await;
+            CdpClient::drain_events(&mut rx);
+        }
         self.cdp.send("Page.reload", json!({})).await?;
         // Wait for load event.
-        let _ = self.cdp.wait_event("Page.loadEventFired", 15).await;
+        if let Err(e) = self.cdp.wait_event("Page.loadEventFired", 15).await {
+            debug!(error = %e, "reload: no load event before timeout");
+        }
         Ok(json!({ "action": "reload", "text": "Page reloaded" }))
     }
 
@@ -3305,6 +3620,7 @@ impl BrowserSession {
             .get("targetId")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        self.note_rsclaw_tab(target_id);
         Ok(json!({"action": "new_tab", "targetId": target_id}))
     }
 
@@ -3979,6 +4295,7 @@ impl BrowserSession {
                     )
                     .await?;
                 let target_id = result["targetId"].as_str().unwrap_or("");
+                self.note_rsclaw_tab(target_id);
                 Ok(json!({"action": "context", "sub": "new_tab", "targetId": target_id}))
             }
             _ => Err(anyhow!("context: use new/dispose/new_tab")),
@@ -4620,7 +4937,7 @@ async fn save_screenshot_bytes(b64_data: &str, format: &str) -> Result<String> {
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw")
+        .join(rsclaw_brand::CLI_NAME)
         .join("screenshots");
     tokio::fs::create_dir_all(&save_dir)
         .await
@@ -4946,8 +5263,29 @@ mod tests {
         assert_eq!(p, 9999);
     }
 
+    /// Needs a local Chrome; run with
+    /// `cargo test -p rsclaw-browser --lib -- --ignored chrome_closes_gracefully`.
+    #[tokio::test]
+    #[ignore]
+    async fn chrome_closes_gracefully() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let path = rsclaw_platform::detect_chrome().expect("Chrome installed");
+        let mut chrome = crate::ChromeProcess::launch(&path, false, None)
+            .await
+            .expect("launch Chrome");
+        let started = std::time::Instant::now();
+        chrome.close_gracefully(std::time::Duration::from_secs(5)).await;
+        assert!(
+            matches!(chrome.child.try_wait(), Ok(Some(_))),
+            "Chrome should exit on Browser.close without the hard kill"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     #[tokio::test]
     async fn detect_existing_chrome_skips_headless() {
+        // reqwest is built without a default rustls provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let server = MockServer::start().await;
         let port = server.address().port();
         let body = json!({
@@ -4969,6 +5307,8 @@ mod tests {
 
     #[tokio::test]
     async fn detect_existing_chrome_accepts_headed() {
+        // reqwest is built without a default rustls provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let server = MockServer::start().await;
         let port = server.address().port();
         let ws = format!("ws://127.0.0.1:{port}/devtools/browser/def");

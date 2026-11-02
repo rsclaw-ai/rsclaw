@@ -61,6 +61,8 @@ pub enum WatchStartError {
     InvalidRegex(String),
     #[error("invalid jq expression: {0}")]
     InvalidJq(String),
+    #[error("invalid url: {0}")]
+    InvalidUrl(String),
     #[error("unresolved env var: {0}")]
     UnresolvedEnv(String),
     #[error("shell exited immediately (code={0:?})")]
@@ -79,14 +81,28 @@ pub enum SourceImpl {
     Sse(SseSource),
 }
 
+/// Tails an arbitrary local file.
+///
+/// SECURITY: owner-only. This source can read any file the gateway process
+/// can read; the `/watch file` command must only be reachable by the owner
+/// (enforced by the preparse owner gate, not here).
 pub struct FileSource {
     pub path: PathBuf,
 }
 
+/// Runs an arbitrary shell command (`sh -c` / `powershell -Command`) and
+/// streams its output.
+///
+/// SECURITY: owner-only. This is host command execution; the `/watch shell`
+/// command must only be reachable by the owner (enforced by the preparse
+/// owner gate, not here).
 pub struct ShellSource {
     pub cmd: String,
 }
 
+/// Streams a remote Server-Sent Events endpoint. The URL is restricted to
+/// public http(s) hosts (SSRF guard, re-checked on every reconnect) and only
+/// `${RSCLAW_WATCH_*}` env vars are expanded into the URL / headers.
 pub struct SseSource {
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -99,6 +115,7 @@ impl SseSource {
     pub fn build(url: &str, headers: &[(String, String)]) -> Result<Self, WatchStartError> {
         let url = crate::sse::substitute_env_vars(url)
             .map_err(|e| WatchStartError::UnresolvedEnv(e.to_string()))?;
+        validate_sse_url_static(&url)?;
         let mut subst_headers = Vec::with_capacity(headers.len());
         for (k, v) in headers {
             let v2 = crate::sse::substitute_env_vars(v)
@@ -110,6 +127,23 @@ impl SseSource {
             headers: subst_headers,
         })
     }
+}
+
+/// Cheap synchronous pre-check so obviously bad SSE targets fail at
+/// `/watch` time instead of on the first connect. Private addresses are
+/// allowed: `/watch` is owner-only.
+fn validate_sse_url_static(raw: &str) -> Result<(), WatchStartError> {
+    let parsed = url::Url::parse(raw).map_err(|e| WatchStartError::InvalidUrl(e.to_string()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(WatchStartError::InvalidUrl(format!(
+            "scheme `{}` not allowed (http/https only)",
+            parsed.scheme()
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(WatchStartError::InvalidUrl("missing host".to_owned()));
+    }
+    Ok(())
 }
 
 impl SourceImpl {
@@ -326,4 +360,27 @@ fn inode_from_metadata(m: &std::fs::Metadata) -> Option<u64> {
 #[cfg(not(unix))]
 fn inode_from_metadata(_m: &std::fs::Metadata) -> Option<u64> {
     None
+}
+
+#[cfg(test)]
+mod sse_url_tests {
+    use super::*;
+
+    #[test]
+    fn sse_build_rejects_non_http_targets_but_allows_private_hosts() {
+        // `/watch` is owner-only, so local / LAN event streams are allowed.
+        for bad in ["file:///etc/passwd", "ftp://example.com/x", "not a url"] {
+            assert!(
+                matches!(SseSource::build(bad, &[]), Err(WatchStartError::InvalidUrl(_))),
+                "should reject {bad}"
+            );
+        }
+        for ok in [
+            "https://example.com/stream",
+            "http://127.0.0.1:8080/events",
+            "http://192.168.1.10/stream",
+        ] {
+            assert!(SseSource::build(ok, &[]).is_ok(), "should accept {ok}");
+        }
+    }
 }

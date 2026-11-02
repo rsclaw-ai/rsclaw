@@ -81,6 +81,9 @@ pub struct AgentHandle {
     /// shared prefix KV cache stays intact across overrides.
     pub plugin_overrides:
         Arc<std::sync::RwLock<HashMap<String, HashMap<String, crate::runtime::PluginOverride>>>>,
+    /// Per-session model switches from `/model <name>`:
+    /// `session_key → provider/model`. Runtime only; see `model_switch`.
+    pub model_overrides: Arc<std::sync::RwLock<HashMap<String, String>>>,
     /// Loaded WASM plugins shared with queue-bypassing slash handlers.
     pub wasm_plugins: Arc<std::sync::RwLock<Arc<Vec<rsclaw_plugin::WasmPlugin>>>>,
     /// Outbound notification sender shared with queue-bypassing slash handlers.
@@ -110,12 +113,11 @@ pub struct AgentHandle {
     pub last_tools_tokens: Arc<AtomicUsize>,
     /// Message-history tokens of the most recent LLM call.
     pub last_msg_tokens: Arc<AtomicUsize>,
-    /// Signal to clear all sessions (set by /clear bypass, consumed by
-    /// runtime).
-    pub clear_signal: Arc<AtomicBool>,
-    /// Signal to start a new session (set by /new bypass, consumed by runtime).
-    /// Unlike clear_signal, this increments the archive generation.
-    pub new_session_signal: Arc<AtomicBool>,
+    /// Pending per-session `/clear` / `/new` requests queued by the
+    /// preparse bypass and consumed by the runtime (next turn of the matching
+    /// session, or mid-loop if that session is running). Scoped to one
+    /// session — never touches other users' sessions.
+    pub session_resets: Arc<std::sync::Mutex<Vec<SessionResetRequest>>>,
     /// Context window in tokens for this agent's primary model. Resolved
     /// at construction time by looking up the model name (e.g.
     /// `brain/brain-model`) in the provider config's `contextWindow`
@@ -137,6 +139,76 @@ pub struct AgentHandle {
     pub js_plugins: Arc<std::sync::RwLock<Option<Arc<rsclaw_plugin::PluginRegistry>>>>,
 }
 
+/// What a queued session reset does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionResetKind {
+    /// `/clear`: drop the session history, keeping a short summary.
+    Clear,
+    /// `/new`: start a new archive generation (summary goes to memory only).
+    NewGeneration,
+    /// Session deleted (HTTP / WS delete): drop the in-memory state and the
+    /// persisted rows without writing any summary back.
+    Delete,
+}
+
+/// A `/clear` or `/new` request queued for one session.
+///
+/// When the requester knows the exact session key the turn will use, build
+/// it with [`SessionResetRequest::exact`]: only that session matches. When it
+/// can only guess the key (cron replay, callers without channel context),
+/// [`SessionResetRequest::with_sender_fallback`] also matches a turn from the
+/// same `(channel, peer_id)` sender. Empty `channel` / `peer_id` disable the
+/// sender fallback.
+#[derive(Debug, Clone)]
+pub struct SessionResetRequest {
+    pub kind: SessionResetKind,
+    /// Session key as derived by the requester (preparse).
+    pub session_key: String,
+    /// Channel the command arrived on (empty = exact-key match only).
+    pub channel: String,
+    /// Sender peer id of the command (empty = exact-key match only).
+    pub peer_id: String,
+}
+
+impl SessionResetRequest {
+    /// Request that matches only the turn whose session key is `session_key`.
+    pub fn exact(kind: SessionResetKind, session_key: impl Into<String>) -> Self {
+        Self {
+            kind,
+            session_key: session_key.into(),
+            channel: String::new(),
+            peer_id: String::new(),
+        }
+    }
+
+    /// Request that matches `session_key`, or any turn from the same
+    /// `(channel, peer_id)` sender. Use only when the exact key is unknown.
+    pub fn with_sender_fallback(
+        kind: SessionResetKind,
+        session_key: impl Into<String>,
+        channel: impl Into<String>,
+        peer_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            session_key: session_key.into(),
+            channel: channel.into(),
+            peer_id: peer_id.into(),
+        }
+    }
+
+    fn matches(&self, session_key: &str, channel: &str, peer_id: &str) -> bool {
+        self.session_key == session_key
+            || (!self.channel.is_empty()
+                && !self.peer_id.is_empty()
+                && self.channel == channel
+                && self.peer_id == peer_id)
+    }
+}
+
+/// Upper bound on queued reset requests per agent; the oldest are dropped.
+const MAX_PENDING_SESSION_RESETS: usize = 256;
+
 /// Per-session context token statistics.
 #[derive(Debug, Clone, Default)]
 pub struct SessionTokens {
@@ -151,6 +223,45 @@ pub struct SessionTokens {
 }
 
 impl AgentHandle {
+    /// Queue a `/clear` or `/new` for one session. A newer request for the
+    /// same session replaces an older one.
+    pub fn request_session_reset(&self, req: SessionResetRequest) {
+        let mut q = self
+            .session_resets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        q.retain(|r| r.session_key != req.session_key);
+        q.push(req);
+        if q.len() > MAX_PENDING_SESSION_RESETS {
+            let excess = q.len() - MAX_PENDING_SESSION_RESETS;
+            q.drain(..excess);
+        }
+    }
+
+    /// Remove and return the reset queued for this turn's session, if any.
+    /// When several match, the most recent request wins.
+    pub fn take_session_reset(
+        &self,
+        session_key: &str,
+        channel: &str,
+        peer_id: &str,
+    ) -> Option<SessionResetKind> {
+        let mut q = self
+            .session_resets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut found = None;
+        q.retain(|r| {
+            if r.matches(session_key, channel, peer_id) {
+                found = Some(r.kind);
+                false
+            } else {
+                true
+            }
+        });
+        found
+    }
+
     /// Replace the WASM plugin snapshot visible to slash handlers.
     pub fn set_wasm_plugins(&self, plugins: Arc<Vec<rsclaw_plugin::WasmPlugin>>) {
         if let Ok(mut g) = self.wasm_plugins.write() {
@@ -402,6 +513,32 @@ impl AgentHandle {
     /// gateway fast-preparse path and the agent-queue `__MODELS__` template,
     /// so the two can never drift (they previously rendered "default" vs the
     /// resolved name independently).
+    /// The model `/model` switched `session_key` to, if any.
+    pub fn session_model(&self, session_key: &str) -> Option<String> {
+        self.model_overrides.read().ok()?.get(session_key).cloned()
+    }
+
+    /// Switches `session_key` to `model`, or back to the configured model.
+    pub fn set_session_model(&self, session_key: &str, model: Option<String>) {
+        if let Ok(mut g) = self.model_overrides.write() {
+            match model {
+                Some(m) => g.insert(session_key.to_owned(), m),
+                None => g.remove(session_key),
+            };
+        }
+    }
+
+    /// `format_models`, leading with the model `session_key` was switched to.
+    pub fn format_models_for(&self, session_key: &str) -> String {
+        match self.session_model(session_key) {
+            Some(m) => format!(
+                "This chat: {m} (/model default to switch back)\n{}",
+                self.format_models().replacen("Current model:", "Default model:", 1)
+            ),
+            None => self.format_models(),
+        }
+    }
+
     pub fn format_models(&self) -> String {
         let mut lines = vec![format!("Current model: {}", self.effective_model)];
         lines.push(String::new());
@@ -439,6 +576,13 @@ pub struct TurnContext {
     /// advancing for a while, a tool is genuinely wedged and the turn is
     /// cancelled. `None` for non-A2A/legacy turns (no watchdog wiring).
     pub progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// The turn's steps (one line per tool call), shared with the spawner so
+    /// a turn it hard-cancels still leaves a note of what was done.
+    pub steps: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    /// Trust level of the sender driving this turn (copied from
+    /// `AgentMessage.trust`). Defaults to `User` so any path that forgets to
+    /// set it fails closed.
+    pub trust: crate::trust::SenderTrust,
 }
 
 impl TurnContext {
@@ -448,6 +592,13 @@ impl TurnContext {
     pub fn progress_tick(&self) {
         if let Some(p) = &self.progress {
             p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record a step in the shared list (no-op when unset).
+    pub fn record_step(&self, line: &str) {
+        if let Some(steps) = &self.steps {
+            steps.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_owned());
         }
     }
 
@@ -556,6 +707,10 @@ pub struct AgentMessage {
     pub images: Vec<ImageAttachment>,
     /// File attachments (raw bytes). Empty for text-only messages.
     pub files: Vec<FileAttachment>,
+    /// Trust level of the sender. Gates high-risk tools and local commands;
+    /// see [`crate::trust`]. Every construction site must decide this
+    /// explicitly — there is deliberately no default.
+    pub trust: crate::trust::SenderTrust,
 }
 
 /// Extract `[file:path]` references from user text, read the files from disk,
@@ -569,6 +724,8 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"\[file:([^\]]+)\]").expect("file ref regex")
     });
+    let rewritten = rewrite_library_refs(text);
+    let text = rewritten.as_str();
 
     let mut images = Vec::new();
     let mut files = Vec::new();
@@ -683,6 +840,74 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
     let cleaned = RE.replace_all(text, "").to_string();
     let cleaned = cleaned.trim().to_owned();
     (cleaned, images, files)
+}
+
+/// Rewrite gateway file-library markers, `[file:<name>](rsclaw-file:<id>)`,
+/// which a client inserts for a file it put through `POST /v1/files`.
+/// A file stored under a canonical upload name becomes its `@token`, which
+/// the `@`-reference resolver later lists for the model (images go to
+/// vision). An older library file is kept where it is: an image becomes a
+/// `[file:<path>]` marker and is attached below; anything else becomes a
+/// plain mention of its path, so audio and video reach the model's tools
+/// instead of being transcribed or parked in the file menu.
+fn rewrite_library_refs(text: &str) -> String {
+    static LIB_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\[file:([^\]\n]+)\]\(rsclaw-file:([^)\s]+)\)").expect("library ref regex")
+    });
+    if !text.contains("rsclaw-file:") {
+        return text.to_owned();
+    }
+    LIB_RE
+        .replace_all(text, |cap: &regex::Captures<'_>| {
+            let name = cap[1].trim();
+            let id = &cap[2];
+            match library_file(id) {
+                Some(LibraryFile::Token(token)) => format!("@{token}"),
+                Some(LibraryFile::Path(path)) => {
+                    let lower = path.to_lowercase();
+                    let image = [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+                        .iter()
+                        .any(|e| lower.ends_with(e));
+                    if image {
+                        format!("[file:{path}]")
+                    } else {
+                        format!("[attached file: {name} = {path}]")
+                    }
+                }
+                None => {
+                    tracing::warn!(file_id = id, "file ref: library file not found");
+                    format!("[attached file: {name} (unavailable)]")
+                }
+            }
+        })
+        .into_owned()
+}
+
+enum LibraryFile {
+    Token(String),
+    Path(String),
+}
+
+/// Find a `POST /v1/files` upload by id under `<base>/var/data/files/`.
+fn library_file(id: &str) -> Option<LibraryFile> {
+    // Ids are `file-<hex>`; anything else could walk out of the directory.
+    let hex = id.strip_prefix("file-")?;
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let dir = rsclaw_config::loader::base_dir().join("var/data/files");
+    if let Ok(meta) = std::fs::read_to_string(dir.join(format!("{id}.meta.json")))
+        && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta)
+        && let Some(token) = meta["token"].as_str().filter(|t| !t.is_empty())
+    {
+        return Some(LibraryFile::Token(token.to_owned()));
+    }
+    let prefix = format!("{id}_");
+    std::fs::read_dir(&dir).ok()?.flatten().find_map(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        (name.starts_with(&prefix) && !name.ends_with(".meta.json"))
+            .then(|| LibraryFile::Path(e.path().to_string_lossy().into_owned()))
+    })
 }
 
 /// Deferred file analysis that the per-user worker should process after
@@ -803,9 +1028,16 @@ impl AgentRegistry {
             vec![rsclaw_config::schema::AgentEntry {
                 id: "main".to_owned(),
                 daemon: false,
+                kb: None,
                 description: None,
                 default: Some(true),
-                name: Some("Main Agent".to_owned()),
+                name: Some(
+                    rsclaw_brand::default_agent_name(
+                        rsclaw_i18n::resolve_lang(cfg.gateway.language.as_deref().unwrap_or(""))
+                            == "zh",
+                    )
+                    .to_owned(),
+                ),
                 workspace,
                 model,
                 flash_model: None,
@@ -815,6 +1047,7 @@ impl AgentRegistry {
                 channels: None,
                 commands: None,
                 allowed_commands: None,
+                non_owner_tools: None,
                 opencode,
                 claudecode,
                 codex,
@@ -840,10 +1073,12 @@ impl AgentRegistry {
 
             for entry in &agent_list {
                 let (tx, rx) = mpsc::channel::<AgentMessage>(32);
+                // 0 would create a semaphore no turn can ever acquire.
                 let permits = entry
                     .lane_concurrency
                     .map(|n| n as usize)
-                    .unwrap_or(max_concurrent);
+                    .unwrap_or(max_concurrent)
+                    .max(1);
                 let kind = if entry.default == Some(true) {
                     AgentKind::Main
                 } else {
@@ -860,7 +1095,7 @@ impl AgentRegistry {
                     .unwrap_or(0) as usize;
                 let effective_model =
                     crate::runtime::resolve_primary_model_for(entry, &cfg.agents.defaults)
-                        .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
+                        .unwrap_or_else(|| "rsclaw/rsclaw-agent-v2".to_owned());
                 let handle = Arc::new(AgentHandle {
                     id: entry.id.clone(),
                     kind,
@@ -873,6 +1108,7 @@ impl AgentRegistry {
                     cancel_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     lifetime: tokio_util::sync::CancellationToken::new(),
                     plugin_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    model_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     wasm_plugins: Arc::new(std::sync::RwLock::new(Arc::new(Vec::new()))),
                     notification_tx: Arc::new(std::sync::RwLock::new(None)),
                     cold_enabled: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -883,8 +1119,7 @@ impl AgentRegistry {
                     last_sys_tokens: Arc::new(AtomicUsize::new(0)),
                     last_tools_tokens: Arc::new(AtomicUsize::new(0)),
                     last_msg_tokens: Arc::new(AtomicUsize::new(0)),
-                    clear_signal: Arc::new(AtomicBool::new(false)),
-                    new_session_signal: Arc::new(AtomicBool::new(false)),
+                    session_resets: Arc::new(std::sync::Mutex::new(Vec::new())),
                     context_window,
                     effective_model,
                     skills: Arc::new(std::sync::RwLock::new(Arc::new(
@@ -1145,6 +1380,7 @@ mod tests {
             name: None,
             commands: None,
             allowed_commands: None,
+            non_owner_tools: None,
             opencode: None,
             claudecode: None,
             codex: None,
@@ -1152,6 +1388,7 @@ mod tests {
             system: None,
             temperature: None,
             daemon: false,
+            kb: None,
         }
     }
 
@@ -1184,4 +1421,53 @@ mod tests {
         assert!(reg.get("alpha").is_ok());
         assert!(reg.get("nonexistent").is_err());
     }
+
+    #[test]
+    fn session_reset_is_scoped_to_one_session() {
+        let cfg = make_runtime(vec![entry("main", true, None)]);
+        let reg = AgentRegistry::from_config(&cfg);
+        let h = reg.get("main").expect("agent");
+        h.request_session_reset(SessionResetRequest::with_sender_fallback(
+            SessionResetKind::Clear,
+            "agent:main:telegram:direct:alice",
+            "telegram",
+            "alice",
+        ));
+        // Another user's turn must not consume (or be affected by) it.
+        assert!(
+            h.take_session_reset("agent:main:telegram:direct:bob", "telegram", "bob")
+                .is_none()
+        );
+        // Same sender in a group session matches via channel + peer.
+        assert_eq!(
+            h.take_session_reset("agent:main:telegram:group:g1", "telegram", "alice"),
+            Some(SessionResetKind::Clear)
+        );
+        // Consumed exactly once.
+        assert!(
+            h.take_session_reset("agent:main:telegram:direct:alice", "telegram", "alice")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exact_session_reset_ignores_same_sender_in_other_session() {
+        let cfg = make_runtime(vec![entry("main", true, None)]);
+        let reg = AgentRegistry::from_config(&cfg);
+        let h = reg.get("main").expect("agent");
+        h.request_session_reset(SessionResetRequest::exact(
+            SessionResetKind::Clear,
+            "agent:main:telegram:direct:alice",
+        ));
+        // `/clear` sent in a DM must not clear the sender's group session.
+        assert!(
+            h.take_session_reset("agent:main:telegram:group:g1", "telegram", "alice")
+                .is_none()
+        );
+        assert_eq!(
+            h.take_session_reset("agent:main:telegram:direct:alice", "telegram", "alice"),
+            Some(SessionResetKind::Clear)
+        );
+    }
 }
+

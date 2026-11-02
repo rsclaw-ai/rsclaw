@@ -140,6 +140,39 @@ fn derive_group_key(
 }
 
 // ---------------------------------------------------------------------------
+// Session key parsing
+// ---------------------------------------------------------------------------
+
+/// Entry-point prefixes whose first key segment names the channel.
+const CHANNEL_PREFIXES: &[&str] = &[
+    "api", "a2a", "cron", "ws", "cli", "acp", "oai", "hook", "webhook", "heartbeat", "system",
+    "subagent", "task",
+];
+
+/// Best-effort `(agent_id, channel)` decoded from a session key.
+///
+/// Recognised shapes: `agent:<agent>:<channel>:<kind>:<peer...>` (and the
+/// channel-less `agent:<agent>:main` / `agent:<agent>:direct:<peer>`),
+/// `desktop:<agent>:<id>`, and entry-point keys such as `api:<uuid>`,
+/// `a2a:...`, `cron:...`, `ws:...` (channel only). Unknown parts are `None`.
+pub fn parse_session_key(key: &str) -> (Option<String>, Option<String>) {
+    let parts: Vec<&str> = key.split(':').collect();
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_owned());
+    match parts.as_slice() {
+        ["agent", agent, rest @ ..] => {
+            let channel = match rest {
+                [] | ["main"] | ["direct", ..] => None,
+                [c, ..] => non_empty(c),
+            };
+            (non_empty(agent), channel)
+        }
+        ["desktop", agent, ..] => (non_empty(agent), Some("desktop".to_owned())),
+        [prefix, ..] if CHANNEL_PREFIXES.contains(prefix) => (None, Some((*prefix).to_owned())),
+        _ => (None, None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Identity links resolution (AGENTS.md §17)
 // ---------------------------------------------------------------------------
 
@@ -172,6 +205,23 @@ pub fn resolve_identity(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn parse_session_key_shapes() {
+        let p = |k: &str| super::parse_session_key(k);
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(p("agent:main:feishu:direct:ou_x"), (some("main"), some("feishu")));
+        assert_eq!(p("agent:main:telegram:group:-100:topic:7"), (some("main"), some("telegram")));
+        assert_eq!(p("agent:ops:feishu:acct:direct:ou_y"), (some("ops"), some("feishu")));
+        assert_eq!(p("agent:main:main"), (some("main"), None));
+        assert_eq!(p("agent:main:direct:u1"), (some("main"), None));
+        assert_eq!(p("desktop:main:abc"), (some("main"), some("desktop")));
+        assert_eq!(p("api:123e4567"), (None, some("api")));
+        assert_eq!(p("a2a:peer:ctx"), (None, some("a2a")));
+        assert_eq!(p("cron:job1"), (None, some("cron")));
+        assert_eq!(p("weird"), (None, None));
+    }
+
     use super::*;
 
     fn params(scope: DmScope, channel: &str, peer: &str) -> SessionKeyParams {

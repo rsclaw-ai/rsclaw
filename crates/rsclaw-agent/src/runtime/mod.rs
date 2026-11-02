@@ -15,8 +15,37 @@
 //!      docs/memory-extraction-redesign.md)
 
 mod agent_loop;
+
+/// Per-session size the stateful backend last reported (prompt + reply
+/// tokens). It can exceed what the runtime's own history adds up to: the
+/// backend keeps earlier turns' tool steps that the runtime drops at turn
+/// end, so compaction has to be timed against this, not the estimate.
+fn server_sizes() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static SIZES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    SIZES.get_or_init(Default::default)
+}
+
+pub(crate) fn record_server_size(session: &str, tokens: usize) {
+    if let Ok(mut map) = server_sizes().lock() {
+        map.insert(session.to_owned(), tokens);
+    }
+}
+
+pub(crate) fn server_size(session: &str) -> Option<usize> {
+    server_sizes().lock().ok()?.get(session).copied()
+}
+
+/// The backend is about to be handed a different (compacted or re-sent)
+/// history; its next call reports the new size.
+pub(crate) fn forget_server_size(session: &str) {
+    if let Ok(mut map) = server_sizes().lock() {
+        map.remove(session);
+    }
+}
 mod dispatch;
 mod run_turn;
+mod session_title;
 
 use std::{
     sync::{
@@ -551,12 +580,114 @@ pub struct RunContext {
     /// `RSCLAW_CAPTURE_TRACES=1`; flushed to the JSONL path in
     /// `RSCLAW_TRACES_PATH` on normal turn completion.
     pub full_trace: Option<super::trace_capture::FullTrace>,
+    /// One line per tool call this turn ("read_file 汉阳安和/起诉状.pdf"),
+    /// so a turn that fails still leaves a record of what it did.
+    pub steps: Vec<String>,
     /// Per-turn observability/control wires for A2A callers
     /// (cancel_token, event_tx, input_request_tx, task/context ids).
     /// Default-constructed for non-A2A turns; `agent_loop` polls
     /// `is_cancelled()` between iterations and at tool-dispatch
     /// boundaries, and calls `emit_working()` before each tool.
     pub turn_ctx: super::registry::TurnContext,
+}
+
+/// How long a context limit learned from a backend's refusals is trusted:
+/// hours, not days, so a backend whose cap is raised is used to it soon.
+const LEARNED_LIMIT_TTL_SECS: u64 = 6 * 3600;
+/// Never learn a limit below this: a refusal of a tiny request is not about size.
+const MIN_LEARNED_LIMIT: usize = 16_000;
+
+/// `ctx_limit2:`: limits stored under `ctx_limit:` were learned from an
+/// undercount of the refused request and are left behind.
+fn learned_limit_key(model: &str) -> String {
+    format!("ctx_limit2:{model}")
+}
+
+/// "limit:unix-seconds" as stored, while still fresh at `now`.
+fn parse_learned_limit(raw: &str, now: u64) -> Option<usize> {
+    let (limit, at) = raw.split_once(':')?;
+    let fresh = now.saturating_sub(at.parse().ok()?) < LEARNED_LIMIT_TTL_SECS;
+    fresh.then(|| limit.parse().ok()).flatten()
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The name a run of repeated calls is counted under. Every plugin tool
+/// arrives as `plugin_invoke`, so driving a page through a plugin (click,
+/// look, fill, look again) would read as one tool called over and over;
+/// it is counted by the plugin tool named inside instead.
+pub(crate) fn streak_name(tool: &str, input: &Value) -> String {
+    match (tool, input["plugin"].as_str(), input["tool"].as_str()) {
+        ("plugin_invoke", Some(plugin), Some(inner)) => format!("plugin_invoke:{}/{}", plugin.trim(), inner.trim()),
+        _ => tool.to_owned(),
+    }
+}
+
+/// A tool call as one short line: its name and the argument that says what
+/// it worked on (a path, a command, a query), if any.
+pub(crate) fn step_line(tool: &str, args_json: &str) -> String {
+    let args: Value = serde_json::from_str(args_json).unwrap_or(Value::Null);
+    let target = ["path", "file_path", "image", "url", "command", "query", "pattern", "action"]
+        .iter()
+        .find_map(|k| args[*k].as_str().map(str::trim).filter(|s| !s.is_empty()));
+    match target {
+        Some(target) => {
+            let target = target.replace('\n', " ");
+            let short = rsclaw_util::truncate_str(&target, 120);
+            let ellipsis = if short.len() < target.len() { "…" } else { "" };
+            format!("{tool} {short}{ellipsis}")
+        }
+        None => tool.to_owned(),
+    }
+}
+
+/// The note a failed turn leaves in the session: why it stopped and the
+/// steps it got through, so the user sees them after a reload and the next
+/// turn ("继续") knows where to pick up. The raw error stays in the log.
+pub(crate) fn failed_turn_note(user_text: &str, error: &str, steps: &[String]) -> String {
+    const SHOWN: usize = 30;
+    let chinese = user_text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+    let reason = if error.contains("turn aborted") || error.contains("canceled") {
+        ("已手动停止", "stopped by the user")
+    } else if error.contains("timed out") {
+        ("运行超时", "it ran out of time")
+    } else if error.contains("session_ctx_exceeded") || error.contains("context") {
+        ("模型上下文已满", "the model's context filled up")
+    } else {
+        ("模型服务出错", "the model service failed")
+    };
+    let skipped = steps.len().saturating_sub(SHOWN);
+    let mut lines: Vec<String> = Vec::new();
+    if skipped > 0 {
+        lines.push(if chinese { format!("…（前 {skipped} 步略）") } else { format!("… ({skipped} earlier steps)") });
+    }
+    lines.extend(steps[skipped..].iter().enumerate().map(|(i, s)| format!("{}. {s}", skipped + i + 1)));
+    match (chinese, steps.is_empty()) {
+        // Not "send it again": a later "发" (publish) read as "resend it"
+        // re-ran an instruction that was done by then.
+        (true, true) => format!("⚠️ 这一轮没有完成（{}），还没有执行任何步骤。回复「继续」可以接着做。", reason.0),
+        (true, false) => format!(
+            "⚠️ 这一轮没有完成（{}）。已完成的 {} 步：\n{}\n\n回复「继续」可以接着做。",
+            reason.0,
+            steps.len(),
+            lines.join("\n")
+        ),
+        (false, true) => format!(
+            "⚠️ This turn did not finish ({}) before any step ran. Reply \"continue\" to pick it up.",
+            reason.1
+        ),
+        (false, false) => format!(
+            "⚠️ This turn did not finish ({}). The {} steps done:\n{}\n\nReply \"continue\" to pick up from here.",
+            reason.1,
+            steps.len(),
+            lines.join("\n")
+        ),
+    }
 }
 
 fn init_full_trace(user_text: &str) -> Option<super::trace_capture::FullTrace> {
@@ -715,6 +846,10 @@ pub struct AgentRuntime {
     /// Per-session compaction state: (last_compaction_time,
     /// turns_since_compaction).
     pub(crate) compaction_state: std::collections::HashMap<String, (std::time::Instant, u32)>,
+    /// Per-session time of the last completed turn. Drives idle eviction —
+    /// the compaction timestamp is NOT activity (a busy session that never
+    /// needed compaction would otherwise look idle since runtime start).
+    pub(crate) session_last_active: std::collections::HashMap<String, std::time::Instant>,
     /// Pending large files awaiting user confirmation (session_key -> files).
     pending_files: std::collections::HashMap<String, Vec<PendingFile>>,
     /// Shared live status for /btw parallel queries.
@@ -830,8 +965,16 @@ impl AgentRuntime {
         );
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
         let live_status = Arc::clone(&handle.live_status);
-        let max_concurrent = config.agents.defaults.max_concurrent.unwrap_or(4);
-        let exec_pool = super::exec_pool::ExecPool::new(max_concurrent as usize);
+        // Background exec concurrency is a tools.exec setting, independent of
+        // agent concurrency (`agents.defaults.maxConcurrent`).
+        let max_background = config
+            .ext
+            .tools
+            .as_ref()
+            .and_then(|t| t.exec.as_ref())
+            .and_then(|e| e.max_background)
+            .unwrap_or(super::exec_pool::DEFAULT_MAX_BACKGROUND);
+        let exec_pool = super::exec_pool::ExecPool::new(max_background);
         let rt = Self {
             handle,
             config,
@@ -856,6 +999,7 @@ impl AgentRuntime {
             browser: Arc::new(tokio::sync::Mutex::new(None)),
             sessions: std::collections::HashMap::new(),
             compaction_state: std::collections::HashMap::new(),
+            session_last_active: std::collections::HashMap::new(),
             pending_files: std::collections::HashMap::new(),
             runtime_max_file_size: None,
             runtime_max_text_chars: None,
@@ -891,14 +1035,23 @@ impl AgentRuntime {
 
         // Spawn a background task that periodically checks for idle browser
         // sessions and drops them to release Chrome memory.  Runs every 60s.
-        // TODO: this spawned task has no JoinHandle and cannot be cancelled on shutdown
+        // Bound to the agent's lifetime token: it stops when the handle is
+        // removed/replaced (hot reload) or once the runtime owning the browser
+        // slot is gone, instead of leaking one task per runtime ever built.
         {
             let browser_handle = Arc::clone(&rt.browser);
+            let lifetime = rt.handle.lifetime.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = lifetime.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
+                    if Arc::strong_count(&browser_handle) == 1 {
+                        break; // runtime dropped; nothing left to reap for
+                    }
                     let mut guard = browser_handle.lock().await;
                     if let Some(ref session) = *guard {
                         if session.is_idle_expired() {
@@ -911,6 +1064,15 @@ impl AgentRuntime {
         }
 
         rt
+    }
+
+    /// Makes this runtime, another lane of the same agent, share `first`'s
+    /// browser, background-exec pool and async task results, so lanes drive
+    /// one Chrome and one exec limit rather than one each.
+    pub fn share_lane_resources(&mut self, first: &AgentRuntime) {
+        self.browser = Arc::clone(&first.browser);
+        self.exec_pool = Arc::clone(&first.exec_pool);
+        self.pending_task_results = Arc::clone(&first.pending_task_results);
     }
 
     /// Resolve the current model name from agent config with fallback.
@@ -928,7 +1090,7 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|m| m.primary_head())
             })
-            .unwrap_or("rsclaw/rsclaw-agent-v1")
+            .unwrap_or("rsclaw/rsclaw-agent-v2")
             .to_owned()
     }
 }
@@ -940,6 +1102,11 @@ pub use super::model_resolution::{
     VisionResolution, is_known_vision_model, model_supports_image_input, resolve_flash_model_for,
     resolve_primary_model_for, resolve_vision_model_for, vision_unavailable_message,
 };
+
+/// Tokens (by `key_data::token_upper_bound`) a turn's recall channel may
+/// carry to the rsclaw backend, under its `--rsclaw-max-recall-tokens`
+/// (1200 on the fleet) with room for the wire wrapper.
+pub(crate) const RSCLAW_RECALL_BUDGET: usize = 1000;
 
 impl AgentRuntime {
     /// Estimate fixed context overhead: system prompt + tools tokens.
@@ -1216,7 +1383,9 @@ impl AgentRuntime {
         if choice == "4" {
             let names: Vec<String> = files.iter().map(|f| f.filename.clone()).collect();
             for f in &files {
-                let _ = std::fs::remove_file(&f.path);
+                if let Err(e) = std::fs::remove_file(&f.path) {
+                    warn!(path = %f.path.display(), "failed to delete pending video: {e}");
+                }
             }
             return Ok(direct(rsclaw_i18n::t_fmt(
                 "video_deleted",
@@ -1527,8 +1696,14 @@ impl AgentRuntime {
     /// (HTML, search results, screenshots) is never concatenated into the
     /// conversation. Returns the extracted text; error means caller should fall
     /// back to plain truncation.
-    /// Per-turn aggregate input guard. Caps the total ToolResult payload in
-    /// `scratchpad` to `budget` tokens by trimming the largest results first.
+    /// Per-iteration input guard. Caps the ToolResult payload added since the
+    /// model's last reply (the tail of `scratchpad` after its last assistant
+    /// message) to `budget` tokens by trimming the largest results first.
+    /// Earlier results already passed this guard; growth across a long turn
+    /// is the pre-flight check's job. Counting the whole turn here starved
+    /// long turns: past ~100 steps every new result, a `read_artifact` page
+    /// included, was cut to the floor under a fresh handle, and the model
+    /// paged handle after handle without ever seeing the content.
     ///
     /// Each trimmed result keeps (or, when it has none yet, is given) a
     /// `read_artifact` handle so the model can page into the full content —
@@ -1550,9 +1725,13 @@ impl AgentRuntime {
 
         use super::context_mgr::estimate_tokens;
 
-        // Index every ToolResult part with its current token cost.
+        // Index this iteration's ToolResult parts with their token cost.
+        let start = scratchpad
+            .iter()
+            .rposition(|m| m.role == Role::Assistant)
+            .map_or(0, |i| i + 1);
         let mut idx: Vec<(usize, usize, usize)> = Vec::new();
-        for (mi, msg) in scratchpad.iter().enumerate() {
+        for (mi, msg) in scratchpad.iter().enumerate().skip(start) {
             if let MessageContent::Parts(parts) = &msg.content {
                 for (pi, part) in parts.iter().enumerate() {
                     if let ContentPart::ToolResult { content, .. } = part {
@@ -1891,6 +2070,153 @@ impl AgentRuntime {
 
     /// If the key has an alias, returns the canonical (old) key so all data
     /// stays under one key. Otherwise returns the key unchanged.
+    /// The context window `model` works with: `contextTokens` (per agent,
+    /// then defaults) when set, else the model's own window capped at the
+    /// default. `explicit` = false ignores `contextTokens` (a separately
+    /// configured compaction model).
+    pub(crate) async fn context_window_for(&self, model: &str, explicit: bool) -> usize {
+        let configured = if !explicit {
+            None
+        } else if self.handle.context_window > 0 {
+            Some(self.handle.context_window)
+        } else {
+            self.live.agents.read().await.defaults.context_tokens.map(|v| v as usize)
+        };
+        crate::model_resolution::effective_context_window(configured, self.model_limits(model))
+    }
+
+    pub(crate) fn model_limits(&self, model: &str) -> crate::model_resolution::ModelLimits {
+        crate::model_resolution::model_limits(self.config.model.models.as_ref(), model)
+    }
+
+    /// The context size `model`'s backend turned a request away at, learned
+    /// from its "context exceeded" errors in the last few hours (a backend may
+    /// cap sessions well below the model's window).
+    pub(crate) fn learned_context_limit(&self, model: &str) -> Option<usize> {
+        let raw = self.store.db.kv_get(&learned_limit_key(model)).ok().flatten()?;
+        parse_learned_limit(&raw, now_unix())
+    }
+
+    /// Records that `model`'s backend refused a request of about
+    /// `rejected_tokens` (same estimate as the pre-flight check), so later
+    /// requests compact and shrink below it instead of being refused.
+    pub(crate) fn learn_context_limit(&self, model: &str, rejected_tokens: usize) {
+        let limit = (rejected_tokens * 9 / 10).max(MIN_LEARNED_LIMIT);
+        if self.learned_context_limit(model).is_some_and(|known| known <= limit) {
+            return;
+        }
+        tracing::warn!(model, rejected_tokens, limit, "context limit learned from the backend");
+        if let Err(e) = self.store.db.kv_set(&learned_limit_key(model), &format!("{limit}:{}", now_unix())) {
+            tracing::warn!(model, "failed to store learned context limit: {e:#}");
+        }
+    }
+
+    /// Key-data kinds and ledger size for this deployment
+    /// (`compaction.keyData`).
+    pub(crate) async fn key_data_settings(&self) -> (Vec<String>, usize) {
+        let cfg = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .compaction
+            .as_ref()
+            .and_then(|c| c.key_data.clone())
+            .unwrap_or_default();
+        let kinds = cfg.kinds.unwrap_or_else(|| {
+            crate::key_data::DEFAULT_KINDS.iter().map(|k| (*k).to_owned()).collect()
+        });
+        (kinds, cfg.max_items.unwrap_or(crate::key_data::DEFAULT_MAX_ITEMS))
+    }
+
+    /// Adds the facts in one tool call (its arguments and the result the
+    /// model saw) to the session's ledger, which outlives the turn.
+    pub(crate) async fn record_key_data(&self, session_key: &str, text: &str) {
+        let (kinds, max_items) = self.key_data_settings().await;
+        let found = crate::key_data::extract(text, &kinds);
+        if found.is_empty() {
+            return;
+        }
+        let key = crate::key_data::ledger_kv_key(session_key);
+        let ledger = self
+            .store
+            .db
+            .kv_get(&key)
+            .ok()
+            .flatten()
+            .map(|raw| crate::key_data::from_json(&raw))
+            .unwrap_or_default();
+        let ledger = crate::key_data::merge(ledger, found, max_items);
+        if let Err(e) = self.store.db.kv_set(&key, &crate::key_data::to_json(&ledger)) {
+            warn!("key data ledger write failed for {session_key}: {e:#}");
+        }
+    }
+
+    /// What a session carries from turn to turn outside its history: the
+    /// working plan and the key-data ledger, for the per-turn recall
+    /// channel. `None` when there is neither.
+    ///
+    /// `budget` (tokens, by `key_data::token_upper_bound`) bounds it where the
+    /// backend caps the recall channel: the plan comes first, then as many of
+    /// the newest facts as fit.
+    pub(crate) fn session_carryover(&self, session_key: &str, budget: Option<usize>) -> Option<String> {
+        const FACTS_HEADER: &str = "[Key facts from earlier tool results in this session, verbatim]";
+        let mut parts = Vec::new();
+        let mut left = budget.unwrap_or(usize::MAX);
+        if let Some(plan) = self.load_todo_rendered(session_key) {
+            // The plan is only as fresh as its last todo call: steps a later
+            // turn finished (a job's wake, say) can still read as open, and
+            // a model taking it as live re-did finished work.
+            let written = self
+                .store
+                .db
+                .kv_get(&crate::tools_misc::todo_at_kv_key(session_key))
+                .ok()
+                .flatten()
+                .map(|at| format!(" written {at}"))
+                .unwrap_or_default();
+            let plan = format!(
+                "[Plan as last written with the todo tool{written}]\n{plan}\n\
+                 It may be out of date: check the conversation since then. Items already \
+                 reported done must be marked done, not redone. Work on an open item only \
+                 when the user's latest message asks for it; if they asked for something \
+                 else, do that and clear or update the plan."
+            );
+            let cost = crate::key_data::token_upper_bound(&plan) + 2;
+            if cost <= left {
+                left -= cost;
+                parts.push(plan);
+            }
+        }
+        let header_cost = crate::key_data::token_upper_bound(FACTS_HEADER) + 3;
+        if left > header_cost {
+            let raw = self
+                .store
+                .db
+                .kv_get(&crate::key_data::ledger_kv_key(session_key))
+                .ok()
+                .flatten();
+            let ledger = raw.map(|r| crate::key_data::from_json(&r)).unwrap_or_default();
+            if let Some(facts) = crate::key_data::render_within(&ledger, left - header_cost) {
+                parts.push(format!("{FACTS_HEADER}\n{facts}"));
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
+    /// The model `/model` switched this session to. The gateway records the
+    /// switch under the key it saw, which may be an alias of the canonical
+    /// key the turn runs under.
+    pub(crate) fn switched_model(&self, session_key: &str) -> Option<String> {
+        self.handle.session_model(session_key).or_else(|| {
+            self.session_aliases
+                .iter()
+                .filter(|(_, canonical)| canonical.as_str() == session_key)
+                .find_map(|(alias, _)| self.handle.session_model(alias))
+        })
+    }
+
     fn resolve_session_key<'a>(&'a self, session_key: &'a str) -> &'a str {
         if let Some(canonical) = self.session_aliases.get(session_key) {
             canonical.as_str()
@@ -1899,12 +2225,12 @@ impl AgentRuntime {
         }
     }
 
-    /// Save summaries of all active sessions to long-term memory.
+    /// Save a summary of ONE session (`session_key`) to long-term memory.
     ///
     /// Called before `/new` — since no summary is injected into the new
     /// session, memory is the only way the LLM can find prior context.
     /// Uses KV cache mode when available (session is still in memory).
-    async fn save_session_summaries_to_memory(&mut self, model: &str) {
+    async fn save_session_summaries_to_memory(&mut self, session_key: &str, model: &str) {
         if self.memory.is_none() {
             return;
         }
@@ -1922,7 +2248,7 @@ impl AgentRuntime {
         let session_data: Vec<(String, String)> = self
             .sessions
             .iter()
-            .filter(|(_, msgs)| msgs.len() > 2)
+            .filter(|(key, msgs)| key.as_str() == session_key && msgs.len() > 2)
             .map(|(key, msgs)| {
                 let transcript = Self::msgs_to_text_static(msgs, 16_000);
                 (key.clone(), transcript)
@@ -1930,6 +2256,7 @@ impl AgentRuntime {
             .collect();
 
         for (session_key, transcript) in &session_data {
+            let session_key = session_key.as_str();
             // Generate summary — try KV cache mode first.
             let summary = if kv_cache_mode >= 1 {
                 let result = self
@@ -2254,19 +2581,19 @@ impl AgentRuntime {
         let ttl = Duration::from_secs(SESSION_IDLE_TTL_SECS);
         let now = std::time::Instant::now();
 
-        // Collect keys to evict: sessions whose compaction_state timestamp
-        // is older than the TTL, or sessions that have no compaction_state
-        // entry at all (never compacted -- use runtime start as proxy).
+        // Collect keys to evict: sessions whose last completed turn is older
+        // than the TTL. Sessions with no recorded turn (loaded but never
+        // finished one) fall back to runtime start.
         let stale_keys: Vec<String> = self
             .sessions
             .keys()
             .filter(|key| {
-                if let Some((last_active, _)) = self.compaction_state.get(*key) {
-                    now.duration_since(*last_active) > ttl
-                } else {
-                    // No compaction state -- compare against runtime start.
-                    now.duration_since(self.started_at) > ttl
-                }
+                let last_active = self
+                    .session_last_active
+                    .get(*key)
+                    .copied()
+                    .unwrap_or(self.started_at);
+                now.duration_since(last_active) > ttl
             })
             .cloned()
             .collect();
@@ -2279,6 +2606,7 @@ impl AgentRuntime {
         for key in &stale_keys {
             self.sessions.remove(key);
             self.compaction_state.remove(key);
+            self.session_last_active.remove(key);
             self.pending_files.remove(key);
         }
 
@@ -2396,6 +2724,62 @@ fn squash_large_strings(val: &serde_json::Value, max_chars: usize) -> serde_json
     }
 }
 
+/// Render a `read_artifact` result: the page content followed by a one-line
+/// status (position, end-of-artifact, sizes) and the tool's `next` hint.
+fn format_artifact_read(val: &serde_json::Value) -> String {
+    let content = val.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let mut meta: Vec<String> = Vec::new();
+    for key in [
+        "mode",
+        "from_line",
+        "to_line",
+        "total_lines",
+        "returned_lines",
+        "selected_lines",
+        "char_count",
+        "byte_size",
+    ] {
+        match val.get(key) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => meta.push(format!("{key}={s}")),
+            Some(serde_json::Value::Number(n)) => meta.push(format!("{key}={n}")),
+            _ => {}
+        }
+    }
+    if val.get("at_end").and_then(|v| v.as_bool()) == Some(true) {
+        meta.push("at_end=true".to_owned());
+    }
+    if val.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
+        meta.push("truncated=true".to_owned());
+    }
+    let mut out = content.trim_end().to_owned();
+    // query: mode answers with ranked `matches` instead of `content`.
+    if let Some(matches) = val.get("matches").and_then(|v| v.as_array()) {
+        if matches.is_empty() {
+            out.push_str("(no matching sections)");
+        }
+        for m in matches {
+            let text = m.get("text").and_then(|v| v.as_str()).unwrap_or("").trim_end();
+            let from = m.get("from_line").and_then(|v| v.as_u64()).unwrap_or(0);
+            let to = m.get("to_line").and_then(|v| v.as_u64()).unwrap_or(0);
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&format!("--- lines {from}-{to} ---\n{text}"));
+        }
+    }
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&format!("[read_artifact {}]", meta.join(" ")));
+    for key in ["note", "next"] {
+        if let Some(text) = val.get(key).and_then(|v| v.as_str()) {
+            out.push_str("\n");
+            out.push_str(text);
+        }
+    }
+    out
+}
+
 fn format_tool_result(val: &serde_json::Value) -> String {
     // exec tool: { exit_code, stdout, stderr }
     if val.get("stdout").is_some() || val.get("stderr").is_some() {
@@ -2427,6 +2811,44 @@ fn format_tool_result(val: &serde_json::Value) -> String {
             out
         }
     }
+    // read_artifact: { tool_result_id, mode, content, total_lines, … }. Keep
+    // the paging metadata — without `at_end` / `next` / the line counts the
+    // model cannot tell how far it has read and starts guessing line ranges
+    // (a `stat` call, whose content is empty, came back as an empty string).
+    else if val.get("tool_result_id").is_some() && val.get("mode").is_some() {
+        format_artifact_read(val)
+    }
+    // list_dir: { path, count, entries: [{ name, path, is_dir, size }] }. One
+    // line per entry instead of pretty JSON (which repeated every absolute
+    // path and pushed a 70-entry listing past the inline budget into an
+    // artifact the model then had to page through).
+    else if let (Some(root), Some(entries)) = (
+        val.get("path").and_then(|v| v.as_str()),
+        val.get("entries").and_then(|v| v.as_array()),
+    ) {
+        let mut out = format!("[{root}] {} entries", entries.len());
+        if let Some(count) = val.get("count").and_then(|v| v.as_u64())
+            && count as usize != entries.len()
+        {
+            out.push_str(&format!(" (of {count})"));
+        }
+        for e in entries {
+            let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            if e.get("is_dir").and_then(|v| v.as_bool()) == Some(true) {
+                out.push_str(&format!("\n{name}/"));
+            } else if let Some(size) = e.get("size").and_then(|v| v.as_u64()) {
+                out.push_str(&format!("\n{name}  {size}B"));
+            } else {
+                out.push_str(&format!("\n{name}"));
+            }
+        }
+        for key in ["truncated_note", "note", "hint"] {
+            if let Some(v) = val.get(key).filter(|v| !v.is_null()) {
+                out.push_str(&format!("\n[{key}: {}]", v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())));
+            }
+        }
+        out
+    }
     // read tool: { content, path }
     else if let Some(content) = val.get("content").and_then(|v| v.as_str()) {
         let path = val.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -2450,6 +2872,25 @@ fn format_tool_result(val: &serde_json::Value) -> String {
     else if let Some(results) = val.get("results").and_then(|v| v.as_array()) {
         let mut out = String::new();
         for (i, r) in results.iter().enumerate() {
+            // search_content returns plain "file:line:text" strings, and
+            // search_file {path, size, is_dir}: show them as they are, or
+            // the model sees "(no title)" and guesses file names.
+            if let Some(line) = r.as_str() {
+                out.push_str(&format!("{}. {line}\n", i + 1));
+                continue;
+            }
+            if r.get("title").is_none()
+                && let Some(path) = r.get("path").and_then(|v| v.as_str())
+            {
+                if r.get("is_dir").and_then(|v| v.as_bool()) == Some(true) {
+                    out.push_str(&format!("{}. {path}/\n", i + 1));
+                } else if let Some(size) = r.get("size").and_then(|v| v.as_u64()) {
+                    out.push_str(&format!("{}. {path}  {size}B\n", i + 1));
+                } else {
+                    out.push_str(&format!("{}. {path}\n", i + 1));
+                }
+                continue;
+            }
             // Title fallback chain widened: skill_search returns
             // {slug, description, installs, registry} (no `title`), so
             // every result was rendering as "(no title)". Try the common
@@ -2780,12 +3221,47 @@ pub(crate) async fn persist_agent_to_config(
     Ok(())
 }
 
-fn intermediate_notification_text(text: &str) -> Option<&str> {
+fn intermediate_notification_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed)
+        Some(trimmed.to_owned())
+    }
+}
+
+/// Text bound for a chat channel: reasoning (`<think>…</think>`, including a
+/// block the template opened in the prompt) never leaves the gateway.
+pub(crate) fn strip_think_for_channel(text: &str) -> String {
+    rsclaw_provider::openai::strip_think_tags_pub(text)
+}
+
+/// Thinking budget for a turn from the first configured source: the agent's
+/// own model, then `agents.defaults.model`, then `agents.defaults.thinking`.
+///
+/// `Some(0)` means "explicitly off" (providers send `enable_thinking: false`);
+/// `None` means "not configured" (the provider's default applies).
+pub(crate) fn resolve_thinking_budget(
+    agent_model: Option<&rsclaw_config::schema::ThinkingConfig>,
+    defaults_model: Option<&rsclaw_config::schema::ThinkingConfig>,
+    defaults: Option<&rsclaw_config::schema::ThinkingConfig>,
+) -> Option<u32> {
+    use rsclaw_config::schema::ThinkingLevel;
+    let t = agent_model.or(defaults_model).or(defaults)?;
+    if let Some(budget) = t.budget_tokens {
+        return Some(budget);
+    }
+    match t.level {
+        Some(ThinkingLevel::Off) => return Some(0),
+        // Let the model decide.
+        Some(ThinkingLevel::Adaptive) => {}
+        Some(ref level) => return Some(level.budget_tokens()),
+        None => {}
+    }
+    match t.enabled {
+        Some(true) => Some(10240),
+        Some(false) => Some(0),
+        None => None,
     }
 }
 
@@ -2795,3 +3271,135 @@ fn intermediate_notification_text(text: &str) -> Option<&str> {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod learned_limit_tests {
+    #[test]
+    fn a_learned_limit_expires_within_hours() {
+        let at = 1_790_000_000u64;
+        assert_eq!(super::parse_learned_limit(&format!("70000:{at}"), at + 3600), Some(70_000));
+        assert_eq!(super::parse_learned_limit(&format!("70000:{at}"), at + 7 * 3600), None);
+        assert_eq!(super::parse_learned_limit("garbage", at), None);
+    }
+
+    #[test]
+    fn learned_limit_key_is_per_model() {
+        assert_eq!(super::learned_limit_key("rsclaw/rsclaw-agent-v2"), "ctx_limit2:rsclaw/rsclaw-agent-v2");
+        assert_ne!(super::learned_limit_key("a/x"), super::learned_limit_key("a/y"));
+    }
+}
+
+#[cfg(test)]
+mod streak_name_tests {
+    use super::streak_name;
+    use serde_json::json;
+
+    #[test]
+    fn plugin_tools_are_counted_apart() {
+        let click = json!({"plugin": "lvsi", "tool": "click_element", "arguments": {"text": "下一步"}});
+        let look = json!({"plugin": "lvsi", "tool": "inspect_page", "arguments": {}});
+        assert_eq!(streak_name("plugin_invoke", &click), "plugin_invoke:lvsi/click_element");
+        assert_ne!(streak_name("plugin_invoke", &click), streak_name("plugin_invoke", &look));
+    }
+
+    #[test]
+    fn other_tools_keep_their_name() {
+        assert_eq!(streak_name("read_artifact", &json!({"mode": "head"})), "read_artifact");
+        assert_eq!(streak_name("plugin_invoke", &json!({"plugin": "lvsi"})), "plugin_invoke");
+    }
+}
+
+#[cfg(test)]
+mod failed_turn_tests {
+    use super::{failed_turn_note, step_line};
+
+    #[test]
+    fn a_failed_turn_lists_its_steps() {
+        assert_eq!(step_line("read_file", r#"{"path":"汉阳安和/起诉状.pdf"}"#), "read_file 汉阳安和/起诉状.pdf");
+        assert_eq!(step_line("todo", r#"{"items":[]}"#), "todo");
+        let steps: Vec<String> = (1..=33).map(|i| format!("read_file {i}.pdf")).collect();
+        let note = failed_turn_note("写个答辩状", "rsclaw turn failed 413: session_ctx_exceeded", &steps);
+        assert!(note.starts_with("⚠️ 这一轮没有完成（模型上下文已满）。已完成的 33 步"), "{note}");
+        assert!(note.contains("…（前 3 步略）\n4. read_file 4.pdf"), "{note}");
+        assert!(note.ends_with("回复「继续」可以接着做。"), "{note}");
+        let note = failed_turn_note("draft it", "agent `main` turn timed out after 1800s", &[]);
+        assert!(note.contains("ran out of time") && note.contains("Reply \"continue\""), "{note}");
+        let note = failed_turn_note("重做第 3 镜", "rsclaw turn failed 502", &[]);
+        assert!(note.ends_with("还没有执行任何步骤。回复「继续」可以接着做。"), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod format_artifact_read_tests {
+    use super::format_tool_result;
+
+    #[test]
+    fn list_dir_renders_one_line_per_entry() {
+        let v = serde_json::json!({"path": "/w", "count": 2, "entries": [
+            {"name": "a.py", "path": "/w/a.py", "is_dir": false, "size": 12},
+            {"name": "docs", "path": "/w/docs", "is_dir": true, "size": 0}]});
+        assert_eq!(format_tool_result(&v), "[/w] 2 entries\na.py  12B\ndocs/");
+    }
+
+    #[test]
+    fn search_results_show_their_paths() {
+        let found = serde_json::json!({"pattern": "*合同*", "results": [
+            {"path": "/d/汉阳安和/1民事委托代理合同 陈东 .docx", "size": 72723, "is_dir": false},
+            {"path": "/d/汉阳安和/原告陈东", "size": 256, "is_dir": true},
+        ]});
+        assert_eq!(
+            format_tool_result(&found),
+            "1. /d/汉阳安和/1民事委托代理合同 陈东 .docx  72723B\n2. /d/汉阳安和/原告陈东/"
+        );
+        let lines = serde_json::json!({"results": ["a.md:3:陈东"]});
+        assert_eq!(format_tool_result(&lines), "1. a.md:3:陈东");
+    }
+
+    #[test]
+    fn stat_is_not_rendered_empty() {
+        let v = serde_json::json!({"tool_result_id": "tr_1", "mode": "stat", "total_lines": 420,
+            "returned_chars": 0, "content": "", "byte_size": 9000, "char_count": 8800});
+        let s = format_tool_result(&v);
+        assert!(s.contains("total_lines=420") && s.contains("byte_size=9000"), "{s}");
+    }
+
+    #[test]
+    fn query_matches_are_rendered() {
+        let val = serde_json::json!({
+            "tool_result_id": "tr_1",
+            "mode": "query:required fields",
+            "total_lines": 177,
+            "matches": [
+                {"from_line": 40, "to_line": 52, "score": 0.81, "text": "\"required\": [\"court_name\"]"}
+            ],
+            "note": "Top semantically-relevant sections.",
+        });
+        let out = super::format_artifact_read(&val);
+        assert!(out.contains("--- lines 40-52 ---"), "{out}");
+        assert!(out.contains("court_name"), "{out}");
+        assert!(out.contains("Top semantically-relevant sections."), "{out}");
+
+        let empty = serde_json::json!({
+            "tool_result_id": "tr_1",
+            "mode": "query:x",
+            "matches": [],
+            "note": "Artifact is empty.",
+        });
+        let out = super::format_artifact_read(&empty);
+        assert!(out.starts_with("(no matching sections)"), "{out}");
+    }
+
+    #[test]
+    fn page_keeps_position_and_next_hint() {
+        let v = serde_json::json!({"tool_result_id": "tr_1", "mode": "next", "total_lines": 420,
+            "returned_lines": 100, "from_line": 1, "to_line": 100, "content": "a\nb",
+            "next": "Call read_artifact again (no mode) to continue from line 101"});
+        let s = format_tool_result(&v);
+        assert!(s.starts_with("a\nb"), "{s}");
+        assert!(s.contains("from_line=1") && s.contains("to_line=100"), "{s}");
+        assert!(s.contains("continue from line 101"), "{s}");
+        let end = serde_json::json!({"tool_result_id": "tr_1", "mode": "next", "total_lines": 3,
+            "at_end": true, "content": "x"});
+        assert!(format_tool_result(&end).contains("at_end=true"));
+    }
+}

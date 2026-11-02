@@ -31,7 +31,30 @@ const MAX_HOPS: u8 = 5;
 /// Hardcoded default when the caller doesn't pass a configured base.
 /// Mirrors `https://api.rsclaw.ai` — the public gen surface, NOT the
 /// LLM `/v1/agent` mount.
-pub const DEFAULT_GEN_HOST: &str = "https://api.rsclaw.ai";
+pub const DEFAULT_GEN_HOST: &str = rsclaw_brand::API_URL;
+
+/// Gen host taken from `models.providers.rsclaw.baseUrl`, so OEM and
+/// self-hosted deployments send video / audio jobs (submit and the
+/// background poller) to the same backend that issued their API key.
+/// Callers without access to config pass `None` to [`gen_host_base`] and
+/// land here before the compiled-in brand default.
+static CONFIGURED_GEN_HOST: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Set (or clear with `None` / empty) the configured gen host. Called at
+/// gateway start and after every config reload.
+pub fn set_configured_gen_host(base: Option<&str>) {
+    let value = base
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    if let Ok(mut slot) = CONFIGURED_GEN_HOST.write() {
+        *slot = value;
+    }
+}
+
+fn configured_gen_host() -> Option<String> {
+    CONFIGURED_GEN_HOST.read().ok().and_then(|g| g.clone())
+}
 
 /// Resolve the canonical rsclaw gen host root from caller-supplied
 /// config.
@@ -45,8 +68,10 @@ pub const DEFAULT_GEN_HOST: &str = "https://api.rsclaw.ai";
 /// Returns the host with **no trailing slash** and **no version
 /// suffix**. Callers append `/v1/<resource>` themselves.
 pub fn gen_host_base(configured: Option<&str>) -> String {
+    let fallback = configured_gen_host();
     let raw = configured
         .filter(|s| !s.is_empty())
+        .or(fallback.as_deref())
         .unwrap_or(DEFAULT_GEN_HOST)
         .trim_end_matches('/');
     if let Some(s) = raw
@@ -180,7 +205,16 @@ async fn send_following(
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| anyhow!("rsclaw_http: {st} omitted Location"))?
                 .to_owned();
-            current = resolve_location(&current, &loc)?;
+            let next = resolve_location(&current, &loc)?;
+            // The Bearer is re-attached on every hop, so only follow hops
+            // that stay inside the fleet and never downgrade to plain HTTP.
+            if !redirect_allowed(&current, &next) {
+                return Err(anyhow!(
+                    "rsclaw_http: refusing {st} redirect from {current} to {next} \
+                     (cross-site or https->http; bearer would leak)"
+                ));
+            }
+            current = next;
             continue;
         }
         return Ok(resp);
@@ -188,6 +222,46 @@ async fn send_following(
     Err(anyhow!(
         "rsclaw_http: too many redirects starting from {initial_url}"
     ))
+}
+
+/// Registrable-domain approximation: the last two labels of a DNS host
+/// (`backend-a.rsclaw.ai` -> `rsclaw.ai`). IP literals and single-label
+/// hosts are returned whole so they only ever match exactly.
+fn site_of(host: &str) -> &str {
+    if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
+        return host;
+    }
+    let mut dots = host.rmatch_indices('.');
+    match (dots.next(), dots.next()) {
+        (Some(_), Some((idx, _))) => &host[idx + 1..],
+        _ => host,
+    }
+}
+
+/// Whether a credentialed request may follow a redirect from `from` to
+/// `to`: same host or same registrable domain (LB -> backend pool), or a
+/// hop between trusted fleet domains (`gateway.trustedRedirectSites`) over
+/// https; never an https -> http downgrade.
+pub(crate) fn redirect_allowed(from: &str, to: &str) -> bool {
+    let (Ok(from), Ok(to)) = (Url::parse(from), Url::parse(to)) else {
+        return false;
+    };
+    if !matches!(to.scheme(), "http" | "https") {
+        return false;
+    }
+    if from.scheme() == "https" && to.scheme() != "https" {
+        return false;
+    }
+    match (from.host_str(), to.host_str()) {
+        (Some(a), Some(b)) => {
+            let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+            a == b
+                || site_of(&a) == site_of(&b)
+                || (to.scheme() == "https"
+                    && rsclaw_util::net::is_trusted_redirect_hop(site_of(&a), site_of(&b)))
+        }
+        _ => false,
+    }
 }
 
 fn resolve_location(current: &str, loc: &str) -> Result<String> {
@@ -273,6 +347,43 @@ mod tests {
             .unwrap(),
             "https://api.rsclaw.ai/backend/v1/videos/video_abc"
         );
+    }
+
+    #[test]
+    fn redirect_policy_blocks_cross_site_and_downgrade() {
+        assert!(redirect_allowed(
+            "https://api.rsclaw.ai/v1/videos",
+            "https://backend-a.rsclaw.ai/v1/videos"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.rsclaw.ai/v1/videos",
+            "https://evil.example.com/v1/videos"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.rsclaw.ai/v1/videos",
+            "http://api.rsclaw.ai/v1/videos"
+        ));
+        assert!(redirect_allowed(
+            "http://127.0.0.1:8080/start",
+            "http://127.0.0.1:8080/final"
+        ));
+        assert!(!redirect_allowed(
+            "http://127.0.0.1:8080/start",
+            "http://10.0.0.1:8080/final"
+        ));
+        // The public domain permanently redirects to the serving domain.
+        assert!(redirect_allowed(
+            "https://api.rsclaw.ai/v1/agent/sessions",
+            "https://api.duoduoyun.work:8443/v1/agent/sessions"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.rsclaw.ai/v1/agent/sessions",
+            "http://api.duoduoyun.work/v1/agent/sessions"
+        ));
+        assert!(!redirect_allowed(
+            "https://api.duoduoyun.work:8443/v1",
+            "https://duoduoyun.work.evil.example/v1"
+        ));
     }
 
     #[tokio::test]

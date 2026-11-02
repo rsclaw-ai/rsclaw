@@ -2070,6 +2070,144 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "Агент не ответил вовремя. Ваше сообщение могло быть не обработано — попробуйте снова.",
     );
 
+    msg!("cmd_owner_only",
+        "en" => "This command is only available to the owner.",
+        "zh" => "该命令仅限主人使用。",
+        "ja" => "このコマンドはオーナーのみ使用できます。",
+        "ko" => "이 명령은 소유자만 사용할 수 있습니다.",
+        "fr" => "Cette commande est réservée au propriétaire.",
+        "de" => "Dieser Befehl ist nur für den Besitzer verfügbar.",
+        "th" => "คำสั่งนี้ใช้ได้เฉพาะเจ้าของเท่านั้น",
+        "vi" => "Lệnh này chỉ dành cho chủ sở hữu.",
+        "es" => "Este comando solo está disponible para el propietario.",
+        "ru" => "Эта команда доступна только владельцу.",
+    );
+
+    msg!("cron_backoff_seconds",
+        "en" => "{n}s",
+        "zh" => "{n}秒",
+    );
+
+    msg!("cron_backoff_minutes",
+        "en" => "{n}min",
+        "zh" => "{n}分钟",
+    );
+
+    msg!("cron_backoff_hours",
+        "en" => "{n}h",
+        "zh" => "{n}小时",
+    );
+
+    msg!("cron_oneshot_missed",
+        "en" => "[missed] Scheduled task \"{name}\" did not run: its time passed while the gateway was offline. It has been removed.",
+        "zh" => "[错过] 定时任务「{name}」未执行：计划时间到达时网关处于离线状态，该任务已移除。",
+    );
+
+    msg!("goal_state_error",
+        "en" => "[goal] Stopped: the goal state could not be updated ({condition}). Send `/goal {condition}` to restart.",
+        "zh" => "[goal] 已停止：目标状态无法更新（{condition}）。发送 `/goal {condition}` 重新开始。",
+    );
+
+    msg!("tg_cmd_help",
+        "en" => "Show available commands",
+        "zh" => "显示可用命令",
+    );
+
+    msg!("tg_cmd_run",
+        "en" => "Execute a shell command",
+        "zh" => "执行 shell 命令",
+    );
+
+    msg!("tg_cmd_search",
+        "en" => "Search the web",
+        "zh" => "网页搜索",
+    );
+
+    msg!("tg_cmd_fetch",
+        "en" => "Fetch a web page",
+        "zh" => "抓取网页",
+    );
+
+    msg!("tg_cmd_find",
+        "en" => "Find files",
+        "zh" => "查找文件",
+    );
+
+    msg!("tg_cmd_grep",
+        "en" => "Search file contents",
+        "zh" => "搜索文件内容",
+    );
+
+    msg!("tg_cmd_read",
+        "en" => "Read a file",
+        "zh" => "读取文件",
+    );
+
+    msg!("tg_cmd_status",
+        "en" => "Gateway status",
+        "zh" => "网关状态",
+    );
+
+    msg!("tg_cmd_version",
+        "en" => "Show version",
+        "zh" => "显示版本",
+    );
+
+    msg!("tg_cmd_models",
+        "en" => "List models",
+        "zh" => "列出模型",
+    );
+
+    msg!("tg_cmd_clear",
+        "en" => "Clear session",
+        "zh" => "清空会话",
+    );
+
+    msg!("tg_cmd_remember",
+        "en" => "Save to memory",
+        "zh" => "保存到记忆",
+    );
+
+    msg!("tg_cmd_recall",
+        "en" => "Search memory",
+        "zh" => "搜索记忆",
+    );
+
+    msg!("tg_video_too_large",
+        "en" => "Video exceeds the Telegram 20MB bot limit. Send a smaller file or share a link.",
+        "zh" => "视频超过 Telegram 机器人 20MB 限制，请发送更小的文件或分享链接。",
+    );
+
+    msg!("tg_video_download_failed",
+        "en" => "Video download failed.",
+        "zh" => "视频下载失败。",
+    );
+
+    msg!("matrix_voice_transcription_failed",
+        "en" => "[voice message - transcription failed]",
+        "zh" => "[语音消息 - 转写失败]",
+    );
+
+    msg!("matrix_voice_received",
+        "en" => "[voice message received]",
+        "zh" => "[收到语音消息]",
+    );
+
+    msg!("matrix_file_download_failed",
+        "en" => "[File received: {filename} but download failed]",
+        "zh" => "[收到文件：{filename}，但下载失败]",
+    );
+
+    msg!("wechat_waiting_scan",
+        "en" => "Waiting for WeChat scan...",
+        "zh" => "等待微信扫码...",
+    );
+
+    msg!("wechat_scanned_confirm",
+        "en" => "Scanned! Please confirm on your phone...",
+        "zh" => "已扫码！请在手机上确认...",
+    );
+
     msg!("chat_reply_error",
         "en" => "An error occurred while processing your message. Please try again.",
         "zh" => "处理消息时发生错误，请重试。",
@@ -2352,6 +2490,13 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ja" => "{iterations}ステップ実行したが進捗なし（最後: {tool}）。会話を続けると別の方法を試します。",
     );
 
+    msg!("agent_output_degenerated",
+        "en" => "The model's output broke down (it kept repeating the same characters), so this step was stopped. Please send the request again; splitting it into smaller steps helps.",
+        "zh" => "模型输出异常（反复输出同样的字符），已中止这一步。请重新发送请求，拆成更小的步骤会更稳定。",
+        "cn" => "模型输出异常（反复输出同样的字符），已中止这一步。请重新发送请求，拆成更小的步骤会更稳定。",
+        "ja" => "モデルの出力が異常になった（同じ文字を繰り返した）ため、このステップを停止しました。もう一度送信してください。小さなステップに分けると安定します。",
+    );
+
     msg!("agent_loop_detected",
         "en" => "Detected repeated identical operation without progress. Trying a different approach.",
         "zh" => "检测到重复执行相同操作但没有进展，尝试换一种方式处理。",
@@ -2590,6 +2735,37 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "de" => "Nach dem Lesen verbrennen",
     );
 
+    // Async image / video jobs: the delivery that carries the result and
+    // the line written back into the session's history.
+    msg!("job_kind_image", "en" => "image", "zh" => "图片");
+    msg!("job_kind_video", "en" => "video", "zh" => "视频");
+    msg!("job_delivered", "en" => "[{kind}] {prompt}", "zh" => "[{kind}] {prompt}");
+    msg!("job_delivery_failed",
+        "en" => "[{kind} failed] {prompt}: {reason}",
+        "zh" => "[{kind}生成失败] {prompt}：{reason}",
+    );
+    msg!("job_ready",
+        "en" => "The {kind} is ready at {path} (@{token}).",
+        "zh" => "{kind}已生成：{path}（@{token}）",
+    );
+    msg!("job_ready_plain", "en" => "The {kind} is ready at {path}.", "zh" => "{kind}已生成：{path}");
+    msg!("job_failed",
+        "en" => "The {kind} generation failed: {reason}",
+        "zh" => "{kind}生成失败：{reason}",
+    );
+    msg!("job_timed_out",
+        "en" => "The {kind} generation timed out: {reason}",
+        "zh" => "{kind}生成超时：{reason}",
+    );
+
+    // approvals.tools: a gated tool call asks the turn's sender in the chat.
+    msg!("tool_approval_prompt",
+        "en" => "⚠️ Approval needed: the assistant wants to run {tool}\n{summary}\n\nReply \"yes\" to go ahead or \"no\" to cancel (within {minutes} min).",
+        "zh" => "⚠️ 需要你确认：智能体要执行 {tool}\n{summary}\n\n回复「同意」执行，回复「拒绝」取消（{minutes} 分钟内有效）。",
+    );
+    msg!("tool_approval_allowed", "en" => "✅ Approved, running it now.", "zh" => "✅ 已同意，正在执行。");
+    msg!("tool_approval_denied", "en" => "❌ Cancelled, it will not run.", "zh" => "❌ 已拒绝，不会执行。");
+
     m
 });
 
@@ -2598,14 +2774,18 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
 // ---------------------------------------------------------------------------
 
 /// Translate a message key to the given language.  Falls back to English.
+/// Product names, paths and CLI invocations follow the build's brand.
 pub fn t(key: &str, lang: &str) -> String {
     if lang == "json" {
+        let key = json_escape(key);
         return format!("{{\"key\":\"{key}\",\"status\":\"ok\"}}");
     }
     MESSAGES
         .get(key)
         .and_then(|lm| lm.get(lang).or_else(|| lm.get("en")))
-        .map(|s| (*s).to_owned())
+        // Strings are written with the default brand's names; rebrand()
+        // is a borrow-through no-op for the default build.
+        .map(|s| rsclaw_brand::rebrand(s).into_owned())
         .unwrap_or_else(|| key.to_owned())
 }
 
@@ -2616,13 +2796,14 @@ pub fn t_fmt(key: &str, lang: &str, args: &[(&str, &str)]) -> String {
     if lang == "json" {
         let pairs: Vec<String> = args
             .iter()
-            .map(|(k, v)| format!("\"{}\":\"{}\"", k, v))
+            .map(|(k, v)| format!("\"{}\":\"{}\"", json_escape(k), json_escape(v)))
             .collect();
         let extra = if pairs.is_empty() {
             String::new()
         } else {
             format!(",{}", pairs.join(","))
         };
+        let key = json_escape(key);
         return format!("{{\"key\":\"{key}\"{extra},\"status\":\"ok\"}}");
     }
     let mut text = t(key, lang);
@@ -2632,11 +2813,35 @@ pub fn t_fmt(key: &str, lang: &str, args: &[(&str, &str)]) -> String {
     text
 }
 
+/// Escape a string for embedding inside a JSON string literal (JSON mode
+/// output). Params may carry user-controlled text (file names, errors), so
+/// quotes, backslashes and control characters must not break the document.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Resolve a human-readable or config language value to a language code.
 ///
-/// Examples: "Chinese" -> "zh", "Thai" -> "th", "ja" -> "ja"
+/// Examples: "Chinese" -> "zh", "Thai" -> "th", "ja" -> "ja".
+/// `"default"` / `"auto"` / empty resolve to the process default language
+/// (see [`default_lang`]), not to German.
 pub fn resolve_lang(config_lang: &str) -> &'static str {
-    let l = config_lang.to_lowercase();
+    let l = config_lang.trim().to_lowercase();
+    if l.is_empty() || l == "default" || l == "auto" {
+        return default_lang();
+    }
     if l.starts_with("zh") || l.starts_with("cn") || l.contains("chinese") || l.contains("中文") {
         "zh"
     } else if l.starts_with("th") || l.contains("thai") || l.contains("ไทย") {
@@ -2688,6 +2893,24 @@ mod tests {
         let msg = t_fmt("file_saved", "json", &[("count", "3")]);
         assert!(msg.contains("\"key\":\"file_saved\""));
         assert!(msg.contains("\"count\":\"3\""));
+    }
+
+    #[test]
+    fn translate_json_mode_escapes_params() {
+        let msg = t_fmt("file_saved", "json", &[("count", "a\"b\\c\nd")]);
+        assert!(
+            msg.contains(r#""count":"a\"b\\c\nd""#),
+            "params must be JSON-escaped: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_lang_default_is_not_german() {
+        assert_eq!(resolve_lang("default"), default_lang());
+        assert_eq!(resolve_lang("Default"), default_lang());
+        assert_eq!(resolve_lang(""), default_lang());
+        assert_eq!(resolve_lang("de"), "de");
+        assert_eq!(resolve_lang("Deutsch"), "de");
     }
 
     #[test]

@@ -107,9 +107,22 @@ fn random_signed_offset(min: i32, max: i32) -> i32 {
 /// the visual target so repeated cached-coordinate clicks do not look
 /// synthetic.
 fn human_move(enigo: &mut Enigo, target_x: i32, target_y: i32) -> Result<(), String> {
+    human_move_with_jitter(enigo, target_x, target_y, 10)
+}
+
+fn human_move_with_jitter(
+    enigo: &mut Enigo,
+    target_x: i32,
+    target_y: i32,
+    maximum_jitter: i32,
+) -> Result<(), String> {
     let (start_x, start_y) = enigo.location().unwrap_or((target_x, target_y));
-    let end_x = target_x.saturating_add(random_signed_offset(5, 10)).max(0);
-    let end_y = target_y.saturating_add(random_signed_offset(5, 10)).max(0);
+    let end_x = target_x
+        .saturating_add(random_signed_offset(5, maximum_jitter))
+        .max(0);
+    let end_y = target_y
+        .saturating_add(random_signed_offset(5, maximum_jitter))
+        .max(0);
     let dx = end_x - start_x;
     let dy = end_y - start_y;
     let control_1 = (
@@ -158,8 +171,9 @@ fn new_enigo() -> Result<Enigo, String> {
                 });
                 return format!(
                     "enigo init failed: {e} (macOS: a permission request was raised \
-                    — enable RsClaw under System Settings → Privacy & Security → \
-                    Accessibility AND Input Monitoring, then quit & reopen RsClaw)"
+                    — enable {app} under System Settings → Privacy & Security → \
+                    Accessibility AND Input Monitoring, then quit & reopen {app})",
+                    app = rsclaw_brand::PRODUCT_NAME
                 );
             }
             #[cfg(not(target_os = "macos"))]
@@ -237,11 +251,98 @@ fn capture_primary_monitor() -> Result<String, String> {
 /// script-based window list. The list is front-to-back where the OS provides
 /// ordering, so the first match is frontmost — letting one call serve both the
 /// main window and a transient child (e.g. WeChat's merged-record viewer).
-/// Virtual-screen rect (origin + size) via GetSystemMetrics — matches the area
-/// `capture_full_png` grabs
-/// (System.Windows.Forms.SystemInformation.VirtualScreen). Fast (no process
-/// spawn); used so the plugin's full-screen 0-1000 coords convert to correct
-/// screen pixels. SM_*VIRTUALSCREEN = 76..79.
+/// Query only the current input target, without spawning a process or
+/// enumerating windows.
+#[cfg(target_os = "windows")]
+struct ForegroundIdentity {
+    window: isize,
+    process_id: u32,
+    executable: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_identity() -> Result<ForegroundIdentity, String> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetForegroundWindow() -> isize;
+        fn GetWindowThreadProcessId(window: isize, process_id: *mut u32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> isize;
+        fn QueryFullProcessImageNameW(
+            process: isize,
+            flags: u32,
+            path: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe {
+        let window = GetForegroundWindow();
+        if window == 0 {
+            return Err("foreground window is unavailable".to_string());
+        }
+        let mut process_id = 0;
+        GetWindowThreadProcessId(window, &mut process_id);
+        if process_id == 0 {
+            return Err("foreground process id is unavailable".to_string());
+        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if process == 0 {
+            return Err(format!(
+                "open foreground process failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut path = vec![0_u16; 32_768];
+        let mut size = 32_768_u32;
+        let queried = QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut size);
+        let query_error = (queried == 0).then(std::io::Error::last_os_error);
+        CloseHandle(process);
+        if let Some(error) = query_error {
+            return Err(format!("query foreground process failed: {error}"));
+        }
+        Ok(ForegroundIdentity {
+            window,
+            process_id,
+            executable: PathBuf::from(OsString::from_wide(&path[..size as usize])),
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_process_name() -> Result<String, String> {
+    foreground_identity()?
+        .executable
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "foreground process name is unavailable".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn supported_full_screen_layout() -> Result<(u32, u32), String> {
+    unsafe extern "system" {
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+    if unsafe { GetSystemMetrics(80) } != 1
+        || unsafe { GetSystemMetrics(76) } != 0
+        || unsafe { GetSystemMetrics(77) } != 0
+    {
+        return Err("system full-screen capture requires one display at origin (0,0)".to_string());
+    }
+    let (_, _, width, height) = virtual_screen_rect();
+    if width == 0 || height == 0 {
+        return Err("physical full-screen layout has zero dimensions".to_string());
+    }
+    Ok((width, height))
+}
+
 #[cfg(target_os = "windows")]
 fn virtual_screen_rect() -> (i32, i32, u32, u32) {
     unsafe extern "system" {
@@ -462,26 +563,19 @@ fn looks_blank(png: &[u8]) -> bool {
 /// copies the captured region here). Requires STA.
 #[cfg(target_os = "windows")]
 fn clipboard_image_png() -> Result<Vec<u8>, String> {
-    use std::os::windows::process::CommandExt;
     let out_png = std::env::temp_dir().join(format!("rsclaw_clip_{}.png", std::process::id()));
-    let script = format!(
-        r#"Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+    // The output path is passed via env, not interpolated (a quote in the
+    // user's temp dir would otherwise break out of the string literal).
+    let script = r#"Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 $img = [System.Windows.Forms.Clipboard]::GetImage()
-if ($img -eq $null) {{ Write-Output 'NOIMG'; exit 1 }}
-$img.Save('{path}', [System.Drawing.Imaging.ImageFormat]::Png)
-Write-Output 'OK'"#,
-        path = out_png.display()
+if ($img -eq $null) { Write-Output 'NOIMG'; exit 1 }
+$img.Save($env:RSCLAW_PS_OUT_PATH, [System.Drawing.Imaging.ImageFormat]::Png)
+Write-Output 'OK'"#;
+    let mut cmd = powershell_command(
+        &["-NoProfile", "-ExecutionPolicy", "Bypass", "-STA"],
+        script,
+        &[("RSCLAW_PS_OUT_PATH", out_png.as_os_str())],
     );
-    let mut cmd = Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-STA",
-        "-Command",
-        &script,
-    ]);
-    cmd.creation_flags(0x08000000);
     let res = cmd
         .output()
         .map_err(|e| format!("clipboard image spawn failed: {e}"))?;
@@ -659,17 +753,16 @@ if($p){ [FWOCR]::Go($p.MainWindowHandle) } else { Write-Error 'WECHAT_WINDOW_NOT
     std::thread::sleep(std::time::Duration::from_millis(1000));
     // Read PNG from clipboard.
     let tmp = PrivateTempFile::create("rsclaw-ocr-alta-", ".png")?;
-    let ps_read = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; \
+    let ps_read = "Add-Type -AssemblyName System.Windows.Forms; \
          Add-Type -AssemblyName System.Drawing; \
          $img=[System.Windows.Forms.Clipboard]::GetImage(); \
-         if($img -eq $null){{ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }}; \
-         $img.Save('{}',[System.Drawing.Imaging.ImageFormat]::Png); 'ok'",
-        tmp.path().display()
+         if($img -eq $null){ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }; \
+         $img.Save($env:RSCLAW_PS_OUT_PATH,[System.Drawing.Imaging.ImageFormat]::Png); 'ok'";
+    let mut ps_cmd = powershell_command(
+        &["-NoProfile", "-STA"],
+        ps_read,
+        &[("RSCLAW_PS_OUT_PATH", tmp.path().as_os_str())],
     );
-    let mut ps_cmd = Command::new("powershell");
-    ps_cmd.args(["-NoProfile", "-STA", "-Command", &ps_read]);
-    ps_cmd.creation_flags(0x08000000);
     match ps_cmd.output() {
         Ok(out) if out.status.success() => match std::fs::read(tmp.path()) {
             Ok(bytes) => {
@@ -1107,6 +1200,59 @@ fn run_osascript(script: &str) -> Result<String, String> {
     }
 }
 
+/// Build an `osascript` command that runs `script` inside an `on run argv`
+/// handler and passes `args` as argv (read in the script as `item N of argv`).
+///
+/// Untrusted values (bundle ids, app names, file paths, dialog titles) MUST go
+/// through argv instead of being interpolated into the script text: AppleScript
+/// string escaping is easy to get wrong, and an injected quote can reach
+/// `do shell script`. The `--` stops osascript option parsing so a value that
+/// starts with `-` is still treated as an argument.
+fn osascript_argv_command<S: AsRef<std::ffi::OsStr>>(script: &str, args: &[S]) -> Command {
+    let mut cmd = Command::new("osascript");
+    cmd.arg("-e")
+        .arg(format!("on run argv\n{script}\nend run"))
+        .arg("--")
+        .args(args);
+    cmd
+}
+
+/// Run `script` with `args` passed as argv (see [`osascript_argv_command`])
+/// and return trimmed stdout.
+fn run_osascript_argv<S: AsRef<std::ffi::OsStr>>(script: &str, args: &[S]) -> Result<String, String> {
+    match osascript_argv_command(script, args).output() {
+        Ok(out) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => Err(format!(
+            "osascript failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        Err(e) => Err(format!("osascript spawn failed: {e}")),
+    }
+}
+
+/// Build a hidden `powershell` command: `powershell <flags> -Command <script>`.
+///
+/// Untrusted values (paths, process names) are passed through environment
+/// variables and read in the script as `$env:NAME`, never interpolated into
+/// the script text. PowerShell treats the typographic quotes U+2018..U+201B as
+/// single-quote delimiters too, so doubling only `'` is not a safe escape.
+/// Sets CREATE_NO_WINDOW on Windows.
+fn powershell_command(flags: &[&str], script: &str, env: &[(&str, &std::ffi::OsStr)]) -> Command {
+    let mut cmd = Command::new("powershell");
+    cmd.args(flags).arg("-Command").arg(script);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    cmd
+}
+
 /// Convert a key name to an AppleScript key code (macOS).
 fn key_to_applescript_code(name: &str) -> Result<u16, String> {
     let code = match name.trim().to_lowercase().as_str() {
@@ -1408,15 +1554,15 @@ impl DesktopSession for NativeDesktopSession {
                 // Frontmost check (System Events) — used both as a fast-path
                 // (skip the whole activation dance when already frontmost, the
                 // common case in a monitor loop) and as the verify poll.
-                let check_script = format!(
-                    r#"tell application "System Events"
-    return frontmost of (first process whose bundle identifier is "{}")
-end tell"#,
-                    bundle_id.replace('"', r#"\""#)
-                );
+                // The bundle id is passed as argv, never interpolated into the
+                // script text (see `osascript_argv_command`).
+                let check_script = r#"set bid to item 1 of argv
+tell application "System Events"
+    return frontmost of (first process whose bundle identifier is bid)
+end tell"#;
                 let is_frontmost = || {
                     matches!(
-                        Command::new("osascript").args(["-e", &check_script]).output(),
+                        osascript_argv_command(check_script, &[&bundle_id]).output(),
                         Ok(out) if out.status.success()
                             && String::from_utf8_lossy(&out.stdout).trim().eq_ignore_ascii_case("true")
                     )
@@ -1437,23 +1583,14 @@ end tell"#,
                 let _ = Command::new("open").args(["-b", &bundle_id]).output();
                 std::thread::sleep(std::time::Duration::from_millis(250));
 
-                let script_activate = format!(
-                    r#"tell application id "{}" to activate"#,
-                    bundle_id.replace('"', r#"\""#)
-                );
-                let _ = Command::new("osascript")
-                    .args(["-e", &script_activate])
-                    .output();
+                let script_activate = r#"tell application id (item 1 of argv) to activate"#;
+                let _ = osascript_argv_command(script_activate, &[&bundle_id]).output();
 
-                let script_frontmost = format!(
-                    r#"tell application "System Events"
-    set frontmost of (first process whose bundle identifier is "{}") to true
-end tell"#,
-                    bundle_id.replace('"', r#"\""#)
-                );
-                let _ = Command::new("osascript")
-                    .args(["-e", &script_frontmost])
-                    .output();
+                let script_frontmost = r#"set bid to item 1 of argv
+tell application "System Events"
+    set frontmost of (first process whose bundle identifier is bid) to true
+end tell"#;
+                let _ = osascript_argv_command(script_frontmost, &[&bundle_id]).output();
 
                 // Verify frontmost up to 4 times (100ms apart), exit as soon as
                 // confirmed.
@@ -1465,52 +1602,46 @@ end tell"#,
                     let _ = Command::new("open").args(["-b", &bundle_id]).output();
                 }
                 Ok("ok".to_string()) // Return ok even if frontmost check fails
-            } else if cfg!(target_os = "windows") {
-                let lower = bundle_id.to_ascii_lowercase();
-                if lower.contains("wechat") || lower.contains("weixin") {
-                    // The operator keeps maximised WeChat frontmost. Do not query
-                    // HWNDs or enumerate processes/windows; VLM screenshot checks
-                    // are the authority before every action.
-                    return Ok("ok".to_string());
-                }
-                let escaped = bundle_id
-                    .replace('`', "``")
-                    .replace('*', "`*")
-                    .replace('?', "`?")
-                    .replace('[', "`[")
-                    .replace(']', "`]")
-                    .replace('\'', "''");
-                let ps = format!(
-                    r#"Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; Get-Process | Where-Object {{$_.ProcessName -like '*{}*'}} | ForEach-Object {{ if ($_.MainWindowHandle -ne 0) {{ [N.W]::SetForegroundWindow($_.MainWindowHandle) }} }}"#,
-                    escaped
-                );
-                #[allow(unused_mut)]
-                let mut ps_cmd = Command::new("powershell");
-                ps_cmd.args(["-NoProfile", "-Command", &ps]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    ps_cmd.creation_flags(0x08000000);
-                }
-                match ps_cmd.output() {
-                    Ok(out) if out.status.success() => Ok("ok".to_string()),
-                    Ok(out) => Err(format!("powershell failed: {}", String::from_utf8_lossy(&out.stderr))),
-                    Err(e) => Err(format!("powershell spawn failed: {e}")),
-                }
-            } else if cfg!(target_os = "linux") {
-                let wmctrl = Command::new("wmctrl").args(["-a", &bundle_id]).status();
-                if matches!(&wmctrl, Ok(s) if s.success()) {
-                    return Ok("ok".to_string());
-                }
-                match Command::new("xdotool")
-                    .args(["search", "--class", &bundle_id, "windowactivate"])
-                    .status()
-                {
-                    Ok(s) if s.success() => Ok("ok".to_string()),
-                    Ok(s) => Err(format!("xdotool exit status: {s}")),
-                    Err(e) => Err(format!("neither wmctrl nor xdotool worked: {e}")),
-                }
             } else {
+                #[cfg(target_os = "windows")]
+                {
+                    let lower = bundle_id.to_ascii_lowercase();
+                    if lower.contains("wechat") || lower.contains("weixin") {
+                        let actual = foreground_process_name()?.to_ascii_lowercase();
+                        if actual.contains("wechat") || actual.contains("weixin") {
+                            return Ok("ok".to_string());
+                        }
+                        return Err(
+                            "Windows WeChat is not foreground; host visual focus is required"
+                                .to_string(),
+                        );
+                    }
+                    // The app name is passed via env and wildcard-escaped inside
+                    // PowerShell; interpolating it into a single-quoted literal
+                    // is unsafe (U+2018..U+201B also terminate PS strings).
+                    let ps = r#"$pat = '*' + [System.Management.Automation.WildcardPattern]::Escape($env:RSCLAW_PS_APP) + '*'; Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; Get-Process | Where-Object {$_.ProcessName -like $pat} | ForEach-Object { if ($_.MainWindowHandle -ne 0) { [N.W]::SetForegroundWindow($_.MainWindowHandle) } }"#;
+                    let mut ps_cmd = powershell_command(
+                        &["-NoProfile"],
+                        ps,
+                        &[("RSCLAW_PS_APP", std::ffi::OsStr::new(&bundle_id))],
+                    );
+                    return match ps_cmd.output() {
+                        Ok(out) if out.status.success() => Ok("ok".to_string()),
+                        Ok(out) => Err(format!("powershell failed: {}", String::from_utf8_lossy(&out.stderr))),
+                        Err(e) => Err(format!("powershell spawn failed: {e}")),
+                    };
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let wmctrl = Command::new("wmctrl").args(["-a", &bundle_id]).status();
+                    if matches!(&wmctrl, Ok(s) if s.success()) { return Ok("ok".to_string()); }
+                    return match Command::new("xdotool").args(["search", "--class", &bundle_id, "windowactivate"]).status() {
+                        Ok(s) if s.success() => Ok("ok".to_string()),
+                        Ok(s) => Err(format!("xdotool exit status: {s}")),
+                        Err(e) => Err(format!("neither wmctrl nor xdotool worked: {e}")),
+                    };
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                 Err("activate_app: unsupported platform".to_string())
             }
         })
@@ -1518,27 +1649,120 @@ end tell"#,
         .map_err(|e| format!("activate_app join failed: {e}"))?
     }
 
+    async fn is_app_frontmost(&self, expected_app: &str) -> Result<bool, String> {
+        let expected_app = expected_app.trim().to_owned();
+        if expected_app.is_empty() {
+            return Ok(false);
+        }
+        tokio::task::spawn_blocking(move || {
+            #[cfg(target_os = "macos")]
+            {
+                let script = r#"tell application "System Events"
+    set frontProcess to first application process whose frontmost is true
+    try
+        return bundle identifier of frontProcess
+    on error
+        return name of frontProcess
+    end try
+end tell"#;
+                let actual = run_osascript(script)
+                    .map_err(|error| format!("frontmost app query failed: {error}"))?;
+                return Ok(actual.trim().eq_ignore_ascii_case(&expected_app)
+                    || bundle_to_app_name(&expected_app).eq_ignore_ascii_case(actual.trim()));
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let actual = foreground_process_name()?.to_ascii_lowercase();
+                let expected = expected_app.to_ascii_lowercase();
+                let wechat_expected = expected.contains("wechat") || expected.contains("weixin");
+                let wechat_actual = actual.contains("wechat") || actual.contains("weixin");
+                let matches =
+                    expected.eq_ignore_ascii_case(&actual) || (wechat_expected && wechat_actual);
+                if !matches {
+                    warn!(actual_process = %actual, expected_app = %expected,
+                        "desktop foreground identity mismatch");
+                }
+                return Ok(matches);
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                let output = Command::new("xdotool")
+                    .args(["getactivewindow", "getwindowclassname"])
+                    .output()
+                    .map_err(|error| format!("frontmost app query failed: {error}"))?;
+                if !output.status.success() {
+                    return Ok(false);
+                }
+                return Ok(String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .eq_ignore_ascii_case(&expected_app));
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+            {
+                let _ = expected_app;
+                Ok(false)
+            }
+        })
+        .await
+        .map_err(|error| format!("frontmost app query join failed: {error}"))?
+    }
+
+    async fn foreground_identity(&self) -> Result<String, String> {
+        tokio::task::spawn_blocking(|| {
+            #[cfg(target_os = "windows")]
+            {
+                let identity = foreground_identity()?;
+                return Ok(format!(
+                    "{:x}:{}:{}",
+                    identity.window,
+                    identity.process_id,
+                    identity.executable.display()
+                ));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err("foreground identity is currently Windows-only".to_string())
+            }
+        })
+        .await
+        .map_err(|error| format!("foreground identity join failed: {error}"))?
+    }
+
+    async fn full_screen_layout(&self) -> Result<(u32, u32), String> {
+        tokio::task::spawn_blocking(|| {
+            #[cfg(target_os = "windows")]
+            {
+                return supported_full_screen_layout();
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err("physical full-screen layout is currently Windows-only".to_string())
+            }
+        })
+        .await
+        .map_err(|error| format!("full-screen layout join failed: {error}"))?
+    }
+
     async fn list_windows(&self, bundle_id: &str) -> Result<String, String> {
         let bundle_id = bundle_id.to_owned();
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
                 let app_name = bundle_to_app_name(&bundle_id);
-                let script = format!(
-                    r#"tell application "System Events" to tell process "{}" to set winList to {{}}
+                // App name goes through argv, not string interpolation.
+                let script = r#"set appName to item 1 of argv
+tell application "System Events" to tell process appName to set winList to {}
 repeat with i from 1 to (count windows)
     set w to window i
     set wName to name of w
     set wPos to position of w
     set wSize to size of w
-    set wInfo to "{{\"idx\":" & i & ",\"title\":\"" & wName & "\",\"x\":" & (item 1 of wPos) & ",\"y\":" & (item 2 of wPos) & ",\"w\":" & (item 1 of wSize) & ",\"h\":" & (item 2 of wSize) & "}}"
+    set wInfo to "{\"idx\":" & i & ",\"title\":\"" & wName & "\",\"x\":" & (item 1 of wPos) & ",\"y\":" & (item 2 of wPos) & ",\"w\":" & (item 1 of wSize) & ",\"h\":" & (item 2 of wSize) & "}"
     set end of winList to wInfo
 end repeat
 set AppleScript's text item delimiters to ","
 return "[" & (winList as string) & "]"
-"#,
-                    app_name.replace('"', r#"\""#)
-                );
-                match run_osascript(&script) {
+"#;
+                match run_osascript_argv(script, &[&app_name]) {
                     Ok(json) => Ok(json),
                     Err(e) => Err(format!("list_windows failed: {e}")),
                 }
@@ -1555,12 +1779,13 @@ return "[" & (winList as string) & "]"
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
                 let app_name = bundle_to_app_name(&bundle_id);
+                // App name goes through argv; window_idx is a u32.
                 let script = format!(
-                    r#"tell application "System Events" to tell process "{}" to click button 1 of window {}"#,
-                    app_name.replace('"', r#"\""#),
+                    r#"set appName to item 1 of argv
+tell application "System Events" to tell process appName to click button 1 of window {}"#,
                     window_idx
                 );
-                match run_osascript(&script) {
+                match run_osascript_argv(&script, &[&app_name]) {
                     Ok(_) => Ok("ok".to_string()),
                     Err(e) => Err(format!("close_window failed: {e}")),
                 }
@@ -1578,8 +1803,9 @@ return "[" & (winList as string) & "]"
             if cfg!(target_os = "macos") {
                 let app_name = bundle_to_app_name(&bundle_id);
                 // Try AppleScript first (most accurate when Accessibility works).
-                let script = format!(
-                    r#"tell application "System Events" to tell process "{}"
+                // App name goes through argv, not string interpolation.
+                let script = r#"set appName to item 1 of argv
+tell application "System Events" to tell process appName
     set winCount to count of windows
     if winCount = 0 then return "0,0,0,0"
     set targetWin to missing value
@@ -1593,10 +1819,8 @@ return "[" & (winList as string) & "]"
     set p to position of targetWin
     set s to size of targetWin
     return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
-end tell"#,
-                    app_name.replace('"', r#"\""#)
-                );
-                match run_osascript(&script) {
+end tell"#;
+                match run_osascript_argv(script, &[&app_name]) {
                     Ok(output) => {
                         let trimmed = output.trim();
                         if trimmed == "0,0,0,0" {
@@ -1637,28 +1861,43 @@ end tell"#,
         .map_err(|e| format!("get_main_window join failed: {e}"))?
     }
 
+    async fn screenshot_full(&self) -> Result<String, String> {
+        #[cfg(target_os = "windows")]
+        {
+            tokio::task::spawn_blocking(|| {
+                let layout = supported_full_screen_layout()?;
+                let png = capture::capture_full_png().map_err(|error| error.to_string())?;
+                if supported_full_screen_layout()? != layout {
+                    return Err("display layout changed during full-screen capture".to_string());
+                }
+                if looks_blank(&png) {
+                    return Err("system full-screen capture is blank".to_string());
+                }
+                Ok(capture::png_to_data_uri(&png))
+            })
+            .await
+            .map_err(|error| format!("full-screen capture join failed: {error}"))?
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(
+                "physical full-screen desktop session capture is currently Windows-only"
+                    .to_string(),
+            )
+        }
+    }
+
     async fn screenshot_window(&self, bundle_id: &str) -> Result<String, String> {
         // A maximised Windows WeChat is the full-screen visual target. Capture
-        // the interactive desktop directly without discovering a HWND. Only if
-        // that capture is blank/blocked use WeChat's own Alt+A screenshot.
+        // the interactive desktop directly without discovering a HWND. Fail
+        // closed when unavailable: Alt+A can insert image drafts into the chat.
         #[cfg(target_os = "windows")]
         {
             let bl = bundle_id.to_lowercase();
             if bl.contains("wechat") || bl.contains("weixin") || bl.contains("xinwechat") {
-                let system_capture = tokio::task::spawn_blocking(|| {
-                    let png = capture::capture_full_png().map_err(|error| error.to_string())?;
-                    if looks_blank(&png) {
-                        return Err("system full-screen capture is blank".to_string());
-                    }
-                    Ok(capture::png_to_data_uri(&png))
-                })
-                .await
-                .map_err(|error| format!("full-screen capture join failed: {error}"))?;
-                match system_capture {
-                    Ok(image) => return Ok(image),
-                    Err(error) => warn!("{error}; using WeChat Alt+A screenshot"),
-                }
-                return self.wechat_builtin_screenshot(bundle_id).await;
+                return self.screenshot_full().await.map_err(|error| {
+                    format!("WeChat system full-screen capture unavailable: {error}")
+                });
             }
         }
         // Primary path: direct window-backing-store capture (overlap-proof,
@@ -1751,13 +1990,78 @@ end tell"#,
             let mut enigo = new_enigo()?;
             let (lx, ly) = scale_for_input(x, y);
             human_move(&mut enigo, lx, ly)?;
+            std::thread::sleep(std::time::Duration::from_millis(90));
             enigo
-                .button(Button::Left, Click)
-                .map_err(|e| format!("button click: {e}"))?;
+                .button(Button::Left, Press)
+                .map_err(|e| format!("button press: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(70));
+            enigo
+                .button(Button::Left, Release)
+                .map_err(|e| format!("button release: {e}"))?;
             Ok("ok".to_string())
         })
         .await
         .map_err(|e| format!("mouse_click join failed: {e}"))?
+    }
+
+    async fn focus_guarded_click(
+        &self,
+        x: u32,
+        y: u32,
+        source_identity: &str,
+        layout: (u32, u32),
+    ) -> Result<String, String> {
+        let source_identity = source_identity.trim().to_owned();
+        if source_identity.is_empty() {
+            return Err("guarded visual focus source identity is empty".to_string());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            tokio::task::spawn_blocking(move || {
+                let identity_token = || -> Result<String, String> {
+                    let identity = foreground_identity()?;
+                    Ok(format!(
+                        "{:x}:{}:{}",
+                        identity.window,
+                        identity.process_id,
+                        identity.executable.display()
+                    ))
+                };
+                if identity_token()? != source_identity || supported_full_screen_layout()? != layout
+                {
+                    return Err(
+                        "foreground identity or physical layout changed before guarded movement"
+                            .to_string(),
+                    );
+                }
+                let mut enigo = new_enigo()?;
+                let (lx, ly) = scale_for_input(x, y);
+                human_move_with_jitter(&mut enigo, lx, ly, crate::FOCUS_JITTER_MAX_PX as i32)?;
+                std::thread::sleep(std::time::Duration::from_millis(90));
+                if identity_token()? != source_identity || supported_full_screen_layout()? != layout
+                {
+                    return Err(
+                        "foreground identity or physical layout changed before guarded press"
+                            .to_string(),
+                    );
+                }
+                enigo
+                    .button(Button::Left, Press)
+                    .map_err(|error| format!("guarded button press: {error}"))?;
+                std::thread::sleep(std::time::Duration::from_millis(70));
+                enigo
+                    .button(Button::Left, Release)
+                    .map_err(|error| format!("guarded button release: {error}"))?;
+                Ok("ok".to_string())
+            })
+            .await
+            .map_err(|error| format!("guarded visual focus click join failed: {error}"))?
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (x, y, source_identity, layout);
+            Err("guarded visual focus click is currently Windows-only".to_string())
+        }
     }
 
     async fn mouse_double_click(&self, x: u32, y: u32) -> Result<String, String> {
@@ -2015,22 +2319,17 @@ end tell"#,
                 // Retry Set-Clipboard a few times: when a RustDesk/remote viewer is
                 // connected its clipboard sync intermittently holds the clipboard,
                 // making Set-Clipboard throw "failed to open clipboard".
-                let ps = format!(
-                    "$t=[System.IO.File]::ReadAllText('{}',[System.Text.Encoding]::UTF8); \
+                // The temp path is passed via env, not interpolated.
+                let ps = "$t=[System.IO.File]::ReadAllText($env:RSCLAW_PS_IN_PATH,[System.Text.Encoding]::UTF8); \
                      $ok=$false; \
-                     for($i=0;$i -lt 10;$i++){{ try{{ Set-Clipboard -Value $t -ErrorAction Stop; $ok=$true; break }} \
-                     catch{{ Start-Sleep -Milliseconds 250 }} }} \
-                     if(-not $ok){{ Write-Error 'clipboard busy after retries'; exit 1 }}",
-                    tmp.display()
+                     for($i=0;$i -lt 10;$i++){ try{ Set-Clipboard -Value $t -ErrorAction Stop; $ok=$true; break } \
+                     catch{ Start-Sleep -Milliseconds 250 } } \
+                     if(-not $ok){ Write-Error 'clipboard busy after retries'; exit 1 }";
+                let mut ps_cmd = powershell_command(
+                    &["-NoProfile", "-STA"],
+                    ps,
+                    &[("RSCLAW_PS_IN_PATH", tmp.as_os_str())],
                 );
-                #[allow(unused_mut)]
-                let mut ps_cmd = Command::new("powershell");
-                ps_cmd.args(["-NoProfile", "-STA", "-Command", &ps]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    ps_cmd.creation_flags(0x08000000);
-                }
                 let r = ps_cmd.output();
                 let _ = std::fs::remove_file(&tmp);
                 match r {
@@ -2114,11 +2413,11 @@ end tell"#,
         let file_path = file_path.to_owned();
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
-                let script = format!(
-                    "set the clipboard to (POSIX file \"{}\")",
-                    file_path.replace('"', "\\\"").replace('\\', "\\\\")
-                );
-                match Command::new("osascript").args(["-e", &script]).output() {
+                // The path goes through argv. The previous inline escaping ran
+                // `"` -> `\"` BEFORE `\` -> `\\`, turning `\"` back into an
+                // unescaped quote (script injection).
+                let script = "set the clipboard to (POSIX file (item 1 of argv))";
+                match osascript_argv_command(script, &[&file_path]).output() {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
                     Ok(out) => Err(format!(
                         "osascript failed: {}",
@@ -2148,15 +2447,14 @@ end tell"#,
                     Err(e) => Err(format!("xclip spawn failed: {e}")),
                 }
             } else if cfg!(target_os = "windows") {
-                let ps = format!("Set-Clipboard -Path '{}'", file_path.replace('\'', "''"));
-                #[allow(unused_mut)]
-                let mut ps_cmd = Command::new("powershell");
-                ps_cmd.args(["-NoProfile", "-Command", &ps]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    ps_cmd.creation_flags(0x08000000);
-                }
+                // The path is passed via env (doubling `'` alone is not a safe
+                // escape: U+2018..U+201B also delimit PS strings), and
+                // -LiteralPath disables wildcard expansion.
+                let mut ps_cmd = powershell_command(
+                    &["-NoProfile"],
+                    "Set-Clipboard -LiteralPath $env:RSCLAW_PS_IN_PATH",
+                    &[("RSCLAW_PS_IN_PATH", std::ffi::OsStr::new(&file_path))],
+                );
                 match ps_cmd.output() {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
                     Ok(out) => Err(format!(
@@ -2228,23 +2526,18 @@ end try"#,
                 // WDA_EXCLUDEFROMCAPTURE.
                 let tmp = std::env::temp_dir()
                     .join(format!("rsclaw_cb_{}.png", std::process::id()));
-                let ps = format!(
-                    "Add-Type -AssemblyName System.Windows.Forms; \
+                // The temp path is passed via env, not interpolated.
+                let ps = "Add-Type -AssemblyName System.Windows.Forms; \
                      Add-Type -AssemblyName System.Drawing; \
                      $img=[System.Windows.Forms.Clipboard]::GetImage(); \
-                     if($img -eq $null){{ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }}; \
-                     $img.Save('{}',[System.Drawing.Imaging.ImageFormat]::Png); \
-                     'ok'",
-                    tmp.display()
+                     if($img -eq $null){ Write-Error 'CLIPBOARD_EMPTY'; exit 1 }; \
+                     $img.Save($env:RSCLAW_PS_OUT_PATH,[System.Drawing.Imaging.ImageFormat]::Png); \
+                     'ok'";
+                let mut ps_cmd = powershell_command(
+                    &["-NoProfile", "-STA"],
+                    ps,
+                    &[("RSCLAW_PS_OUT_PATH", tmp.as_os_str())],
                 );
-                #[allow(unused_mut)]
-                let mut ps_cmd = Command::new("powershell");
-                ps_cmd.args(["-NoProfile", "-STA", "-Command", &ps]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    ps_cmd.creation_flags(0x08000000);
-                }
                 match ps_cmd.output() {
                     Ok(out) if out.status.success() => match std::fs::read(&tmp) {
                         Ok(bytes) => {
@@ -2294,23 +2587,20 @@ end try"#,
         let title = title.to_owned();
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
-                let script = format!(
-                    r#"choose file with prompt "{}""#,
-                    title.replace('"', "\\\"")
-                );
-                match Command::new("osascript").args(["-e", &script]).output() {
+                // The prompt title goes through argv, not string interpolation.
+                let script = "choose file with prompt (item 1 of argv)";
+                match osascript_argv_command(script, &[&title]).output() {
                     Ok(out) if out.status.success() => {
                         let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
                         // AppleScript returns alias like "alias Macintosh HD:Users:..."
                         // Convert to POSIX path
                         if path.starts_with("alias ") {
                             let alias_path = path.strip_prefix("alias ").unwrap_or(&path);
-                            match Command::new("osascript")
-                                .args([
-                                    "-e",
-                                    &format!("POSIX path of {} \"{}\"", "alias", alias_path),
-                                ])
-                                .output()
+                            match osascript_argv_command(
+                                "POSIX path of alias (item 1 of argv)",
+                                &[alias_path],
+                            )
+                            .output()
                             {
                                 Ok(out2) if out2.status.success() => {
                                     Ok(String::from_utf8_lossy(&out2.stdout).trim().to_string())
@@ -2333,5 +2623,42 @@ end try"#,
         })
         .await
         .map_err(|e| format!("file_dialog_open join failed: {e}"))?
+    }
+}
+
+#[cfg(test)]
+mod script_arg_tests {
+    use super::*;
+
+    #[test]
+    fn osascript_argv_keeps_untrusted_value_out_of_script() {
+        let evil = r#"x\" & (do shell script "id") & "\"#;
+        let cmd = osascript_argv_command("return item 1 of argv", &[evil]);
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "-e");
+        let script = args[1].to_string_lossy();
+        assert!(script.starts_with("on run argv\n"));
+        assert!(script.ends_with("\nend run"));
+        assert!(!script.contains("do shell script"));
+        assert_eq!(args[2], "--");
+        assert_eq!(args[3], evil);
+    }
+
+    #[test]
+    fn powershell_env_carries_value_verbatim() {
+        let evil = "a\u{2019}; Remove-Item C:\\ -Recurse; \u{2018}b'";
+        let cmd = powershell_command(
+            &["-NoProfile"],
+            "Set-Clipboard -LiteralPath $env:RSCLAW_PS_IN_PATH",
+            &[("RSCLAW_PS_IN_PATH", std::ffi::OsStr::new(evil))],
+        );
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args[0], "-NoProfile");
+        assert_eq!(args[1], "-Command");
+        assert!(!args[2].to_string_lossy().contains("Remove-Item"));
+        let env: Vec<_> = cmd.get_envs().collect();
+        assert!(env.iter().any(|(k, v)| *k == "RSCLAW_PS_IN_PATH"
+            && *v == Some(std::ffi::OsStr::new(evil))));
     }
 }

@@ -57,9 +57,11 @@ async fn non_silk_audio_does_not_panic() {
     let _result = transcribe_audio(&client, &ogg_bytes, "voice.ogg", "audio/ogg").await;
 }
 
-/// `download_file` should download bytes from a URL.
+/// `download_file` fetches platform-supplied media URLs, which are untrusted
+/// input, so it goes through the SSRF guard: loopback targets are refused
+/// without being requested.
 #[tokio::test]
-async fn download_file_from_mock() {
+async fn download_file_refuses_loopback() {
     init_crypto();
     let server = MockServer::start().await;
 
@@ -69,14 +71,13 @@ async fn download_file_from_mock() {
             ResponseTemplate::new(200)
                 .set_body_bytes(vec![0x52, 0x49, 0x46, 0x46]), // "RIFF" header
         )
-        .expect(1)
+        .expect(0)
         .mount(&server)
         .await;
 
     let client = reqwest::Client::new();
     let url = format!("{}/audio/test.wav", server.uri());
-    let bytes = download_file(&client, &url).await.unwrap();
-    assert_eq!(bytes, vec![0x52, 0x49, 0x46, 0x46]);
+    assert!(download_file(&client, &url).await.is_err());
 }
 
 /// `download_file` should return an error for non-2xx responses.

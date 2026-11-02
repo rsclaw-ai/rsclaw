@@ -111,6 +111,12 @@ fn plugins_list() -> Result<()> {
     );
     for p in &plugins {
         let version = p.version.as_deref().unwrap_or("-");
+        let version = if crate::bundled_plugins::is_bundled(&p.name) {
+            format!("{version}*")
+        } else {
+            version.to_owned()
+        };
+        let version = version.as_str();
         let desc = p.description.as_deref().unwrap_or("-");
         println!(
             "  {:<24} {:<10} {:<8} {}",
@@ -202,7 +208,7 @@ async fn plugins_install(spec: &str) -> Result<()> {
                 "plugin `{spec}` is in the hub allowlist but has no download URL — \
                  the hub manifest may be stale"
             ),
-            None => bail!(
+            None => brand_bail!(
                 "`{spec}` is not a local path, URL, or known hub plugin slug. \
                  Browse available plugins with `rsclaw plugins marketplace`."
             ),
@@ -467,14 +473,24 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 // ---------------------------------------------------------------------------
 
 fn plugins_set_enabled(name: &str, enabled: bool) -> Result<()> {
+    let locked = format!("plugins.entries.{name}.enabled");
+    if rsclaw_config::brand_layers::locked_paths()
+        .iter()
+        .any(|p| *p == locked || locked.starts_with(&format!("{p}.")))
+    {
+        bail!("plugin `{name}` is managed by the distributor of this build and cannot be toggled");
+    }
     // Verify the plugin is installed
     let plugin_dir = plugins_dir().join(name);
     if !plugin_dir.exists() {
         bail!("plugin `{name}` not found. Install it first.");
     }
 
-    let (path, mut val) = load_config_json()
-        .map_err(|_| anyhow::anyhow!("No config file found. Run `rsclaw onboard` first."))?;
+    let (path, mut val) = load_config_json().map_err(|_| {
+        anyhow::anyhow!(
+            rsclaw_brand::rebrand("No config file found. Run `rsclaw onboard` first.").into_owned()
+        )
+    })?;
 
     // Ensure plugins.entries.<name>.enabled exists
     {
@@ -646,6 +662,12 @@ fn plugins_inspect(name: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn plugins_uninstall(name: &str) -> Result<()> {
+    if crate::bundled_plugins::is_bundled(name) {
+        bail!(
+            "plugin `{name}` ships with this build and is reinstalled on every start; \
+             it cannot be uninstalled"
+        );
+    }
     let plugin_dir = plugins_dir().join(name);
     if !plugin_dir.exists() {
         bail!("plugin `{name}` not found in {}", plugins_dir().display());

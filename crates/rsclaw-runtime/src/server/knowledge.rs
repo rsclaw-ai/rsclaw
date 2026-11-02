@@ -19,7 +19,11 @@ use axum::{
     routing::{get, post},
 };
 use futures::{Stream, StreamExt as _};
-use rsclaw_kb::{KnowledgeError, KnowledgeService, model::KbCollection, service::DocInfo};
+use rsclaw_kb::{
+    KnowledgeError, KnowledgeService,
+    model::KbCollection,
+    service::{CollectionCounts, DocInfo},
+};
 use serde::{Deserialize, Serialize};
 
 /// Routes nested under `/api/v1/knowledge`. State is the `KnowledgeService`
@@ -80,6 +84,7 @@ fn err_response(e: KnowledgeError) -> Response {
         KnowledgeError::CollectionNotFound => (StatusCode::NOT_FOUND, "collection_not_found"),
         KnowledgeError::DocNotFound => (StatusCode::NOT_FOUND, "doc_not_found"),
         KnowledgeError::DuplicateName => (StatusCode::CONFLICT, "duplicate_name"),
+        KnowledgeError::ReadOnly => (StatusCode::FORBIDDEN, "read_only"),
         KnowledgeError::Internal(ref err) => {
             tracing::warn!("knowledge internal error: {err:#}");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal")
@@ -99,12 +104,15 @@ struct CollectionDto {
     embed_model: Option<String>,
     /// P2 will populate from the resolved embedder; 0 until then.
     embed_dim: u32,
-    /// P2 will populate by counting docs/chunks tagged to this collection.
+    /// Active docs/chunks/bytes tagged to this collection.
     doc_count: u64,
     chunk_count: u64,
     bytes: u64,
     created_at: String,
     updated_at: String,
+    /// A subscribed knowledge pack: kept in sync from its server, so its
+    /// documents and name cannot be changed here.
+    read_only: bool,
 }
 
 fn ms_to_rfc3339(ms: i64) -> String {
@@ -113,9 +121,21 @@ fn ms_to_rfc3339(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+impl CollectionDto {
+    fn with_counts(mut self, counts: Option<&CollectionCounts>) -> Self {
+        if let Some(c) = counts {
+            self.doc_count = c.doc_count as u64;
+            self.chunk_count = c.chunk_count as u64;
+            self.bytes = c.bytes;
+        }
+        self
+    }
+}
+
 impl From<KbCollection> for CollectionDto {
     fn from(c: KbCollection) -> Self {
         CollectionDto {
+            read_only: rsclaw_kb::model::is_pack_collection(&c.id),
             id: c.id,
             name: c.name,
             description: c.description,
@@ -150,7 +170,15 @@ struct PatchCollectionReq {
 async fn list_collections(State(svc): State<Arc<KnowledgeService>>) -> Response {
     match svc.list_collections() {
         Ok(cols) => {
-            let dtos: Vec<CollectionDto> = cols.into_iter().map(Into::into).collect();
+            // Counts are cosmetic; a failure here must not hide the list.
+            let counts = svc.collection_counts().unwrap_or_default();
+            let dtos: Vec<CollectionDto> = cols
+                .into_iter()
+                .map(|c| {
+                    let n = counts.get(&c.id).copied();
+                    CollectionDto::from(c).with_counts(n.as_ref())
+                })
+                .collect();
             Json(serde_json::json!({ "collections": dtos })).into_response()
         }
         Err(e) => err_response(e),
@@ -187,7 +215,11 @@ async fn get_collection(
     Path(id): Path<String>,
 ) -> Response {
     match svc.get_collection(&id) {
-        Ok(c) => Json(CollectionDto::from(c)).into_response(),
+        Ok(c) => {
+            let counts = svc.collection_counts().unwrap_or_default();
+            let n = counts.get(&c.id).copied();
+            Json(CollectionDto::from(c).with_counts(n.as_ref())).into_response()
+        }
         Err(e) => err_response(e),
     }
 }
@@ -651,12 +683,15 @@ async fn upload_from_url(
     if url.is_empty() {
         return bad_request("url_required");
     }
-    if let Err(code) = validate_public_http_url(url) {
+    if let Err(code) = validate_public_http_url(url).await {
         return bad_request(code);
     }
     // 404 early if the collection is gone (before any network fetch).
     if let Err(e) = svc.get_collection(&cid) {
         return err_response(e);
+    }
+    if rsclaw_kb::model::is_pack_collection(&cid) {
+        return err_response(KnowledgeError::ReadOnly);
     }
     match svc.ingest_url(&cid, url).await {
         Ok(outcome) => {
@@ -695,64 +730,30 @@ async fn upload_from_url(
 }
 
 /// SSRF guard for user-supplied fetch URLs. Requires http(s) and rejects
-/// targets that resolve to loopback / private / link-local / unspecified
-/// addresses (and the literal `localhost`). NOTE: this validates at request
-/// time; a fully hardened impl would also pin the resolved IP through to the
-/// connector to defeat DNS-rebinding (deferred — v1 accepts the TOCTOU
-/// window since the fetcher re-resolves immediately after).
-fn validate_public_http_url(raw: &str) -> Result<(), &'static str> {
-    use std::net::ToSocketAddrs;
+/// targets that resolve to loopback / private / link-local / CGNAT /
+/// IPv4-mapped / NAT64 forms of those / unspecified addresses (and
+/// `localhost`, `*.localhost`, `*.local`), via the shared
+/// `rsclaw_util::net` guard. NOTE: this only validates the initial URL at
+/// request time; the fetch itself (KB `UrlSyncer`) must pin DNS and
+/// re-validate redirects to close the rebinding/redirect gap.
+async fn validate_public_http_url(raw: &str) -> Result<(), &'static str> {
     let parsed = url::Url::parse(raw).map_err(|_| "invalid_url")?;
     match parsed.scheme() {
         "http" | "https" => {}
         _ => return Err("invalid_url"),
     }
-    let host = parsed.host_str().ok_or("invalid_url")?;
-    let host_l = host.to_ascii_lowercase();
-    if host_l == "localhost" || host_l.ends_with(".localhost") {
-        return Err("url_not_allowed");
+    if parsed.host_str().is_none() {
+        return Err("invalid_url");
     }
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|_| "url_unresolved")?;
-    let mut any = false;
-    for addr in addrs {
-        any = true;
-        if !is_public_ip(&addr.ip()) {
-            return Err("url_not_allowed");
-        }
-    }
-    if !any {
-        return Err("url_unresolved");
-    }
-    Ok(())
-}
-
-/// True only for globally-routable addresses (best-effort, std-only).
-fn is_public_ip(ip: &std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            !(v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || o[0] == 0
-                // CGNAT 100.64.0.0/10 (is_shared is unstable)
-                || (o[0] == 100 && (o[1] & 0xc0) == 0x40))
-        }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                // unique-local fc00::/7
-                || (s[0] & 0xfe00) == 0xfc00
-                // link-local fe80::/10
-                || (s[0] & 0xffc0) == 0xfe80)
+    match rsclaw_util::net::resolve_public_url(&parsed).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("did not resolve") || msg.contains("dns lookup") {
+                Err("url_unresolved")
+            } else {
+                Err("url_not_allowed")
+            }
         }
     }
 }
@@ -902,7 +903,8 @@ async fn compact(State(svc): State<Arc<KnowledgeService>>) -> Response {
 
 /// SSE stream of `knowledge.doc.status_changed` events, so the UI can react to
 /// async indexing finishing without polling. Each event's data is the JSON
-/// `{ type, docId, status }`.
+/// `{ type, docId, docTitle, collectionId, status }` (`collectionId` may be
+/// null for a doc with no collection tag).
 async fn events(
     State(svc): State<Arc<KnowledgeService>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -1241,6 +1243,16 @@ mod http_tests {
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0]["status"], "ready");
 
+        // collection totals reflect the tagged doc
+        let (st, body) = send(&app, "GET", "/collections", None).await;
+        assert_eq!(st, StatusCode::OK);
+        let col = &body["collections"][0];
+        assert_eq!(col["docCount"], 1);
+        assert!(col["chunkCount"].as_u64().unwrap() > 0);
+        assert!(col["bytes"].as_u64().unwrap() > 0);
+        let (_, body) = send(&app, "GET", &format!("/collections/{cid}"), None).await;
+        assert_eq!(body["docCount"], 1);
+
         // content
         let resp = app
             .clone()
@@ -1291,8 +1303,8 @@ mod http_tests {
         assert_eq!(body["error"], "collection_not_found");
     }
 
-    #[test]
-    fn ssrf_guard_blocks_private_and_loopback() {
+    #[tokio::test]
+    async fn ssrf_guard_blocks_private_and_loopback() {
         // Loopback / private / link-local / localhost must be rejected; these
         // use IP literals or `localhost` so the test needs no external DNS.
         for bad in [
@@ -1303,27 +1315,34 @@ mod http_tests {
             "http://169.254.169.254/latest/meta-data", // cloud metadata SSRF classic
             "http://[::1]/x",
             "http://0.0.0.0/x",
+            // IPv4-mapped IPv6 forms of loopback / metadata addresses.
+            "http://[::ffff:127.0.0.1]/x",
+            "http://[::ffff:169.254.169.254]/x",
         ] {
             assert!(
-                validate_public_http_url(bad).is_err(),
+                validate_public_http_url(bad).await.is_err(),
                 "should reject {bad}"
             );
         }
         // Bad scheme / not-a-url.
         assert_eq!(
-            validate_public_http_url("ftp://example.com").unwrap_err(),
+            validate_public_http_url("ftp://example.com")
+                .await
+                .unwrap_err(),
             "invalid_url"
         );
         assert_eq!(
-            validate_public_http_url("file:///etc/passwd").unwrap_err(),
+            validate_public_http_url("file:///etc/passwd")
+                .await
+                .unwrap_err(),
             "invalid_url"
         );
         assert_eq!(
-            validate_public_http_url("not a url").unwrap_err(),
+            validate_public_http_url("not a url").await.unwrap_err(),
             "invalid_url"
         );
         // A public IP literal passes (no DNS needed).
-        assert!(validate_public_http_url("https://8.8.8.8/").is_ok());
+        assert!(validate_public_http_url("https://8.8.8.8/").await.is_ok());
     }
 
     #[test]
@@ -1424,6 +1443,9 @@ mod http_tests {
     #[test]
     fn is_public_ip_classification() {
         use std::net::IpAddr;
+
+        use rsclaw_util::net::is_public_ip;
+        assert!(!is_public_ip(&"::ffff:10.0.0.1".parse::<IpAddr>().unwrap())); // v4-mapped
         assert!(is_public_ip(&"8.8.8.8".parse::<IpAddr>().unwrap()));
         assert!(is_public_ip(&"1.1.1.1".parse::<IpAddr>().unwrap()));
         assert!(!is_public_ip(&"10.1.2.3".parse::<IpAddr>().unwrap()));

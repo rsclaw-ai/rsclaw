@@ -12,6 +12,7 @@
 //!   - edit_pdf     (.pdf)  replace text / delete pages via lopdf
 //!   - read_doc     (.xlsx/.docx/.pdf) extract text content for inspection
 
+pub mod pdf_render;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -34,6 +35,16 @@ pub fn safe_extract_pdf_text(path: &Path) -> Result<String> {
 }
 
 /// Extract text from PDF bytes in memory, catching panics.
+/// Text of each page, guarded like [`safe_extract_pdf_from_mem`].
+pub fn safe_extract_pdf_pages_from_mem(bytes: &[u8]) -> Result<Vec<String>> {
+    let bytes_owned = bytes.to_vec();
+    match std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem_by_pages(&bytes_owned)) {
+        Ok(Ok(pages)) => Ok(pages),
+        Ok(Err(e)) => Err(anyhow!("pdf extract error: {e}")),
+        Err(_) => Err(anyhow!("pdf extract panicked (likely malformed font encoding)")),
+    }
+}
+
 pub fn safe_extract_pdf_from_mem(bytes: &[u8]) -> Result<String> {
     let bytes_owned = bytes.to_vec();
     match std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem(&bytes_owned)) {
@@ -261,22 +272,157 @@ fn create_excel(args: &Value, path: &Path) -> Result<Value> {
 // Word (.docx)
 // ---------------------------------------------------------------------------
 
-fn create_word(args: &Value, path: &Path) -> Result<Value> {
-    use docx_rs::*;
-
-    let title = args["title"].as_str().unwrap_or("");
-    let content = args["content"].as_str().unwrap_or("");
-
-    if content.is_empty() && title.is_empty() {
-        return Ok(json!({
-            "error": "create_word requires 'content' parameter. Please provide the text content to write into the document.",
-            "hint": "Retry with: {\"action\": \"create_word\", \"path\": \"file.docx\", \"content\": \"your text here\"}"
-        }));
+/// `content` without a leading heading that repeats `title`: models pass the
+/// title and also open the content with `# <title>`, which printed it twice.
+fn skip_repeated_title<'a>(content: &'a str, title: &str) -> &'a str {
+    let title = title.trim();
+    if title.is_empty() {
+        return content;
     }
+    let trimmed = content.trim_start();
+    let (first, rest) = trimmed.split_once('\n').unwrap_or((trimmed, ""));
+    if first.trim_start_matches('#').trim() == title {
+        rest
+    } else {
+        content
+    }
+}
 
+/// `text` split into (span, bold) by markdown `**` pairs. An unpaired
+/// `**` is dropped rather than printed.
+fn inline_spans(text: &str) -> Vec<(String, bool)> {
+    let parts: Vec<&str> = text.split("**").collect();
+    let paired = parts.len() % 2 == 1;
+    let mut spans: Vec<(String, bool)> = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        // With an odd marker count the last marker has no partner: its
+        // text stays plain.
+        let bold = i % 2 == 1 && (paired || i + 1 < parts.len());
+        if part.is_empty() {
+            continue;
+        }
+        match spans.last_mut() {
+            Some((prev, prev_bold)) if *prev_bold == bold => prev.push_str(part),
+            _ => spans.push(((*part).to_owned(), bold)),
+        }
+    }
+    spans
+}
+
+/// `text` without markdown `**` markers (for headings, bold anyway).
+fn strip_bold_markers(text: &str) -> String {
+    text.replace("**", "")
+}
+
+/// Whether CJK characters make up most of the letters in `text`.
+fn is_mostly_cjk(text: &str) -> bool {
+    let (mut cjk, mut latin) = (0usize, 0usize);
+    for c in text.chars() {
+        if ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c) {
+            cjk += 1;
+        } else if c.is_ascii_alphabetic() {
+            latin += 1;
+        }
+    }
+    cjk > 0 && cjk * 2 >= latin
+}
+
+/// A document laid out the way Chinese legal and official papers are:
+/// A4 with official-document margins, a centred 宋体 title, 黑体 / 楷体
+/// headings, 仿宋 body text indented two characters at a fixed line
+/// height, every line its own paragraph (so each party line of a brief is
+/// indented), and the closing "此致" indented, the court flush left and the
+/// signature and date on the right.
+fn chinese_document(title: &str, content: &str) -> docx_rs::Docx {
+    use docx_rs::*;
+    const LATIN: &str = "Times New Roman";
+    const BODY_FONT: &str = "仿宋";
+    const BODY_SIZE: usize = 28; // 14pt (四号), half-points
+    const TWO_CHARS: i32 = 560; // two 14pt characters, twips
+    let fonts = |east_asia: &str| RunFonts::new().east_asia(east_asia).ascii(LATIN).hi_ansi(LATIN);
+    let body_spacing = || LineSpacing::new().line(520).line_rule(LineSpacingType::Exact); // 26pt
+    let title_paragraph = |text: &str| {
+        Paragraph::new()
+            .add_run(Run::new().add_text(text).bold().size(44).fonts(fonts("宋体")))
+            .align(AlignmentType::Center)
+            .line_spacing(LineSpacing::new().after(240))
+    };
+    let heading = |text: &str, font: &str| {
+        Paragraph::new()
+            .add_run(Run::new().add_text(text).bold().size(BODY_SIZE).fonts(fonts(font)))
+            .line_spacing(body_spacing().before(120))
+    };
+    // Markdown **bold** inside a line becomes real bold.
+    let body_line = |text: &str| {
+        inline_spans(text).into_iter().fold(Paragraph::new(), |p, (span, bold)| {
+            let run = Run::new().add_text(span).size(BODY_SIZE).fonts(fonts(BODY_FONT));
+            p.add_run(if bold { run.bold() } else { run })
+        })
+    };
+
+    let mut docx = Docx::new()
+        .page_size(11906, 16838)
+        .page_margin(PageMargin::new().top(2098).bottom(1984).left(1588).right(1474));
+    let mut has_title = !title.trim().is_empty();
+    if has_title {
+        docx = docx.add_paragraph(title_paragraph(title.trim()));
+    }
+    // After "此致": the next line is the court (flush left), the rest is the
+    // signature block (right-aligned).
+    #[derive(PartialEq)]
+    enum Closing {
+        No,
+        Court,
+        Signature,
+    }
+    let mut closing = Closing::No;
+    for block in content.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        if let Some(text) = block.strip_prefix("# ") {
+            // The first heading of an untitled document is its title.
+            let text = strip_bold_markers(text.trim());
+            docx = docx.add_paragraph(if has_title { heading(&text, "黑体") } else { title_paragraph(&text) });
+            has_title = true;
+            continue;
+        }
+        if let Some(text) = block.strip_prefix("## ") {
+            docx = docx.add_paragraph(heading(&strip_bold_markers(text.trim()), "黑体"));
+            continue;
+        }
+        if let Some(text) = block.strip_prefix("### ") {
+            docx = docx.add_paragraph(heading(&strip_bold_markers(text.trim()), "楷体"));
+            continue;
+        }
+        for line in block.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let bullet = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "));
+            let mut p = match bullet {
+                Some(item) => body_line(&format!("• {item}")),
+                None => body_line(line),
+            }
+            .line_spacing(body_spacing());
+            if line == "此致" {
+                closing = Closing::Court;
+                p = p.indent(None, Some(SpecialIndentType::FirstLine(TWO_CHARS)), None, None);
+            } else if closing == Closing::Court {
+                closing = Closing::Signature;
+            } else if closing == Closing::Signature {
+                p = p.align(AlignmentType::Right);
+            } else if bullet.is_none() {
+                p = p.indent(None, Some(SpecialIndentType::FirstLine(TWO_CHARS)), None, None);
+            }
+            docx = docx.add_paragraph(p);
+        }
+    }
+    docx
+}
+
+/// The layout for non-Chinese documents: YaHei 10.5pt, 1.5 line spacing.
+fn plain_document(title: &str, content: &str) -> docx_rs::Docx {
+    use docx_rs::*;
     let mut docx = Docx::new();
-
-    // Default font: use CJK-friendly font stack.
     let default_font = "Microsoft YaHei";
     let font_size = 21; // 10.5pt in half-points
 
@@ -304,7 +450,7 @@ fn create_word(args: &Value, path: &Path) -> Result<Value> {
             continue;
         }
         if block.starts_with("### ") {
-            let text = &block[4..];
+            let text = &strip_bold_markers(&block[4..]);
             docx = docx.add_paragraph(
                 Paragraph::new()
                     .add_run(
@@ -317,7 +463,7 @@ fn create_word(args: &Value, path: &Path) -> Result<Value> {
                     .style("Heading3"),
             );
         } else if block.starts_with("## ") {
-            let text = &block[3..];
+            let text = &strip_bold_markers(&block[3..]);
             docx = docx.add_paragraph(
                 Paragraph::new()
                     .add_run(
@@ -330,7 +476,7 @@ fn create_word(args: &Value, path: &Path) -> Result<Value> {
                     .style("Heading2"),
             );
         } else if block.starts_with("# ") {
-            let text = &block[2..];
+            let text = &strip_bold_markers(&block[2..]);
             docx = docx.add_paragraph(
                 Paragraph::new()
                     .add_run(
@@ -357,26 +503,55 @@ fn create_word(args: &Value, path: &Path) -> Result<Value> {
                         .trim_start_matches("* ");
                     let p = Paragraph::new().add_run(
                         Run::new()
-                            .add_text(format!("  \u{2022}  {text}"))
+                            .add_text(format!("  \u{2022}  {}", strip_bold_markers(text)))
                             .size(font_size)
                             .fonts(RunFonts::new().east_asia(default_font)),
                     );
                     docx = docx.add_paragraph(p);
                 }
             } else {
-                // Regular paragraph with line spacing.
-                let p = Paragraph::new()
-                    .add_run(
-                        Run::new()
-                            .add_text(block)
+                // Regular paragraph with line spacing. A single newline is a
+                // line break: Word ignores newlines inside text, which ran a
+                // brief's party lines ("答辩人…" / "住所地…" / "法定代表人…")
+                // and its signature block together.
+                let mut p = Paragraph::new();
+                for (i, line) in block.lines().enumerate() {
+                    if i > 0 {
+                        p = p.add_run(Run::new().add_break(BreakType::TextWrapping));
+                    }
+                    for (span, bold) in inline_spans(line.trim_end()) {
+                        let run = Run::new()
+                            .add_text(span)
                             .size(font_size)
-                            .fonts(RunFonts::new().east_asia(default_font)),
-                    )
-                    .line_spacing(LineSpacing::new().line(360)); // 1.5x line spacing
+                            .fonts(RunFonts::new().east_asia(default_font));
+                        p = p.add_run(if bold { run.bold() } else { run });
+                    }
+                }
+                let p = p.line_spacing(LineSpacing::new().line(360)); // 1.5x line spacing
                 docx = docx.add_paragraph(p);
             }
         }
     }
+    docx
+}
+
+fn create_word(args: &Value, path: &Path) -> Result<Value> {
+
+    let title = args["title"].as_str().unwrap_or("");
+    let content = skip_repeated_title(args["content"].as_str().unwrap_or(""), title);
+
+    if content.is_empty() && title.is_empty() {
+        return Ok(json!({
+            "error": "create_word requires 'content' parameter. Please provide the text content to write into the document.",
+            "hint": "Retry with: {\"action\": \"create_word\", \"path\": \"file.docx\", \"content\": \"your text here\"}"
+        }));
+    }
+
+    let docx = if is_mostly_cjk(content) || is_mostly_cjk(title) {
+        chinese_document(title, content)
+    } else {
+        plain_document(title, content)
+    };
 
     let file = std::fs::File::create(path)?;
     docx.build().pack(file)?;
@@ -882,11 +1057,34 @@ fn edit_excel(args: &Value, path: &Path) -> Result<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Zip entry size caps (zip-bomb protection)
+// ---------------------------------------------------------------------------
+
+/// Maximum uncompressed bytes read from a single zip entry.
+const MAX_ZIP_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum total uncompressed bytes read from one archive.
+const MAX_ZIP_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read one zip entry fully, failing once it exceeds `MAX_ZIP_ENTRY_BYTES`
+/// instead of trusting the (attacker-controlled) declared size.
+fn read_zip_entry_capped<R: std::io::Read>(entry: R, name: &str) -> Result<Vec<u8>> {
+    use std::io::Read as IoRead;
+    let mut buf = Vec::new();
+    let n = entry.take(MAX_ZIP_ENTRY_BYTES + 1).read_to_end(&mut buf)?;
+    if n as u64 > MAX_ZIP_ENTRY_BYTES {
+        return Err(anyhow!(
+            "zip entry '{name}' exceeds {MAX_ZIP_ENTRY_BYTES} bytes uncompressed"
+        ));
+    }
+    Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
 // Edit Word (.docx) — read existing + append/replace content
 // ---------------------------------------------------------------------------
 
 fn edit_word(args: &Value, path: &Path) -> Result<Value> {
-    use std::io::{Read as IoRead, Write};
+    use std::io::Write;
 
     let append_text = args["append"].as_str();
     let replace_text = args["content"].as_str();
@@ -928,13 +1126,20 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| anyhow!("edit_word: invalid docx zip: {e}"))?;
 
-    // Read all entries into memory.
+    // Read all entries into memory, capped per entry and in total so a zip
+    // bomb cannot exhaust memory.
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut total: u64 = 0;
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
+        let entry = archive.by_index(i)?;
         let name = entry.name().to_owned();
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
+        let buf = read_zip_entry_capped(entry, &name)?;
+        total += buf.len() as u64;
+        if total > MAX_ZIP_TOTAL_BYTES {
+            return Err(anyhow!(
+                "edit_word: docx uncompressed size exceeds {MAX_ZIP_TOTAL_BYTES} bytes"
+            ));
+        }
         entries.push((name, buf));
     }
 
@@ -966,30 +1171,53 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
         }
     }
 
-    // Rewrite the zip with modified document.xml.
-    let out_file = std::fs::File::create(path)?;
-    let mut writer = zip::ZipWriter::new(out_file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    // Rewrite the zip with modified document.xml. Write to a temp file in
+    // the same directory and rename over the original, so a failure midway
+    // never leaves the user's document truncated.
+    drop(archive);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document.docx".to_owned());
+    let tmp_path = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let write_result = (|| -> Result<()> {
+        let out_file = std::fs::File::create(&tmp_path)?;
+        let mut writer = zip::ZipWriter::new(out_file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
 
-    for (name, data) in &entries {
-        writer.start_file(name, opts)?;
-        if name == "word/document.xml" {
-            // Insert new paragraphs before the closing </w:body> tag.
-            let xml = String::from_utf8_lossy(data);
-            if let Some(pos) = xml.rfind("</w:body>") {
-                let (before, after) = xml.split_at(pos);
-                let modified = format!("{before}{new_paras}{after}");
-                writer.write_all(modified.as_bytes())?;
+        for (name, data) in &entries {
+            writer.start_file(name, opts)?;
+            if name == "word/document.xml" {
+                // Insert new paragraphs before the closing </w:body> tag.
+                let xml = String::from_utf8_lossy(data);
+                if let Some(pos) = xml.rfind("</w:body>") {
+                    let (before, after) = xml.split_at(pos);
+                    let modified = format!("{before}{new_paras}{after}");
+                    writer.write_all(modified.as_bytes())?;
+                } else {
+                    // Fallback: write as-is if structure not found.
+                    writer.write_all(data)?;
+                }
             } else {
-                // Fallback: write as-is if structure not found.
                 writer.write_all(data)?;
             }
-        } else {
-            writer.write_all(data)?;
         }
+        let mut out_file = writer.finish()?;
+        out_file.flush()?;
+        out_file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        if let Err(rm_err) = std::fs::remove_file(&tmp_path) {
+            tracing::warn!(
+                path = %tmp_path.display(),
+                "edit_word: failed to remove temp file after error: {rm_err}"
+            );
+        }
+        return Err(e);
     }
-    writer.finish()?;
 
     Ok(json!({
         "edited": true,
@@ -1184,17 +1412,19 @@ fn read_doc(path: &Path) -> Result<Value> {
     match ext.as_str() {
         "xlsx" | "xls" => read_excel(path),
         "docx" => read_docx(path),
+        "doc" => read_legacy_doc(path),
         "pdf" => read_pdf(path),
         other => Err(anyhow!(
-            "read_doc: unsupported format '.{other}'. Supported: xlsx, docx, pdf"
+            "read_doc: unsupported format '.{other}'. Supported: xlsx, xls, docx, doc, pdf"
         )),
     }
 }
 
 fn read_excel(path: &Path) -> Result<Value> {
-    use calamine::{Data, Reader, Xlsx, open_workbook};
+    use calamine::{Data, Reader, open_workbook_auto};
 
-    let mut wb: Xlsx<_> = open_workbook(path)
+    // Auto-detect so legacy .xls opens too (the Xlsx reader rejects it).
+    let mut wb = open_workbook_auto(path)
         .map_err(|e| anyhow!("read_doc: cannot open '{}': {e}", path.display()))?;
 
     let sheet_names: Vec<String> = wb.sheet_names().to_vec();
@@ -1236,23 +1466,426 @@ fn read_excel(path: &Path) -> Result<Value> {
     }))
 }
 
-fn read_docx(path: &Path) -> Result<Value> {
-    use std::io::Read as IoRead;
+/// Plain text of a legacy Office file (.doc, .xls) for `read_file`, which
+/// otherwise rejects them as non-UTF-8. Spreadsheet rows come back one per
+/// line, cells separated by tabs, under a `# <sheet>` heading.
+pub fn legacy_office_text(path: &Path) -> Result<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let v = match ext.as_str() {
+        "doc" => read_legacy_doc(path)?,
+        "xls" => read_excel(path)?,
+        other => return Err(anyhow!("legacy_office_text: not a legacy Office file: .{other}")),
+    };
+    if let Some(text) = v["text"].as_str() {
+        return Ok(text.to_owned());
+    }
+    let mut out = String::new();
+    for sheet in v["sheets"].as_array().into_iter().flatten() {
+        out.push_str(&format!("# {}\n", sheet["name"].as_str().unwrap_or("")));
+        for row in sheet["rows"].as_array().into_iter().flatten() {
+            let cells: Vec<&str> = row
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| c.as_str().unwrap_or(""))
+                .collect();
+            out.push_str(&cells.join("\t"));
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
 
+/// Text of a legacy binary Word file (.doc). Word 97–2003 files are read
+/// directly from their piece table; anything that reader rejects (Word 6/95,
+/// encrypted, damaged) falls back to what the system has: macOS textutil,
+/// antiword or catdoc, Word itself on Windows, else LibreOffice converting
+/// to .docx.
+fn read_legacy_doc(path: &Path) -> Result<Value> {
+    use std::process::Command;
+
+    let done = |text: String, via: &str| {
+        json!({
+            "path": path.display().to_string(),
+            "format": "doc",
+            "text": text,
+            "length": text.len(),
+            "via": via,
+        })
+    };
+    match read_word97_text(path) {
+        Ok(text) if !text.is_empty() => return Ok(done(text, "native")),
+        Ok(_) => {}
+        Err(e) => tracing::debug!(path = %path.display(), "native .doc reader declined: {e}"),
+    }
+    let readers: &[(&str, &[&str])] = &[
+        ("textutil", &["-convert", "txt", "-stdout"]),
+        ("antiword", &["-w", "0"]),
+        ("catdoc", &[]),
+    ];
+    for (bin, args) in readers {
+        if let Ok(out) = Command::new(bin).args(*args).arg(path).output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !text.is_empty() {
+                return Ok(done(text, bin));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Word, when installed, reads its own format; read-only, no prompts.
+        let script = format!(
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $w=New-Object -ComObject Word.Application; \
+             $w.Visible=$false; $d=$w.Documents.Open('{}', $false, $true); $d.Content.Text; \
+             $d.Close(0); $w.Quit()",
+            path.display().to_string().replace('\'', "''")
+        );
+        if let Ok(out) = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !text.is_empty() {
+                return Ok(done(text, "word"));
+            }
+        }
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "rsclaw-doc-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    for bin in ["soffice", "libreoffice"] {
+        let converted = Command::new(bin)
+            .args(["--headless", "--convert-to", "docx", "--outdir"])
+            .arg(&dir)
+            .arg(path)
+            .output();
+        if converted.is_ok_and(|o| o.status.success()) {
+            let docx = dir.join(path.with_extension("docx").file_name().unwrap_or_default());
+            let read = read_docx(&docx);
+            let _ = std::fs::remove_dir_all(&dir);
+            if let Ok(mut v) = read {
+                v["path"] = json!(path.display().to_string());
+                v["format"] = json!("doc");
+                v["via"] = json!(bin);
+                return Ok(v);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Err(anyhow!(
+        "read_doc: cannot read the legacy Word file '{}': no converter on this machine \
+         (textutil, antiword, catdoc, Word or LibreOffice). Ask the user for a .docx or PDF copy.",
+        path.display()
+    ))
+}
+
+/// Main-document text of a Word 97–2003 file ([MS-DOC]): the FIB names the
+/// table stream and the Clx, whose piece table maps character positions to
+/// runs of UTF-16LE or 8-bit text in the WordDocument stream.
+fn read_word97_text(path: &Path) -> Result<String> {
+    use std::io::Read;
+
+    // Some writers (macOS textutil among them) leave allocation tables that
+    // even cfb's permissive mode refuses; read those by following the chains.
+    let stream = |name: &str| -> Result<Vec<u8>> {
+        match cfb::open(path) {
+            Ok(mut file) => {
+                let mut buf = Vec::new();
+                file.open_stream(format!("/{name}"))
+                    .map_err(|e| anyhow!("no {name} stream: {e}"))?
+                    .read_to_end(&mut buf)?;
+                Ok(buf)
+            }
+            Err(_) => read_cfb_stream_lenient(&std::fs::read(path)?, name),
+        }
+    };
+    let word = stream("WordDocument")?;
+
+    let u16_at = |b: &[u8], o: usize| -> Result<usize> {
+        b.get(o..o + 2)
+            .map(|s| u16::from_le_bytes([s[0], s[1]]) as usize)
+            .ok_or_else(|| anyhow!("truncated at {o}"))
+    };
+    let u32_at = |b: &[u8], o: usize| -> Result<usize> {
+        b.get(o..o + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+            .ok_or_else(|| anyhow!("truncated at {o}"))
+    };
+
+    if u16_at(&word, 0)? != 0xA5EC {
+        return Err(anyhow!("not a Word 97+ document"));
+    }
+    let flags = u16_at(&word, 0x0A)?;
+    if flags & 0x0100 != 0 {
+        return Err(anyhow!("encrypted"));
+    }
+    let table_name = if flags & 0x0200 != 0 {
+        "1Table"
+    } else {
+        "0Table"
+    };
+
+    // FibBase is 32 bytes, then three length-prefixed arrays: fibRgW (u16s),
+    // fibRgLw (u32s; ccpText is its fourth entry) and fibRgFcLcb (fc/lcb pairs;
+    // the Clx is pair 33).
+    let csw = u16_at(&word, 32)?;
+    let rg_lw = 34 + csw * 2 + 2;
+    let cslw = u16_at(&word, 34 + csw * 2)?;
+    let ccp_text = u32_at(&word, rg_lw + 12)?;
+    let rg_fclcb = rg_lw + cslw * 4 + 2;
+    let fc_clx = u32_at(&word, rg_fclcb + 33 * 8)?;
+    let lcb_clx = u32_at(&word, rg_fclcb + 33 * 8 + 4)?;
+
+    let table = stream(table_name)?;
+    let clx = table
+        .get(fc_clx..fc_clx + lcb_clx)
+        .ok_or_else(|| anyhow!("Clx outside the table stream"))?;
+
+    // Skip the Prc entries (0x01, cb, grpprl) to reach the Pcdt (0x02).
+    let mut pos = 0;
+    while clx.get(pos) == Some(&0x01) {
+        pos += 3 + u16_at(clx, pos + 1)?;
+    }
+    if clx.get(pos) != Some(&0x02) {
+        return Err(anyhow!("no piece table"));
+    }
+    let lcb = u32_at(clx, pos + 1)?;
+    let plc = clx
+        .get(pos + 5..pos + 5 + lcb)
+        .ok_or_else(|| anyhow!("piece table truncated"))?;
+    if lcb < 4 || (lcb - 4) % 12 != 0 {
+        return Err(anyhow!("malformed piece table"));
+    }
+    let pieces = (lcb - 4) / 12;
+
+    let mut raw = String::new();
+    for i in 0..pieces {
+        let cp_start = u32_at(plc, i * 4)?;
+        if cp_start >= ccp_text {
+            break;
+        }
+        let cp_end = u32_at(plc, (i + 1) * 4)?.min(ccp_text);
+        let chars = cp_end.saturating_sub(cp_start);
+        let fc = u32_at(plc, (pieces + 1) * 4 + i * 8 + 2)?;
+        if fc & 0x4000_0000 != 0 {
+            let off = (fc & 0x3FFF_FFFF) / 2;
+            let bytes = word
+                .get(off..off + chars)
+                .ok_or_else(|| anyhow!("piece {i} outside the document"))?;
+            raw.extend(bytes.iter().map(|&b| cp1252_char(b)));
+        } else {
+            let bytes = word
+                .get(fc..fc + chars * 2)
+                .ok_or_else(|| anyhow!("piece {i} outside the document"))?;
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            raw.extend(char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')));
+        }
+    }
+    Ok(clean_word_text(&raw))
+}
+
+/// One root-level stream of a compound file ([MS-CFB]), read by following
+/// its sector chain without validating the allocation tables. Chains are
+/// bounded by the file size, so a cycle cannot loop forever.
+fn read_cfb_stream_lenient(data: &[u8], name: &str) -> Result<Vec<u8>> {
+    // Sector numbers above this are markers (end of chain, free, FAT, DIFAT).
+    const MAX_SECT: u32 = 0xFFFF_FFFA;
+    fn chain<'a>(
+        start: u32,
+        table: &[u32],
+        max_bytes: usize,
+        read: &dyn Fn(u32) -> Option<&'a [u8]>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut s = start;
+        while s <= MAX_SECT && out.len() < max_bytes {
+            match read(s) {
+                Some(bytes) => out.extend_from_slice(bytes),
+                None => break,
+            }
+            s = table.get(s as usize).copied().unwrap_or(u32::MAX);
+        }
+        out
+    }
+    let u16_at = |o: usize| data.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]));
+    let u32_at = |o: usize| {
+        data.get(o..o + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let short = || anyhow!("compound file truncated");
+
+    if data.get(0..8) != Some(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1][..]) {
+        return Err(anyhow!("not an OLE compound file"));
+    }
+    let shift = u16_at(0x1E).ok_or_else(short)?;
+    if !(7..=12).contains(&shift) {
+        return Err(anyhow!("bad sector size"));
+    }
+    let size = 1usize << shift;
+    let sector = |s: u32| 512usize.max(size) + s as usize * size;
+    let limit = data.len() / size + 1;
+
+    // The FAT's own sectors: 109 in the header, the rest in DIFAT sectors.
+    let fat_count = u32_at(0x2C).ok_or_else(short)? as usize;
+    let mut fat_sectors = Vec::new();
+    for i in 0..109 {
+        let s = u32_at(0x4C + i * 4).ok_or_else(short)?;
+        if s <= MAX_SECT {
+            fat_sectors.push(s);
+        }
+    }
+    let mut difat = u32_at(0x44).ok_or_else(short)?;
+    while difat <= MAX_SECT && fat_sectors.len() < fat_count && fat_sectors.len() < limit {
+        let base = sector(difat);
+        for i in 0..size / 4 - 1 {
+            let s = u32_at(base + i * 4).ok_or_else(short)?;
+            if s <= MAX_SECT {
+                fat_sectors.push(s);
+            }
+        }
+        difat = u32_at(base + size - 4).ok_or_else(short)?;
+    }
+    let mut fat = Vec::new();
+    for s in fat_sectors {
+        let base = sector(s);
+        for i in 0..size / 4 {
+            fat.push(u32_at(base + i * 4).unwrap_or(u32::MAX));
+        }
+    }
+    // The last sector may be cut short when the file was not padded out.
+    let big = |s: u32| {
+        let at = sector(s);
+        data.get(at..(at + size).min(data.len()))
+            .filter(|b| !b.is_empty())
+    };
+
+    let dir = chain(u32_at(0x30).ok_or_else(short)?, &fat, data.len(), &big);
+    let entry = |i: usize| dir.get(i * 128..i * 128 + 128);
+    let root = entry(0).ok_or_else(|| anyhow!("no root directory entry"))?;
+    let field_u32 = |e: &[u8], o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
+    let wanted: Vec<u16> = name.encode_utf16().collect();
+    let found = (1..dir.len() / 128).filter_map(entry).find(|e| {
+        let len = (u16::from_le_bytes([e[64], e[65]]) as usize / 2).saturating_sub(1);
+        let units: Vec<u16> = e[..len.min(32) * 2]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        e[66] == 2 && units == wanted
+    });
+    let e = found.ok_or_else(|| anyhow!("no {name} stream"))?;
+    let start = field_u32(e, 116);
+    let len = field_u32(e, 120) as usize;
+    let cutoff = u32_at(0x38).ok_or_else(short)? as usize;
+
+    let mut bytes = if len < cutoff {
+        // Small streams live in 64-byte mini sectors inside the root's stream.
+        let mini_stream = chain(field_u32(root, 116), &fat, data.len(), &big);
+        let minifat_bytes = chain(u32_at(0x3C).ok_or_else(short)?, &fat, data.len(), &big);
+        let minifat: Vec<u32> = minifat_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mini = |s: u32| mini_stream.get(s as usize * 64..s as usize * 64 + 64);
+        chain(start, &minifat, len, &mini)
+    } else {
+        chain(start, &fat, len, &big)
+    };
+    if bytes.len() < len {
+        return Err(anyhow!("{name} stream truncated"));
+    }
+    bytes.truncate(len);
+    Ok(bytes)
+}
+
+/// Windows-1252 for the 8-bit ("compressed") pieces of a Word file.
+fn cp1252_char(b: u8) -> char {
+    const HIGH: [u16; 32] = [
+        0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x8D, 0x017D, 0x8F, 0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013,
+        0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178,
+    ];
+    match b {
+        0x80..=0x9F => char::from_u32(HIGH[(b - 0x80) as usize] as u32).unwrap_or('\u{FFFD}'),
+        _ => b as char,
+    }
+}
+
+/// Turn Word's in-text control characters into plain text: paragraph and
+/// line breaks become newlines, table cell marks tabs, field codes keep only
+/// their displayed result, and object anchors are dropped.
+fn clean_word_text(raw: &str) -> String {
+    // Each open field: true once its separator (0x14) has been seen.
+    let mut fields: Vec<bool> = Vec::new();
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\u{13}' => fields.push(false),
+            '\u{14}' => {
+                if let Some(sep) = fields.last_mut() {
+                    *sep = true;
+                }
+            }
+            '\u{15}' => {
+                fields.pop();
+            }
+            _ if fields.iter().any(|sep| !sep) => {}
+            '\r' | '\u{0B}' | '\u{0C}' => out.push('\n'),
+            '\u{07}' => out.push('\t'),
+            '\u{1E}' => out.push('-'),
+            '\u{A0}' => out.push(' '),
+            '\t' | '\n' => out.push(c),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    let mut text = String::with_capacity(out.len());
+    let mut blank = 0;
+    for line in out.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    text.trim().to_owned()
+}
+
+fn read_docx(path: &Path) -> Result<Value> {
     let file = std::fs::File::open(path)
         .map_err(|e| anyhow!("read_doc: cannot open '{}': {e}", path.display()))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| anyhow!("read_doc: invalid docx zip: {e}"))?;
 
-    let mut xml = String::new();
-    if let Ok(mut entry) = archive.by_name("word/document.xml") {
-        entry.read_to_string(&mut xml)?;
+    let xml = if let Ok(entry) = archive.by_name("word/document.xml") {
+        let buf = read_zip_entry_capped(entry, "word/document.xml")?;
+        String::from_utf8(buf)
+            .map_err(|e| anyhow!("read_doc: word/document.xml is not valid UTF-8: {e}"))?
     } else {
         return Err(anyhow!(
             "read_doc: '{}' is a zip archive but has no word/document.xml — not a valid .docx (possibly an .xlsx/.pptx or renamed file). Check the real format and retry with the matching extension, or re-create it with 'create_word'.",
             path.display()
         ));
-    }
+    };
 
     // Extract text from <w:t> tags.
     let mut text = String::new();
@@ -1368,6 +2001,77 @@ mod tests {
         println!("DOCX output: {}", path.display());
     }
 
+    fn document_xml(path: &std::path::Path) -> String {
+        let file = std::fs::File::open(path).expect("open docx");
+        let mut zip = zip::ZipArchive::new(file).expect("zip");
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("word/document.xml").expect("document.xml"), &mut xml)
+            .expect("read xml");
+        xml
+    }
+
+    #[tokio::test]
+    async fn create_word_lays_out_a_chinese_brief() {
+        let dir = std::env::temp_dir().join("rsclaw_doc_brief_test");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("brief.docx");
+        let content = "# 民事答辩状\n\n答辩人：武汉安和置业有限公司\n住所地：武汉市汉阳区江城大道88号\n\
+            法定代表人：周宁\n\n## 一、答辩请求\n\n请求驳回被答辩人的全部诉讼请求。\n\n此致\n武汉市汉阳区人民法院\n\n\
+            答辩人：武汉安和置业有限公司\n二〇二六年 月 日";
+        let args = json!({"action": "create_word", "path": path.to_str().expect("path"), "content": content});
+        handle(&args, &path).await.expect("create_word");
+        let xml = document_xml(&path);
+        assert!(!xml.contains("有限公司住所地"), "party lines ran together: {xml}");
+        assert!(xml.contains("仿宋") && xml.contains("黑体") && xml.contains("Times New Roman"), "{xml}");
+        assert!(xml.contains(r#"w:jc w:val="center""#), "title not centred: {xml}");
+        assert!(xml.contains(r#"w:firstLine="560""#), "body not indented two characters: {xml}");
+        // Signature and date on the right; the court flush left.
+        assert_eq!(xml.matches(r#"w:jc w:val="right""#).count(), 2, "{xml}");
+        assert!(xml.contains(r#"w:top="2098""#), "official margins missing: {xml}");
+    }
+
+    #[test]
+    fn inline_spans_turn_markdown_bold_into_bold() {
+        assert_eq!(
+            inline_spans("**被答辩人（原告）：陈东**，男"),
+            vec![("被答辩人（原告）：陈东".to_owned(), true), ("，男".to_owned(), false)]
+        );
+        assert_eq!(inline_spans("plain"), vec![("plain".to_owned(), false)]);
+        // An unpaired marker is dropped, its text stays plain.
+        assert_eq!(inline_spans("a **b"), vec![("a b".to_owned(), false)]);
+    }
+
+    #[tokio::test]
+    async fn create_word_prints_no_markdown_markers() {
+        let dir = std::env::temp_dir().join("rsclaw_doc_bold_test");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        for (name, content) in [
+            ("zh.docx", "## **一、答辩请求**\n\n**答辩人（被告）：武汉安和置业有限公司**\n住所地：武汉"),
+            ("en.docx", "## **Claims**\n\nThe **defendant** denies it."),
+        ] {
+            let path = dir.join(name);
+            let args = json!({"action": "create_word", "path": path.to_str().expect("path"), "content": content});
+            handle(&args, &path).await.expect("create_word");
+            let xml = document_xml(&path);
+            assert!(!xml.contains("**"), "{name}: markers printed: {xml}");
+            assert!(xml.contains("<w:b />") || xml.contains("<w:b/>"), "{name}: no bold run: {xml}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_word_keeps_line_breaks_in_plain_documents() {
+        let dir = std::env::temp_dir().join("rsclaw_doc_linebreak_test");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("notes.docx");
+        let args = json!({
+            "action": "create_word",
+            "path": path.to_str().expect("path"),
+            "content": "Attendees: Alice\nBob\nCarol\n\nNext meeting on Monday",
+        });
+        handle(&args, &path).await.expect("create_word");
+        assert_eq!(document_xml(&path).matches("<w:br").count(), 2);
+    }
+
     #[tokio::test]
     async fn test_create_pdf_and_read_back() {
         let dir = std::env::temp_dir().join("rsclaw_pdf_test");
@@ -1450,5 +2154,69 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod skip_repeated_title_tests {
+    use super::skip_repeated_title;
+
+    #[test]
+    fn drops_only_a_heading_that_repeats_the_title() {
+        assert_eq!(skip_repeated_title("# 民事答辩状\n\n答辩人：甲", "民事答辩状"), "\n答辩人：甲");
+        assert_eq!(skip_repeated_title("民事答辩状\n答辩人：甲", "民事答辩状"), "答辩人：甲");
+        assert_eq!(skip_repeated_title("# 答辩请求\n一、", "民事答辩状"), "# 答辩请求\n一、");
+        assert_eq!(skip_repeated_title("# 民事答辩状", ""), "# 民事答辩状");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod legacy_doc_tests {
+    #[test]
+    fn reads_a_legacy_word_file() {
+        let dir = std::env::temp_dir().join(format!("rsclaw-doc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("note.txt");
+        std::fs::write(&txt, "证据目录\n证据一：中标结果公告").unwrap();
+        let doc = dir.join("note.doc");
+        let made = std::process::Command::new("textutil")
+            .args(["-convert", "doc", "-output"])
+            .arg(&doc)
+            .arg(&txt)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let native = super::read_word97_text(&doc).unwrap();
+        assert!(native.starts_with("证据目录\n证据一"), "{native:?}");
+        let v = super::read_legacy_doc(&doc).unwrap();
+        assert_eq!(v["format"], "doc");
+        assert_eq!(v["via"], "native", "{v}");
+        assert!(v["text"].as_str().unwrap().contains("中标结果公告"), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod word97_text_tests {
+    use super::{clean_word_text, cp1252_char};
+
+    #[test]
+    fn breaks_cells_and_fields_become_plain_text() {
+        let raw = "证据目录\r序号\u{07}名称\u{07}\u{07}\r\u{13} PAGE \u{14}3\u{15}\u{01}页\u{0B}末行\r\r\r\r";
+        assert_eq!(clean_word_text(raw), "证据目录\n序号\t名称\n3页\n末行");
+    }
+
+    #[test]
+    fn nested_field_keeps_only_the_outer_result() {
+        let raw = "a\u{13}IF \u{13}PAGE\u{14}1\u{15} = 1\u{14}yes\u{15}b";
+        assert_eq!(clean_word_text(raw), "ayesb");
+    }
+
+    #[test]
+    fn eight_bit_pieces_decode_as_windows_1252() {
+        assert_eq!(cp1252_char(b'A'), 'A');
+        assert_eq!(cp1252_char(0x93), '\u{201C}');
+        assert_eq!(cp1252_char(0x80), '\u{20AC}');
+        assert_eq!(cp1252_char(0xE9), 'é');
     }
 }

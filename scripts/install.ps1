@@ -77,6 +77,18 @@ function Get-Target {
 # --- Resolve version + cache release data ---
 $script:ReleaseData = $null
 
+# Numeric sort key for a release tag such as "v2026.10.1" or "v0.1.0-beta".
+# A plain string sort would rank "v2026.9" above "v2026.10".
+function Get-VersionKey {
+    param([string]$Tag)
+    if ($Tag -match '^v?(\d+(\.\d+){0,3})') {
+        $parts = @($Matches[1] -split '\.')
+        while ($parts.Count -lt 2) { $parts += "0" }
+        try { return [version]($parts -join '.') } catch {}
+    }
+    return [version]"0.0"
+}
+
 function Get-LatestVersion {
     if ($Version -ne "") {
         return $Version
@@ -85,14 +97,14 @@ function Get-LatestVersion {
     # Primary: app.rsclaw.ai/api/version (array of releases, find latest CLI tag v*)
     try {
         $script:ReleaseData = Invoke-RestMethod -Uri "https://app.rsclaw.ai/api/version" -TimeoutSec 5
-        $cliTags = $script:ReleaseData | Where-Object { $_.tag_name -match '^v' -and $_.tag_name -notmatch '^app-' } | ForEach-Object { $_.tag_name } | Sort-Object -Descending
+        $cliTags = $script:ReleaseData | Where-Object { $_.tag_name -match '^v\d' } | ForEach-Object { $_.tag_name } | Sort-Object -Property @{ Expression = { Get-VersionKey $_ } } -Descending
         if ($cliTags) { return ($cliTags | Select-Object -First 1) }
     } catch {}
 
     # Fallback: GitHub releases API
     try {
         $script:ReleaseData = Invoke-RestMethod -Uri "$GhApi/repos/$Repo/releases?per_page=10" -TimeoutSec 10
-        $cliTags = $script:ReleaseData | Where-Object { $_.tag_name -match '^v' -and $_.tag_name -notmatch '^app-' } | ForEach-Object { $_.tag_name } | Sort-Object -Descending
+        $cliTags = $script:ReleaseData | Where-Object { $_.tag_name -match '^v\d' } | ForEach-Object { $_.tag_name } | Sort-Object -Property @{ Expression = { Get-VersionKey $_ } } -Descending
         if ($cliTags) { return ($cliTags | Select-Object -First 1) }
     } catch {}
 
@@ -100,22 +112,42 @@ function Get-LatestVersion {
     exit 1
 }
 
-# Extract browser_download_url for a given filename from cached release data
+# Resolve the download URL of an exact asset name inside ONE release tag.
+# Archive, checksum and tray URLs must never be picked independently from a
+# multi-release API response (e.g. an app-v* release's SHA256SUMS.txt).
 function Get-DownloadUrl {
-    param([string]$FileName)
+    param([string]$FileName, [string]$Tag)
     if ($script:ReleaseData) {
         foreach ($r in $script:ReleaseData) {
+            if ($r.tag_name -ne $Tag) { continue }
             if ($r.assets) {
                 foreach ($a in $r.assets) {
-                    if ($a.name -like "*$FileName*") {
+                    if ($a.name -eq $FileName) {
                         return $a.browser_download_url
                     }
                 }
             }
         }
     }
-    # Fallback
-    return "$GhUrl/$Repo/releases/download/$Version/$FileName"
+    # Fallback: canonical release-download URL for the same tag.
+    return "$GhUrl/$Repo/releases/download/$Tag/$FileName"
+}
+
+# Return the SHA256 for an exact file name from SHA256SUMS content, or $null
+# when there is not exactly one well-formed entry.
+function Get-ExpectedHash {
+    param([string]$Content, [string]$FileName)
+    $found = @()
+    foreach ($line in ($Content -split "`n")) {
+        $fields = @($line.Trim() -split "\s+")
+        if ($fields.Count -ge 2 -and $fields[1].TrimStart('*') -eq $FileName) {
+            $found += $fields[0]
+        }
+    }
+    if ($found.Count -eq 1 -and $found[0] -match '^[0-9a-fA-F]{64}$') {
+        return $found[0]
+    }
+    return $null
 }
 
 # --- Verify checksum ---
@@ -166,8 +198,8 @@ function Main {
     Write-Host "Installing rsclaw $ver ..."
 
     $archiveName = "rsclaw-$ver-$target.zip"
-    $downloadUrl = Get-DownloadUrl $archiveName
-    $checksumsUrl = Get-DownloadUrl "SHA256SUMS.txt"
+    $downloadUrl = Get-DownloadUrl -FileName $archiveName -Tag $ver
+    $checksumsUrl = Get-DownloadUrl -FileName "SHA256SUMS.txt" -Tag $ver
 
     $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "rsclaw-install-$(Get-Random)"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
@@ -186,23 +218,27 @@ function Main {
             exit 1
         }
 
-        # Verify checksum
+        # Verify checksum (mandatory, mirrors install.sh)
+        Write-Host "Downloading checksums ..."
+        $checksumsFile = Join-Path $tmpDir "SHA256SUMS.txt"
         try {
-            $checksums = Invoke-WebRequest -Uri $checksumsUrl -UseBasicParsing
-            $lines = $checksums.Content -split "`n"
-            foreach ($line in $lines) {
-                if ($line -like "*$archiveName*") {
-                    $expected = ($line -split "\s+")[0]
-                    Write-Host "Verifying checksum ..."
-                    Test-Checksum -File (Join-Path $tmpDir $archiveName) -Expected $expected
-                    Write-Host "Checksum OK"
-                    break
-                }
-            }
+            Invoke-WebRequest -Uri $checksumsUrl -OutFile $checksumsFile -UseBasicParsing -TimeoutSec 60
         }
         catch {
-            Write-Host "Warning: checksums not available, skipping verification"
+            Write-Host "Error: checksums are required but could not be downloaded" -ForegroundColor Red
+            Write-Host "  URL: $checksumsUrl"
+            Write-Host "  Error: $_"
+            exit 1
         }
+        $checksumsContent = [System.IO.File]::ReadAllText($checksumsFile)
+        $expected = Get-ExpectedHash -Content $checksumsContent -FileName $archiveName
+        if (-not $expected) {
+            Write-Host "Error: expected exactly one valid checksum for $archiveName" -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "Verifying checksum ..."
+        Test-Checksum -File (Join-Path $tmpDir $archiveName) -Expected $expected
+        Write-Host "Checksum OK"
 
         Write-Host "Extracting ..."
         Expand-Zip -ZipPath (Join-Path $tmpDir $archiveName) -DestPath $tmpDir
@@ -234,22 +270,35 @@ function Main {
         }
 
         # --- Install tray script ---
+        # The tray script runs at every login with -ExecutionPolicy Bypass, so
+        # it must come from the same release tag and match SHA256SUMS.txt.
+        # Anything else (not published / no checksum / mismatch) is skipped.
         $trayScript = "rsclaw-tray.ps1"
-        $trayUrl = if ($GhProxy) {
-            "$GhProxy/https://raw.githubusercontent.com/$Repo/main/scripts/$trayScript"
+        $trayPath = Join-Path $Prefix $trayScript
+        $trayVerified = $false
+        $trayExpected = Get-ExpectedHash -Content $checksumsContent -FileName $trayScript
+        if (-not $trayExpected) {
+            Write-Host "Warning: $trayScript is not listed in SHA256SUMS.txt for $ver, skipping tray install" -ForegroundColor Yellow
         } else {
-            "https://raw.githubusercontent.com/$Repo/main/scripts/$trayScript"
-        }
-        try {
-            Write-Host "Downloading tray controller ..."
-            Invoke-WebRequest -Uri $trayUrl -OutFile (Join-Path $Prefix $trayScript) -UseBasicParsing
-        } catch {
-            Write-Host "Warning: tray script download failed, skipping" -ForegroundColor Yellow
+            $trayUrl = Get-DownloadUrl -FileName $trayScript -Tag $ver
+            $trayTmp = Join-Path $tmpDir $trayScript
+            try {
+                Write-Host "Downloading tray controller ..."
+                Invoke-WebRequest -Uri $trayUrl -OutFile $trayTmp -UseBasicParsing -TimeoutSec 60
+                $trayActual = (Get-FileHash -Path $trayTmp -Algorithm SHA256).Hash.ToLower()
+                if ($trayActual -eq $trayExpected.ToLower()) {
+                    Copy-Item -Path $trayTmp -Destination $trayPath -Force
+                    $trayVerified = $true
+                } else {
+                    Write-Host "Warning: tray script checksum mismatch, skipping tray install" -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host "Warning: tray script download failed, skipping: $_" -ForegroundColor Yellow
+            }
         }
 
         # --- Create startup shortcut ---
-        $trayPath = Join-Path $Prefix $trayScript
-        if (Test-Path $trayPath) {
+        if ($trayVerified) {
             try {
                 $startupDir = [Environment]::GetFolderPath("Startup")
                 $shortcutPath = Join-Path $startupDir "RsClaw Tray.lnk"
@@ -269,7 +318,9 @@ function Main {
         Write-Host ""
         Write-Host "rsclaw $ver installed successfully!" -ForegroundColor Green
         Write-Host "  Location: $Prefix\$Binary"
-        Write-Host "  Tray:     $Prefix\$trayScript"
+        if ($trayVerified) {
+            Write-Host "  Tray:     $Prefix\$trayScript"
+        }
 
         Write-Host ""
         Write-Host "Note: restart your terminal for PATH changes to take effect."

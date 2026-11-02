@@ -25,8 +25,8 @@ use crate::{
     embedder::resolve_embedder,
     jobs::{Job, JobKind, JobStatus},
     model::{
-        COLLECTION_TAG_PREFIX, CallerScope, ChunkStatus, KbChunk, KbCollection, KbDoc, KbStatus,
-        collection_tag,
+        COLLECTION_TAG_PREFIX, CallerScope, ChunkStatus, KbChunk, KbCollection, KbDoc, KbSource,
+        KbStatus, LogicalSourceId, collection_tag, is_pack_collection, pack_collection_id,
     },
     pipeline::{IngestInput, ingest_canonicalized},
     search::SearchCtx,
@@ -48,6 +48,10 @@ pub enum KnowledgeError {
     DuplicateName,
     #[error("doc_not_found")]
     DocNotFound,
+    /// The collection is a subscribed knowledge pack: its server owns the
+    /// content, so it cannot be changed here.
+    #[error("read_only: a subscribed knowledge pack is changed on its server, not here")]
+    ReadOnly,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -97,6 +101,14 @@ pub struct SearchHit {
 /// Aggregate knowledge-base stats.
 pub struct KbStats {
     pub collection_count: usize,
+    pub doc_count: usize,
+    pub chunk_count: usize,
+    pub bytes: u64,
+}
+
+/// Per-collection document totals (active docs only).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionCounts {
     pub doc_count: usize,
     pub chunk_count: usize,
     pub bytes: u64,
@@ -174,9 +186,29 @@ impl KnowledgeService {
         let store = Arc::new(KbStore::open(&kb_root.join("kb.redb"))?);
         let embedder = resolve_embedder(&kb_root);
         let dim = embedder.dimension();
-        let index = Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim)?);
+        let (index, scan) = KbIndex::open_and_rebuild_for(
+            &paths,
+            &store,
+            dim,
+            Some(embedder.embedder_id().to_string()),
+        )?;
+        let index = Arc::new(index);
+        // Chunks the dense layer rejected (zero / wrong-dim vectors from a
+        // failed remote embed, or vectors from a different embedder of the
+        // same dimension) are re-embedded in the background.
+        if !scan.stale_docs.is_empty() {
+            match enqueue_reembed(&store, &scan.stale_docs) {
+                Ok(n) if n > 0 => tracing::warn!(
+                    docs = n,
+                    embedder = embedder.embedder_id(),
+                    "kb: chunks embedded by another model or with invalid vectors; re-embedding"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("kb: failed to enqueue re-embed jobs: {e:#}"),
+            }
+        }
         let (events, _) = broadcast::channel(256);
-        let cfg = rsclaw_config::load().ok();
+        let cfg = rsclaw_config::load_cached().ok();
         // queryInstruction comes from the SAME effective embed config the
         // embedder was resolved from (`kb.embed` override, else `memorySearch`),
         // so a KB-specific asymmetric model uses its own instruction.
@@ -226,23 +258,56 @@ impl KnowledgeService {
         self.events.subscribe()
     }
 
-    /// Emit a `status_changed=ready` event for each doc that has newly gained
-    /// its first indexed chunk since `emitted` was last updated. `emitted`
-    /// tracks already-announced docs to avoid duplicates.
-    fn emit_ready_transitions(&self, emitted: &mut HashSet<String>) {
-        if let Ok(ready) = self.ready_doc_ids() {
-            for id in ready {
-                if emitted.insert(id.clone()) {
-                    let payload = serde_json::json!({
-                        "type": "knowledge.doc.status_changed",
-                        "docId": id,
-                        "status": "ready",
-                    })
-                    .to_string();
-                    let _ = self.events.send(payload);
-                }
+    /// Emit a `status_changed=ready` event when the doc indexed by a just-
+    /// completed job has gained its first indexed chunk. Only that doc's
+    /// chunks are read (it used to decode every chunk in the KB per job).
+    /// `emitted` tracks already-announced docs to avoid duplicates.
+    fn emit_ready_transition(&self, job: &JobKind, emitted: &mut HashSet<String>) {
+        let JobKind::ChunkAndEmbed { doc_id, .. } = job else {
+            return;
+        };
+        if emitted.contains(doc_id) {
+            return;
+        }
+        match self.doc_with_active_chunk(doc_id) {
+            Ok(Some(d)) => {
+                emitted.insert(doc_id.clone());
+                // Collections are tags on the doc; report the first one.
+                let collection_id = d
+                    .tags
+                    .iter()
+                    .find_map(|t| t.strip_prefix(COLLECTION_TAG_PREFIX).map(str::to_owned));
+                let payload = serde_json::json!({
+                    "type": "knowledge.doc.status_changed",
+                    "docId": doc_id,
+                    "docTitle": d.title,
+                    "collectionId": collection_id,
+                    "status": "ready",
+                })
+                .to_string();
+                // No SSE subscriber connected is the normal case.
+                let _ = self.events.send(payload);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("kb: ready-transition check failed: {e:#}"),
+        }
+    }
+
+    /// The doc `doc_id`, when it currently owns at least one Active chunk.
+    fn doc_with_active_chunk(&self, doc_id: &str) -> anyhow::Result<Option<KbDoc>> {
+        let rtx = self.store.begin_read()?;
+        let Some(d) = docs::get(&rtx, doc_id)? else {
+            return Ok(None);
+        };
+        for id in crate::store::chunks::chunk_ids_for_logical(&rtx, &d.logical_source_id)? {
+            if let Some(c) = crate::store::chunks::get(&rtx, &id)?
+                && c.doc_id == d.id
+                && c.status == ChunkStatus::Active
+            {
+                return Ok(Some(d));
             }
         }
+        Ok(None)
     }
 
     /// Active doc ids that currently have ≥1 indexed chunk (i.e. `ready`).
@@ -266,13 +331,18 @@ impl KnowledgeService {
     /// Process one queued KB job (chunk + embed + index). Returns whether a
     /// job was claimed. Used by the background worker and tests.
     pub fn drain_once(&self) -> anyhow::Result<bool> {
+        Ok(self.drain_one_job()?.is_some())
+    }
+
+    /// Process one queued KB job; returns the kind of the job handled.
+    fn drain_one_job(&self) -> anyhow::Result<Option<JobKind>> {
         let ctx = HandlerCtx {
             store: self.store.clone(),
             paths: self.paths.clone(),
             embedder: self.embedder.clone(),
             index: self.index.clone(),
         };
-        WorkerPool::run_one_blocking(&ctx, &WorkerConfig::default(), &DefaultDispatcher)
+        WorkerPool::run_one_blocking_job(&ctx, &WorkerConfig::default(), &DefaultDispatcher)
     }
 
     /// Requeue jobs whose claiming worker died mid-flight (claim TTL
@@ -355,11 +425,11 @@ impl KnowledgeService {
                 }
                 next_reclaim = std::time::Instant::now() + reclaim_every;
             }
-            match this.drain_once() {
-                // A job finished — emit status_changed=ready for any doc
-                // that just gained its first indexed chunk.
-                Ok(true) => this.emit_ready_transitions(&mut emitted),
-                Ok(false) => std::thread::sleep(Duration::from_millis(500)),
+            match this.drain_one_job() {
+                // A job finished — emit status_changed=ready if its doc
+                // just gained its first indexed chunk.
+                Ok(Some(job)) => this.emit_ready_transition(&job, &mut emitted),
+                Ok(None) => std::thread::sleep(Duration::from_millis(500)),
                 Err(e) => {
                     tracing::warn!("kb knowledge worker: {e:#}");
                     std::thread::sleep(Duration::from_secs(2));
@@ -380,20 +450,38 @@ impl KnowledgeService {
         bytes: &[u8],
         mime: Option<&str>,
     ) -> KResult<(String, bool)> {
+        writable(collection_id)?;
+        self.ingest_into(collection_id, title, title, bytes, mime, None, None)
+    }
+
+    /// `ingest` without the read-only check. `file_name` gives the raw
+    /// copy's extension; `seed` and `source` override the content-derived
+    /// identity and the "(manual)" provenance.
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_into(
+        &self,
+        collection_id: &str,
+        title: &str,
+        file_name: &str,
+        bytes: &[u8],
+        mime: Option<&str>,
+        seed: Option<LogicalSourceId>,
+        source: Option<KbSource>,
+    ) -> KResult<(String, bool)> {
         self.get_collection(collection_id)?; // 404 if the collection is gone
         let detected = mime
             .map(|m| m.to_string())
-            .unwrap_or_else(|| detect_mime(bytes, Some(title)));
-        let ext = title
+            .unwrap_or_else(|| detect_mime(bytes, Some(file_name)));
+        let ext = file_name
             .rsplit('.')
             .next()
-            .filter(|e| *e != title)
+            .filter(|e| *e != file_name)
             .unwrap_or("");
         let mut canon = canonicalize_by_mime(CanonicalizeInput {
             bytes,
             mime: &detected,
             hint_title: Some(title),
-            logical_source_id_seed: None,
+            logical_source_id_seed: seed,
         })?
         .ok_or_else(|| {
             KnowledgeError::Internal(anyhow::anyhow!(
@@ -411,7 +499,7 @@ impl KnowledgeService {
                 visibility: None,
                 owner_user_id: None,
                 seen_key: Some(("knowledge", &lsid)),
-                source: None,
+                source,
                 paths: &self.paths,
             },
         )?;
@@ -421,7 +509,9 @@ impl KnowledgeService {
             // in HNSW + Tantivy. Multiple callers (agent thread, bg
             // worker) may race on claim_next, but the first to claim
             // processes it; the other sees "no job" and returns.
-            let _ = self.drain_once();
+            if let Err(e) = self.drain_once() {
+                tracing::warn!("kb ingest: inline index drain failed (worker retries): {e:#}");
+            }
         }
         Ok((out.doc_id, out.noop))
     }
@@ -436,7 +526,8 @@ impl KnowledgeService {
         collection_id: &str,
         url: &str,
     ) -> Result<crate::sync::SyncOutcome, crate::sync::SyncError> {
-        use crate::sync::{KbSourceSyncer, SyncContext, SyncReason, UrlSyncer};
+        use crate::sync::{KbSourceSyncer, SyncContext, SyncError, SyncReason, UrlSyncer};
+        writable(collection_id).map_err(|e| SyncError::Permanent(e.to_string()))?;
         let syncer = UrlSyncer {
             url: url.to_string(),
             tags: vec![collection_tag(collection_id)],
@@ -519,11 +610,20 @@ impl KnowledgeService {
 
     /// Tombstone a document; the compactor reaps its chunks/vectors later.
     pub fn delete_doc(&self, collection_id: &str, doc_id: &str) -> KResult<()> {
-        let rtx = self.store.begin_read()?;
-        let mut d = self.active_doc_in_collection(&rtx, collection_id, doc_id)?;
-        drop(rtx);
-        d.status = KbStatus::Tombstoned;
+        writable(collection_id)?;
+        self.tombstone_doc(collection_id, doc_id)
+    }
+
+    fn tombstone_doc(&self, collection_id: &str, doc_id: &str) -> KResult<()> {
+        // Read + write in ONE write tx so a concurrent update can't be
+        // overwritten by a stale copy (or resurrect a deleted doc).
+        let tag = collection_tag(collection_id);
         let wtx = self.store.begin_write()?;
+        let mut d = docs::get_in_wtx(&wtx, doc_id)?
+            .filter(|d| d.status == KbStatus::Active && d.tags.iter().any(|t| t == &tag))
+            .ok_or(KnowledgeError::DocNotFound)?;
+        d.status = KbStatus::Tombstoned;
+        d.updated_at = now_ms();
         docs::put(&wtx, &d)?;
         wtx.commit().map_err(anyhow::Error::from)?;
         Ok(())
@@ -532,7 +632,9 @@ impl KnowledgeService {
     /// O(1) check for "is there anything searchable at all" — gates the
     /// auto-recall path so empty-KB deployments never pay a query embed.
     pub fn has_content(&self) -> bool {
-        !self.index.hnsw.is_empty()
+        // BM25 counts too: while chunks await re-embedding the dense layer
+        // can be empty although the KB is searchable.
+        !self.index.hnsw.is_empty() || self.index.tantivy.num_docs() > 0
     }
 
     /// Semantic search over one or more collections (empty = all). Hits below
@@ -591,6 +693,48 @@ impl KnowledgeService {
         Ok(hits)
     }
 
+    /// [`Self::search`] limited to an agent's collections. `allowed` (ids or
+    /// names) is the agent's scope, None for an unscoped agent; `requested`
+    /// narrows it further. A scope that admits no collection finds nothing:
+    /// it never widens to the whole knowledge base.
+    pub fn search_scoped(
+        &self,
+        query: &str,
+        allowed: Option<&[String]>,
+        requested: &[String],
+        top_k: usize,
+        score_threshold: f32,
+    ) -> KResult<Vec<SearchHit>> {
+        let Some(allowed) = allowed else {
+            return self.search(query, requested, top_k, score_threshold);
+        };
+        let ids = scoped_ids(
+            self.resolve_collections(allowed)?,
+            (!requested.is_empty())
+                .then(|| self.resolve_collections(requested))
+                .transpose()?,
+        );
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.search(query, &ids, top_k, score_threshold)
+    }
+
+    /// The ids of the collections `refs` names, each by id or by name.
+    /// Unknown names are skipped (a pack not yet synced, say).
+    pub fn resolve_collections(&self, refs: &[String]) -> KResult<Vec<String>> {
+        let all = self.list_collections()?;
+        let mut ids: Vec<String> = Vec::new();
+        for r in refs.iter().map(|r| r.trim()).filter(|r| !r.is_empty()) {
+            if let Some(c) = all.iter().find(|c| c.id == r || c.name == r)
+                && !ids.contains(&c.id)
+            {
+                ids.push(c.id.clone());
+            }
+        }
+        Ok(ids)
+    }
+
     /// Aggregate stats across all collections/docs/chunks.
     pub fn stats(&self) -> KResult<KbStats> {
         let rtx = self.store.begin_read()?;
@@ -623,6 +767,30 @@ impl KnowledgeService {
         })
     }
 
+    /// Active doc / chunk / byte totals keyed by collection id. Collections
+    /// with no documents are absent from the map.
+    pub fn collection_counts(&self) -> KResult<HashMap<String, CollectionCounts>> {
+        let rtx = self.store.begin_read()?;
+        let chunks = self.chunk_counts(&rtx)?;
+        let mut out: HashMap<String, CollectionCounts> = HashMap::new();
+        for d in self.all_active_docs(&rtx)? {
+            let Some(cid) = d
+                .tags
+                .iter()
+                .find_map(|t| t.strip_prefix(COLLECTION_TAG_PREFIX))
+            else {
+                continue;
+            };
+            let e = out.entry(cid.to_owned()).or_default();
+            e.doc_count += 1;
+            e.chunk_count += chunks.get(&d.id).copied().unwrap_or(0);
+            e.bytes += std::fs::metadata(self.paths.root.join(&d.markdown_path))
+                .map(|m| m.len())
+                .unwrap_or(0);
+        }
+        Ok(out)
+    }
+
     /// Run one compactor tick + HNSW snapshot dump. The CLI `kb compact`
     /// used to open the redb file directly, which fights the gateway's
     /// exclusive write lock — this is the gateway-internal path that
@@ -634,6 +802,12 @@ impl KnowledgeService {
         let now = chrono::Utc::now().timestamp_millis();
         let stats =
             run_compactor_tick(&self.store, &self.paths, now).map_err(KnowledgeError::Internal)?;
+        // Drop purged chunks from tantivy and rebuild HNSW (also reaps
+        // orphaned vertices) BEFORE snapshotting, so the snapshot manifest
+        // matches redb and is reusable on the next start.
+        self.index
+            .apply_purge(&self.store, &stats.purged_chunk_ids)
+            .map_err(KnowledgeError::Internal)?;
         let snapshot_ok = match self.index.snapshot_hnsw(&self.paths) {
             Ok(()) => true,
             Err(e) => {
@@ -664,13 +838,13 @@ impl KnowledgeService {
     /// Tombstone a doc by id alone. Same end-state as `delete_doc` but
     /// no collection arg required.
     pub fn delete_doc_by_id(&self, doc_id: &str) -> KResult<()> {
-        let rtx = self.store.begin_read()?;
-        let mut d = docs::get(&rtx, doc_id)?
+        let wtx = self.store.begin_write()?;
+        let mut d = docs::get_in_wtx(&wtx, doc_id)?
             .filter(|d| d.status == KbStatus::Active)
             .ok_or(KnowledgeError::DocNotFound)?;
-        drop(rtx);
+        writable_doc(&d)?;
         d.status = KbStatus::Tombstoned;
-        let wtx = self.store.begin_write()?;
+        d.updated_at = now_ms();
         docs::put(&wtx, &d)?;
         wtx.commit().map_err(anyhow::Error::from)?;
         Ok(())
@@ -681,26 +855,32 @@ impl KnowledgeService {
     /// HTTP path.
     pub fn tombstone_by_tag(&self, tag: &str) -> KResult<usize> {
         use redb::ReadableTable;
-        let rtx = self.store.begin_read()?;
+        let wtx = self.store.begin_write()?;
         let mut victims: Vec<KbDoc> = Vec::new();
         {
-            let tbl = rtx.open_table(KB_DOCS).map_err(anyhow::Error::from)?;
+            let tbl = wtx.open_table(KB_DOCS).map_err(anyhow::Error::from)?;
             for entry in tbl.iter().map_err(anyhow::Error::from)? {
-                let (_, v) = entry.map_err(anyhow::Error::from)?;
-                let d: KbDoc = decode(v.value())?;
+                let (k, v) = entry.map_err(anyhow::Error::from)?;
+                let d: KbDoc = match decode(v.value()) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(doc = %k.value(), "kb: skip undecodable doc: {e:#}");
+                        continue;
+                    }
+                };
                 if d.status == KbStatus::Active && d.tags.iter().any(|t| t == tag) {
                     victims.push(d);
                 }
             }
         }
-        drop(rtx);
         if victims.is_empty() {
             return Ok(0);
         }
         let n = victims.len();
-        let wtx = self.store.begin_write()?;
+        let now = now_ms();
         for mut d in victims {
             d.status = KbStatus::Tombstoned;
+            d.updated_at = now;
             docs::put(&wtx, &d)?;
         }
         wtx.commit().map_err(anyhow::Error::from)?;
@@ -713,13 +893,14 @@ impl KnowledgeService {
         doc_id: &str,
         visibility: crate::model::KbVisibility,
     ) -> KResult<()> {
-        let rtx = self.store.begin_read()?;
-        let mut d = docs::get(&rtx, doc_id)?
+        // Same tx for read + write: a visibility change must never write
+        // back a stale Active copy over a concurrent delete.
+        let wtx = self.store.begin_write()?;
+        let mut d = docs::get_in_wtx(&wtx, doc_id)?
             .filter(|d| d.status == KbStatus::Active)
             .ok_or(KnowledgeError::DocNotFound)?;
-        drop(rtx);
+        writable_doc(&d)?;
         d.visibility = visibility;
-        let wtx = self.store.begin_write()?;
         docs::put(&wtx, &d)?;
         wtx.commit().map_err(anyhow::Error::from)?;
         Ok(())
@@ -859,7 +1040,9 @@ impl KnowledgeService {
         }
         // Drain the in-process worker so freshly-enqueued chunk+embed
         // jobs are committed before we report counts.
-        let _ = self.drain_once();
+        if let Err(e) = self.drain_once() {
+            tracing::warn!("kb sync-all: inline index drain failed (worker retries): {e:#}");
+        }
         Ok(serde_json::json!({
             "candidates": total,
             "ran": to_run.len(),
@@ -945,8 +1128,14 @@ impl KnowledgeService {
         let mut counts: HashMap<String, usize> = HashMap::new();
         let tbl = rtx.open_table(KB_CHUNKS)?;
         for entry in tbl.iter()? {
-            let (_, v) = entry?;
-            let c: KbChunk = decode(v.value())?;
+            let (k, v) = entry?;
+            let c: KbChunk = match decode(v.value()) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(chunk = %k.value(), "kb: skip undecodable chunk: {e:#}");
+                    continue;
+                }
+            };
             if c.status == ChunkStatus::Active {
                 *counts.entry(c.doc_id).or_default() += 1;
             }
@@ -1049,6 +1238,16 @@ impl KnowledgeService {
         name: Option<String>,
         description: Option<Option<String>>,
     ) -> KResult<KbCollection> {
+        writable(id)?;
+        self.update_collection_meta(id, name, description)
+    }
+
+    fn update_collection_meta(
+        &self,
+        id: &str,
+        name: Option<String>,
+        description: Option<Option<String>>,
+    ) -> KResult<KbCollection> {
         let mut c = self.get_collection(id)?;
         let old_name = c.name.clone();
         if let Some(new_name) = name {
@@ -1078,14 +1277,32 @@ impl KnowledgeService {
     /// Delete a collection and tombstone all of its documents (the compactor
     /// reaps their chunks/vectors later). Returns the number of docs removed.
     pub fn delete_collection(&self, id: &str) -> KResult<usize> {
+        writable(id)?;
+        self.remove_collection(id)
+    }
+
+    fn remove_collection(&self, id: &str) -> KResult<usize> {
         self.get_collection(id)?; // 404 if absent
         let tag = collection_tag(id);
-        let rtx = self.store.begin_read()?;
-        let docs_to_remove = self.collect_active_docs(&rtx, &tag)?;
-        drop(rtx);
         let wtx = self.store.begin_write()?;
+        let mut docs_to_remove: Vec<KbDoc> = Vec::new();
+        {
+            let tbl = wtx.open_table(KB_DOCS).map_err(anyhow::Error::from)?;
+            for entry in tbl.iter().map_err(anyhow::Error::from)? {
+                let (k, v) = entry.map_err(anyhow::Error::from)?;
+                match decode::<KbDoc>(v.value()) {
+                    Ok(d) if d.status == KbStatus::Active && d.tags.iter().any(|t| t == &tag) => {
+                        docs_to_remove.push(d)
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(doc = %k.value(), "kb: skip undecodable doc: {e:#}"),
+                }
+            }
+        }
+        let now = now_ms();
         for mut d in docs_to_remove.iter().cloned() {
             d.status = KbStatus::Tombstoned;
+            d.updated_at = now;
             docs::put(&wtx, &d)?;
         }
         collections::delete(&wtx, id)?;
@@ -1094,8 +1311,202 @@ impl KnowledgeService {
     }
 }
 
+// --- knowledge packs ------------------------------------------------------
+//
+// A subscribed pack is a collection `pack_<pack id>` written only by the pack
+// sync (`sync::pack`); every user-facing write path refuses it (`writable`).
+// A pack doc's identity is its path in the pack, so a new version of a doc
+// replaces the previous one instead of sitting next to it.
+
+/// A pack doc as kept locally: the doc id and the sha256 of its raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPackDoc {
+    pub doc_id: String,
+    pub sha256: String,
+}
+
+impl KnowledgeService {
+    /// Create (or rename) the local collection of pack `pack_id`; returns
+    /// its id. A name another collection already uses gets the pack id
+    /// appended.
+    pub fn ensure_pack_collection(&self, pack_id: &str, name: &str) -> KResult<String> {
+        let id = pack_collection_id(pack_id);
+        let name = if name.trim().is_empty() {
+            pack_id
+        } else {
+            name.trim()
+        };
+        let free_name = |n: &str| -> KResult<bool> {
+            let rtx = self.store.begin_read()?;
+            Ok(collections::find_by_name(&rtx, n)?.is_none_or(|owner| owner == id))
+        };
+        let name = if free_name(name)? {
+            name.to_owned()
+        } else {
+            format!("{name} ({pack_id})")
+        };
+        match self.get_collection(&id) {
+            Ok(c) if c.name == name => Ok(id),
+            Ok(_) => self
+                .update_collection_meta(&id, Some(name), None)
+                .map(|_| id),
+            Err(KnowledgeError::CollectionNotFound) => {
+                let now = now_ms();
+                let c = KbCollection {
+                    id: id.clone(),
+                    name,
+                    description: None,
+                    embed_model: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                let wtx = self.store.begin_write()?;
+                collections::put(&wtx, &c)?;
+                wtx.commit().map_err(anyhow::Error::from)?;
+                Ok(id)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The ids of the packs kept locally.
+    pub fn local_packs(&self) -> KResult<Vec<String>> {
+        Ok(self
+            .list_collections()?
+            .into_iter()
+            .filter_map(|c| {
+                c.id.strip_prefix(crate::model::PACK_COLLECTION_PREFIX)
+                    .map(str::to_owned)
+            })
+            .collect())
+    }
+
+    /// Pack `pack_id`'s local docs by their path in the pack.
+    pub fn pack_docs(&self, pack_id: &str) -> KResult<HashMap<String, LocalPackDoc>> {
+        let tag = collection_tag(&pack_collection_id(pack_id));
+        let prefix = pack_doc_identity(pack_id, "");
+        let rtx = self.store.begin_read()?;
+        Ok(self
+            .collect_active_docs(&rtx, &tag)?
+            .into_iter()
+            .filter_map(|d| {
+                let path = d
+                    .logical_source_id
+                    .strip_prefix(prefix.as_str())?
+                    .to_owned();
+                Some((
+                    path,
+                    LocalPackDoc {
+                        doc_id: d.id,
+                        sha256: d.raw_sha256,
+                    },
+                ))
+            })
+            .collect())
+    }
+
+    /// Store `bytes` as the doc at `path` in pack `pack_id`, replacing the
+    /// doc that path held before. Returns `(doc_id, noop)` like `ingest`.
+    pub fn ingest_pack_doc(
+        &self,
+        pack_id: &str,
+        path: &str,
+        title: &str,
+        bytes: &[u8],
+        mime: Option<&str>,
+    ) -> KResult<(String, bool)> {
+        let identity = pack_doc_identity(pack_id, path);
+        self.ingest_into(
+            &pack_collection_id(pack_id),
+            title,
+            path.rsplit('/').next().unwrap_or(path),
+            bytes,
+            mime,
+            Some(LogicalSourceId(identity.clone())),
+            Some(KbSource::Doc {
+                path: PathBuf::from(identity),
+            }),
+        )
+    }
+
+    /// Drop a doc the pack no longer has.
+    pub fn remove_pack_doc(&self, pack_id: &str, doc_id: &str) -> KResult<()> {
+        self.tombstone_doc(&pack_collection_id(pack_id), doc_id)
+    }
+
+    /// Drop a pack this machine no longer follows, with all its docs.
+    pub fn remove_pack(&self, pack_id: &str) -> KResult<usize> {
+        self.remove_collection(&pack_collection_id(pack_id))
+    }
+}
+
+/// The identity (logical source id) of the doc at `path` in pack `pack_id`.
+fn pack_doc_identity(pack_id: &str, path: &str) -> String {
+    format!("pack:{pack_id}:{path}")
+}
+
+/// Refuses user-facing writes to a subscribed pack.
+fn writable(collection_id: &str) -> KResult<()> {
+    if is_pack_collection(collection_id) {
+        Err(KnowledgeError::ReadOnly)
+    } else {
+        Ok(())
+    }
+}
+
+/// [`writable`] for a doc, by the collection it belongs to.
+fn writable_doc(doc: &KbDoc) -> KResult<()> {
+    doc.tags
+        .iter()
+        .filter_map(|t| t.strip_prefix(COLLECTION_TAG_PREFIX))
+        .try_for_each(writable)
+}
+
+/// The collections a scoped search covers: the agent's `allowed` ones, or
+/// those of them the caller `requested`.
+fn scoped_ids(allowed: Vec<String>, requested: Option<Vec<String>>) -> Vec<String> {
+    match requested {
+        None => allowed,
+        Some(requested) => requested
+            .into_iter()
+            .filter(|id| allowed.contains(id))
+            .collect(),
+    }
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Enqueue a `ChunkAndEmbed` job for every doc in `doc_ids` that is still
+/// Active and the latest version of its source. Enqueue is idempotent on the
+/// job dedupe key. Returns the number of docs considered for re-embedding.
+fn enqueue_reembed(store: &KbStore, doc_ids: &HashSet<String>) -> anyhow::Result<usize> {
+    let wtx = store.begin_write()?;
+    let mut n = 0usize;
+    for id in doc_ids {
+        let Some(d) = docs::get_in_wtx(&wtx, id)? else {
+            continue;
+        };
+        if d.status != KbStatus::Active {
+            continue;
+        }
+        let is_latest = docs::latest_version_in_wtx(&wtx, &d.logical_source_id)?
+            .is_some_and(|p| p.doc_id == d.id);
+        if !is_latest {
+            continue;
+        }
+        crate::store::jobs::enqueue(
+            &wtx,
+            &Job::new(JobKind::ChunkAndEmbed {
+                doc_id: d.id.clone(),
+                doc_version: d.version,
+            }),
+        )?;
+        n += 1;
+    }
+    wtx.commit()?;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -1355,12 +1766,20 @@ mod tests {
             .unwrap();
         while s.drain_once().unwrap() {}
         let mut emitted = HashSet::new();
-        s.emit_ready_transitions(&mut emitted);
+        let job = JobKind::ChunkAndEmbed {
+            doc_id: doc_id.clone(),
+            doc_version: 1,
+        };
+        s.emit_ready_transition(&job, &mut emitted);
         let msg = rx.try_recv().expect("expected an SSE status event");
         assert!(msg.contains("knowledge.doc.status_changed"), "got: {msg}");
         assert!(msg.contains(&doc_id), "got: {msg}");
+        let ev: serde_json::Value = serde_json::from_str(&msg).expect("event JSON");
+        // Title comes from the doc record (here: the markdown H1).
+        assert_eq!(ev["docTitle"], "A", "got: {msg}");
+        assert_eq!(ev["collectionId"], serde_json::json!(c.id), "got: {msg}");
         // idempotent: no duplicate for the same doc
-        s.emit_ready_transitions(&mut emitted);
+        s.emit_ready_transition(&job, &mut emitted);
         assert!(
             rx.try_recv().is_err(),
             "should not re-emit for the same doc"
@@ -1436,5 +1855,147 @@ mod tests {
             s.delete_collection(&c.id),
             Err(KnowledgeError::CollectionNotFound)
         ));
+    }
+    #[test]
+    fn a_pack_doc_is_replaced_by_its_new_version_and_removed_when_dropped() {
+        let (_t, s) = svc();
+        let cid = s.ensure_pack_collection("parenting", "育儿知识").unwrap();
+        assert_eq!(cid, "pack_parenting");
+        let v1 = b"# Spit-up\n\nburp the baby after every feed.";
+        s.ingest_pack_doc(
+            "parenting",
+            "feeding/spit.md",
+            "Spit-up",
+            v1,
+            Some("text/markdown"),
+        )
+        .unwrap();
+        let v2 = b"# Spit-up\n\nkeep the baby upright for twenty minutes.";
+        let (doc2, noop) = s
+            .ingest_pack_doc(
+                "parenting",
+                "feeding/spit.md",
+                "Spit-up",
+                v2,
+                Some("text/markdown"),
+            )
+            .unwrap();
+        assert!(!noop);
+        let docs = s.pack_docs("parenting").unwrap();
+        assert_eq!(docs.len(), 1, "the new version replaces the old one");
+        let local = &docs["feeding/spit.md"];
+        assert_eq!(local.doc_id, doc2);
+        assert_eq!(local.sha256, crate::content_store::atomic::sha256_hex(v2));
+        assert_eq!(s.list_docs(&cid).unwrap().len(), 1);
+
+        s.remove_pack_doc("parenting", &doc2).unwrap();
+        assert!(s.pack_docs("parenting").unwrap().is_empty());
+        assert_eq!(s.local_packs().unwrap(), vec!["parenting".to_string()]);
+        s.remove_pack("parenting").unwrap();
+        assert!(s.local_packs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pack_is_read_only_to_everyone_but_its_sync() {
+        let (_t, s) = svc();
+        let cid = s.ensure_pack_collection("cloudpc", "云电脑").unwrap();
+        let (doc, _) = s
+            .ingest_pack_doc(
+                "cloudpc",
+                "faq.md",
+                "FAQ",
+                b"# FAQ\n\nprices",
+                Some("text/markdown"),
+            )
+            .unwrap();
+        let read_only = |r: KResult<()>| matches!(r, Err(KnowledgeError::ReadOnly));
+        assert!(matches!(
+            s.ingest(&cid, "x.md", b"hi", Some("text/markdown")),
+            Err(KnowledgeError::ReadOnly)
+        ));
+        assert!(read_only(s.delete_doc(&cid, &doc)));
+        assert!(read_only(s.delete_doc_by_id(&doc)));
+        assert!(read_only(
+            s.set_doc_visibility(&doc, crate::model::KbVisibility::Global)
+        ));
+        assert!(matches!(
+            s.update_collection(&cid, Some("renamed".into()), None),
+            Err(KnowledgeError::ReadOnly)
+        ));
+        assert!(matches!(
+            s.delete_collection(&cid),
+            Err(KnowledgeError::ReadOnly)
+        ));
+        assert_eq!(s.pack_docs("cloudpc").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_pack_whose_name_is_taken_keeps_its_id_in_the_name() {
+        let (_t, s) = svc();
+        s.create_collection("育儿知识", None, None).unwrap();
+        let cid = s.ensure_pack_collection("parenting", "育儿知识").unwrap();
+        assert_eq!(s.get_collection(&cid).unwrap().name, "育儿知识 (parenting)");
+        // A second pass with the same name leaves it as is.
+        s.ensure_pack_collection("parenting", "育儿知识").unwrap();
+        assert_eq!(s.get_collection(&cid).unwrap().name, "育儿知识 (parenting)");
+    }
+
+    #[test]
+    fn a_scoped_search_never_reaches_outside_the_agents_collections() {
+        let (_t, s) = svc();
+        let mine = s.create_collection("mine", None, None).unwrap();
+        let other = s.create_collection("other", None, None).unwrap();
+        s.ingest(
+            &mine.id,
+            "a.md",
+            b"# A\n\nquantum particles here.",
+            Some("text/markdown"),
+        )
+        .unwrap();
+        s.ingest(
+            &other.id,
+            "b.md",
+            b"# B\n\nquantum particles there.",
+            Some("text/markdown"),
+        )
+        .unwrap();
+        while s.drain_once().unwrap() {}
+        let collections = |hits: Vec<SearchHit>| -> Vec<String> {
+            hits.into_iter().filter_map(|h| h.collection_id).collect()
+        };
+
+        let scope = vec!["mine".to_string()]; // by name
+        let hits = s
+            .search_scoped("quantum particles", Some(&scope), &[], 5, 0.0)
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(collections(hits).iter().all(|c| c == &mine.id));
+
+        // Asking for a collection outside the scope finds nothing.
+        let hits = s
+            .search_scoped(
+                "quantum particles",
+                Some(&scope),
+                std::slice::from_ref(&other.id),
+                5,
+                0.0,
+            )
+            .unwrap();
+        assert!(hits.is_empty());
+
+        // A scope naming nothing that exists finds nothing, not everything.
+        let gone = vec!["pack_not_synced_yet".to_string()];
+        assert!(
+            s.search_scoped("quantum particles", Some(&gone), &[], 5, 0.0)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Unscoped agents still search every collection.
+        let hits = s
+            .search_scoped("quantum particles", None, &[], 5, 0.0)
+            .unwrap();
+        let found = collections(hits);
+        assert!(found.contains(&mine.id) && found.contains(&other.id));
     }
 }

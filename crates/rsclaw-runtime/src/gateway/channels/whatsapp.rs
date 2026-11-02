@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     super::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},
-    default_dm_scope,
+    bare_account_name, default_dm_scope, register_outbound_sender,
 };
 use crate::gateway::session::{MessageKind, SessionKeyParams, derive_session_key};
 
@@ -52,9 +52,12 @@ pub(crate) fn start_whatsapp_if_configured(
         enforcers.insert("whatsapp".to_owned(), Arc::clone(&enforcer));
     }
 
-    // Collect (account_name, phone_number_id, access_token) tuples from
-    // accounts.<name>.{phoneNumberId, accessToken}
-    let mut wa_accounts: Vec<(String, String, String)> = Vec::new();
+    // Collect (account_name, phone_number_id, access_token, app_secret,
+    // verify_token) from
+    // accounts.<name>.{phoneNumberId, accessToken, appSecret, verifyToken}
+    #[allow(clippy::type_complexity)]
+    let mut wa_accounts: Vec<(String, String, String, Option<String>, Option<String>)> =
+        Vec::new();
     if let Some(accts) = &wa_cfg.accounts {
         for (name, acct) in accts {
             let pid = acct
@@ -65,8 +68,24 @@ pub(crate) fn start_whatsapp_if_configured(
                 .get("accessToken")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let app_secret = acct
+                .get("appSecret")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(rsclaw_config::loader::expand_env_vars);
+            let verify_token = acct
+                .get("verifyToken")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(rsclaw_config::loader::expand_env_vars);
             if !pid.is_empty() && !token.is_empty() {
-                wa_accounts.push((name.clone(), pid.to_owned(), token.to_owned()));
+                wa_accounts.push((
+                    name.clone(),
+                    pid.to_owned(),
+                    token.to_owned(),
+                    app_secret,
+                    verify_token,
+                ));
             }
         }
     }
@@ -76,7 +95,9 @@ pub(crate) fn start_whatsapp_if_configured(
         return;
     }
 
-    for (acct_name, phone_number_id, access_token) in wa_accounts {
+    let bare_acct = bare_account_name(wa_accounts.iter().map(|(n, _, _, _, _)| n));
+
+    for (acct_name, phone_number_id, access_token, app_secret, verify_token) in wa_accounts {
         let acct_for_log = acct_name.clone();
         let w_acct_outer = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
@@ -86,15 +107,13 @@ pub(crate) fn start_whatsapp_if_configured(
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register WhatsApp channel sender for notification routing.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("whatsapp/{}", acct_name), out_tx.clone());
-            senders
-                .entry("whatsapp".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        register_outbound_sender(
+            &channel_senders,
+            "whatsapp",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         // Per-user inbound queue for WhatsApp.
         type WaItem = (String, String, Vec<rsclaw_agent::registry::ImageAttachment>);
@@ -315,7 +334,9 @@ pub(crate) fn start_whatsapp_if_configured(
                                 &handle,
                                 "whatsapp",
                                 &from,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("whatsapp", &from, false),
                             )
                             .await
                             {
@@ -330,6 +351,7 @@ pub(crate) fn start_whatsapp_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("whatsapp", &from, false),
                                 session_key,
                                 text,
                                 channel: "whatsapp".to_string(),
@@ -418,13 +440,24 @@ pub(crate) fn start_whatsapp_if_configured(
             },
         );
 
-        let wa = Arc::new(WhatsAppChannel::with_api_base(
-            phone_number_id,
-            access_token,
-            wa_cfg.api_base.clone(),
-            on_message,
-        ));
-        if whatsapp_slot.set(Arc::clone(&wa)).is_err() {
+        let wa = Arc::new(
+            WhatsAppChannel::with_api_base(
+                phone_number_id,
+                access_token,
+                wa_cfg.api_base.clone(),
+                on_message,
+            )
+            .with_app_secret(app_secret)
+            .with_verify_token(verify_token),
+        );
+        // Only expose /hooks/whatsapp when X-Hub-Signature-256 can be
+        // verified; without the app secret anyone could forge messages.
+        if !wa.has_app_secret() {
+            error!(
+                account = %acct_for_log,
+                "whatsapp: accounts.<name>.appSecret not configured — inbound webhook /hooks/whatsapp DISABLED (outbound only)"
+            );
+        } else if whatsapp_slot.set(Arc::clone(&wa)).is_err() {
             tracing::debug!("slot already set, skipping");
         }
         let wa_send = Arc::clone(&wa);
@@ -456,9 +489,10 @@ pub(crate) fn start_whatsapp_if_configured(
             tracing::warn!("failed to register channel: {e}");
         }
         let shutdown_for_run = shutdown.clone();
+        let run_status = rsclaw_channel::status::StatusHandle::new("whatsapp", &acct_for_log);
         tokio::spawn(async move {
             tokio::select! {
-                res = wa.run() => {
+                res = rsclaw_channel::status::track(run_status, wa.run()) => {
                     if let Err(e) = res {
                         error!("whatsapp channel: {e:#}");
                     }

@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw-runtime"
-version = "2026.8.28"
+version = "2026.10.20"
 edition = "2024"
 rust-version = "1.91"
 description = "rsclaw composition root: AppState/RPC handlers (a2a, cmd, cron, gateway, hooks, server, ws) + process entry point"
@@ -12,6 +12,7 @@ name = "rsclaw_runtime"
 path = "src/lib.rs"
 
 [dependencies]
+rsclaw-brand = { path = "../rsclaw-brand", version = "0.1.0" }
 # Extracted workspace crates
 rsclaw-agent = { path = "../rsclaw-agent", version = "0.1.1" }
 rsclaw-types = { path = "../rsclaw-types", version = "0.1.0" }
@@ -122,7 +123,7 @@ webrtc = { version = "=0.20.0", default-features = false, features = ["runtime-t
 futures = "0.3"
 bytes = "1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 tokenizers = "0.21"
 qrcode = "0.14"
 xz2 = "0.1"
@@ -152,8 +153,8 @@ fs2 = "0.4.3"
 htmd    = "0.5"
 lol_html = "1.2"
 include_dir = "0.7"
-wasmtime = { version = "36.0.13", features = ["async"] }
-wasmtime-wasi = "36.0.13"
+wasmtime = { version = "36.0.17", features = ["async"] }
+wasmtime-wasi = "36.0.17"
 moka = { version = "0.12", features = ["future"] }
 tray-icon = { version = "0.21", optional = true }
 muda = { version = "0.17", optional = true }
@@ -178,7 +179,7 @@ openclaw-migrate = ["rsclaw-migrate/openclaw-migrate"]
 tray = ["dep:tray-icon", "dep:muda"]
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }
+winapi = { version = "0.3", features = ["handleapi", "processenv", "processthreadsapi", "winbase", "winnls", "winnt"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

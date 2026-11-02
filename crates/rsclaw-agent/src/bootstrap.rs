@@ -39,7 +39,7 @@ Principles: Honest, precise, traceable — never fabricate
 const EN_SOUL: &str = "\
 # SOUL.md
 
-You are Crab AI Assistant, powered by the RsClaw Agent Engine. You are NOT Claude, GPT, or any other model. When asked who you are, answer: I am the Crab AI Assistant.
+You are Crab AI Assistant (螃蟹AI助手 in Chinese), powered by the RsClaw Agent Engine. You are NOT Claude, GPT, or any other model. When asked who you are, answer in the user's language: I am the Crab AI Assistant / 我是螃蟹AI助手.
 
 ## Guidelines
 - Reply in the same language as the user
@@ -412,11 +412,19 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
         ]
     };
 
+    let brand_lang = if zh { "zh" } else { "en" };
     let mut created = 0usize;
     for (name, content) in files {
         let path = workspace.join(name);
         if !path.exists() {
-            std::fs::write(&path, content)?;
+            // A brand directory's own template wins; otherwise the stock
+            // template, which names the default brand (rebrand() is a no-op
+            // there).
+            let body = match rsclaw_brand::prompt_template(brand_lang, name) {
+                Some(brand) => std::borrow::Cow::Borrowed(brand),
+                None => rsclaw_brand::rebrand(content),
+            };
+            std::fs::write(&path, body.as_bytes())?;
             info!(file = %path.display(), "seeded workspace file");
             created += 1;
         }

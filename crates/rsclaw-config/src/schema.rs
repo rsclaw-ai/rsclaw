@@ -95,6 +95,13 @@ pub struct MetaConfig {
 #[serde(rename_all = "camelCase")]
 pub struct GatewayConfig {
     pub port: Option<u16>,
+    /// Registrable domains between which credentialed https redirects of
+    /// the model fleet may be followed (e.g. a public API domain that
+    /// permanently redirects to the serving domain). Unset uses the
+    /// built-in fleet domains; a list replaces them. Other cross-site
+    /// redirects and https->http downgrades are always refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_redirect_sites: Option<Vec<String>>,
     pub mode: Option<GatewayMode>,
     pub bind: Option<BindMode>,
     /// Custom bind address (IP string like "192.168.0.169"). Used when bind is
@@ -102,6 +109,14 @@ pub struct GatewayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_address: Option<String>,
     pub auth: Option<GatewayAuth>,
+    /// Explicit owner identities, each `"<channel>:<peer_id>"` (e.g.
+    /// `"telegram:12345"`, `"feishu:ou_abc"`). Owners may use high-risk
+    /// capabilities (shell, file writes, cron, local slash commands such as
+    /// `/sh` `/cat`). Local entry points (desktop, WebSocket, CLI, loopback
+    /// HTTP) and DM senders listed in a channel's static `allowFrom` are
+    /// owners implicitly; paired users and group members are not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owners: Option<Vec<String>>,
     /// A2A endpoint (`/api/v1/a2a`) authentication. When any field here is
     /// populated, the A2A middleware accepts these credentials.
     /// `gateway.auth.token` is also accepted as a Bearer when set
@@ -540,6 +555,10 @@ pub struct AgentDefaults {
     /// (browser/shell/cap): 100. Budget depletes on stagnation/errors, not on
     /// productive iterations. Set to 0 to use built-in defaults.
     pub max_iterations: Option<u32>,
+    /// Hard ceiling on loop steps in one turn, whatever the stagnation
+    /// budget says (default 80). Raise it for agents whose work is many
+    /// short tool steps, such as reading a case folder.
+    pub max_steps: Option<u32>,
     /// Send intermediate text to user during multi-step tool calls. Default:
     /// true.
     pub intermediate_output: Option<bool>,
@@ -552,6 +571,30 @@ pub struct AgentDefaults {
     /// Codex MCP configuration for default agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexConfig>,
+    /// Session title generation (`agents.defaults.sessionTitles`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_titles: Option<SessionTitlesConfig>,
+}
+
+/// Session title generation settings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTitlesConfig {
+    /// After the first assistant reply of a conversation, ask the flash
+    /// model for a concise title replacing the first-message-derived one
+    /// (never overrides a user-set title). Default: true.
+    #[serde(default = "session_titles_llm_default")]
+    pub llm: bool,
+}
+
+impl Default for SessionTitlesConfig {
+    fn default() -> Self {
+        Self { llm: true }
+    }
+}
+
+fn session_titles_llm_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -594,6 +637,13 @@ pub struct AgentEntry {
     /// empty/null = none (default for non-main agents).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_commands: Option<String>,
+    /// High-risk tools that non-owner senders (paired users, group members,
+    /// A2A peers, webhooks) may still call on this agent. By default
+    /// non-owners cannot call any tool in
+    /// `rsclaw_agent::trust::OWNER_ONLY_TOOLS`. Use `["*"]` to lift the
+    /// restriction entirely for this agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_owner_tools: Option<Vec<String>>,
     /// rsclaw extension: use OpenCode ACP client instead of LLM
     /// When set, this agent spawns opencode acp subprocess and routes all
     /// prompts through it.
@@ -628,6 +678,22 @@ pub struct AgentEntry {
     /// list.
     #[serde(default)]
     pub daemon: bool,
+    /// rsclaw extension: which knowledge-base collections this agent may
+    /// read. None = every collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kb: Option<AgentKbConfig>,
+}
+
+/// An agent's knowledge-base scope (`agents.list[].kb`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentKbConfig {
+    /// Collections (id or name) every knowledge-base search of this agent is
+    /// limited to: the `knowledge_base` tool, auto-recall and a cron
+    /// preflight's `kbQuery`. A subscribed pack is the collection
+    /// `pack_<pack id>`. Unset = every collection; empty = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collections: Option<Vec<String>>,
 }
 
 /// OpenCode ACP configuration for an agent.
@@ -1002,12 +1068,34 @@ impl ThinkingLevel {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThinkingConfig {
     pub enabled: Option<bool>,
     pub level: Option<ThinkingLevel>,
     pub budget_tokens: Option<u32>,
+}
+
+// `rsclaw setup` and the settings panel write the budget as `budget`, so
+// that spelling is read too. It wins over `budgetTokens` when a file has
+// both: the panel edits `budget`, which makes it the newer choice.
+impl<'de> Deserialize<'de> for ThinkingConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            enabled: Option<bool>,
+            level: Option<ThinkingLevel>,
+            budget_tokens: Option<u32>,
+            budget: Option<u32>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            enabled: raw.enabled,
+            level: raw.level,
+            budget_tokens: raw.budget.or(raw.budget_tokens),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1099,6 +1187,25 @@ pub struct CompactionConfig {
     /// Higher values preserve more tool call/result detail but require a
     /// compact model with sufficient context window. Default: 16000 tokens.
     pub max_transcript_tokens: Option<usize>,
+    /// What a summary must carry verbatim for this deployment's work.
+    pub key_data: Option<KeyDataConfig>,
+}
+
+/// Facts compaction keeps verbatim. Rule-extracted from the compacted
+/// turns; any the summary drops are appended to it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyDataConfig {
+    /// Kinds to keep, in priority order: phone, landline, id_card, email,
+    /// credit_code, case_no, amount, date, org, legal_rep. Default: phone,
+    /// id_card, email, credit_code, case_no.
+    pub kinds: Option<Vec<String>>,
+    /// Most facts appended to one summary (default 60).
+    pub max_items: Option<usize>,
+    /// Extra summary section(s) for the scenario, e.g. a "## Case Facts"
+    /// section listing what a lawyer's summary must hold. Added to the
+    /// summary template before its closing rule.
+    pub template: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1178,7 +1285,7 @@ pub struct ProviderConfig {
     pub user_agent: Option<String>,
     /// Override the wire `prefix_id` for `rsclaw` providers (protocol
     /// §2.1.1 / §2.10.1, namespaced `<ns>/<ver>`). Defaults to
-    /// `provider::rsclaw::RSCLAW_DEFAULT_PREFIX_ID` (`rsclaw/2026.8.28`)
+    /// `provider::rsclaw::RSCLAW_DEFAULT_PREFIX_ID` (`rsclaw/2026.10.24`)
     /// when omitted. Ignored for non-rsclaw `api` formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_id: Option<String>,
@@ -1906,6 +2013,12 @@ pub struct CronDelivery {
     /// If true, silently ignore delivery failures.
     #[serde(default)]
     pub best_effort: Option<bool>,
+    /// Session to add the result to, as an assistant message that is also
+    /// pushed to the session's `/api/v1/stream` subscribers. Set for jobs
+    /// created in a session with no channel to send on (the app's HTTP
+    /// chat); wins over `channel` / `to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1959,6 +2072,13 @@ pub struct SessionResultLimits {
     pub web_browser: Option<usize>,
     /// exec result max chars in session (default: 3000)
     pub exec: Option<usize>,
+    /// plugin_invoke result max chars in session (default: 12000). A
+    /// plugin's result is structured state the model acts on (a ticket, the
+    /// next chat to answer); cut short, the model can't see what to do next.
+    pub plugin: Option<usize>,
+    /// knowledge_base / memory_search result max chars in session (default:
+    /// 12000). The hits are what the model answers from.
+    pub knowledge: Option<usize>,
     /// Default for all other tools (default: 3000)
     pub default: Option<usize>,
 }
@@ -1987,6 +2107,10 @@ pub struct ExecToolConfig {
     /// Timeout for exec commands in seconds (default: 1800 = 30 minutes).
     /// Matches openclaw's defaultTimeoutSec.
     pub timeout_seconds: Option<u64>,
+    /// Max concurrently running background exec tasks (default: 4, 0 =
+    /// unlimited). Read at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_background: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2397,8 +2521,14 @@ pub enum SecretOrString {
 }
 
 impl SecretOrString {
-    /// Return the plain string value if this is not a SecretRef.
-    /// For SecretRef variants, resolution happens in `SecretsManager`.
+    /// Return the literal string if this is `Plain`, `None` for ANY SecretRef.
+    ///
+    /// **This is NOT a resolver.** It does not look up `{source:"env"}` /
+    /// file / exec refs and does not expand `${VAR}`. Callers that need the
+    /// secret's value must use [`SecretOrString::resolve_full`] (preferred,
+    /// handles every source) or [`SecretOrString::resolve_early`] (env +
+    /// plain only). Using `as_plain().unwrap_or("")` as an expected token is
+    /// an auth bypass: a ref-configured token becomes the empty string.
     pub fn as_plain(&self) -> Option<&str> {
         match self {
             SecretOrString::Plain(s) => Some(s.as_str()),
@@ -2409,8 +2539,8 @@ impl SecretOrString {
     /// Resolve eagerly without a full `RuntimeConfig`.
     /// - `Plain` → returns the string as-is.
     /// - `Ref { source: Env, id }` → calls `std::env::var(id)`.
-    /// - `Ref { source: File | Exec, .. }` → returns `None` (needs
-    ///   `SecretsManager`).
+    /// - `Ref { source: File | Exec, .. }` → returns `None` (use
+    ///   [`SecretOrString::resolve_full`]).
     pub fn resolve_early(&self) -> Option<String> {
         match self {
             SecretOrString::Plain(s) => {
@@ -2427,6 +2557,11 @@ impl SecretOrString {
     /// `SecretsConfig`. This is the full-resolution path — use when
     /// `secrets.providers` is available (i.e. after the schema is loaded).
     /// Falls back to `resolve_early()` for Env refs and plain strings.
+    ///
+    /// This is the canonical way to obtain a secret value from config.
+    /// `None` means "configured but unresolvable" (missing env var, failed
+    /// file/exec) — callers doing authentication must treat that as
+    /// "reject", never as an empty expected value.
     pub fn resolve_full(&self, secrets: Option<&SecretsConfig>) -> Option<String> {
         match self {
             SecretOrString::Plain(s) => {
@@ -2674,6 +2809,31 @@ pub struct KbConfig {
     /// defense-in-depth bound on an arbitrary-file-read surface; widen it only
     /// if you trust every local process that can reach the gateway.
     pub allowed_upload_roots: Option<Vec<String>>,
+    /// Knowledge packs this machine subscribes to: the packs its account may
+    /// read on the server, each kept as a local read-only collection
+    /// `pack_<pack id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packs: Option<KbPacksConfig>,
+}
+
+/// Knowledge-pack subscription (`kb.packs`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KbPacksConfig {
+    /// Server API root, e.g. `https://api.rsclaw.ai/v1`. Unset = the rsclaw
+    /// provider's base URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// API key of the account whose packs to follow. Unset = the rsclaw
+    /// provider's key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretOrString>,
+    /// Seconds between checks for a new published version. Default 600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+    /// Kill-switch without deleting the block. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 /// Cross-encoder rerank endpoint for the KB search pipeline (`kb.rerank`).
@@ -2700,14 +2860,14 @@ pub struct KbRerankConfig {
     pub enabled: Option<bool>,
 }
 
-/// OCR endpoint config (`kb.ocr`). Speaks the rsclaw-native `/v1/ocr`
-/// shape (`{model, image, stream:false}` → `{content, …}`).
+/// OCR endpoint config (`kb.ocr`). Speaks the rsclaw-native
+/// `/v1/agent/ocr` shape (`{model, image, stream:false}` → `{content, …}`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KbOcrConfig {
     /// API root, e.g. `https://api.rsclaw.ai/v1`. May be empty when
     /// `model` is a `rsclaw-*` name (then defaults to the fleet API).
-    /// `/ocr` is appended at request time.
+    /// `/agent/ocr` is appended at request time.
     #[serde(default)]
     pub base_url: String,
     /// Model name (e.g. `rsclaw-ocr-v1`). Drives both the request body
@@ -2720,6 +2880,12 @@ pub struct KbOcrConfig {
     /// Optional language hint ("zh"/"en"/…); omitted → endpoint auto-detects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// Instruction sent with every image unless the caller gives its own.
+    /// Unset, the endpoint picks one. Models differ: PaddleOCR-VL only
+    /// knows its task prompts ("OCR:", "Table Recognition:"), and a long
+    /// free-form instruction makes it drop table values and invent text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     /// Kill-switch without deleting the block. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -2855,6 +3021,31 @@ pub struct UiConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalsConfig {
     pub exec: Option<ExecApprovalConfig>,
+    /// Tools that only run after a person approves the call.
+    pub tools: Option<ToolApprovalConfig>,
+}
+
+/// `approvals.tools`: a hard gate in front of chosen tools (publishing,
+/// deleting). A matching call waits for the owner's answer — in the desktop
+/// app, or by replying 同意 / 拒绝 in the chat — and fails if it is refused
+/// or not answered in time.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolApprovalConfig {
+    pub enabled: Option<bool>,
+    /// Tool names to gate: `plugin.tool` or `plugin__tool` for plugin
+    /// tools, the bare name for built-in ones; `*` matches any run of
+    /// characters (`*.delete_video`).
+    #[serde(rename = "match")]
+    pub patterns: Option<Vec<String>>,
+    /// Let scheduled (cron) turns through without asking; their schedule
+    /// was already approved. Default true.
+    pub exempt_cron: Option<bool>,
+    /// Session keys (with `*`) whose calls are never gated.
+    pub exempt_sessions: Option<Vec<String>>,
+    /// Refuse a gated call outright, without asking, in a turn no person
+    /// started (a job's wake, heartbeat / system turns). Default true.
+    pub block_in_wake: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2906,4 +3097,38 @@ pub struct WebConfig {
     pub port: Option<u16>,
     pub bind: Option<String>,
     pub tls_enabled: Option<bool>,
+}
+
+#[cfg(test)]
+mod thinking_config_tests {
+    use super::*;
+
+    fn budget(src: &str) -> Option<u32> {
+        json5::from_str::<ThinkingConfig>(src)
+            .expect("thinking config")
+            .budget_tokens
+    }
+
+    #[test]
+    fn budget_is_read_under_both_spellings() {
+        // What `rsclaw setup` and the settings panel write.
+        assert_eq!(budget("{ budget: 0 }"), Some(0));
+        assert_eq!(budget("{ budget: 4096 }"), Some(4096));
+        assert_eq!(budget("{ budgetTokens: 0 }"), Some(0));
+        assert_eq!(budget("{ enabled: true }"), None);
+        // The panel edits `budget`, so it carries the newer choice.
+        assert_eq!(budget("{ budgetTokens: 0, budget: 16384 }"), Some(16384));
+    }
+
+    #[test]
+    fn setup_template_budget_reaches_agent_defaults() {
+        let cfg: Config = json5::from_str("{ agents: { defaults: { thinking: { budget: 0 } } } }")
+            .expect("config");
+        let thinking = cfg
+            .agents
+            .and_then(|a| a.defaults)
+            .and_then(|d| d.thinking)
+            .expect("thinking");
+        assert_eq!(thinking.budget_tokens, Some(0));
+    }
 }

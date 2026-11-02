@@ -92,7 +92,8 @@ pub fn write(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
         )?;
         writeln!(
             f,
-            "# in from the shell, run `rsclaw env sync` (see docs/env.md)."
+            "# in from the shell, run `{} env sync` (see docs/env.md).",
+            rsclaw_brand::CLI_NAME
         )?;
         writeln!(f)?;
 

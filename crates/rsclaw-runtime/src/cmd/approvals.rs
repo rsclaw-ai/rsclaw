@@ -1,73 +1,24 @@
 use anyhow::Result;
 use rsclaw_cli::approvals::{AllowlistCommand, ApprovalsCommand};
-use rsclaw_config as config;
 
 use super::config_json::{load_config_json, set_nested_value};
 
 pub async fn cmd_approvals(sub: ApprovalsCommand) -> Result<()> {
     match sub {
+        // The gateway has no exec-approvals HTTP endpoint; approvals live in
+        // the config file (`execApprovals`), which hot-reload picks up.
         ApprovalsCommand::Get => {
-            // Try running gateway first, fall back to config file.
-            let cfg = config::load().ok();
-            let port = cfg.as_ref().map_or(18888, |c| c.gateway.port);
-            let auth_token = cfg
-                .as_ref()
-                .and_then(|c| c.gateway.auth_token.as_deref())
-                .unwrap_or("");
-
-            let url = format!("http://127.0.0.1:{port}/api/v1/exec-approvals");
-            let client = reqwest::Client::new();
-            let resp = client
-                .get(&url)
-                .header("Authorization", format!("Bearer {auth_token}"))
-                .send()
-                .await;
-
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    let body: serde_json::Value = r.json().await.unwrap_or_default();
-                    println!("{}", serde_json::to_string_pretty(&body)?);
-                }
-                _ => {
-                    // Fall back to config file.
-                    let (_path, val) = load_config_json()?;
-                    let approvals = val.pointer("/execApprovals").cloned().unwrap_or_default();
-                    println!("{}", serde_json::to_string_pretty(&approvals)?);
-                }
-            }
+            let (_path, val) = load_config_json()?;
+            let approvals = val.pointer("/execApprovals").cloned().unwrap_or_default();
+            println!("{}", serde_json::to_string_pretty(&approvals)?);
         }
         ApprovalsCommand::Set { file } => {
             let contents = std::fs::read_to_string(&file)?;
             let payload: serde_json::Value = serde_json::from_str(&contents)?;
-
-            let cfg = config::load().ok();
-            let port = cfg.as_ref().map_or(18888, |c| c.gateway.port);
-            let auth_token = cfg
-                .as_ref()
-                .and_then(|c| c.gateway.auth_token.as_deref())
-                .unwrap_or("");
-
-            let url = format!("http://127.0.0.1:{port}/api/v1/exec-approvals");
-            let client = reqwest::Client::new();
-            let resp = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {auth_token}"))
-                .json(&payload)
-                .send()
-                .await;
-
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    println!("exec approvals updated via gateway");
-                }
-                _ => {
-                    // Fall back: write directly to config.
-                    let (path, mut val) = load_config_json()?;
-                    set_nested_value(&mut val, "execApprovals", payload)?;
-                    std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-                    println!("exec approvals written to config file");
-                }
-            }
+            let (path, mut val) = load_config_json()?;
+            set_nested_value(&mut val, "execApprovals", payload)?;
+            std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+            println!("exec approvals written to config file");
         }
         ApprovalsCommand::Allowlist(allowlist_cmd) => match allowlist_cmd {
             AllowlistCommand::Add { agent, pattern } => {

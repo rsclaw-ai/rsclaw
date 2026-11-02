@@ -35,7 +35,8 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 const DINGTALK_OAPI_BASE: &str = "https://oapi.dingtalk.com";
-const DINGTALK_API_BASE: &str = "https://api.dingtalk.com";
+/// Default DingTalk v1.0 API base.
+pub const DINGTALK_API_BASE: &str = "https://api.dingtalk.com";
 
 /// DingTalk single-message text limit.
 const DINGTALK_CHUNK_LIMIT: usize = 20_000;
@@ -43,20 +44,62 @@ const DINGTALK_CHUNK_LIMIT: usize = 20_000;
 /// Access token refresh margin -- refresh 5 minutes before actual expiry.
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(300);
 
+/// Fetch an internal-app access token from the v1.0 endpoint
+/// (`POST {api_base}/v1.0/oauth2/accessToken`). Credentials travel in the
+/// JSON body, never in the URL, so they cannot leak into logs via transport
+/// errors. The token is the same one the legacy `oapi` endpoints (e.g.
+/// `media/upload`) accept. Returns `(access_token, expire_in_secs)`.
+pub async fn fetch_app_access_token(
+    client: &reqwest::Client,
+    api_base: &str,
+    app_key: &str,
+    app_secret: &str,
+) -> Result<(String, u64)> {
+    let url = format!("{}/v1.0/oauth2/accessToken", api_base.trim_end_matches('/'));
+    let http_resp = client
+        .post(&url)
+        .json(&json!({
+            "appKey": app_key,
+            "appSecret": app_secret,
+        }))
+        .send()
+        .await
+        .context("DingTalk accessToken request")?;
+    let status = http_resp.status();
+    let body = http_resp
+        .bytes()
+        .await
+        .context("DingTalk accessToken read")?;
+    let resp: TokenResponse = serde_json::from_slice(&body)
+        .with_context(|| format!("DingTalk accessToken parse (HTTP {})", status.as_u16()))?;
+
+    if !status.is_success() || resp.access_token.is_empty() {
+        bail!(
+            "DingTalk accessToken error (HTTP {}) {}: {}",
+            status.as_u16(),
+            resp.code.unwrap_or_default(),
+            resp.message.unwrap_or_default()
+        );
+    }
+    Ok((resp.access_token, resp.expire_in))
+}
+
 // ---------------------------------------------------------------------------
 // API response types
 // ---------------------------------------------------------------------------
 
+/// Response of `POST /v1.0/oauth2/accessToken`. Errors come back as a
+/// non-2xx status with `code` / `message` instead.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
-    #[serde(default)]
+    #[serde(default, rename = "accessToken")]
     access_token: String,
+    #[serde(default, rename = "expireIn")]
+    expire_in: u64,
     #[serde(default)]
-    expires_in: u64,
+    code: Option<String>,
     #[serde(default)]
-    errcode: i64,
-    #[serde(default)]
-    errmsg: Option<String>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,40 +203,16 @@ impl DingTalkChannel {
             return Ok(cached.token.clone());
         }
 
-        let url = format!(
-            "{}/gettoken?appkey={}&appsecret={}",
-            self.oapi_base, self.app_key, self.app_secret
-        );
-
-        let resp: TokenResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("DingTalk gettoken request")?
-            .json()
-            .await
-            .context("DingTalk gettoken parse")?;
-
-        if resp.errcode != 0 {
-            bail!(
-                "DingTalk gettoken error {}: {}",
-                resp.errcode,
-                resp.errmsg.unwrap_or_default()
-            );
-        }
-
-        let token = resp.access_token.clone();
+        let (token, expire_in) =
+            fetch_app_access_token(&self.client, &self.api_base, &self.app_key, &self.app_secret)
+                .await?;
         *cache = Some(CachedToken {
-            token: resp.access_token,
+            token: token.clone(),
             obtained_at: Instant::now(),
-            expires_in: Duration::from_secs(resp.expires_in),
+            expires_in: Duration::from_secs(expire_in),
         });
 
-        info!(
-            "DingTalk access token refreshed (expires in {}s)",
-            resp.expires_in
-        );
+        info!("DingTalk access token refreshed (expires in {expire_in}s)");
         Ok(token)
     }
 
@@ -380,9 +399,13 @@ impl DingTalkChannel {
             .download_url
             .context("DingTalk media download: no downloadUrl in response")?;
 
-        let media_bytes = self.client.get(&download_url).send().await?.bytes().await?;
+        let media_resp = self.client.get(&download_url).send().await?;
+        if !media_resp.status().is_success() {
+            bail!("DingTalk media download failed: {}", media_resp.status());
+        }
+        let media_bytes = crate::read_media_body(media_resp).await?;
         debug!(size = media_bytes.len(), "DingTalk media file downloaded");
-        Ok(media_bytes.to_vec())
+        Ok(media_bytes)
     }
 
     // -----------------------------------------------------------------------
@@ -461,6 +484,14 @@ impl DingTalkChannel {
             data.clone()
         };
 
+        // Stream redeliveries (missed ACK, reconnect) reuse msgId: dedup.
+        if let Some(mid) = payload.get("msgId").and_then(|v| v.as_str())
+            && crate::is_duplicate_inbound("dingtalk", mid)
+        {
+            debug!(msg_id = mid, "DingTalk: duplicate message dropped");
+            return;
+        }
+
         // Extract message fields.
         let sender_id = payload
             .get("senderStaffId")
@@ -468,6 +499,9 @@ impl DingTalkChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
+        if let Some(nick) = payload.get("senderNick").and_then(|v| v.as_str()) {
+            crate::peer_names::record_peer_name("dingtalk", &sender_id, nick);
+        }
 
         let conversation_id = payload
             .get("conversationId")
@@ -499,9 +533,46 @@ impl DingTalkChannel {
                     .or_else(|| payload.get("msgContent").and_then(|v| v.as_str()));
 
                 match content {
-                    Some(t) if !t.trim().is_empty() => t.trim().to_owned(),
+                    Some(t) if !t.trim().is_empty() => crate::strip_inbound_sentinels(t.trim()),
                     _ => return,
                 }
+            }
+            "richText" => {
+                // Mixed text + inline pictures: content.richText is a list of
+                // `{text}` and `{downloadCode|pictureDownloadCode, type:"picture"}`.
+                let items = payload
+                    .pointer("/content/richText")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut parts: Vec<String> = Vec::new();
+                for item in &items {
+                    if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                        if !t.trim().is_empty() {
+                            parts.push(t.to_owned());
+                        }
+                        continue;
+                    }
+                    let code = item
+                        .get("downloadCode")
+                        .or_else(|| item.get("pictureDownloadCode"))
+                        .and_then(|v| v.as_str());
+                    if let Some(code) = code {
+                        match self.download_media_file(code).await {
+                            Ok(bytes) => {
+                                use base64::Engine;
+                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                images.push(rsclaw_types::ImageAttachment {
+                                    data: format!("data:image/png;base64,{b64}"),
+                                    mime_type: "image/png".to_owned(),
+                                    source_path: None,
+                                });
+                            }
+                            Err(e) => warn!("DingTalk richText image download failed: {e:#}"),
+                        }
+                    }
+                }
+                crate::strip_inbound_sentinels(parts.join("\n").trim())
             }
             "audio" | "voice" => {
                 let download_code = payload
@@ -526,7 +597,7 @@ impl DingTalkChannel {
                     }
                 }
             }
-            "picture" | "richText" => {
+            "picture" => {
                 let download_code = payload
                     .get("content")
                     .and_then(|c| c.get("downloadCode"))
@@ -782,10 +853,17 @@ impl DingTalkChannel {
                                             "message": "OK",
                                             "data": "",
                                         });
-                                        let _ = write.send(WsMessage::Text(ack.to_string().into())).await;
+                                        if let Err(e) = write.send(WsMessage::Text(ack.to_string().into())).await {
+                                            warn!("DingTalk: event ACK failed: {e}");
+                                        }
                                     }
 
-                                    self.handle_stream_event(&event).await;
+                                    // Downloads / transcription run off the
+                                    // stream loop so pings and ACKs keep flowing.
+                                    let this = Arc::clone(self);
+                                    tokio::spawn(async move {
+                                        this.handle_stream_event(&event).await;
+                                    });
                                 }
                                 Err(e) => {
                                     warn!("DingTalk: invalid JSON from stream: {e}");
@@ -793,7 +871,9 @@ impl DingTalkChannel {
                             }
                         }
                         Some(Ok(WsMessage::Ping(data))) => {
-                            let _ = write.send(WsMessage::Pong(data)).await;
+                            if let Err(e) = write.send(WsMessage::Pong(data)).await {
+                                warn!("DingTalk: pong failed: {e}");
+                            }
                         }
                         Some(Ok(WsMessage::Close(_))) => {
                             info!("DingTalk: WebSocket close frame received");
@@ -1240,6 +1320,19 @@ mod tests {
     #[test]
     fn chunk_limit() {
         assert_eq!(DINGTALK_CHUNK_LIMIT, 20_000);
+    }
+
+    #[test]
+    fn token_response_v1_fields() {
+        let ok: TokenResponse =
+            serde_json::from_str(r#"{"accessToken":"abc","expireIn":7200}"#).expect("parse");
+        assert_eq!(ok.access_token, "abc");
+        assert_eq!(ok.expire_in, 7200);
+        let err: TokenResponse =
+            serde_json::from_str(r#"{"code":"invalidClientId","message":"bad key","requestid":"x"}"#)
+                .expect("parse");
+        assert!(err.access_token.is_empty());
+        assert_eq!(err.code.as_deref(), Some("invalidClientId"));
     }
 
     #[test]

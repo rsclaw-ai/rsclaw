@@ -92,14 +92,19 @@ impl AgentRuntime {
             drop(pending);
             if !completed.is_empty() {
                 if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+                    // Insert BEFORE the current user message so it stays the
+                    // last message: the vision swap and first-iteration recall
+                    // both key off the trailing user message.
+                    let mut at = current_user_insert_index(sess);
                     for (task_id, _, result) in &completed {
-                        sess.push(Message {
+                        sess.insert(at, Message {
                             role: Role::System,
                             content: MessageContent::Text(format!(
                                 "[async task {task_id} completed]\n{result}"
                             )),
                             rsclaw_hidden: None,
                         });
+                        at += 1;
                     }
                     info!(
                         session = %ctx.session_key,
@@ -200,11 +205,14 @@ impl AgentRuntime {
                     });
                 }
 
+                // Same placement rule as async task results above: keep the
+                // current user message last.
+                let mut at = current_user_insert_index(sess);
                 for result in pending_results {
                     let tool_call_id = result.tool_call_id.clone();
                     // If ToolUse not in history, inject synthetic one
                     if !session_tool_ids.contains(&tool_call_id) {
-                        sess.push(Message {
+                        sess.insert(at, Message {
                             role: Role::Assistant,
                             content: MessageContent::Parts(vec![ContentPart::ToolUse {
                                 id: tool_call_id.clone(),
@@ -213,6 +221,7 @@ impl AgentRuntime {
                             }]),
                             rsclaw_hidden: None,
                         });
+                        at += 1;
                     }
                     let is_error = result.exit_code.map(|c| c != 0).unwrap_or(true);
                     let content = serde_json::json!({
@@ -221,7 +230,7 @@ impl AgentRuntime {
                         "stderr": result.stderr,
                     })
                     .to_string();
-                    sess.push(Message {
+                    sess.insert(at, Message {
                         role: Role::Tool,
                         content: MessageContent::Parts(vec![ContentPart::ToolResult {
                             tool_use_id: tool_call_id,
@@ -230,6 +239,7 @@ impl AgentRuntime {
                         }]),
                         rsclaw_hidden: None,
                     });
+                    at += 1;
                 }
             }
         }
@@ -278,12 +288,27 @@ impl AgentRuntime {
         let mut last_tool_name_only = String::new();
         let mut same_name_streak: usize = 0;
         const MAX_SAME_NAME_STREAK: usize = 10;
+        // Shell runs a different command each time and is how document work
+        // gets done (read this file, convert that one, write the result), so
+        // it gets a longer run before the depletion starts.
+        const MAX_SAME_NAME_STREAK_SHELL: usize = 30;
         // Absolute hard ceiling on loop iterations, independent of the
         // progress-aware stagnation budget. The budget treats every call that
         // returns new output as "free", so a productive-looking loop (paging,
         // re-routing search) can spin unbounded — this is the universal
-        // backstop. Set well above any legitimate multi-tool turn.
-        const HARD_MAX_ITERATIONS: usize = 80;
+        // backstop. Set well above any legitimate multi-tool turn;
+        // `agents.defaults.maxSteps` overrides it.
+        const DEFAULT_HARD_MAX_ITERATIONS: usize = 80;
+        let hard_max_iterations: usize = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .max_steps
+            .map(|v| v as usize)
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_HARD_MAX_ITERATIONS);
         // Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
         // Identical-failing-call ledger: hash(tool_name + canonical args) →
@@ -310,8 +335,24 @@ impl AgentRuntime {
         }
         ctx.turn_metrics.stagnation_budget = budget;
         let mut last_result_hash: Option<String> = None;
+        // Recent (call, result) pairs. A loop of two or more calls that keep
+        // returning the same (click 下一步 → look at the page → click again)
+        // never repeats one call back to back, and each result differs from
+        // the one before it, so neither check above sees it.
+        let mut recent_outcomes: std::collections::VecDeque<(String, Option<String>)> =
+            std::collections::VecDeque::new();
+        const OUTCOME_WINDOW: usize = 12;
+        const MAX_SAME_OUTCOME: usize = 3;
         let mut last_tool_name = String::new();
         let mut wrapup_injected = false;
+        // Times this turn ran into the model's context limit. Each recovery
+        // cuts older tool results, and a model that then re-reads what was
+        // cut fills the context again: a loop with no end.
+        let mut context_overflows = 0usize;
+        // Responses after the wrap-up prompt whose tool calls were refused.
+        let mut wrapup_refusals = 0usize;
+        // Responses cut off because the model fell into repeating itself.
+        let mut degenerate_retries = 0usize;
         // DAEMON: consecutive "tried to end with no tool call" re-injects. Reset
         // whenever the model actually makes a tool call. If it keeps refusing
         // (some models won't honor the loop), we stop re-injecting after a cap
@@ -319,6 +360,27 @@ impl AgentRuntime {
         // than hot-looping the LLM endpoint forever.
         let mut daemon_noprogress_streak = 0u32;
         const DAEMON_NOPROGRESS_CAP: u32 = 5;
+        // Daemon scratchpad ceiling (messages); tokens are capped separately.
+        const DAEMON_SCRATCHPAD_MAX_MSGS: usize = 80;
+        // Per-result char cap applied to older tool results when a
+        // ContextExceeded retry finds nothing to compact.
+        const CONTEXT_RETRY_TOOL_RESULT_CHARS: usize = 1_000;
+        // Headroom kept under the context limit once the estimate is
+        // calibrated: the next turn's new input plus a full reply.
+        const PREFLIGHT_RESERVE_TOKENS: usize = 12_288;
+        // Headroom under the context limit at which a stateful backend is
+        // re-sent the shrunk history: a reply and a little new input.
+        const REPLAY_RESERVE_TOKENS: usize = 4_096;
+        // Set once pre-flight compaction proves to be a no-op this turn, so it
+        // isn't re-attempted (and re-billed) on every iteration.
+        let mut preflight_compaction_stalled = false;
+        // Loop-detector CRITICAL hits this turn. The first one refuses the
+        // call with a tool-result error; a second ends the turn gracefully.
+        let mut loop_critical_hits = 0usize;
+        // Set when every tool of the last iteration reported
+        // `turnComplete: true`: the next iteration closes the turn with this
+        // text instead of asking the model to restate finished work.
+        let mut finished_by_tools: Option<String> = None;
         let mut iteration = 0usize;
 
         loop {
@@ -328,7 +390,7 @@ impl AgentRuntime {
             // paging / re-routing). A turn that legitimately needs >80 tool
             // iterations is itself pathological; stop and hand back what we have.
             // (Daemon agents are exempt — they loop forever by design.)
-            if !daemon_mode && iteration > HARD_MAX_ITERATIONS {
+            if !daemon_mode && iteration > hard_max_iterations {
                 warn!(
                     session = %ctx.session_key,
                     iterations = iteration,
@@ -355,6 +417,7 @@ impl AgentRuntime {
                         tool_log: vec![],
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -368,12 +431,16 @@ impl AgentRuntime {
                     outcome: crate::registry::ReplyOutcome::Ok,
                 });
             }
-            // Check clear_signal mid-loop: clear sessions and abort.
-            if self.handle.clear_signal.load(Ordering::SeqCst) {
-                self.handle.clear_signal.store(false, Ordering::SeqCst);
-                info!(session = %ctx.session_key, "agent_loop: clear_signal, clearing sessions");
-                self.sessions.clear();
-                self.compaction_state.clear();
+            // Check for a /clear or /new aimed at THIS session mid-loop: apply
+            // it to this session only and end the turn. Requests for other
+            // sessions are left queued for their own next turn.
+            if let Some(kind) = self.handle.take_session_reset(
+                &ctx.session_key,
+                &ctx.channel,
+                &ctx.peer_id,
+            ) {
+                info!(session = %ctx.session_key, ?kind, "agent_loop: session reset requested, ending turn");
+                self.apply_session_reset(&ctx.session_key, kind).await;
                 let terminal_text = "[session cleared]".to_string();
                 if let Some(ref bus) = self.event_bus {
                     let _ = bus.send(AgentEvent {
@@ -386,6 +453,7 @@ impl AgentRuntime {
                         tool_log: vec![],
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -430,6 +498,7 @@ impl AgentRuntime {
                         tool_log: tool_log.clone(),
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -442,6 +511,11 @@ impl AgentRuntime {
                     needs_outer_done_emit: false,
                     outcome: crate::registry::ReplyOutcome::Ok,
                 });
+            }
+            // Close to the hard ceiling, start the wrap-up so the turn ends on
+            // an answer from what the model has, not on the ceiling notice.
+            if !daemon_mode && !wrapup_injected && iteration + 8 >= hard_max_iterations {
+                budget = budget.min(0);
             }
             // Stagnation budget check: when budget depletes, inject a wrap-up
             // prompt (soft limit). If the LLM still calls tools after that,
@@ -456,21 +530,22 @@ impl AgentRuntime {
                 );
                 // Soft limit: inject a system message asking the LLM to wrap up.
                 // This is NOT user-facing; LLM prompts are always English literals.
-                if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                    sess.push(Message {
-                        role: Role::User,
-                        content: MessageContent::Text(
-                            "[system] You have been executing for many steps without producing new results. \
-                             Please summarize your progress and provide a final answer, \
-                             or clearly state what is blocking you.".to_owned(),
-                        ),
-                        rsclaw_hidden: None,
-                    });
-                }
+                // Goes into the turn scratchpad (never the persistent session):
+                // it is a working-turn nudge and must not leak into history.
+                turn_scratchpad.push(Message {
+                    role: Role::User,
+                    content: MessageContent::Text(
+                        "[system] You have been executing for many steps without producing new results. \
+                         Please summarize your progress and provide a final answer, \
+                         or clearly state what is blocking you.".to_owned(),
+                    ),
+                    rsclaw_hidden: None,
+                });
                 wrapup_injected = true;
                 // Give the LLM one more chance to produce a final answer.
-            } else if !daemon_mode && budget <= 0 && wrapup_injected {
-                // Hard stop: LLM called another tool despite the wrap-up prompt.
+            } else if !daemon_mode && wrapup_injected && wrapup_refusals >= 2 {
+                // Hard stop: the model kept calling tools after the wrap-up
+                // prompt and two refusals.
                 warn!(
                     session = %ctx.session_key,
                     iterations = iteration,
@@ -498,6 +573,7 @@ impl AgentRuntime {
                         tool_log: tool_log.clone(),
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -542,6 +618,7 @@ impl AgentRuntime {
                         tool_log: tool_log.clone(),
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -614,6 +691,21 @@ impl AgentRuntime {
             };
             self.cap_turn_input_to_budget(&ctx.session_key, &mut turn_scratchpad, per_turn_budget)
                 .await;
+            // Daemon turns never end, and cap_turn_input_to_budget only
+            // shrinks each tool result down to a floor — it never drops
+            // messages — so a forever-looping monitor would still grow the
+            // scratchpad without bound (one ToolUse + floor-sized result per
+            // poll). Drop the oldest tool pairs past a message/token budget.
+            if daemon_mode {
+                let dropped = crate::context_mgr::trim_scratchpad_front(
+                    &mut turn_scratchpad,
+                    DAEMON_SCRATCHPAD_MAX_MSGS,
+                    per_turn_budget.saturating_mul(2),
+                );
+                if dropped > 0 {
+                    debug!(session = %ctx.session_key, dropped, "agent_loop: daemon scratchpad trimmed");
+                }
+            }
 
             let scratchpad_tokens: usize = turn_scratchpad.iter().map(msg_tokens).sum();
             if effective_kv_mode < 2
@@ -638,73 +730,30 @@ impl AgentRuntime {
             //                                  prompt_builder.rs)
             //   [1…n] history — session user/assistant messages
             //   [tail] …      — turn_scratchpad  (per-iteration tools)
-            let mut messages = {
-                let mut raw = self
-                    .sessions
-                    .get(&ctx.session_key)
-                    .cloned()
-                    .unwrap_or_default();
+            let mut messages = self.build_request_messages(ctx, &mut turn_scratchpad);
 
-                // For vision models: replace last user message with multimodal
-                // version containing original images (only for this API call).
-                // Must happen before scratchpad is appended so last() is the
-                // session user message, not a tool result.
-                if ctx.has_images {
-                    if let Some(last) = raw.last_mut() {
-                        if last.role == Role::User {
-                            *last = ctx.user_msg_with_images.clone().unwrap_or(last.clone());
-                        }
-                    }
-                }
-
-                // Append current-turn scratch-paper (tool calls + results).
-                // Always at the tail; discarded when this turn ends.
-                raw.extend(turn_scratchpad.clone());
-
-                // Repair transcript: ensure all tool_calls have matching tool_results.
-                let repair_result = repair_tool_result_pairing(raw);
-
-                // Synthetic tool results (generated by repair to fix broken
-                // pairs) go into the scratch-paper buffer, not the persistent
-                // session.  They are working-turn artefacts; no need to persist.
-                if !repair_result.synthetic_messages.is_empty() {
-                    turn_scratchpad.extend(repair_result.synthetic_messages.clone());
-                }
-
-                repair_result.messages
-            };
-
-            // Resolve thinking budget from agent config or defaults.
+            // Resolve thinking budget: the agent's own model, then
+            // `agents.defaults.model`, then `agents.defaults.thinking`.
             let thinking_budget = {
                 let agent_thinking = self
                     .handle
                     .config
                     .model
                     .as_ref()
-                    .and_then(|m| m.thinking.as_ref())
-                    .cloned();
-                // Clone the live default so we don't hold the lock across the
-                // closure / `.and_then` chain below.
-                let default_thinking = self.live.agents.read().await.defaults.thinking.clone();
-                let tc = agent_thinking.or(default_thinking);
-                tc.and_then(|t| {
-                    // Explicit budget_tokens takes precedence.
-                    if let Some(budget) = t.budget_tokens {
-                        return Some(budget);
-                    }
-                    // Then try level mapping.
-                    if let Some(ref level) = t.level {
-                        let b = level.budget_tokens();
-                        if b > 0 {
-                            return Some(b);
-                        }
-                    }
-                    // Then fall back to enabled bool (medium budget as default).
-                    if t.enabled == Some(true) {
-                        return Some(10240);
-                    }
-                    None
-                })
+                    .and_then(|m| m.thinking.clone());
+                // Clone the live defaults so we don't hold the lock.
+                let (default_model_thinking, default_thinking) = {
+                    let agents = self.live.agents.read().await;
+                    (
+                        agents.defaults.model.as_ref().and_then(|m| m.thinking.clone()),
+                        agents.defaults.thinking.clone(),
+                    )
+                };
+                super::resolve_thinking_budget(
+                    agent_thinking.as_ref(),
+                    default_model_thinking.as_ref(),
+                    default_thinking.as_ref(),
+                )
             };
 
             let msg_count = messages.len();
@@ -735,6 +784,11 @@ impl AgentRuntime {
                     + msg_count * 10
             };
             let approx_tokens = component_est.max(body_est);
+            // The estimate runs low on CJK text and tool output (about 1.5x
+            // against the fleet worker's count); scale it by what the
+            // provider reported for this session's earlier calls.
+            let calibrated_tokens = token_scale(&ctx.session_key)
+                .map_or(approx_tokens, |s| (approx_tokens as f32 * s) as usize);
             self.handle.update_session_tokens(
                 &ctx.session_key,
                 crate::registry::SessionTokens {
@@ -746,22 +800,33 @@ impl AgentRuntime {
             );
             info!(session = %ctx.session_key, msg_count, approx_tokens, sys_tokens, tools_tokens, msg_tokens = msg_tokens_sum, model = %model, "LLM call: context size");
 
-            // Context usage awareness: inject hint into the LAST user message
-            // (not system prompt) to preserve KV cache prefix stability.
-            if approx_tokens > 0 && context_tokens > 0 {
-                let usage_pct = (approx_tokens * 100) / context_tokens;
-                let usage_hint = if usage_pct >= 90 {
-                    Some(format!(
-                        "[Context usage: {usage_pct}% — CRITICAL. \
+            // Context usage awareness: inject hint into the current (last) user
+            // message, not the system prompt. The text is a FIXED string per
+            // bucket (70/80/90%) — an exact percentage would change almost every
+            // iteration and rewrite a message that sits before the whole
+            // scratchpad, invalidating the provider's prompt-prefix cache for
+            // the rest of the turn. With buckets the bytes only change when a
+            // threshold is crossed.
+            if calibrated_tokens > 0 && context_tokens > 0 {
+                let usage_pct = (calibrated_tokens * 100) / context_tokens;
+                let usage_hint: Option<&str> = if usage_pct >= 90 {
+                    Some(
+                        "[Context usage: over 90% — CRITICAL. \
                         Keep responses very concise. Do not re-read files already in context. \
-                        Suggest user start a new session if task is complete.]"
-                    ))
+                        Suggest user start a new session if task is complete.]",
+                    )
+                } else if usage_pct >= 80 {
+                    Some(
+                        "[Context usage: over 80%. \
+                        Keep tool outputs short (use offset/limit for reads, \
+                        pipe to head/tail for commands). Avoid re-reading files already in context.]",
+                    )
                 } else if usage_pct >= 70 {
-                    Some(format!(
-                        "[Context usage: {usage_pct}%. \
+                    Some(
+                        "[Context usage: over 70%. \
                         Optimize: keep tool outputs short (use offset/limit for reads, \
-                        pipe to head/tail for commands). Avoid re-reading files already in context.]"
-                    ))
+                        pipe to head/tail for commands). Avoid re-reading files already in context.]",
+                    )
                 } else {
                     None
                 };
@@ -877,7 +942,7 @@ impl AgentRuntime {
                     .or(agents_live.defaults.temperature)
                     .map(Some)
                     .unwrap_or_else(|| {
-                        if thinking_budget.is_some() {
+                        if thinking_budget.unwrap_or(0) > 0 {
                             None
                         } else if tools.is_empty() {
                             Some(0.7)
@@ -887,9 +952,16 @@ impl AgentRuntime {
                     });
                 let per_agent_ctx =
                     per_agent_entry.and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
-                let context_limit = per_agent_ctx
-                    .or(agents_live.defaults.context_tokens)
-                    .unwrap_or(128_000) as usize;
+                // Unset: the turn model's own window, capped at the default.
+                let context_limit = crate::model_resolution::effective_context_window(
+                    per_agent_ctx.or(agents_live.defaults.context_tokens).map(|v| v as usize),
+                    self.model_limits(&model),
+                );
+                // A backend that refused requests below that (a per-session
+                // cap) sets the real limit.
+                let context_limit = self
+                    .learned_context_limit(&model)
+                    .map_or(context_limit, |learned| context_limit.min(learned));
                 (temperature, context_limit)
             };
 
@@ -900,10 +972,92 @@ impl AgentRuntime {
                 .get(&ctx.session_key)
                 .map(|msgs| msgs.iter().map(crate::context_mgr::msg_tokens).sum())
                 .unwrap_or(0);
-            let total_est = overhead + session_tokens;
-            // Use 80% of context limit as threshold to account for token estimation
-            // inaccuracy (estimate is ~char/3.5, actual tokenization may differ by 10-15%).
-            if total_est > (context_limit * 80 / 100) {
+            // This turn's tool calls and results count too: a long turn
+            // (reading a case folder) grows the context there, not in the
+            // stored session.
+            let turn_tokens: usize = turn_scratchpad.iter().map(msg_tokens).sum();
+            let scale = token_scale(&ctx.session_key);
+            let total_est = scale.map_or(overhead + session_tokens + turn_tokens, |s| {
+                ((overhead + session_tokens + turn_tokens) as f32 * s) as usize
+            });
+            // The parts above can come in far under the request being sent
+            // (16k against an 83k request the fleet refused): take the
+            // request's own estimate when it is larger.
+            let total_est = total_est.max(calibrated_tokens);
+            // Calibrated against the provider's real count: compact once the
+            // next input and reply would no longer fit. Uncalibrated: keep a
+            // 20% margin for the estimate's error.
+            let preflight_threshold = if scale.is_some() {
+                context_limit.saturating_sub(PREFLIGHT_RESERVE_TOKENS)
+            } else {
+                context_limit * 80 / 100
+            };
+            // A stateful backend (rsclaw) also keeps earlier turns' tool
+            // steps the runtime has dropped: its last reported size plus what
+            // this call adds is what meets its per-session cap. When only
+            // that is too big, the history itself is fine: have the backend
+            // take it afresh, without the old steps, instead of compacting.
+            let backend = {
+                let (name, _) = self.providers.resolve_model(&model);
+                self.providers.get(name).ok()
+            };
+            if let Some(provider) = backend.as_ref()
+                && provider.holds_dropped_steps(&ctx.session_key)
+                && let Some(server) = super::server_size(&ctx.session_key)
+            {
+                let adding: usize = messages
+                    .iter()
+                    .rev()
+                    .take_while(|m| !matches!(m.role, Role::Assistant))
+                    .map(crate::context_mgr::msg_tokens)
+                    .sum();
+                if server + adding > preflight_threshold && total_est <= preflight_threshold {
+                    info!(
+                        session = %ctx.session_key,
+                        server,
+                        adding,
+                        total_est,
+                        "pre-flight: backend session full of earlier tool steps; re-sending the history"
+                    );
+                    provider.drop_session(&ctx.session_key);
+                    super::forget_server_size(&ctx.session_key);
+                }
+            }
+            if total_est > preflight_threshold && preflight_compaction_stalled {
+                // The stored session has nothing left to fold; shrink this
+                // turn's older tool results instead (handles stay readable).
+                let shrunk = crate::context_mgr::shrink_oldest_tool_results(
+                    &mut turn_scratchpad,
+                    CONTEXT_RETRY_TOOL_RESULT_CHARS,
+                );
+                if shrunk > 0 {
+                    warn!(
+                        session = %ctx.session_key,
+                        total_est,
+                        preflight_threshold,
+                        shrunk,
+                        "pre-flight: near the context limit, shrank older tool results of this turn"
+                    );
+                    messages = self.build_request_messages(ctx, &mut turn_scratchpad);
+                }
+                // A stateful backend still holds those results in full and
+                // keeps growing to its cap. Once it is about to reach it,
+                // have it take the shrunk history instead of failing there.
+                // Not sooner: a re-sent history is rendered afresh, and a
+                // model reading its past calls rendered as text may write
+                // its next one as text too. Its reported size then no
+                // longer describes the request, so stop scaling by it until
+                // the next call reports again.
+                if total_est > context_limit.saturating_sub(REPLAY_RESERVE_TOKENS) {
+                    let (resolved_provider, _) = self.providers.resolve_model(&model);
+                    if let Ok(provider) = self.providers.get(resolved_provider) {
+                        provider.drop_session(&ctx.session_key);
+                    }
+                    forget_token_scale(&ctx.session_key);
+                    super::forget_server_size(&ctx.session_key);
+                }
+            }
+            if !preflight_compaction_stalled && total_est > preflight_threshold {
                 warn!(
                     session = %ctx.session_key,
                     total_est,
@@ -913,12 +1067,29 @@ impl AgentRuntime {
                     "pre-flight: approaching context limit, forcing compaction"
                 );
                 self.compact_inner(&ctx.session_key, model, true).await;
-                // Re-read messages after compaction.
-                messages = self
-                    .sessions
-                    .get(&ctx.session_key)
-                    .cloned()
-                    .unwrap_or_default();
+                super::forget_server_size(&ctx.session_key);
+                let after = self.session_token_sum(&ctx.session_key);
+                if after < session_tokens {
+                    // Rebuild the request from the compacted session PLUS this
+                    // turn's scratchpad (tool calls/results, vision swap,
+                    // pairing repair). Rebuilding from the session alone would
+                    // hide every tool result of this turn from the model, which
+                    // then repeats side-effecting calls.
+                    messages = self.build_request_messages(ctx, &mut turn_scratchpad);
+                } else {
+                    // Compaction freed nothing (no old portion to fold, or the
+                    // summary call failed). Keep the request as built and stop
+                    // re-trying for the rest of this turn — each attempt can be
+                    // a full LLM summarisation call. A real overflow is still
+                    // handled by the ContextExceeded retry below.
+                    preflight_compaction_stalled = true;
+                    warn!(
+                        session = %ctx.session_key,
+                        session_tokens,
+                        after,
+                        "pre-flight: compaction freed nothing; not retrying this turn"
+                    );
+                }
             }
 
             // Single live-config read per LLM iteration. Previously this
@@ -1066,7 +1237,10 @@ impl AgentRuntime {
             }
 
             let providers = Arc::clone(&self.providers);
-            let stream_result = self.failover.call(req.clone(), &providers).await;
+            let stream_result = match finished_by_tools.take() {
+                Some(text) => Ok(finished_turn_stream(text)),
+                None => self.failover.call(req.clone(), &providers).await,
+            };
 
             // If the LLM rejects for context overflow, compact and retry once.
             // Use the precise `ContextExceeded` classification rather than a
@@ -1081,22 +1255,73 @@ impl AgentRuntime {
                         == rsclaw_provider::health::ErrorKind::ContextExceeded =>
                 {
                     warn!(session = %ctx.session_key, error = %e, "session context exceeded; compacting and retrying once");
+                    // The pre-flight total leaves out much of what the
+                    // request carried (it came in at 16k on a refused 83k
+                    // request); learn from the size of the request itself.
+                    self.learn_context_limit(&model, approx_tokens.max(total_est));
+                    let before = self.session_token_sum(&ctx.session_key);
                     self.compact_inner(&ctx.session_key, &model, true).await;
-                    // Rebuild messages after compaction.
-                    let compacted = self
-                        .sessions
-                        .get(&ctx.session_key)
-                        .cloned()
-                        .unwrap_or_default();
+                    if self.session_token_sum(&ctx.session_key) >= before {
+                        // Compaction freed nothing — shrink this turn's older
+                        // tool results instead so the retry is actually smaller.
+                        let shrunk = crate::context_mgr::shrink_oldest_tool_results(
+                            &mut turn_scratchpad,
+                            CONTEXT_RETRY_TOOL_RESULT_CHARS,
+                        );
+                        warn!(
+                            session = %ctx.session_key,
+                            shrunk,
+                            "context exceeded: compaction freed nothing; shrank older tool results"
+                        );
+                    }
+                    context_overflows += 1;
+                    if context_overflows >= MAX_CONTEXT_OVERFLOWS && !daemon_mode && !wrapup_injected {
+                        warn!(
+                            session = %ctx.session_key,
+                            context_overflows,
+                            "agent_loop: context keeps overflowing, wrapping up"
+                        );
+                        // LLM-facing; English like the other wrap-up nudges.
+                        turn_scratchpad.push(Message {
+                            role: Role::User,
+                            content: MessageContent::Text(
+                                "[system] This turn has filled the model's context several times; \
+                                 older tool results are being cut, and reading them again will not \
+                                 fit. Stop calling tools. Answer now with what you already have: \
+                                 the result if it is ready, otherwise what you found and what is \
+                                 left, so the user can continue in a new message."
+                                    .to_owned(),
+                            ),
+                            rsclaw_hidden: None,
+                        });
+                        wrapup_injected = true;
+                    }
+                    // Rebuild from compacted session + this turn's scratchpad
+                    // (never the session alone — that drops tool results).
                     let mut retry_req = req.clone();
-                    retry_req.messages = compacted;
+                    retry_req.messages = self.build_request_messages(ctx, &mut turn_scratchpad);
+                    self.failover.call(retry_req, &providers).await?
+                }
+                // The backend caps the per-turn recall channel; over it, the
+                // turn goes out without recall rather than failing outright.
+                Err(ref e) if format!("{e:#}").contains("recall_too_large") && req.recall.is_some() => {
+                    warn!(session = %ctx.session_key, error = %e, "recall over the backend cap; retrying without it");
+                    let mut retry_req = req.clone();
+                    retry_req.recall = None;
                     self.failover.call(retry_req, &providers).await?
                 }
                 other => other?,
             };
             let mut text_buf = String::new();
             let mut reasoning_buf = String::new();
+            let mut inline_think = InlineThink::default();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
+            // Signed reasoning blocks (Anthropic thinking / redacted_thinking)
+            // not yet followed by a tool call, and those anchored to the id
+            // of the tool call they preceded. Persisted on the assistant
+            // tool turn so the provider can replay them unchanged.
+            let mut pending_signed: Vec<rsclaw_provider::ContentPart> = Vec::new();
+            let mut signed_by_tool: Vec<(String, Vec<rsclaw_provider::ContentPart>)> = Vec::new();
             // Track loop detection warnings per tool call id (to inject into result)
             let mut loop_warnings: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
@@ -1126,6 +1351,8 @@ impl AgentRuntime {
             let delta_flush_chars = if is_local_ui { 40 } else { 80 };
             let mut delta_buf = String::new();
             let mut last_delta_flush = std::time::Instant::now();
+            let mut degenerate_checked_at = 0usize;
+            let mut degenerated = false;
 
             loop {
                 // Idle watchdog: bound each await on the next stream event so a
@@ -1157,14 +1384,26 @@ impl AgentRuntime {
                             continue;
                         }
                         // Close <think> tag when transitioning from reasoning to text.
-                        if thinking_budget.unwrap_or(0) > 0
-                            && !reasoning_buf.is_empty()
-                            && !text_buf.ends_with("</think>")
-                        {
-                            text_buf.push_str("</think>");
-                            delta_buf.push_str("</think>");
-                        }
+                        let tag = inline_think.close();
+                        text_buf.push_str(tag);
+                        delta_buf.push_str(tag);
                         text_buf.push_str(&delta);
+                        // A model can fall into emitting one short piece over
+                        // and over until max_tokens (minutes of '////').
+                        // Stop reading as soon as that shows.
+                        if text_buf.len() >= degenerate_checked_at + 256 {
+                            degenerate_checked_at = text_buf.len();
+                            if degenerate_tail(&text_buf) {
+                                warn!(
+                                    session = %ctx.session_key,
+                                    text_len = text_buf.len(),
+                                    "agent_loop: model output degenerated into repetition, cutting the response"
+                                );
+                                degenerated = true;
+                                delta_buf.clear();
+                                break;
+                            }
+                        }
                         // Update live status text preview (first ~200 chars).
                         if text_buf.len() <= 250 {
                             if let Ok(mut status) = self.live_status.try_write() {
@@ -1183,7 +1422,12 @@ impl AgentRuntime {
                         delta_buf.push_str(&delta);
                         let now = std::time::Instant::now();
                         let elapsed = now.duration_since(last_delta_flush);
-                        if delta_buf.len() >= delta_flush_chars || elapsed >= delta_flush_interval {
+                        // Hold back what may still become a NO_REPLY answer,
+                        // which must never reach the user.
+                        let holding = rsclaw_events::notice::may_become_no_reply(&text_buf);
+                        if !holding
+                            && (delta_buf.len() >= delta_flush_chars || elapsed >= delta_flush_interval)
+                        {
                             if let Some(ref bus) = self.event_bus {
                                 let _ = bus.send(AgentEvent {
                                     session_id: ctx.session_key.clone(),
@@ -1195,6 +1439,7 @@ impl AgentRuntime {
                                     tool_log: vec![],
                                     question: None,
                                     channel: None,
+                                    origin: None,
                                 });
                             }
                             last_delta_flush = now;
@@ -1204,40 +1449,38 @@ impl AgentRuntime {
                         reasoning_buf.push_str(&delta);
                         // Only emit <think> tags when thinking is explicitly enabled.
                         if thinking_budget.unwrap_or(0) > 0 {
-                            if reasoning_buf.len() == delta.len() {
-                                // First chunk — open tag.
-                                text_buf.push_str("<think>");
-                                delta_buf.push_str("<think>");
-                            }
+                            let tag = inline_think.before_reasoning();
+                            text_buf.push_str(tag);
+                            delta_buf.push_str(tag);
                             text_buf.push_str(&delta);
                             delta_buf.push_str(&delta);
                         }
                     }
+                    StreamEvent::ReasoningBlock {
+                        text,
+                        signature,
+                        redacted,
+                        model,
+                    } => {
+                        // Text already arrived via ReasoningDelta; keep the
+                        // replay metadata only.
+                        pending_signed.push(rsclaw_provider::ContentPart::Reasoning {
+                            text,
+                            signature,
+                            redacted,
+                            model: Some(model),
+                        });
+                    }
                     StreamEvent::ToolCall { id, name, input } => {
+                        if !id.is_empty() && !pending_signed.is_empty() {
+                            signed_by_tool.push((id.clone(), std::mem::take(&mut pending_signed)));
+                        }
                         if !id.is_empty() && !name.is_empty() {
                             // New tool call with both id and name — start fresh entry.
-                            // Use check_with_params which hashes the full input
-                            // (OpenClaw-compatible). This ensures
-                            // different arguments count as different calls.
-                            if let Some(warning_msg) = ctx
-                                .loop_detector
-                                .check_with_params(&name, &input)
-                                .to_result()?
-                            {
-                                tracing::warn!(tool = %name, params = ?input, "{}", warning_msg);
-                                // Store warning to inject into tool result (so LLM sees it)
-                                loop_warnings.insert(id.clone(), warning_msg.clone());
-                                ctx.loop_warning_triggered = true;
-                                // Factual trace for end-of-turn failure-lesson
-                                // extraction (ground truth: what was actually
-                                // called, truncated). First loop of the turn wins.
-                                if ctx.loop_failure.is_none() {
-                                    let args = serde_json::to_string(&input).unwrap_or_default();
-                                    let args: String = args.chars().take(400).collect();
-                                    ctx.loop_failure =
-                                        Some(format!("tool={name}; args={args}; {warning_msg}"));
-                                }
-                            }
+                            // Loop detection runs in dispatch Phase 1, once the
+                            // arguments are fully accumulated and parsed; at this
+                            // point streaming providers still carry `{}` args, so
+                            // every same-name call would hash identically.
                             tool_calls.push((id, name, input));
                         } else if !id.is_empty() && name.is_empty() {
                             // Streaming tool call: first chunk has id but no name yet
@@ -1310,6 +1553,21 @@ impl AgentRuntime {
                     StreamEvent::Done { usage } => {
                         // Update context total with real usage from LLM if available.
                         if let Some(ref u) = usage {
+                            // A backend still holding dropped tool steps
+                            // reports the session's size, not this request's:
+                            // track it as such and keep it out of the scale.
+                            let holds = {
+                                let (name, _) = self.providers.resolve_model(&model);
+                                self.providers
+                                    .get(name)
+                                    .is_ok_and(|p| p.holds_dropped_steps(&ctx.session_key))
+                            };
+                            if holds {
+                                super::record_server_size(&ctx.session_key, (u.input + u.output) as usize);
+                            } else {
+                                record_token_scale(&ctx.session_key, u.input, approx_tokens);
+                                super::forget_server_size(&ctx.session_key);
+                            }
                             let real_tokens = (u.input + u.output) as usize;
                             if let Ok(mut map) = self.handle.session_tokens.write() {
                                 if let Some(st) = map.get_mut(&ctx.session_key) {
@@ -1324,6 +1582,20 @@ impl AgentRuntime {
                             );
                         }
                     }
+                    // The fleet worker ends a reply that fell into a loop
+                    // with `degenerate_output:` and drops the session (the
+                    // provider replays it next call): same recovery as our
+                    // own check above.
+                    StreamEvent::Error(e) if e.contains("degenerate_output") => {
+                        warn!(
+                            session = %ctx.session_key,
+                            error = %e,
+                            "agent_loop: worker cut a degenerate response"
+                        );
+                        degenerated = true;
+                        delta_buf.clear();
+                        break;
+                    }
                     StreamEvent::Error(e) => {
                         return Err(anyhow!("LLM stream error: {e}"));
                     }
@@ -1331,16 +1603,13 @@ impl AgentRuntime {
             }
 
             // Close unclosed <think> tag if stream ended during reasoning.
-            if thinking_budget.unwrap_or(0) > 0
-                && !reasoning_buf.is_empty()
-                && !text_buf.ends_with("</think>")
-            {
-                text_buf.push_str("</think>");
-                delta_buf.push_str("</think>");
-            }
+            let tag = inline_think.close();
+            text_buf.push_str(tag);
+            delta_buf.push_str(tag);
 
-            // Flush any remaining buffered delta.
-            if !delta_buf.is_empty() {
+            // Flush any remaining buffered delta, unless the answer is
+            // NO_REPLY.
+            if !delta_buf.is_empty() && !rsclaw_events::notice::may_become_no_reply(&text_buf) {
                 if let Some(ref bus) = self.event_bus {
                     let _ = bus.send(AgentEvent {
                         session_id: ctx.session_key.clone(),
@@ -1352,6 +1621,7 @@ impl AgentRuntime {
                         tool_log: vec![],
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
             }
@@ -1552,6 +1822,24 @@ impl AgentRuntime {
                 }
             }
 
+            // Same for `[tool_use NAME({json})]`, the form the rsclaw worker
+            // renders tool calls in replayed history (a model echoes it after
+            // a context-overflow replay).
+            if tool_calls.is_empty() && text_buf.contains("[tool_use ") {
+                let rescued = crate::tool_call_repair::rescue_bracket_tool_calls(&text_buf, &tools);
+                for (id, name, input) in rescued {
+                    tracing::warn!(
+                        tool = %name,
+                        rescued_from_text = true,
+                        "agent_loop: rescued tool call from [tool_use] text — server returned no native tool_calls"
+                    );
+                    tool_calls.push((id, name, input));
+                }
+                if !tool_calls.is_empty() {
+                    text_buf.clear();
+                }
+            }
+
             // If no tool calls, we have the final assistant reply.
             tracing::info!(
                 session = %ctx.session_key,
@@ -1559,6 +1847,25 @@ impl AgentRuntime {
                 text_len = text_buf.len(),
                 "agent_loop: stream finished"
             );
+            if degenerated {
+                // The server drops the cut-off reply too, so nothing of it is
+                // kept; ask once for the work to go on.
+                text_buf.clear();
+                tool_calls.clear();
+                degenerate_retries += 1;
+                if degenerate_retries <= 1 && !daemon_mode {
+                    turn_scratchpad.push(Message {
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "[system] Your last reply degenerated into one short piece repeated over and over, and was discarded. \
+                             Continue the task. Write long documents to a file with a tool instead of into the reply.".to_owned(),
+                        ),
+                        rsclaw_hidden: None,
+                    });
+                    continue;
+                }
+                text_buf = rsclaw_i18n::t("agent_output_degenerated", rsclaw_i18n::default_lang()).to_owned();
+            }
             if tool_calls.is_empty() {
                 // DAEMON agents must never end their turn by "concluding". A
                 // monitor like agent_wechat is a `while(true)` poll loop; some
@@ -1568,10 +1875,12 @@ impl AgentRuntime {
                 // straight back into the loop and `continue` — true continuous
                 // monitoring, no reliance on cron to resurrect a dead turn.
                 //
-                // Context can't grow unbounded: cap_turn_input_to_budget() trims
-                // turn_scratchpad to per_turn_budget at the top of every
-                // iteration. Monitor dedup is external (SQL dedupKey +
-                // sidebar_snap), so dropping older scratch history is harmless.
+                // Context can't grow unbounded: at the top of every iteration
+                // cap_turn_input_to_budget() shrinks tool results and
+                // trim_scratchpad_front() drops the oldest tool pairs past the
+                // daemon message/token budget. Monitor dedup is external (SQL
+                // dedupKey + sidebar_snap), so dropping older scratch history is
+                // harmless.
                 if daemon_mode && daemon_noprogress_streak < DAEMON_NOPROGRESS_CAP {
                     daemon_noprogress_streak += 1;
                     tracing::info!(
@@ -1641,14 +1950,14 @@ impl AgentRuntime {
                     .iter()
                     .any(|kw| lower_text.contains(&kw.to_lowercase()) || text_buf.contains(kw));
 
-                // Check if turn_scratchpad contains tool calls (from earlier iterations)
+                // Check if turn_scratchpad contains tool calls (from earlier iterations).
+                // Any tool counts: a plugin call or an async image_gen that answered
+                // "已检查…" / "已交给…" is a real action, not a fabricated one.
                 let has_tool_in_turn = turn_scratchpad.iter().any(|msg| {
                     if let rsclaw_provider::MessageContent::Parts(parts) = &msg.content {
-                        parts.iter().any(|p| {
-                            matches!(p, rsclaw_provider::ContentPart::ToolUse { name, .. }
-                                if name == "cap"
-                                    || name == "web_search" || name == "shell" || name == "execute_command")
-                        })
+                        parts
+                            .iter()
+                            .any(|p| matches!(p, rsclaw_provider::ContentPart::ToolUse { .. }))
                     } else {
                         false
                     }
@@ -1694,19 +2003,33 @@ impl AgentRuntime {
                 // Empty responses pollute history and confuse the LLM on
                 // subsequent turns (it sees its own empty reply and mimics it).
                 if !text_buf.trim().is_empty() {
+                    // The turn's tool results are dropped at turn end, so the
+                    // stored reply names the files it produced: a later turn
+                    // ("发") then uses the exact path instead of guessing one.
+                    let files = reply_attachments(&tool_files, &tool_images);
+                    let mut stored_text = text_buf.clone();
+                    if let Some(note) = rsclaw_events::media::attachments_note(&files) {
+                        stored_text.push_str(&note);
+                    }
                     let assistant_msg = Message {
                         role: Role::Assistant,
-                        content: MessageContent::Text(text_buf.clone()),
+                        content: MessageContent::Text(stored_text),
                         rsclaw_hidden: None,
                     };
                     // Internal sessions (heartbeat/cron/system): skip DB
                     // persist so replies like "HEARTBEAT_OK" don't
                     // accumulate in session history.
                     if !is_internal_session(&ctx.session_key) {
-                        if let Err(e) = self.store.db.append_message(
-                            &ctx.session_key,
-                            &serde_json::to_value(&assistant_msg).unwrap_or_default(),
-                        ) {
+                        // The row also carries the turn's attachments, so a
+                        // client reloading history can render the music or
+                        // video a tool made, and when it was sent.
+                        let mut row = serde_json::to_value(&assistant_msg).unwrap_or_default();
+                        if !files.is_empty() {
+                            row["files"] = rsclaw_events::media::files_json(&files);
+                        }
+                        row["sent_at"] =
+                            serde_json::json!(chrono::Local::now().format("%Y-%m-%d %H:%M").to_string());
+                        if let Err(e) = self.store.db.append_message(&ctx.session_key, &row) {
                             tracing::error!(error = %e, "failed to persist message");
                         }
                         if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
@@ -1730,6 +2053,7 @@ impl AgentRuntime {
                         tool_log: tool_log.clone(),
                         question: None,
                         channel: None,
+                        origin: None,
                     });
                 }
 
@@ -1817,7 +2141,8 @@ impl AgentRuntime {
             if intermediate_enabled
                 && !is_streaming_channel
                 && !tool_calls.is_empty()
-                && let Some(intermediate_text) = intermediate_notification_text(&text_buf)
+                && let Some(intermediate_text) =
+                    intermediate_notification_text(&strip_think_for_channel(&text_buf))
             {
                 if let Some(ref ntx) = self.notification_tx {
                     let notif_target = if !ctx.chat_id.is_empty() {
@@ -1828,7 +2153,7 @@ impl AgentRuntime {
                     let _ = ntx.send(rsclaw_channel::OutboundMessage {
                         target_id: notif_target,
                         is_group: false,
-                        text: intermediate_text.to_owned(),
+                        text: intermediate_text.clone(),
                         reply_to: None,
                         images: vec![],
                         files: vec![],
@@ -1850,19 +2175,41 @@ impl AgentRuntime {
                 // Only save text if there are no tool calls (final reply).
                 parts.push(rsclaw_provider::ContentPart::Text { text: text_buf });
             }
-            // Persist reasoning_content so providers that require it (e.g.
-            // kimi-for-coding) see it on subsequent turns.
-            if !reasoning_buf.is_empty() {
-                parts.push(rsclaw_provider::ContentPart::Reasoning {
-                    text: reasoning_buf,
-                });
-            }
-            for (id, name, input) in &tool_calls {
-                parts.push(rsclaw_provider::ContentPart::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                });
+            let has_signed = !signed_by_tool.is_empty() || !pending_signed.is_empty();
+            if has_signed && !tool_calls.is_empty() {
+                // Signed thinking blocks replace the aggregated reasoning
+                // copy (their texts concatenate to `reasoning_buf`). Each
+                // block keeps its position before the tool call it preceded;
+                // blocks of a dropped tool call lead the turn.
+                for (anchor, blocks) in signed_by_tool.iter_mut() {
+                    if !tool_calls.iter().any(|(id, _, _)| id == anchor) {
+                        parts.append(blocks);
+                    }
+                }
+                for (id, name, input) in &tool_calls {
+                    if let Some((_, blocks)) = signed_by_tool.iter_mut().find(|(a, _)| a == id) {
+                        parts.append(blocks);
+                    }
+                    parts.push(rsclaw_provider::ContentPart::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                }
+                parts.append(&mut pending_signed);
+            } else {
+                // Persist reasoning_content so providers that require it
+                // (e.g. kimi-for-coding) see it on subsequent turns.
+                if !reasoning_buf.is_empty() {
+                    parts.push(rsclaw_provider::ContentPart::reasoning(reasoning_buf));
+                }
+                for (id, name, input) in &tool_calls {
+                    parts.push(rsclaw_provider::ContentPart::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                }
             }
             let assistant_msg = Message {
                 role: Role::Assistant,
@@ -1941,9 +2288,35 @@ impl AgentRuntime {
                 tool_input_str: String,
             }
             let mut to_dispatch: Vec<PendingDispatch> = Vec::new();
+            let iteration_call_count = tool_calls.len();
+
+            // After the wrap-up prompt, tools are closed: refuse the calls so
+            // the model answers from what it has instead of working on.
+            let tools_closed = wrapup_injected && !daemon_mode;
+            if tools_closed {
+                wrapup_refusals += 1;
+            }
 
             // ---- Phase 1: serial preflight ----
             for (tool_id, tool_name, tool_input) in tool_calls {
+                if tools_closed {
+                    turn_scratchpad.push(Message {
+                        role: Role::Tool,
+                        content: MessageContent::Parts(vec![
+                            rsclaw_provider::ContentPart::ToolResult {
+                                tool_use_id: tool_id.clone(),
+                                content: json!({
+                                    "error": "REFUSED: tools are closed for this turn. Write your final answer now from what you already have, and say what is still missing.",
+                                    "retryable": false,
+                                })
+                                .to_string(),
+                                is_error: Some(true),
+                            },
+                        ]),
+                        rsclaw_hidden: None,
+                    });
+                    continue;
+                }
                 // Skip tools with parse errors — do not execute, return error directly.
                 // This prevents infinite retry loops when model output gets truncated.
                 if let Some(parse_error) = tool_input.get("_parse_error").and_then(|v| v.as_str()) {
@@ -1963,8 +2336,11 @@ impl AgentRuntime {
                             "Too many consecutive parse errors, aborting turn"
                         );
                         // Record for loop detection
-                        ctx.loop_detector
-                            .record_result(&serde_json::json!({"error": "too many parse errors"}));
+                        ctx.loop_detector.record_result_for(
+                            &tool_id,
+                            &tool_name,
+                            &serde_json::json!({"error": "too many parse errors"}),
+                        );
                         // Return error to break the loop
                         return Err(anyhow!(
                             "Turn aborted: {} consecutive tool parse errors. Model output may be corrupted.",
@@ -1973,8 +2349,11 @@ impl AgentRuntime {
                     }
 
                     // Record for loop detection so error doesn't count as a "different result"
-                    ctx.loop_detector
-                        .record_result(&serde_json::json!({"error": err_msg}));
+                    ctx.loop_detector.record_result_for(
+                        &tool_id,
+                        &tool_name,
+                        &serde_json::json!({"error": err_msg}),
+                    );
 
                     // Directly return error to scratch-paper buffer without executing the tool.
                     let tool_msg = Message {
@@ -1992,6 +2371,93 @@ impl AgentRuntime {
                     continue;
                 }
 
+                // Progress-aware loop detection over the fully-parsed call
+                // (hashes name + complete args; results are attributed back by
+                // tool_call_id in Phase 3, so parallel calls don't mix up).
+                match ctx
+                    .loop_detector
+                    .check_with_params_id(&tool_name, &tool_input, &tool_id)
+                {
+                    crate::loop_detection::LoopCheckResult::Ok => {}
+                    crate::loop_detection::LoopCheckResult::Warning { message, .. } => {
+                        warn!(tool = %tool_name, "{}", message);
+                        // Injected into this call's tool result so the LLM sees it.
+                        loop_warnings.insert(tool_id.clone(), message.clone());
+                        ctx.loop_warning_triggered = true;
+                        // Factual trace for end-of-turn failure-lesson
+                        // extraction (ground truth: what was actually called,
+                        // truncated). First loop of the turn wins.
+                        if ctx.loop_failure.is_none() {
+                            let args = serde_json::to_string(&tool_input).unwrap_or_default();
+                            let args: String = args.chars().take(400).collect();
+                            ctx.loop_failure = Some(format!("tool={tool_name}; args={args}; {message}"));
+                        }
+                    }
+                    crate::loop_detection::LoopCheckResult::Critical { message, .. } => {
+                        warn!(tool = %tool_name, "{}", message);
+                        ctx.loop_warning_triggered = true;
+                        if ctx.loop_failure.is_none() {
+                            let args = serde_json::to_string(&tool_input).unwrap_or_default();
+                            let args: String = args.chars().take(400).collect();
+                            ctx.loop_failure = Some(format!("tool={tool_name}; args={args}; {message}"));
+                        }
+                        loop_critical_hits += 1;
+                        if loop_critical_hits >= 2 && !daemon_mode {
+                            // The model ignored the first refusal — end the turn
+                            // gracefully instead of erroring it away.
+                            let terminal_text =
+                                rsclaw_i18n::t("agent_loop_detected", rsclaw_i18n::default_lang())
+                                    .to_owned();
+                            if let Some(ref bus) = self.event_bus {
+                                let _ = bus.send(AgentEvent {
+                                    session_id: ctx.session_key.clone(),
+                                    agent_id: ctx.agent_id.clone(),
+                                    delta: terminal_text.clone(),
+                                    done: true,
+                                    files: tool_files.clone(),
+                                    images: tool_images.clone(),
+                                    tool_log: tool_log.clone(),
+                                    question: None,
+                                    channel: None,
+                                    origin: None,
+                                });
+                            }
+                            return Ok(AgentReply {
+                                text: terminal_text,
+                                is_empty: false,
+                                tool_calls: None,
+                                images: vec![],
+                                files: vec![],
+                                pending_analysis: None,
+                                needs_outer_done_emit: false,
+                                outcome: crate::registry::ReplyOutcome::Ok,
+                            });
+                        }
+                        // Refuse this call: hand the model a tool-result error
+                        // (keeps tool_use/tool_result pairing valid) and let it
+                        // change course on the next iteration.
+                        ctx.loop_detector
+                            .record_result_for(&tool_id, &tool_name, &json!({"error": message}));
+                        turn_scratchpad.push(Message {
+                            role: Role::Tool,
+                            content: MessageContent::Parts(vec![
+                                rsclaw_provider::ContentPart::ToolResult {
+                                    tool_use_id: tool_id.clone(),
+                                    content: json!({
+                                        "error": format!("REFUSED: {message}"),
+                                        "retryable": false,
+                                    })
+                                    .to_string(),
+                                    is_error: Some(true),
+                                },
+                            ]),
+                            rsclaw_hidden: None,
+                        });
+                        error_streak += 1;
+                        continue;
+                    }
+                }
+
                 // Detect consecutive identical tool calls (same name + same args).
                 let call_key = crate::loop_detection::hash_tool_call(&tool_name, &tool_input);
                 if call_key == last_tool_key {
@@ -2005,6 +2471,35 @@ impl AgentRuntime {
                         ctx.turn_metrics.same_call_streak_max.max(same_call_streak);
                     // Daemon agents poll the same tool forever by design — don't
                     // treat a repeated identical call as a stagnation break.
+                    if !daemon_mode && same_call_streak >= MAX_SAME_CALL_STREAK && !wrapup_injected {
+                        // First time: refuse the call and drain the budget so
+                        // the next iteration asks for a final answer. The
+                        // model then hands back what it has instead of the
+                        // turn ending with nothing.
+                        warn!(
+                            tool = %tool_name,
+                            streak = same_call_streak,
+                            "agent_loop: identical tool call repeated, asking for a final answer"
+                        );
+                        budget = 0;
+                        ctx.turn_metrics.stagnation_budget = budget;
+                        turn_scratchpad.push(Message {
+                            role: Role::Tool,
+                            content: MessageContent::Parts(vec![
+                                rsclaw_provider::ContentPart::ToolResult {
+                                    tool_use_id: tool_id.clone(),
+                                    content: json!({
+                                        "error": "REFUSED: this exact call was already made several times with the same result.",
+                                        "retryable": false,
+                                    })
+                                    .to_string(),
+                                    is_error: Some(true),
+                                },
+                            ]),
+                            rsclaw_hidden: None,
+                        });
+                        continue;
+                    }
                     if !daemon_mode && same_call_streak >= MAX_SAME_CALL_STREAK {
                         warn!(
                             tool = %tool_name,
@@ -2030,6 +2525,7 @@ impl AgentRuntime {
                                 tool_log: tool_log.clone(),
                                 question: None,
                                 channel: None,
+                                origin: None,
                             });
                         }
                         return Ok(AgentReply {
@@ -2053,9 +2549,20 @@ impl AgentRuntime {
                 // same_call_streak (args differ) and the stagnation budget (each
                 // result is "new"), so deplete the budget hard past the
                 // threshold to force the wrap-up prompt instead of spinning.
-                if tool_name == last_tool_name_only {
+                // A plugin tool such as fill_field runs once per form field,
+                // so it gets the longer run that shell gets.
+                let name_limit = if matches!(
+                    tool_name.as_str(),
+                    "shell" | "execute_command" | "exec" | "plugin_invoke"
+                ) {
+                    MAX_SAME_NAME_STREAK_SHELL
+                } else {
+                    MAX_SAME_NAME_STREAK
+                };
+                let streak_name = super::streak_name(&tool_name, &tool_input);
+                if streak_name == last_tool_name_only {
                     same_name_streak += 1;
-                    if same_name_streak > MAX_SAME_NAME_STREAK {
+                    if same_name_streak > name_limit {
                         budget -= 4;
                         ctx.turn_metrics.stagnation_budget = budget;
                         warn!(
@@ -2066,7 +2573,7 @@ impl AgentRuntime {
                         );
                     }
                 } else {
-                    last_tool_name_only = tool_name.clone();
+                    last_tool_name_only = streak_name;
                     same_name_streak = 1;
                 }
 
@@ -2076,7 +2583,7 @@ impl AgentRuntime {
                 // web_browser, agent…) re-raises the budget every iteration and
                 // the same-name depletion above never bites; only the hard
                 // iteration ceiling would stop the spin.
-                if same_name_streak <= MAX_SAME_NAME_STREAK
+                if same_name_streak <= name_limit
                     && matches!(
                         tool_name.as_str(),
                         "web_browser"
@@ -2295,6 +2802,7 @@ impl AgentRuntime {
                                             tool_log: vec![],
                                             question: None,
                                             channel: None,
+                                            origin: None,
                                         });
                                     }
                                 }
@@ -2398,7 +2906,12 @@ impl AgentRuntime {
                                     })
                                     .unwrap_or(preview)
                             } else {
-                                preview
+                                // Other tools: a `> target` line (file, URL,
+                                // query) so the card says what was touched.
+                                match tool_target(&tool_input_str) {
+                                    Some(target) => format!("> {target}\n{preview}"),
+                                    None => preview,
+                                }
                             };
                             let marker =
                                 format!("<rstool name=\"{tool_name}\">{display_out}</rstool>");
@@ -2412,6 +2925,7 @@ impl AgentRuntime {
                                 tool_log: vec![],
                                 question: None,
                                 channel: None,
+                                origin: None,
                             });
                         }
                         (idx, timed)
@@ -2435,6 +2949,14 @@ impl AgentRuntime {
                 .into_iter()
                 .map(|o| o.expect("every dispatch future yields exactly one result"))
                 .collect();
+
+            // The turn ends without another model call only when every call of
+            // this iteration ran and reported `turnComplete: true`; one that
+            // was refused, failed or said nothing leaves the model to go on.
+            let mut finished_summaries = (!daemon_mode
+                && !to_dispatch.is_empty()
+                && to_dispatch.len() == iteration_call_count)
+                .then(Vec::new);
 
             // ---- Phase 3: serial post-processing in LLM emit order ----
             for (dispatch_idx, (pending, timed_result)) in to_dispatch
@@ -2469,36 +2991,34 @@ impl AgentRuntime {
                 .await;
 
                 let mut error_repeats_once = false;
+                // Failure flag for the tool_result message; mirrors `has_error`
+                // (Ok arm) / always true (Err arm) instead of text sniffing.
+                let result_is_error: bool;
+                // read_artifact handle for a result the backstop offloaded.
+                // Kept apart from the body so the per-tool char truncation
+                // below can never cut it off.
+                let mut artifact_hint: Option<String> = None;
+                let can_read_artifacts = self
+                    .allowed_tools_for_dispatch()
+                    .is_none_or(|allowed| allowed.contains("read_artifact"));
                 let (mut result_text, result_images) = match result {
                     Ok(v) => {
                         // Reset parse error counter on successful tool execution
                         ctx.parse_error_count = 0;
-                        // Tool result indicates failure if any of:
-                        //   exit_code != 0  |  has "error" field  |  stderr length > 0
-                        let has_error = match &v {
-                            serde_json::Value::Object(obj) => {
-                                obj.get("exit_code")
-                                    .and_then(|c| c.as_i64())
-                                    .map(|c| c != 0)
-                                    .unwrap_or(false)
-                                    || obj.contains_key("error")
-                                    || obj
-                                        .get("stderr")
-                                        .and_then(|s| s.as_str())
-                                        .map(|s| !s.is_empty())
-                                        .unwrap_or(false)
-                            }
-                            _ => {
-                                // Fallback: check string representation
-                                let v_str = v.to_string();
-                                v_str.contains("\"exit_code\":")
-                                    && !v_str.contains("\"exit_code\":0")
-                                    && !v_str.contains("\"exit_code\": 0")
-                                    || v_str.contains("\"error\"")
-                                    || v_str.contains("\"stderr\":")
-                                        && !v_str.contains("\"stderr\":\"\"")
-                            }
-                        };
+                        // Tool result indicates failure only via exit_code != 0,
+                        // a non-empty `error`, or success/ok == false — the same
+                        // rule the loop detector uses. Non-empty stderr alone is
+                        // NOT a failure: compilers, git, npm, cargo etc. write
+                        // progress to stderr and exit 0.
+                        let has_error = crate::loop_detection::is_result_failure(&v);
+                        result_is_error = has_error;
+                        let completes =
+                            v.get("turnComplete").and_then(Value::as_bool) == Some(true);
+                        if has_error || !completes {
+                            finished_summaries = None;
+                        } else if let Some(summaries) = finished_summaries.as_mut() {
+                            summaries.push(turn_summary_of(&v));
+                        }
                         if has_error {
                             error_streak += 1;
                             last_error_info = Some(v.to_string());
@@ -2512,6 +3032,14 @@ impl AgentRuntime {
                         } else {
                             error_streak = 0;
                             last_error_info = None;
+                            // A successful side-effecting call (file write/edit,
+                            // shell command) may have changed the workspace, so an
+                            // earlier failure of the same call is no longer
+                            // deterministic: edit -> `cargo test` -> edit ->
+                            // `cargo test` must not be refused.
+                            if is_workspace_mutating_tool(&tool_name) {
+                                failed_calls.clear();
+                            }
                         }
                         // Record into per-turn metrics for workflow
                         // crystallization. Truncate args/result so we don't
@@ -2558,7 +3086,8 @@ impl AgentRuntime {
                         } else {
                             v.clone()
                         };
-                        ctx.loop_detector.record_result(&result_for_loop);
+                        ctx.loop_detector
+                            .record_result_for(&tool_id, &tool_name, &result_for_loop);
 
                         // Stagnation budget depletion: progress-aware cost model.
                         // - New output (different result hash) → budget unchanged (free)
@@ -2566,7 +3095,8 @@ impl AgentRuntime {
                         // - Tool error                         → budget -= 2
                         // - Repeated identical call             → budget -= 2 (added below)
                         last_tool_name = tool_name.clone();
-                        let current_hash = ctx.loop_detector.last_result_hash().map(String::from);
+                        let current_hash =
+                            ctx.loop_detector.result_hash_for(&tool_id).map(String::from);
                         if has_error {
                             budget -= 2;
                         } else if current_hash.as_deref() == last_result_hash.as_deref() {
@@ -2574,6 +3104,24 @@ impl AgentRuntime {
                             budget -= 1;
                         }
                         // else: new output, budget unchanged
+                        let outcome = (
+                            crate::loop_detection::hash_tool_call(&tool_name, &tool_input_for_metrics),
+                            current_hash.clone(),
+                        );
+                        let seen = recent_outcomes.iter().filter(|o| **o == outcome).count() + 1;
+                        if recent_outcomes.len() == OUTCOME_WINDOW {
+                            recent_outcomes.pop_front();
+                        }
+                        recent_outcomes.push_back(outcome);
+                        if !daemon_mode && seen >= MAX_SAME_OUTCOME && budget > 0 {
+                            warn!(
+                                session = %ctx.session_key,
+                                tool = %tool_name,
+                                seen,
+                                "agent_loop: a call keeps returning the same result in a cycle, asking for a final answer"
+                            );
+                            budget = 0;
+                        }
                         last_result_hash = current_hash;
                         ctx.turn_metrics.stagnation_budget = budget;
                         // Loop A: capture recalled memory IDs from search results.
@@ -2637,9 +3185,14 @@ impl AgentRuntime {
                             // token-saving tradeoff. The per-turn aggregate guard
                             // (cap_turn_input_to_budget) still bounds a pathologically
                             // huge SKILL.md, so this can't blow the context unbounded.
+                            // `plugin_describe` is the same kind of spec: one tool's
+                            // input schema, which the model must match field by field.
                             let v = if matches!(
                                 tool_name.as_str(),
-                                "read_artifact" | "read_session_archive" | "skill_use"
+                                "read_artifact"
+                                    | "read_session_archive"
+                                    | "skill_use"
+                                    | "plugin_describe"
                             ) {
                                 v
                             } else {
@@ -2665,7 +3218,7 @@ impl AgentRuntime {
                             } else {
                                 // Format structured tool results (exec, read, etc.) for better LLM
                                 // comprehension
-                                let mut text = format_tool_result(&v);
+                                let text = format_tool_result(&v);
                                 // Surface the artifact envelope to the LLM —
                                 // format_tool_result is shape-specific (exec
                                 // returns stdout+stderr, read returns content,
@@ -2680,7 +3233,7 @@ impl AgentRuntime {
                                     if let Some(id) =
                                         v.get("_tool_result_id").and_then(|x| x.as_str())
                                     {
-                                        text.push_str(&format!(
+                                        artifact_hint = Some(format!(
                                             "\n\n[truncated — call read_artifact(tool_result_id=\"{id}\") for full output]"
                                         ));
                                     } else if let Some(ids) =
@@ -2693,7 +3246,7 @@ impl AgentRuntime {
                                             })
                                             .collect();
                                         if !pairs.is_empty() {
-                                            text.push_str(&format!(
+                                            artifact_hint = Some(format!(
                                                 "\n\n[truncated — fields compacted: {}. Call read_artifact with the id of the field you need.]",
                                                 pairs.join(", ")
                                             ));
@@ -2710,7 +3263,18 @@ impl AgentRuntime {
                         // the outermost with_context() wrapper and root cause
                         // (wasm trap, http status, panic msg) is hidden.
                         let err_chain = format!("{e:#}");
-                        warn!(tool = %tool_name, "tool error: {}", err_chain);
+                        result_is_error = true;
+                        finished_summaries = None;
+                        // The arguments as the model sent them (before any
+                        // tool rejoins a split one), so a malformed call can
+                        // be told apart from a parser that dropped a field.
+                        let sent = tool_input_for_metrics.to_string();
+                        warn!(
+                            tool = %tool_name,
+                            args = rsclaw_util::truncate_str(&sent, 600),
+                            "tool error: {}",
+                            err_chain
+                        );
                         // Store error info for user feedback when breaking loop
                         last_error_info = Some(err_chain.clone());
                         // Err-path failures feed the identical-failure ledger
@@ -2722,8 +3286,11 @@ impl AgentRuntime {
                         error_repeats_once = repeat_counts[dispatch_idx] == 1 && *entry >= 2;
                         error_streak += 1;
                         // Record error result for loop detection (errors count as results too).
-                        ctx.loop_detector
-                            .record_result(&serde_json::json!({"error": err_chain.clone()}));
+                        ctx.loop_detector.record_result_for(
+                            &tool_id,
+                            &tool_name,
+                            &serde_json::json!({"error": err_chain.clone()}),
+                        );
                         let payload = serde_json::json!({
                             "error": err_chain,
                             "_do_not_retry": true,
@@ -2740,6 +3307,16 @@ impl AgentRuntime {
                 // streaming subscribers see per-tool cards in real time; this
                 // block only builds `tool_log` for the final AgentReply
                 // (rendered by non-streaming channels like Feishu/WeChat).
+                // The facts this result showed outlive the turn (its tool
+                // results don't).
+                self.record_key_data(
+                    &ctx.session_key,
+                    &format!("{tool_input_str}\n{result_text}"),
+                )
+                .await;
+                let step = super::step_line(&tool_name, &tool_input_str);
+                ctx.turn_ctx.record_step(&step);
+                ctx.steps.push(step);
                 {
                     let args_str = tool_input_str;
                     let out_str = if result_text.len() > 4000 {
@@ -3105,15 +3682,58 @@ impl AgentRuntime {
                         // @fly-ai/flyai-cli` on line 60 — past the 3000-char
                         // cut — so the agent saw only `runtime: node` in
                         // frontmatter and made up `node index.js` instead).
-                        "skill_use" => limits.and_then(|l| l.default).unwrap_or(60_000),
+                        "skill_use" | "plugin_describe" => {
+                            limits.and_then(|l| l.default).unwrap_or(60_000)
+                        }
+                        // Recovery tools page their own output against the
+                        // artifact read budget and advance a server-side
+                        // cursor. Cutting a page here loses the tail for good
+                        // (the cursor has already moved past it), and the model
+                        // then loops re-reading an artifact it can never see.
+                        "read_artifact" | "read_session_archive" => usize::MAX,
                         "read_file" | "read" => limits.and_then(|l| l.default).unwrap_or(3000),
+                        "plugin_invoke" | "plugin.invoke" => {
+                            limits.and_then(|l| l.plugin).unwrap_or(12_000)
+                        }
+                        // Search hits are what the model answers from; cut
+                        // at 3000 it pages them back through read_artifact
+                        // or searches again for the part it lost.
+                        "knowledge_base" | "memory_search" => {
+                            limits.and_then(|l| l.knowledge).unwrap_or(12_000)
+                        }
                         _ => limits.and_then(|l| l.default).unwrap_or(3000),
                     };
 
                     let needs_compression =
                         matches!(tool_name.as_str(), "web_fetch" | "web_browser" | "browser");
 
-                    if needs_compression && result_text.chars().count() > max_chars {
+                    // Anything cut below must stay recoverable: when the
+                    // backstop didn't already offload this result (it only
+                    // does so past its own threshold), store the full text as
+                    // an artifact now. Recovery tools are exempt — re-storing
+                    // their output would nest artifacts.
+                    if artifact_hint.is_none()
+                        && result_text.chars().count() > max_chars
+                        && !matches!(
+                            tool_name.as_str(),
+                            "read_artifact" | "read_session_archive"
+                        )
+                    {
+                        match rsclaw_artifact::default_store().write(&ctx.session_key, &result_text)
+                        {
+                            Ok(id) => {
+                                artifact_hint = Some(format!(
+                                    "\n\n[truncated — call read_artifact(tool_result_id=\"{}\") for full output]",
+                                    id.as_str()
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(tool = %tool_name, error = %e, "failed to store truncated tool result as artifact");
+                            }
+                        }
+                    }
+
+                    let body = if needs_compression && result_text.chars().count() > max_chars {
                         let sk = ctx.session_key.clone();
                         let tn = tool_name.clone();
                         match self
@@ -3139,7 +3759,8 @@ impl AgentRuntime {
                         truncate_chars(&result_text, max_chars)
                     } else {
                         result_text.clone()
-                    }
+                    };
+                    body
                 };
 
                 // Inject loop detection warning if present (so LLM sees it and can stop)
@@ -3175,20 +3796,27 @@ impl AgentRuntime {
                     session_text
                 };
 
+                // The read_artifact handle goes last: after truncation (so it is
+                // never cut off) and after the hints above (so the per-turn
+                // guard's `split_artifact_marker` still finds it at the tail).
+                // An agent whose tool list leaves out read_artifact cannot
+                // follow the handle; pointing it there only sends it looking.
+                let session_text = match artifact_hint {
+                    Some(_) if !can_read_artifacts => format!(
+                        "{session_text}\n\n[truncated — the rest is not available to this agent; \
+                         work from what is shown above]"
+                    ),
+                    Some(hint) => format!("{session_text}{hint}"),
+                    None => session_text,
+                };
+
                 let tool_msg = Message {
                     role: Role::Tool,
                     content: MessageContent::Parts(vec![
                         rsclaw_provider::ContentPart::ToolResult {
                             tool_use_id: tool_id.clone(),
                             content: session_text,
-                            // Detect error from result content (exit_code != 0 or error field)
-                            is_error: Some(
-                                result_text.contains("\"exit_code\":")
-                                    && !result_text.contains("\"exit_code\": 0")
-                                    || result_text.contains("\"error\"")
-                                    || result_text.contains("[stderr]")
-                                    || result_text.contains("[exit code:"),
-                            ),
+                            is_error: Some(result_is_error),
                         },
                     ]),
                     rsclaw_hidden: None,
@@ -3198,6 +3826,365 @@ impl AgentRuntime {
                 // Only the final assistant text reply enters the conversation history.
                 turn_scratchpad.push(tool_msg);
             }
+            if let Some(summaries) = finished_summaries {
+                info!(
+                    session = %ctx.session_key,
+                    tools = summaries.len(),
+                    "agent_loop: the tools reported the turn complete, ending it without another model call"
+                );
+                finished_by_tools = Some(finished_turn_text(summaries));
+            }
         }
+    }
+}
+
+/// The reply text of a turn its tools finished: their `turnSummary` lines.
+pub(super) fn finished_turn_text(summaries: Vec<String>) -> String {
+    let text = summaries
+        .into_iter()
+        .filter(|summary| !summary.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        "Done.".to_owned()
+    } else {
+        text
+    }
+}
+
+pub(super) fn turn_summary_of(result: &Value) -> String {
+    result
+        .get("turnSummary")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+/// A model response that only says `text`, for a turn its tools finished.
+pub(super) fn finished_turn_stream(text: String) -> rsclaw_provider::LlmStream {
+    Box::pin(futures::stream::iter([
+        Ok(StreamEvent::TextDelta(text)),
+        Ok(StreamEvent::Done { usage: None }),
+    ]))
+}
+
+impl AgentRuntime {
+    /// Build the per-iteration request copy of the conversation: the
+    /// persistent session history (current user message swapped for its
+    /// multimodal version on vision turns) followed by this turn's
+    /// scratchpad, then tool-call/tool-result pairing repair.
+    ///
+    /// Synthetic results minted by the repair are appended to the scratchpad
+    /// (working-turn artefacts, never persisted). Every path that (re)builds
+    /// the request — the normal build and both post-compaction rebuilds —
+    /// must go through here so none of them silently drops the scratchpad.
+    pub(super) fn build_request_messages(
+        &self,
+        ctx: &RunContext,
+        turn_scratchpad: &mut Vec<Message>,
+    ) -> Vec<Message> {
+        let mut raw = self
+            .sessions
+            .get(&ctx.session_key)
+            .cloned()
+            .unwrap_or_default();
+
+        // Vision turns: replace the current user message with the multimodal
+        // version (images are request-local, never persisted). The current
+        // user message is the last User-role entry of the session — async and
+        // exec_pool results are inserted before it, and turn-local nudges live
+        // in the scratchpad, which is appended below.
+        if ctx.has_images
+            && let Some(with_images) = ctx.user_msg_with_images.as_ref()
+            && let Some(current) = raw.iter_mut().rev().find(|m| m.role == Role::User)
+        {
+            *current = with_images.clone();
+        }
+
+        // Append current-turn scratch-paper (tool calls + results).
+        raw.extend(turn_scratchpad.iter().cloned());
+
+        // Repair transcript: ensure all tool_calls have matching tool_results.
+        let repair_result = repair_tool_result_pairing(raw);
+        if !repair_result.synthetic_messages.is_empty() {
+            turn_scratchpad.extend(repair_result.synthetic_messages);
+        }
+        repair_result.messages
+    }
+
+    /// Estimated token total of the persistent (in-memory) session history.
+    pub(super) fn session_token_sum(&self, session_key: &str) -> usize {
+        self.sessions
+            .get(session_key)
+            .map(|msgs| msgs.iter().map(crate::context_mgr::msg_tokens).sum())
+            .unwrap_or(0)
+    }
+}
+
+/// Index at which out-of-band history (async task / exec_pool results) should
+/// be inserted so the current user message stays the last session entry.
+fn current_user_insert_index(sess: &[Message]) -> usize {
+    match sess.last() {
+        Some(m) if m.role == Role::User => sess.len() - 1,
+        _ => sess.len(),
+    }
+}
+
+/// Tools whose successful execution can change the workspace, invalidating
+/// the "identical call already failed" ledger (the same call may now succeed).
+fn is_workspace_mutating_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "write" | "edit_file" | "edit" | "shell" | "execute_command" | "exec"
+    )
+}
+
+/// The `<think>` tag written around reasoning that is shown inline in the
+/// reply text. Each run of reasoning chunks gets one opening and one closing
+/// tag, however many text chunks follow it.
+#[derive(Default)]
+struct InlineThink {
+    open: bool,
+}
+
+impl InlineThink {
+    /// Tag to write before a reasoning chunk.
+    fn before_reasoning(&mut self) -> &'static str {
+        if std::mem::replace(&mut self.open, true) {
+            ""
+        } else {
+            "<think>"
+        }
+    }
+
+    /// Tag to write before a text chunk, and when the stream ends.
+    fn close(&mut self) -> &'static str {
+        if std::mem::replace(&mut self.open, false) {
+            "</think>"
+        } else {
+            ""
+        }
+    }
+}
+
+#[cfg(test)]
+mod inline_think_tests {
+    use super::InlineThink;
+
+    /// Renders a stream of `(is_reasoning, chunk)` the way the agent loop does.
+    fn render(chunks: &[(bool, &str)]) -> String {
+        let mut think = InlineThink::default();
+        let mut out = String::new();
+        for (is_reasoning, chunk) in chunks {
+            out.push_str(if *is_reasoning {
+                think.before_reasoning()
+            } else {
+                think.close()
+            });
+            out.push_str(chunk);
+        }
+        out.push_str(think.close());
+        out
+    }
+
+    #[test]
+    fn reasoning_is_closed_once_before_the_answer() {
+        // Every text chunk after the first used to get its own `</think>`.
+        let got = render(&[(true, "a"), (true, "b"), (false, "1"), (false, "2")]);
+        assert_eq!(got, "<think>ab</think>12");
+    }
+
+    #[test]
+    fn text_alone_gets_no_tags() {
+        assert_eq!(render(&[(false, "1"), (false, "2")]), "12");
+    }
+
+    #[test]
+    fn reasoning_left_open_is_closed_at_the_end() {
+        assert_eq!(render(&[(true, "a")]), "<think>a</think>");
+    }
+
+    #[test]
+    fn a_second_reasoning_run_gets_its_own_tags() {
+        let got = render(&[(true, "a"), (false, "1"), (true, "b"), (false, "2")]);
+        assert_eq!(got, "<think>a</think>1<think>b</think>2");
+    }
+}
+
+/// The argument a tool card names as its target: the first string among the
+/// usual path / URL / query keys, on one line and capped in length.
+fn tool_target(args_json: &str) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "path", "file_path", "file", "url", "query", "q", "dir", "directory", "pattern", "app",
+    ];
+    let args: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    let value = KEYS
+        .iter()
+        .find_map(|k| args.get(*k).and_then(|v| v.as_str()))?
+        .trim();
+    let line = value.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut target: String = line.chars().take(200).collect();
+    if line.chars().count() > 200 {
+        target.push('…');
+    }
+    Some(target)
+}
+
+#[cfg(test)]
+mod tool_target_tests {
+    use super::{reply_attachments, tool_target};
+
+    #[test]
+    fn names_the_path_url_or_query() {
+        assert_eq!(tool_target(r#"{"path":"/a/起诉状.pdf"}"#).as_deref(), Some("/a/起诉状.pdf"));
+        assert_eq!(tool_target(r#"{"query":"诉讼时效 司法解释\n"}"#).as_deref(), Some("诉讼时效 司法解释"));
+        assert_eq!(tool_target(r#"{"action":"list"}"#), None);
+        assert_eq!(tool_target("not json"), None);
+        let long = "字".repeat(300);
+        assert_eq!(tool_target(&format!(r#"{{"url":"{long}"}}"#)).unwrap().chars().count(), 201);
+    }
+
+    #[test]
+    fn reply_attachments_keep_files_and_saved_images() {
+        let files = vec![(
+            "dl_a_1abc.mp3".to_owned(),
+            "audio/mpeg".to_owned(),
+            r"C:\d\audios\dl_a_1abc.mp3".to_owned(),
+        )];
+        let images = vec![
+            "data:image/png;base64,AAAA".to_owned(),
+            "/d/images/dl_i_1abc.jpg".to_owned(),
+        ];
+        let out = reply_attachments(&files, &images);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].0, "dl_i_1abc.jpg");
+        assert_eq!(out[1].1, "image/jpeg");
+    }
+}
+
+/// A turn's attachments as `(name, mime, path)`: the files tools made plus
+/// the images they saved to disk (inline `data:` images have no path).
+fn reply_attachments(
+    files: &[(String, String, String)],
+    images: &[String],
+) -> Vec<(String, String, String)> {
+    let mut out = files.to_vec();
+    for path in images.iter().filter(|i| !i.starts_with("data:")) {
+        if out.iter().any(|(_, _, p)| p == path) {
+            continue;
+        }
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned();
+        let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+        let mime = match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => "image/png",
+        };
+        out.push((name, mime.to_owned(), path.clone()));
+    }
+    out
+}
+
+/// Whether the end of `text` is one piece of 1–8 characters repeated for
+/// at least 600 characters: a model stuck in a loop, not prose.
+/// Context-limit recoveries in one turn before it is wrapped up.
+const MAX_CONTEXT_OVERFLOWS: usize = 3;
+
+fn degenerate_tail(text: &str) -> bool {
+    // A 1-8 char piece filling the last 600 chars ("////…"), or a phrase of
+    // 9-24 chars repeated 60 times in a row ("edit_word, edit_word, …" ran
+    // to 30k chars). A sentence said a few dozen times is left alone.
+    const SPAN: usize = 600;
+    const PHRASE_REPEATS: usize = 60;
+    let tail: Vec<char> = text.chars().rev().take(24 * PHRASE_REPEATS).collect();
+    let repeats = |period: usize, span: usize| {
+        tail.len() >= span && (period..span).all(|i| tail[i] == tail[i - period])
+    };
+    (1..=8).any(|p| repeats(p, SPAN)) || (9..=24).any(|p| repeats(p, p * PHRASE_REPEATS))
+}
+
+#[cfg(test)]
+mod degenerate_tail_tests {
+    use super::degenerate_tail;
+
+    #[test]
+    fn flags_a_repeated_short_piece_only() {
+        assert!(degenerate_tail(&format!("答辩状正文{}", "/".repeat(700))));
+        assert!(degenerate_tail(&"的的的的".repeat(200)));
+        assert!(degenerate_tail(&"ab12".repeat(200)));
+        assert!(!degenerate_tail(&"/".repeat(500)));
+        let prose = "原告主张的事实与客观情况不符，答辩人收取的服务费具有合同依据。".repeat(30);
+        assert!(!degenerate_tail(&prose));
+    }
+
+    #[test]
+    fn flags_a_looping_phrase() {
+        assert!(degenerate_tail(&format!("agent, anycli, {}", "edit_word, ".repeat(200))));
+        assert!(!degenerate_tail(&"edit_word, ".repeat(40)));
+        let list: String = (1..300).map(|i| format!("{i}. 第{i}项\n")).collect();
+        assert!(!degenerate_tail(&list));
+    }
+}
+
+/// Per-session ratio of the provider's real prompt size to our estimate.
+fn token_scales() -> &'static std::sync::Mutex<std::collections::HashMap<String, f32>> {
+    static SCALES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, f32>>> =
+        std::sync::OnceLock::new();
+    SCALES.get_or_init(Default::default)
+}
+
+/// How much to scale this session's token estimate, once a call has
+/// reported its real prompt size.
+fn token_scale(session: &str) -> Option<f32> {
+    token_scales().lock().ok()?.get(session).copied()
+}
+
+/// Drop what earlier calls taught about this session's size: the provider
+/// is about to be sent a different history than the one it counted.
+fn forget_token_scale(session: &str) {
+    if let Ok(mut map) = token_scales().lock() {
+        map.remove(session);
+    }
+}
+
+/// Learn from a call's reported prompt size (`real`) against our estimate
+/// of the same request. Only ever scales up (1.0 to 3.0): some providers
+/// leave cached tokens out of the count, and a low count must not make us
+/// compact later than the plain estimate would.
+fn record_token_scale(session: &str, real: u64, estimated: usize) {
+    if real < 2_000 || estimated < 1_000 {
+        return;
+    }
+    let ratio = (real as f32 / estimated as f32).clamp(1.0, 3.0);
+    if let Ok(mut map) = token_scales().lock() {
+        let next = map.get(session).map_or(ratio, |old| (old + ratio) / 2.0);
+        map.insert(session.to_owned(), next);
+    }
+}
+
+#[cfg(test)]
+mod token_scale_tests {
+    use super::{forget_token_scale, record_token_scale, token_scale};
+
+    #[test]
+    fn scales_up_from_real_counts_only() {
+        assert_eq!(token_scale("ts-a"), None);
+        record_token_scale("ts-a", 72_000, 48_000);
+        assert_eq!(token_scale("ts-a"), Some(1.5));
+        record_token_scale("ts-a", 60_000, 60_000);
+        assert_eq!(token_scale("ts-a"), Some(1.25));
+        // A provider that leaves cached tokens out never scales us down.
+        record_token_scale("ts-b", 3_000, 50_000);
+        assert_eq!(token_scale("ts-b"), Some(1.0));
+        // Tiny calls teach nothing.
+        record_token_scale("ts-c", 500, 400);
+        assert_eq!(token_scale("ts-c"), None);
+        forget_token_scale("ts-a");
+        assert_eq!(token_scale("ts-a"), None);
     }
 }

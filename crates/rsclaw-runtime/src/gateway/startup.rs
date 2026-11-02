@@ -30,26 +30,9 @@ use crate::{
     server::{AppState, serve},
 };
 
-// ---------------------------------------------------------------------------
-// Sync-only channel allow-list
-// ---------------------------------------------------------------------------
-
-/// Channels whose responses arrive back at the caller through a non-
-/// notification transport — currently the HTTP `/api/v1/message`
-/// endpoint, which uses a `oneshot::reply_tx` on the `AgentMessage`
-/// plus an optional SSE byte stream.
-///
-/// The agent runtime still fans the assistant reply out onto the
-/// notification bus for observers (UI, telemetry), so this list
-/// suppresses the otherwise-misleading `WARN: no channel sender
-/// registered` log for those known-by-design absences. Future
-/// sync-only entry points (stdio MCP, in-process embeds, etc.)
-/// should be added here.
-const SYNC_ONLY_CHANNELS: &[&str] = &["api"];
-
-fn is_sync_only_channel(name: &str) -> bool {
-    SYNC_ONLY_CHANNELS.contains(&name)
-}
+// Sync-only channels (HTTP /api/v1/message) have no notification sender by
+// design; see `rsclaw_channel::SYNC_ONLY_CHANNELS`.
+use rsclaw_channel::is_sync_only_channel;
 
 // ---------------------------------------------------------------------------
 // Gateway entry point
@@ -182,7 +165,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     //    drain, opening redb here would fail with "Database locked by another
     //    gateway instance". Wait up to 5s for the parent to actually exit before
     //    letting MemoryStore / KB / a2a tasks open their redbs.
-    wait_for_parent_release();
+    wait_for_parent_release().await;
+
+    // ---- Process-environment mutation window ----------------------------
+    // Every `std::env::set_var` / `remove_var` the gateway performs happens
+    // in this block, first thing in `start_gateway` and before it spawns any
+    // task, subprocess or HTTP client. The tokio runtime (built in main
+    // before config is loaded) already has idle worker threads, so these
+    // writes are not strictly single-threaded; keeping them in one place
+    // before anything else runs is what makes them safe in practice. Do not
+    // add env writes elsewhere.
+    //
     // 0. Refresh the tools/bin shim dir, then enrich the process PATH before
     //    anything spawns a subprocess. Desktop/launchd-started gateways inherit a
     //    stripped PATH; the shim dir + PATH prepend let cap-rs coding-agent drivers
@@ -194,18 +187,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // 0. Apply global proxy env vars before any HTTP clients are created.
     rsclaw_config::apply_proxy_env(&config);
 
-    // 0a. Initialize the self-evolution config singleton from
-    //     `[ext.evolution]` (or built-in defaults if absent). Read by memory
-    //     tier transition, crystallizer, and meditation phases.
-    rsclaw_agent::evolution::init_evolution_config(
-        rsclaw_agent::evolution::EvolutionConfig::from_raw(config.ext.evolution.as_ref()),
-    );
-
     // 0b. Propagate skill-registry credentials from rsclaw.json5 into
     //     process env. Spawned skill subprocesses (python CLIs etc.)
     //     inherit env, so this is the bridge that lets users keep keys
-    //     in the config file instead of shell rc / launchctl. Done here,
-    //     pre-runtime, while the process is still single-threaded.
+    //     in the config file instead of shell rc / launchctl.
     propagate_skill_registry_env(&config);
 
     // 0c. Propagate the root-level `env: { … }` map into process env.
@@ -214,6 +199,18 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     //     and gateway-spawned subprocesses. Shell-provided env wins so
     //     `ASTOCK=... cargo run -- gateway restart` still overrides.
     propagate_user_env(&config);
+    // ---- End of environment mutation window -----------------------------
+
+    // 0. Sender trust: owners (gateway.owners + static channel allowFrom)
+    //    gate high-risk tools and local slash commands.
+    crate::gateway::trust::refresh_from_config(&config);
+
+    // 0a. Initialize the self-evolution config singleton from
+    //     `[ext.evolution]` (or built-in defaults if absent). Read by memory
+    //     tier transition, crystallizer, and meditation phases.
+    rsclaw_agent::evolution::init_evolution_config(
+        rsclaw_agent::evolution::EvolutionConfig::from_raw(config.ext.evolution.as_ref()),
+    );
 
     // 1. Resolve data directory — respects RSCLAW_BASE_DIR for --dev/--profile.
     let base_dir = rsclaw_config::loader::base_dir();
@@ -306,6 +303,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         tokio::sync::broadcast::channel::<rsclaw_events::RestartRequest>(16);
     let pending_restart: Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>> =
         Arc::new(std::sync::RwLock::new(None));
+    // "Offer withdrawn" events (latch cleared), relayed as `restart.cleared`.
+    let (restart_cleared_tx, _restart_cleared_rx) =
+        tokio::sync::broadcast::channel::<rsclaw_events::RestartCleared>(16);
 
     // Graceful-shutdown coordinator — wired to task queue worker, axum graceful
     // shutdown, and the /api/v1/restart drain handler. Created here (before the
@@ -393,6 +393,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // 7. Load all plugins (JS + WASM) and register built-in memory slot.
     let plugins_dir = base_dir.join("plugins");
+    // Brand-bundled plugins first, so a fresh or upgraded install loads them
+    // on this start (no-op for builds that bundle none).
+    crate::bundled_plugins::install_all(&plugins_dir);
     let wasm_browser: Arc<tokio::sync::Mutex<Option<rsclaw_browser::BrowserSession>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     // Resolve default vision model for the host-vlm interface (plugin
@@ -432,6 +435,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         warn!("plugin load error: {e:#}");
         PluginRegistry::new()
     });
+    rsclaw_plugin::vision_observer::warm_up();
+
     if let Some(ref mem_arc) = memory
         && !plugin_registry.slots.has_memory()
     {
@@ -701,7 +706,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             notification_tx.clone(),
             shutdown.clone(),
             Arc::clone(&config),
-        ));
+        )
+        .with_event_bus(event_tx.clone()));
         tokio::spawn(async move { worker.run().await });
         info!("external jobs worker started");
     }
@@ -733,9 +739,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             };
                             if let Some(tx) = tx {
                                 info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
-                                if let Err(e) = tx.send(msg.clone()).await {
-                                    tracing::warn!(error = %e, "notification send failed");
-                                }
+                                route_notification(ch_name, &tx, msg.clone());
                             } else if is_sync_only_channel(ch_name) {
                                 // sync-only channels (HTTP /api/v1/message, future stdio
                                 // MCP, etc.) carry their reply back through their own
@@ -755,20 +759,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                                 warn!(channel = %ch_name, "no channel sender registered for notification");
                             }
                         } else {
-                            // No channel specified — send to first registered channel (default)
-                            let first = {
-                                let guard =
-                                    senders.read().expect("channel_senders RwLock poisoned");
-                                guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
-                            };
-                            if let Some((ch_name, tx)) = first {
-                                info!(channel = %ch_name, "routing notification to default channel");
-                                if let Err(e) = tx.send(msg.clone()).await {
-                                    tracing::warn!(error = %e, "notification send failed");
-                                }
-                            } else {
-                                warn!("notification: no channels registered");
-                            }
+                            // No channel specified. Picking "the first" entry of
+                            // a HashMap is effectively random and would deliver
+                            // to the wrong recipient on the wrong channel; drop.
+                            warn!(
+                                target_id = %msg.target_id,
+                                "notification without a channel dropped"
+                            );
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -837,13 +834,20 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // double-apply.
     let reload_mutex = Arc::new(tokio::sync::Mutex::new(()));
 
+    // Filled once `AppState` exists (step 13) so the watcher bridge can run
+    // the same scoped channel reload as `POST /api/v1/reload?scope=channels`.
+    let reload_app_state: Arc<std::sync::OnceLock<crate::server::AppState>> =
+        Arc::new(std::sync::OnceLock::new());
+
     // 12. Start config hot-reload watcher (if config file is detectable).
     if let Some(config_path) = config::loader::detect_config_path() {
         let (mut watcher, mut reload_rx) = FileWatcher::new(config_path);
         tokio::spawn(async move { watcher.run().await });
         let live_reload = Arc::clone(&live);
+        let bridge_app_state = Arc::clone(&reload_app_state);
         let watcher_reload_mutex = Arc::clone(&reload_mutex);
         let bridge_tx = restart_request_tx.clone();
+        let bridge_cleared_tx = restart_cleared_tx.clone();
         let bridge_pending = Arc::clone(&pending_restart);
         let bridge_shutdown = shutdown.clone();
         let cfg_lang = config
@@ -867,25 +871,128 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             let old = live_reload.snapshot().await;
                             rsclaw_config::live_config::classify_change(&old, &new_owned)
                         };
-                        live_reload.apply(new_owned).await;
-                        drop(guard);
+                        crate::gateway::trust::refresh_from_config(&new_owned);
+                        live_reload.apply(new_owned.clone()).await;
 
+                        // Channel edits (typically a desktop/CLI QR login
+                        // writing a new `channels.<ch>.accounts` entry) and
+                        // provider edits (a key or baseUrl set with
+                        // `config set`) are applied right away with the same
+                        // scoped reload as `rsclaw gateway reload --scope …`.
+                        // Neither cancels agent turns: channels only (re)start
+                        // listeners and providers only swap the registry.
+                        // Leaving them as an offer meant a freshly scanned bot
+                        // stayed silent and a newly set key kept failing with
+                        // 401 until a restart. It also syncs the live snapshot
+                        // so later saves don't re-report the sections. Still
+                        // under the reload mutex, as the helper expects.
+                        let sections = impact.sections();
+                        let touches = |name: &str| sections.iter().any(|s| s == name);
+                        let mut auto_scopes: Vec<&'static str> = Vec::new();
+                        if touches("config.channels") {
+                            auto_scopes.push("channels");
+                        }
+                        if touches("config.models") || touches("config.auth") {
+                            auto_scopes.push("providers");
+                        }
+                        let auto_applied = if auto_scopes.is_empty() {
+                            false
+                        } else {
+                            match bridge_app_state.get() {
+                                Some(state) => {
+                                    let details = crate::server::apply_reload_scopes(
+                                        state,
+                                        &auto_scopes,
+                                        new_owned,
+                                    )
+                                    .await;
+                                    info!(
+                                        scopes = ?auto_scopes,
+                                        details = %serde_json::Value::Object(details),
+                                        "config change: reloaded automatically"
+                                    );
+                                    true
+                                }
+                                None => {
+                                    warn!(
+                                        scopes = ?auto_scopes,
+                                        "config change arrived before the server is up; \
+                                         offering a reload instead"
+                                    );
+                                    false
+                                }
+                            }
+                        };
+                        let auto_sections: &[&str] = if auto_applied {
+                            &["config.channels", "config.models", "config.auth"]
+                        } else {
+                            &[]
+                        };
+                        drop(guard);
+                        if auto_applied {
+                            clear_auto_applied_reload_offer(
+                                &bridge_pending,
+                                &bridge_tx,
+                                &bridge_cleared_tx,
+                            );
+                        }
+                        // Sections the automatic reload already took care of
+                        // are not part of any banner below.
+                        let not_auto_applied = |list: Vec<String>| -> Vec<String> {
+                            list.into_iter()
+                                .filter(|s| !auto_sections.iter().any(|a| *a == s.as_str()))
+                                .collect()
+                        };
+
+                        // The watcher emits `RequiresRestart` just before the
+                        // `FullReload` of the same save. When a Required
+                        // restart is already pending, don't replace that banner
+                        // with a weaker reload / recommended one.
+                        let required_pending = bridge_pending
+                            .read()
+                            .map(|g| {
+                                g.as_ref().is_some_and(|r| {
+                                    r.urgency == rsclaw_events::RestartUrgency::Required
+                                })
+                            })
+                            .unwrap_or(false);
                         match impact {
                             rsclaw_config::live_config::ChangeImpact::Hot => {
                                 info!("config hot-reload applied (hot-safe fields only)");
+                            }
+                            rsclaw_config::live_config::ChangeImpact::NeedsReload {
+                                sections, ..
+                            }
+                            | rsclaw_config::live_config::ChangeImpact::NeedsRestart { sections }
+                                if required_pending =>
+                            {
+                                info!(
+                                    ?sections,
+                                    "config change applied; a required restart is already pending"
+                                );
                             }
                             // Snapshotted inside components (agent handles,
                             // provider/skill/plugin registries) — a scoped
                             // in-process reload rebuilds them in about a
                             // second, no cold boot and no dropped listener.
-                            // Offered rather than auto-applied: re-spawning an
-                            // agent cancels its in-flight turns, and saving a
-                            // config file should not silently kill the
-                            // conversation the user is in the middle of.
+                            // Offered rather than auto-applied (channels and
+                            // providers aside, see above): re-spawning an agent cancels
+                            // its in-flight turns, and saving a config file
+                            // should not silently kill the conversation the
+                            // user is in the middle of.
                             rsclaw_config::live_config::ChangeImpact::NeedsReload {
                                 sections,
                                 scopes,
                             } => {
+                                let sections = not_auto_applied(sections);
+                                let scopes: Vec<String> = scopes
+                                    .into_iter()
+                                    .filter(|s| !(auto_applied && auto_scopes.iter().any(|a| *a == s.as_str())))
+                                    .collect();
+                                if scopes.is_empty() {
+                                    info!("config change applied via automatic reload");
+                                    continue;
+                                }
                                 info!(
                                     ?sections,
                                     ?scopes,
@@ -903,6 +1010,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                                 );
                             }
                             rsclaw_config::live_config::ChangeImpact::NeedsRestart { sections } => {
+                                let sections = not_auto_applied(sections);
                                 warn!(?sections, "config change requires gateway restart");
                                 publish_restart(
                                     &bridge_tx,
@@ -931,7 +1039,14 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         );
                     }
                     Ok(_) => {}
-                    Err(_) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // A burst of saves overflowed the buffer. Keep the
+                        // bridge alive; the next change carries the latest
+                        // full config anyway.
+                        warn!(skipped = n, "config reload bridge lagged; continuing");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -948,8 +1063,52 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             std::collections::HashMap<String, Arc<rsclaw_channel::custom::CustomWebhookChannel>>,
         >,
     > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    // Custom channels named like a local entry point ("ws", "cli", ...) would
+    // inherit owner trust; refuse them.
+    let reserved_custom = config
+        .channel
+        .channels
+        .custom
+        .as_ref()
+        .is_some_and(|cs| cs.iter().any(|c| rsclaw_agent::trust::is_local_channel(&c.name)));
+    let custom_start_cfg;
+    let custom_cfg_ref: &RuntimeConfig = if reserved_custom {
+        let mut c: RuntimeConfig = (*config).clone();
+        if let Some(cs) = c.channel.channels.custom.as_mut() {
+            cs.retain(|ch| {
+                let reserved = rsclaw_agent::trust::is_local_channel(&ch.name);
+                if reserved {
+                    warn!(
+                        channel = %ch.name,
+                        "custom channel uses a reserved local channel name; refusing to start it"
+                    );
+                }
+                !reserved
+            });
+        }
+        custom_start_cfg = c;
+        &custom_start_cfg
+    } else {
+        config.as_ref()
+    };
+    // Webhooks (hooks.* and custom webhook channels) refuse every request
+    // until a non-empty hooks.token resolves.
+    let hooks_enabled = config.ops.hooks.as_ref().is_some_and(|h| h.enabled);
+    let has_custom_webhook = config
+        .channel
+        .channels
+        .custom
+        .as_ref()
+        .is_some_and(|cs| cs.iter().any(|c| c.channel_type == "webhook"));
+    if (hooks_enabled || has_custom_webhook) && crate::hooks::resolve_hooks_token(&config).is_none()
+    {
+        warn!(
+            "webhooks are configured but hooks.token is missing or did not resolve; \
+             /hooks/* will answer 503 until a token is set"
+        );
+    }
     start_custom_channels(
-        &config,
+        custom_cfg_ref,
         Arc::clone(&registry),
         &channel_manager,
         Arc::clone(&custom_webhooks),
@@ -1048,7 +1207,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 Some(shutdown.clone()),
             )
             .with_daemon_agent_ids(config.agents.daemon_agent_ids())
-            .with_wasm_plugins(Arc::clone(&wasm_plugins_live));
+            .with_wasm_plugins(Arc::clone(&wasm_plugins_live))
+            .with_session_sink(crate::cron::SessionSink {
+                db: Arc::clone(&store.db),
+                event_bus: event_tx.clone(),
+            });
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
                     error!("cron runner error: {e:#}");
@@ -1104,6 +1267,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             // Register the single live instance so agent tools (knowledge_base)
             // reach it without re-opening redb (which is exclusively locked).
             rsclaw_kb::set_global_service(Arc::clone(&svc));
+            // Keep the knowledge packs this account subscribes to in step
+            // with the server (no-op without `kb.packs`).
+            rsclaw_kb::sync::pack::spawn_from_config(Arc::clone(&svc));
             Some(svc)
         }
         Err(e) => {
@@ -1143,6 +1309,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         agent_spawner: Arc::clone(&spawner),
         task_queue: Arc::clone(&task_queue_mgr),
         restart_request_tx: restart_request_tx.clone(),
+        restart_cleared_tx: restart_cleared_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
         task_event_bus: a2a_bus,
@@ -1161,6 +1328,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         // Same cell the file watcher holds — see its definition above.
         reload_mutex: Arc::clone(&reload_mutex),
     };
+    if reload_app_state.set(state.clone()).is_err() {
+        warn!("config watcher app state already set; automatic channel reload keeps the old one");
+    }
     if !rsclaw_types::set_outbound_a2a_host(Arc::new(
         crate::a2a::relay::GatewayOutboundA2aHost::new(state.clone()),
     )) {
@@ -1228,7 +1398,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         let client = reqwest::Client::builder()
-            .user_agent("rsclaw/dev")
+            .user_agent(concat!(rsclaw_brand::brand_user_agent!(), "/dev"))
             .timeout(std::time::Duration::from_secs(10))
             .build();
 
@@ -1241,10 +1411,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         // updater agree on what "latest" means.
         let sources = [
             crate::cmd::update::RSCLAW_VERSION_URL,
-            "https://api.github.com/repos/rsclaw-ai/rsclaw/releases?per_page=10",
+            rsclaw_brand::RELEASES_API_URL,
         ];
         let mut release: Option<serde_json::Value> = None;
-        for url in sources {
+        for url in sources.into_iter().filter(|u| !u.is_empty()) {
             if let Ok(resp) = client.get(url).send().await {
                 if resp.status().is_success() {
                     let body = resp.bytes().await.unwrap_or_default();
@@ -1291,7 +1461,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                     info!(
                         current = current_raw,
                         latest = latest_raw,
-                        "new rsclaw version available -- run `rsclaw update` to upgrade"
+                        "new {cli} version available -- run `{cli} update` to upgrade",
+                        cli = rsclaw_brand::CLI_NAME
                     );
                 }
             }
@@ -1311,8 +1482,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // defaults.toml is always the fallback. Takes effect on the next config
     // load / restart, never mutating the already-running config in place.
     tokio::spawn(async {
-        const DEFAULTS_URL: &str = "https://app.rsclaw.ai/defaults.toml";
+        const DEFAULTS_URL: &str = rsclaw_brand::DEFAULTS_URL;
         const THROTTLE: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+        if DEFAULTS_URL.is_empty() {
+            // The brand ships no remote catalog; the embedded one is final.
+            return;
+        }
 
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
@@ -1328,7 +1503,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
 
         let Ok(client) = reqwest::Client::builder()
-            .user_agent("rsclaw/dev")
+            .user_agent(concat!(rsclaw_brand::brand_user_agent!(), "/dev"))
             .timeout(std::time::Duration::from_secs(10))
             .build()
         else {
@@ -1703,7 +1878,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 /// already exited. Logs at info on actual wait so the next
 /// "why did startup take 3 seconds" question is answerable from the
 /// log alone.
-fn wait_for_parent_release() {
+async fn wait_for_parent_release() {
     let Ok(pid_str) = std::env::var("RSCLAW_PARENT_PID") else {
         return;
     };
@@ -1733,7 +1908,7 @@ fn wait_for_parent_release() {
             return;
         }
         waited = true;
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     warn!(
         parent_pid = pid,
@@ -1895,7 +2070,7 @@ fn try_service_self_restart() -> bool {
         // path stops us and leaves it to a human / monitoring system.
         use std::os::windows::process::CommandExt;
         let status = std::process::Command::new("sc")
-            .args(["stop", "rsclaw"])
+            .args(["stop", rsclaw_brand::WINDOWS_SERVICE])
             .creation_flags(0x08000000)
             .status();
         if matches!(status, Ok(s) if s.success()) {
@@ -1943,6 +2118,43 @@ fn registry_env_names(name: &str) -> Option<(&'static str, &'static str)> {
 /// SAFETY: called once during single-threaded gateway startup, before
 /// any async runtime tasks spawn — matches the existing precedent in
 /// `apply_proxy_env` and `propagate_skill_registry_env`.
+/// How long a notification may wait for room in a full channel queue before
+/// it is dropped.
+const NOTIFICATION_SEND_TIMEOUT_SECS: u64 = 30;
+
+/// Hand `msg` to a channel's outbound queue without blocking the notification
+/// router: a full queue (stuck channel) gets a bounded background wait so
+/// other channels keep flowing.
+fn route_notification(
+    ch_name: &str,
+    tx: &mpsc::Sender<OutboundMessage>,
+    msg: OutboundMessage,
+) {
+    match tx.try_send(msg) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(msg)) => {
+            warn!(channel = %ch_name, "notification queue full; delivering in background");
+            let tx = tx.clone();
+            let ch = ch_name.to_owned();
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(NOTIFICATION_SEND_TIMEOUT_SECS),
+                    tx.send(msg),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(channel = %ch, error = %e, "notification send failed"),
+                    Err(_) => warn!(channel = %ch, "notification dropped: channel queue stayed full"),
+                }
+            });
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!(channel = %ch_name, "notification send failed: channel closed");
+        }
+    }
+}
+
 fn propagate_user_env(config: &RuntimeConfig) {
     let Some(env_map) = config.raw.env.as_ref() else {
         return;
@@ -1950,22 +2162,60 @@ fn propagate_user_env(config: &RuntimeConfig) {
     apply_user_env_map(&env_map.0);
 }
 
+/// Names of the variables a previous start exported from the config file.
+/// `gateway restart` re-execs the process with its environment, so without
+/// this record a value exported last time would look shell-provided and an
+/// edited config value would never take effect.
+const CONFIG_ENV_KEYS_VAR: &str = "RSCLAW_CONFIG_ENV_KEYS";
+
 /// Inner helper, separated from `propagate_user_env` so it can be unit-tested
 /// without constructing a full `RuntimeConfig`.
 fn apply_user_env_map(env_map: &std::collections::HashMap<String, String>) {
+    let owned: std::collections::HashSet<String> = std::env::var(CONFIG_ENV_KEYS_VAR)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|k| !k.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut now_owned = apply_user_env_map_owned(env_map, &owned);
+    now_owned.sort();
+    // SAFETY: pre-async-runtime, single-threaded.
+    unsafe { std::env::set_var(CONFIG_ENV_KEYS_VAR, now_owned.join(",")) };
+}
+
+/// Export `env_map`. Variables in `owned` came from the config on an earlier
+/// start: they follow the config (updated, or removed once the config drops
+/// them). Any other variable already set came from the shell / launchd /
+/// systemd and wins. Returns the variables the config now owns.
+fn apply_user_env_map_owned(
+    env_map: &std::collections::HashMap<String, String>,
+    owned: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut now_owned = Vec::new();
     for (key, raw_val) in env_map {
-        if key.is_empty() {
+        if key.is_empty() || key == CONFIG_ENV_KEYS_VAR {
             continue;
         }
-        if std::env::var(key).is_ok() {
+        if std::env::var(key).is_ok() && !owned.contains(key) {
             // Already set by shell / launchd / systemd — don't clobber.
             continue;
         }
         let expanded = rsclaw_config::loader::expand_env_vars(raw_val);
-        // SAFETY: pre-async-runtime, single-threaded.
-        unsafe { std::env::set_var(key, &expanded) };
-        info!(key = %key, "exported user env var from rsclaw.json5");
+        if std::env::var(key).ok().as_deref() != Some(expanded.as_str()) {
+            // SAFETY: pre-async-runtime, single-threaded.
+            unsafe { std::env::set_var(key, &expanded) };
+            info!(key = %key, "exported user env var from {}", rsclaw_brand::CONFIG_FILE);
+        }
+        now_owned.push(key.clone());
     }
+    for key in owned {
+        if !env_map.contains_key(key) {
+            // SAFETY: pre-async-runtime, single-threaded.
+            unsafe { std::env::remove_var(key) };
+            info!(key = %key, "removed user env var dropped from {}", rsclaw_brand::CONFIG_FILE);
+        }
+    }
+    now_owned
 }
 
 /// Read `skill_registries.<name>.{apiKey,baseUrl}` from the resolved
@@ -2026,7 +2276,23 @@ fn spawn_agent_tasks(
     cap_manager: std::sync::Arc<rsclaw_cap::CapAgentManager>,
     cap_live_manager: std::sync::Arc<rsclaw_cap::CapLiveManager>,
 ) {
-    for (agent_id, mut rx) in receivers {
+    let goal_continuation: rsclaw_agent::GoalContinuationFn =
+        Arc::new(enqueue_goal_continuation);
+    // Hand the same gateway wiring to the spawner so dynamically spawned and
+    // hot-replaced agents (config reload) keep MCP, notifications,
+    // computer-use and /goal continuation.
+    if let Some(sp) = spawner.as_ref() {
+        sp.set_runtime_wiring(rsclaw_agent::RuntimeWiring {
+            mcp: mcp.clone(),
+            notification_tx: notification_tx.clone(),
+            computer_permission: Some(Arc::clone(&computer_permission)),
+            computer_permission_tx: Some(computer_permission_tx.clone()),
+            computer_status_tx: Some(computer_status_tx.clone()),
+            computer_runs: Some(Arc::clone(&computer_runs)),
+            goal_continuation: Some(Arc::clone(&goal_continuation)),
+        });
+    }
+    for (agent_id, rx) in receivers {
         let handle = match registry.get(&agent_id) {
             Ok(h) => h,
             Err(e) => {
@@ -2051,408 +2317,89 @@ fn spawn_agent_tasks(
             })
             .unwrap_or_default();
 
-        let mut runtime = AgentRuntime::new(
-            Arc::clone(&handle),
-            Arc::clone(&config),
-            Arc::clone(&live),
-            Arc::clone(&providers),
-            fallback_models,
-            Arc::clone(&skills),
-            Arc::clone(&store),
-            memory.clone(),
-            Some(Arc::clone(&registry)),
-            Some(event_tx.clone()),
-            spawner.clone(),
-            plugins.clone(),
-            mcp.clone(),
-            notification_tx.clone(),
-            model_health.clone(),
-            Some(Arc::clone(&cap_manager)),
-            Some(Arc::clone(&cap_live_manager)),
+        let build = || {
+            let mut runtime = AgentRuntime::new(
+                Arc::clone(&handle),
+                Arc::clone(&config),
+                Arc::clone(&live),
+                Arc::clone(&providers),
+                fallback_models.clone(),
+                Arc::clone(&skills),
+                Arc::clone(&store),
+                memory.clone(),
+                Some(Arc::clone(&registry)),
+                Some(event_tx.clone()),
+                spawner.clone(),
+                plugins.clone(),
+                mcp.clone(),
+                notification_tx.clone(),
+                model_health.clone(),
+                Some(Arc::clone(&cap_manager)),
+                Some(Arc::clone(&cap_live_manager)),
+            );
+
+            // Inject WASM plugins into the agent runtime.
+            runtime.wasm_plugins = Arc::clone(&wasm_plugins);
+
+            // Share the computer_use permission store + broadcast channel
+            // so `tool_vlm_drive` can register pending requests that the WS
+            // handler can resolve.
+            runtime.computer_permission = Some(Arc::clone(&computer_permission));
+            runtime.computer_permission_tx = Some(computer_permission_tx.clone());
+            runtime.computer_status_tx = Some(computer_status_tx.clone());
+            runtime.computer_runs = Some(Arc::clone(&computer_runs));
+            runtime
+        };
+
+        // Lanes: each session's turns run in order on one runtime, while
+        // different sessions run side by side (see `spawn_lanes`).
+        let count = rsclaw_agent::spawner::lane_count(&handle);
+        let first = build();
+        let mut lanes = Vec::with_capacity(count);
+        for _ in 1..count {
+            let mut lane = build();
+            lane.share_lane_resources(&first);
+            lanes.push(lane);
+        }
+        lanes.insert(0, first);
+        rsclaw_agent::spawner::spawn_lanes(
+            handle,
+            rx,
+            lanes,
+            Some(goal_continuation.clone()),
+            false,
+            "agent runtime task started",
         );
+    }
+}
 
-        // Inject WASM plugins into the agent runtime.
-        runtime.wasm_plugins = Arc::clone(&wasm_plugins);
-
-        // Share the computer_use permission store + broadcast channel
-        // so `tool_vlm_drive` can register pending requests that the WS
-        // handler can resolve.
-        runtime.computer_permission = Some(Arc::clone(&computer_permission));
-        runtime.computer_permission_tx = Some(computer_permission_tx.clone());
-        runtime.computer_status_tx = Some(computer_status_tx.clone());
-        runtime.computer_runs = Some(Arc::clone(&computer_runs));
-
-        let event_tx_task = event_tx.clone();
-        let config_for_task = Arc::clone(&config);
-        tokio::spawn(async move {
-            info!(agent_id = %handle.id, "agent runtime task started");
-            loop {
-                let msg = tokio::select! {
-                    _ = handle.lifetime.cancelled() => {
-                        info!(agent_id = %handle.id, "agent runtime lifetime cancelled, stopping");
-                        break;
-                    }
-                    msg = rx.recv() => match msg {
-                        Some(m) => m,
-                        None => break,
-                    },
-                };
-                info!(
-                    agent_id = %handle.id,
-                    session_key = %msg.session_key,
-                    channel = %msg.channel,
-                    "agent runtime: received msg from queue"
-                );
-                let AgentMessage {
-                    session_key,
-                    text,
-                    channel,
-                    peer_id,
-                    chat_id,
-                    reply_tx,
-                    extra_tools,
-                    images,
-                    files,
-                    account,
-                    task_id,
-                    context_id,
-                    cancel_token,
-                    event_tx,
-                    input_request_tx,
-                } = msg;
-                // Hard-cancel token for this turn. A2A callers supply their own
-                // (CancelTask). For everyone else (WS chat.abort, channels) we
-                // mint one and register it under the session key so chat.abort
-                // can fire `.cancel()` — the `tokio::select!` below then drops
-                // the in-flight `run_turn` future immediately, even if it's
-                // parked on a stalled LLM stream. `registered` tracks whether
-                // we own the map entry so we clean it up afterwards.
-                let (turn_token, registered) = match cancel_token {
-                    Some(t) => (t, false),
-                    None => {
-                        let t = tokio_util::sync::CancellationToken::new();
-                        if let Ok(mut toks) = handle.cancel_tokens.write() {
-                            toks.insert(session_key.clone(), t.clone());
-                        }
-                        (t, true)
-                    }
-                };
-
-                // Build a TurnContext from the A2A wires on AgentMessage.
-                // `cancel_token` is now always set, so the runtime's
-                // cooperative `is_cancelled()` checks (between iterations and
-                // at tool-dispatch boundaries) also observe WS aborts.
-                let is_daemon = runtime.is_daemon_agent(&handle.id);
-                // Progress heartbeat for the daemon watchdog (bumped once per
-                // agent-loop iteration via TurnContext::progress_tick).
-                let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let turn_ctx = rsclaw_agent::registry::TurnContext {
-                    task_id,
-                    context_id,
-                    event_tx,
-                    cancel_token: Some(turn_token.clone()),
-                    input_request_tx,
-                    progress: Some(progress.clone()),
-                };
-                // Stuck-turn watchdog. Two modes:
-                //  - Normal turns: flat 20-min wall-clock cap (a single turn should complete;
-                //    if not, something's wedged).
-                //  - Daemon agents (agent_wechat monitor): they loop FOREVER, so a wall-clock
-                //    cap can't apply. Instead watch PROGRESS — the loop bumps a counter every
-                //    iteration; if it stops advancing for STALL_LIMIT, a tool is genuinely
-                //    wedged (e.g. enter_chat spinning), so cancel and let the cron backstop
-                //    restart. A healthy forever-loop bumps every few seconds → never killed.
-                let watchdog_token = turn_token.clone();
-                let watchdog_agent = handle.id.clone();
-                let watchdog_session = session_key.clone();
-                let watchdog = tokio::spawn(async move {
-                    use std::sync::atomic::Ordering;
-                    if is_daemon {
-                        const POLL: std::time::Duration = std::time::Duration::from_secs(30);
-                        const STALL_LIMIT: std::time::Duration =
-                            std::time::Duration::from_secs(180);
-                        let mut last = progress.load(Ordering::Relaxed);
-                        let mut stalled = std::time::Duration::ZERO;
-                        loop {
-                            tokio::time::sleep(POLL).await;
-                            if watchdog_token.is_cancelled() {
-                                break;
-                            }
-                            let cur = progress.load(Ordering::Relaxed);
-                            if cur != last {
-                                last = cur;
-                                stalled = std::time::Duration::ZERO;
-                                continue;
-                            }
-                            stalled += POLL;
-                            if stalled >= STALL_LIMIT {
-                                tracing::error!(
-                                    agent = %watchdog_agent,
-                                    session = %watchdog_session,
-                                    stall_s = stalled.as_secs(),
-                                    "stuck-turn watchdog (daemon): no loop progress — a tool is \
-                                     wedged; firing cancel_token (cron will restart)"
-                                );
-                                watchdog_token.cancel();
-                                break;
-                            }
-                        }
-                    } else {
-                        const TURN_WALL_CLOCK_LIMIT: std::time::Duration =
-                            std::time::Duration::from_secs(20 * 60);
-                        tokio::time::sleep(TURN_WALL_CLOCK_LIMIT).await;
-                        if !watchdog_token.is_cancelled() {
-                            tracing::error!(
-                                agent = %watchdog_agent,
-                                session = %watchdog_session,
-                                limit_s = TURN_WALL_CLOCK_LIMIT.as_secs(),
-                                "stuck-turn watchdog: firing cancel_token — turn exceeded \
-                                 wall-clock limit; the agent queue must not stay dark"
-                            );
-                            watchdog_token.cancel();
-                        }
-                    }
-                });
-                let result = tokio::select! {
-                    biased;
-                    // Hard cancel: drops the run_turn future (and every await
-                    // it holds — LLM stream, tool calls) the moment the token
-                    // fires. This is what frees the single-threaded queue when
-                    // a turn is wedged on a non-yielding await.
-                    _ = turn_token.cancelled() => Err(anyhow::anyhow!("turn aborted")),
-                    r = runtime.run_turn(
-                        &session_key,
-                        &text,
-                        &channel,
-                        &peer_id,
-                        &chat_id,
-                        account.as_deref(),
-                        extra_tools,
-                        images,
-                        files,
-                        turn_ctx,
-                    ) => r,
-                };
-                // Turn completed (success/error/cancel) — stop the watchdog.
-                // If the watchdog already fired the cancel, the select! above
-                // already exited via the cancellation branch; this abort is
-                // just hygiene to release the spawned task.
-                watchdog.abort();
-                // Drop our registered token so a later abort for this session
-                // can't cancel a future turn, and the map doesn't leak.
-                if registered {
-                    if let Ok(mut toks) = handle.cancel_tokens.write() {
-                        toks.remove(&session_key);
-                    }
-                }
-                let turn_errored = result.is_err();
-                let reply = result.unwrap_or_else(|e| {
-                    // A2A consumers key off `outcome` to publish the right
-                    // terminal status (Failed vs Canceled). Without this
-                    // distinction the A2A reply-watcher saw `Ok(reply)` and
-                    // always published Completed — so cancellations and
-                    // LLM/tool errors were silently reported as success.
-                    //
-                    // Both A2A CancelTask and WS chat.abort produce
-                    // cancellations from the user; only genuine LLM/tool
-                    // failures should map to Error and show
-                    // "backend_unavailable" to the user. "turn aborted" is
-                    // the WS abort path (agent/runtime.rs:5457), "canceled
-                    // by A2A CancelTask" is the A2A path.
-                    let err_str = e.to_string();
-                    let is_user_cancel = err_str.contains("canceled by A2A CancelTask")
-                        || err_str.contains("turn aborted");
-                    // A user-initiated cancel is not an error — log at INFO so
-                    // it doesn't pollute error dashboards / alerting.
-                    if is_user_cancel {
-                        info!(agent = %handle.id, "turn canceled by user: {e:#}");
-                    } else {
-                        error!(agent = %handle.id, "turn error: {e:#}");
-                    }
-                    let outcome = if is_user_cancel {
-                        rsclaw_agent::registry::ReplyOutcome::Canceled
-                    } else {
-                        rsclaw_agent::registry::ReplyOutcome::Error
-                    };
-                    // User-facing text: don't leak the raw anyhow Error
-                    // (HTTP status codes, internal IDs, JSON error bodies)
-                    // to the chat channel — that material is operator-
-                    // debug-only and lives in the ERROR log above. The
-                    // end user sees an i18n'd "service unavailable" line
-                    // for real LLM / transport errors; the original
-                    // outcome tag (Error / Canceled) survives so A2A
-                    // consumers still key off the terminal status.
-                    let i18n_lang = config_for_task
-                        .raw
-                        .gateway
-                        .as_ref()
-                        .and_then(|g| g.language.as_deref())
-                        .map(rsclaw_i18n::resolve_lang)
-                        .unwrap_or("en");
-                    let user_text = match outcome {
-                        rsclaw_agent::registry::ReplyOutcome::Canceled => "[canceled]".to_owned(),
-                        _ => rsclaw_i18n::t("backend_unavailable", i18n_lang),
-                    };
-                    AgentReply {
-                        text: user_text,
-                        is_empty: false,
-                        tool_calls: None,
-                        images: vec![],
-                        files: vec![],
-                        pending_analysis: None,
-                        needs_outer_done_emit: false,
-                        outcome,
-                    }
-                });
-                // Emit to event_bus for any reply path that bypassed
-                // agent_loop (preparse, file-attach short-circuits, /btw,
-                // disk-low, __DIRECT_REPLY__, etc.) *and* for turns that
-                // failed with Err (agent_loop returns early via `?` on LLM
-                // errors and never gets to emit done — WS clients would hang
-                // waiting for the terminator forever). Normal LLM turns
-                // already emit deltas + done from inside agent_loop, so a
-                // second emit would duplicate the done frame.
-                if reply.needs_outer_done_emit || turn_errored {
-                    if !reply.text.is_empty() {
-                        // receiver may have been dropped
-                        let _ = event_tx_task.send(rsclaw_events::AgentEvent {
-                            session_id: session_key.clone(),
-                            agent_id: handle.id.clone(),
-                            delta: reply.text.clone(),
-                            done: false,
-                            files: vec![],
-                            images: vec![],
-                            tool_log: vec![],
-                            question: None,
-                            channel: None,
-                        });
-                    }
-                    // receiver may have been dropped
-                    let _ = event_tx_task.send(rsclaw_events::AgentEvent {
-                        session_id: session_key.clone(),
-                        agent_id: handle.id.clone(),
-                        delta: String::new(),
-                        done: true,
-                        files: vec![],
-                        images: vec![],
-                        tool_log: vec![],
-                        question: None,
-                        channel: None,
-                    });
-                }
-                // /goal — completion-driven turn loop. See
-                // `src/agent/goal.rs`. After every turn, if the
-                // session has an active goal we either:
-                //   * append a terminal status (✅/❌/⚠) to the reply text so the user sees it
-                //     in the same chat bubble, AND clear the goal state, OR
-                //   * schedule the next iteration via the task queue.
-                //
-                // Mutating `reply.text` is safe because nothing on the
-                // path from here to the channel send re-evaluates the
-                // text against goal markers — the hook ran, the
-                // decision is made. Submitting the next turn happens
-                // INSIDE this match arm (not via reply_tx) because the
-                // channel reply path delivers `reply` to the user; the
-                // next /goal turn is a separate enqueued message that
-                // arrives through the normal worker loop.
-                let mut reply = reply;
-                if !turn_errored
-                    && let Some(reaction) =
-                        rsclaw_agent::goal::check_after_turn(&session_key, &reply.text).await
-                {
-                    use rsclaw_agent::goal::Reaction;
-                    match reaction {
-                        Reaction::Done(status_line) => {
-                            // Strip the GOAL_ marker line itself so it
-                            // doesn't read as machine output in the
-                            // user's chat — the human-friendly status
-                            // line we append takes its place.
-                            reply.text = strip_trailing_goal_marker(&reply.text);
-                            if !reply.text.is_empty() {
-                                reply.text.push_str("\n\n");
-                            }
-                            reply.text.push_str(&status_line);
-                            reply.is_empty = reply.text.is_empty()
-                                && reply.images.is_empty()
-                                && reply.files.is_empty();
-                        }
-                        Reaction::Continue(next_prompt) => {
-                            // Strip the user-visible reply of any
-                            // accidentally-leaked GOAL_* marker
-                            // (parse_terminal said Continue, so there
-                            // can't be one — but defensive).
-                            if let Some(tq) = crate::gateway::task_queue::get_task_queue() {
-                                let delivery_channel: &str =
-                                    if channel == "ws" { "desktop" } else { &channel };
-                                if let Err(e) = crate::gateway::task_queue::submit_to_queue(
-                                    &tq,
-                                    &session_key,
-                                    &next_prompt,
-                                    delivery_channel,
-                                    &peer_id,
-                                    &peer_id,
-                                    false,
-                                    crate::gateway::task_queue::Priority::Cron,
-                                ) {
-                                    warn!(
-                                        session = %session_key,
-                                        error = %e,
-                                        "/goal: failed to enqueue continuation turn"
-                                    );
-                                }
-                            } else {
-                                warn!(
-                                    "/goal: task_queue not installed; cannot enqueue continuation"
-                                );
-                            }
-                        }
-                    }
-                }
-                // receiver may have been dropped (e.g. channel timeout)
-                let _ = reply_tx.send(reply);
-            }
-            info!(agent_id = %handle.id, "agent runtime task ended (channel closed)");
-        });
+/// `/goal` continuation hook: enqueue the next iteration on the task queue.
+fn enqueue_goal_continuation(session_key: &str, next_prompt: &str, channel: &str, peer_id: &str) {
+    let Some(tq) = crate::gateway::task_queue::get_task_queue() else {
+        warn!("/goal: task_queue not installed; cannot enqueue continuation");
+        return;
+    };
+    if let Err(e) = crate::gateway::task_queue::submit_to_queue(
+        &tq,
+        session_key,
+        next_prompt,
+        channel,
+        peer_id,
+        peer_id,
+        false,
+        crate::gateway::task_queue::Priority::Cron,
+    ) {
+        warn!(
+            session = %session_key,
+            error = %e,
+            "/goal: failed to enqueue continuation turn"
+        );
     }
 }
 
 // ---------------------------------------------------------------------------
 // Bind address helper
 // ---------------------------------------------------------------------------
-
-/// Drop the trailing `GOAL_ACHIEVED` / `GOAL_FAILED ...` line from a
-/// reply when it terminated a `/goal` loop. Anything after the marker
-/// on the same line is also dropped (per spec the marker must be the
-/// last non-blank line). We then trim any leftover trailing blank
-/// lines so the appended "✅ Goal achieved" status reads as a clean
-/// continuation, not as a margin-floating block.
-fn strip_trailing_goal_marker(text: &str) -> String {
-    let mut lines: Vec<&str> = text.lines().collect();
-    // Find the last non-blank line. If it carries a marker, remove it
-    // plus any blank lines that immediately precede it.
-    while let Some(last) = lines.last() {
-        if last.trim().is_empty() {
-            lines.pop();
-            continue;
-        }
-        break;
-    }
-    if let Some(last) = lines.last() {
-        let t = last.trim();
-        if t == "GOAL_ACHIEVED" || t.starts_with("GOAL_FAILED") {
-            lines.pop();
-            // Strip any blank lines now trailing.
-            while let Some(last) = lines.last() {
-                if last.trim().is_empty() {
-                    lines.pop();
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-    lines.join("\n")
-}
 
 fn resolve_bind_addr(config: &RuntimeConfig) -> SocketAddr {
     let port = config.gateway.port;
@@ -2565,6 +2512,7 @@ pub(crate) async fn handle_pending_analysis(
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
+        trust: rsclaw_agent::trust::channel_trust(&analysis.channel, &analysis.peer_id, is_group),
         session_key: analysis.session_key,
         text: analysis.text,
         channel: analysis.channel,
@@ -2667,6 +2615,11 @@ async fn run_embedder_reembed(
     /// Docs embedded per batch. Keeps each lock window to a few hundred ms
     /// even with the slowest CPU-only BGE inference.
     const BATCH: usize = 50;
+    /// Stop the pass once this many embeds in a row failed with no success in
+    /// between — the embedder is down (or these docs can never embed), so
+    /// spinning further only burns CPU / remote quota. Unmigrated docs stay
+    /// pending and the next start retries them.
+    const MAX_CONSECUTIVE_FAILURES: usize = 20;
 
     let (embedder, expected_total) = {
         let mut mem = mem_arc.lock().await;
@@ -2679,6 +2632,8 @@ async fn run_embedder_reembed(
 
     let mut total = 0usize;
     let mut batch_no = 0usize;
+    let mut consecutive_failures = 0usize;
+    let mut stopped_early = false;
     loop {
         let pending = {
             let mem = mem_arc.lock().await;
@@ -2694,10 +2649,36 @@ async fn run_embedder_reembed(
         // calls are safe.
         let batch_started = std::time::Instant::now();
         use rayon::prelude::*;
-        let batch: Vec<(usize, Vec<f32>)> = pending
+        let results: Vec<(usize, anyhow::Result<Vec<f32>>)> = pending
             .into_par_iter()
-            .map(|(idx, text)| (idx, embedder.embed(&text)))
+            .map(|(idx, text)| (idx, embedder.try_embed(&text)))
             .collect();
+        let mut batch: Vec<(usize, Vec<f32>)> = Vec::with_capacity(results.len());
+        let mut failed = 0usize;
+        for (idx, res) in results {
+            match res {
+                Ok(v) => batch.push((idx, v)),
+                Err(e) => {
+                    failed += 1;
+                    warn!(idx, error = %format!("{e:#}"), "embedder re-embed: embedding failed, skipping doc");
+                }
+            }
+        }
+        if batch.is_empty() {
+            consecutive_failures += failed;
+        } else {
+            consecutive_failures = 0;
+        }
+        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            warn!(
+                consecutive_failures,
+                total,
+                expected = expected_total,
+                "embedder re-embed: embedder keeps failing; stopping early (remaining docs retry on next start)"
+            );
+            stopped_early = true;
+            break;
+        }
         let applied = {
             let mut mem = mem_arc.lock().await;
             match mem.swap_apply_batch(batch) {
@@ -2731,6 +2712,14 @@ async fn run_embedder_reembed(
             batch_ms = batch_started.elapsed().as_millis() as u64,
             "embedder re-embed: batch complete"
         );
+    }
+
+    if stopped_early && total == 0 {
+        // Nothing migrated: keep the old primary index serving instead of
+        // swapping in an empty one.
+        let mut mem = mem_arc.lock().await;
+        mem.abort_swap();
+        anyhow::bail!("embedder re-embed: embedder failed for every doc; migration aborted");
     }
 
     let migrated = {
@@ -3100,6 +3089,57 @@ pub(crate) async fn ensure_bge_model_present(
     Ok(())
 }
 
+/// After the watcher bridge auto-applied a channel reload, drop the
+/// `channels` scope (and `config.channels` section) from a latched
+/// scoped-reload offer. When nothing is left to offer the latch is cleared and
+/// a `RestartCleared` event is broadcast so open UIs drop the banner live;
+/// when other scopes remain, the trimmed offer is re-broadcast. A pending
+/// full-restart request (`RemedyKind::Restart`) is left untouched.
+fn clear_auto_applied_reload_offer(
+    latch: &Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>>,
+    request_tx: &tokio::sync::broadcast::Sender<rsclaw_events::RestartRequest>,
+    cleared_tx: &tokio::sync::broadcast::Sender<rsclaw_events::RestartCleared>,
+) {
+    let outcome = {
+        let Ok(mut guard) = latch.write() else {
+            warn!("pending_restart lock poisoned; stale reload offer not cleared");
+            return;
+        };
+        let Some(req) = guard.as_mut() else {
+            return;
+        };
+        if req.remedy != rsclaw_events::RemedyKind::Reload
+            || !req.reload_scopes.iter().any(|s| s == "channels")
+        {
+            return;
+        }
+        req.reload_scopes.retain(|s| s != "channels");
+        let rsclaw_events::RestartReason::ConfigChanged { sections } = &mut req.reason;
+        sections.retain(|s| s != "config.channels");
+        if req.reload_scopes.is_empty() {
+            let at_ms = req.at_ms;
+            *guard = None;
+            Err(at_ms)
+        } else {
+            Ok(req.clone())
+        }
+    };
+    // `send` failing just means no WS client is connected; the latch is the
+    // source of truth for late joiners.
+    match outcome {
+        Err(at_ms) => {
+            info!("pending reload offer cleared: channel reload was auto-applied");
+            let _ = cleared_tx.send(rsclaw_events::RestartCleared {
+                at_ms: Some(at_ms),
+                reason: rsclaw_events::RestartClearReason::AutoApplied,
+            });
+        }
+        Ok(trimmed) => {
+            let _ = request_tx.send(trimmed);
+        }
+    }
+}
+
 /// Publish a `RestartRequest` into the broadcast channel and store it in the
 /// `pending_restart` latch so late-connecting UI clients see it on handshake.
 ///
@@ -3142,12 +3182,25 @@ pub(crate) fn publish_restart(
         loop {
             tokio::time::sleep(Duration::from_millis(200)).await;
             if shutdown.inflight() == 0 {
-                let mut updated = req;
-                updated.inflight = 0;
-                if let Ok(mut guard) = latch.write() {
-                    *guard = Some(updated.clone());
+                // Only re-publish the offer that is still latched: if it was
+                // dismissed, auto-cleared or superseded meanwhile, re-latching
+                // it here would resurrect a stale banner.
+                let updated = match latch.write() {
+                    Ok(mut guard) => match guard.as_mut() {
+                        Some(cur) if cur.at_ms == req.at_ms => {
+                            cur.inflight = 0;
+                            Some(cur.clone())
+                        }
+                        _ => None,
+                    },
+                    Err(_) => {
+                        warn!("pending_restart lock poisoned; drained restart not re-published");
+                        None
+                    }
+                };
+                if let Some(updated) = updated {
+                    let _ = tx.send(updated);
                 }
-                let _ = tx.send(updated);
                 return;
             }
             if std::time::Instant::now() >= deadline {
@@ -3171,7 +3224,7 @@ mod user_env_tests {
             "RSCLAW_TEST_USER_ENV_NEW".to_owned(),
             "from-config".to_owned(),
         );
-        apply_user_env_map(&map);
+        apply_user_env_map_owned(&map, &Default::default());
         assert_eq!(
             std::env::var("RSCLAW_TEST_USER_ENV_NEW").as_deref(),
             Ok("from-config")
@@ -3187,13 +3240,41 @@ mod user_env_tests {
             "RSCLAW_TEST_USER_ENV_KEEP".to_owned(),
             "from-config".to_owned(),
         );
-        apply_user_env_map(&map);
+        apply_user_env_map_owned(&map, &Default::default());
         assert_eq!(
             std::env::var("RSCLAW_TEST_USER_ENV_KEEP").as_deref(),
             Ok("from-shell"),
             "shell-provided value must not be overwritten"
         );
         unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_KEEP") };
+    }
+
+    #[test]
+    fn config_owned_value_follows_config_on_restart() {
+        unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_OWNED", "old-config") };
+        unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_DROPPED", "old-config") };
+        let owned: std::collections::HashSet<String> = [
+            "RSCLAW_TEST_USER_ENV_OWNED".to_owned(),
+            "RSCLAW_TEST_USER_ENV_DROPPED".to_owned(),
+        ]
+        .into();
+        let mut map = HashMap::new();
+        map.insert(
+            "RSCLAW_TEST_USER_ENV_OWNED".to_owned(),
+            "new-config".to_owned(),
+        );
+        let now = apply_user_env_map_owned(&map, &owned);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_OWNED").as_deref(),
+            Ok("new-config"),
+            "a value the config exported earlier must follow the edited config"
+        );
+        assert!(
+            std::env::var("RSCLAW_TEST_USER_ENV_DROPPED").is_err(),
+            "a value the config no longer lists must be removed"
+        );
+        assert_eq!(now, vec!["RSCLAW_TEST_USER_ENV_OWNED".to_owned()]);
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_OWNED") };
     }
 
     #[test]
@@ -3205,12 +3286,73 @@ mod user_env_tests {
             "RSCLAW_TEST_USER_ENV_TARGET".to_owned(),
             "${RSCLAW_TEST_USER_ENV_REF}/app.log".to_owned(),
         );
-        apply_user_env_map(&map);
+        apply_user_env_map_owned(&map, &Default::default());
         assert_eq!(
             std::env::var("RSCLAW_TEST_USER_ENV_TARGET").as_deref(),
             Ok("/var/log/foo/app.log")
         );
         unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_REF") };
         unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_TARGET") };
+    }
+}
+
+#[cfg(test)]
+mod reload_offer_tests {
+    use super::*;
+
+    fn latch_with(
+        req: rsclaw_events::RestartRequest,
+    ) -> Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>> {
+        Arc::new(std::sync::RwLock::new(Some(req)))
+    }
+
+    fn reason(sections: &[&str]) -> rsclaw_events::RestartReason {
+        rsclaw_events::RestartReason::ConfigChanged {
+            sections: sections.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn auto_applied_channel_reload_clears_stale_offer() {
+        let (req_tx, mut req_rx) = tokio::sync::broadcast::channel(4);
+        let (clr_tx, mut clr_rx) = tokio::sync::broadcast::channel(4);
+        // Channels-only reload offer: cleared entirely.
+        let latch = latch_with(rsclaw_events::RestartRequest::new_reload(
+            reason(&["config.channels"]),
+            "reload".to_owned(),
+            vec!["channels".to_owned()],
+        ));
+        let at_ms = latch.read().expect("lock").as_ref().map(|r| r.at_ms);
+        clear_auto_applied_reload_offer(&latch, &req_tx, &clr_tx);
+        assert!(latch.read().expect("lock").is_none());
+        let cleared = clr_rx.try_recv().expect("cleared event");
+        assert_eq!(cleared.at_ms, at_ms);
+        assert_eq!(cleared.reason, rsclaw_events::RestartClearReason::AutoApplied);
+
+        // Offer with other scopes left: kept, minus channels.
+        let latch = latch_with(rsclaw_events::RestartRequest::new_reload(
+            reason(&["config.channels", "config.agents"]),
+            "reload".to_owned(),
+            vec!["channels".to_owned(), "agents".to_owned()],
+        ));
+        clear_auto_applied_reload_offer(&latch, &req_tx, &clr_tx);
+        let guard = latch.read().expect("lock");
+        let kept = guard.as_ref().expect("offer kept");
+        assert_eq!(kept.reload_scopes, vec!["agents".to_owned()]);
+        drop(guard);
+        let rebroadcast = req_rx.try_recv().expect("trimmed offer re-broadcast");
+        assert_eq!(rebroadcast.reload_scopes, vec!["agents".to_owned()]);
+        assert!(clr_rx.try_recv().is_err());
+
+        // Hard restart requirement: untouched.
+        let latch = latch_with(rsclaw_events::RestartRequest::new(
+            reason(&["config.channels"]),
+            rsclaw_events::RestartUrgency::Required,
+            "restart".to_owned(),
+        ));
+        clear_auto_applied_reload_offer(&latch, &req_tx, &clr_tx);
+        assert!(latch.read().expect("lock").is_some());
+        assert!(req_rx.try_recv().is_err());
+        assert!(clr_rx.try_recv().is_err());
     }
 }

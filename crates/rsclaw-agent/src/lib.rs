@@ -11,16 +11,21 @@
 pub mod bootstrap;
 pub mod collaboration;
 pub mod compaction;
+pub mod compaction_profile;
 pub mod context_mgr;
 pub mod direct_apis;
 pub use rsclaw_doc as doc;
 pub use rsclaw_evolution as evolution;
 pub mod exec_pool;
 pub mod goal;
+pub mod key_data;
 pub use rsclaw_platform::install_hints;
 pub mod loop_detection;
 pub mod model_resolution;
+pub mod model_switch;
 pub use rsclaw_memory as memory;
+pub mod approvals;
+pub mod tool_approval;
 pub mod args_sanitizer;
 pub mod memory_extractor;
 pub mod platform;
@@ -58,6 +63,7 @@ pub mod tools_voice;
 pub mod tools_web;
 pub mod stock_capability;
 pub mod trace_capture;
+pub mod trust;
 pub mod video;
 pub use rsclaw_types::turn_metrics;
 pub mod web_parsers;
@@ -69,8 +75,9 @@ pub use loop_detection::LoopDetector;
 pub use memory::{MemoryDoc, MemoryStore};
 pub use registry::{
     AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, FileAttachment,
-    ImageAttachment, PendingAnalysis, SessionTokens,
+    ImageAttachment, PendingAnalysis, SessionResetKind, SessionResetRequest, SessionTokens,
 };
 pub use runtime::{AgentRuntime, LiveStatus};
-pub use spawner::AgentSpawner;
+pub use spawner::{AgentSpawner, GoalContinuationFn, RuntimeWiring, process_queued_message};
+pub use trust::SenderTrust;
 pub use workspace::{SessionType, WorkspaceContext};

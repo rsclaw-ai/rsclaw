@@ -26,6 +26,11 @@ pub(crate) fn todo_kv_key(session_key: &str) -> String {
     format!("todo:{session_key}")
 }
 
+/// redb KV key for when the plan was last written (`YYYY-MM-DD HH:MM`).
+pub(crate) fn todo_at_kv_key(session_key: &str) -> String {
+    format!("todo_at:{session_key}")
+}
+
 /// Normalize a todo status keyword. Tolerates the whitespace/case/hyphen
 /// noise the v1 block protocol introduces into string args; returns `None`
 /// for genuinely unknown values so the tool can teach the model the enum.
@@ -54,6 +59,12 @@ fn render_todo(items: &[TodoItem]) -> String {
         .join("\n")
 }
 
+/// PDF files start with `%PDF` within their first KiB (the spec tolerates
+/// junk before the header).
+fn looks_like_pdf(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(1024)].windows(4).any(|w| w == b"%PDF")
+}
+
 impl AgentRuntime {
     // -----------------------------------------------------------------------
     // TTS (text-to-speech)
@@ -74,10 +85,15 @@ impl AgentRuntime {
             text
         };
 
-        let out_path = std::env::temp_dir().join(format!(
-            "rsclaw_tts_{}.wav",
-            chrono::Utc::now().timestamp_millis()
-        ));
+        // Spoken replies are media the user receives like any other, so
+        // they take a canonical name a client can fetch and reference.
+        let out_path = rsclaw_channel::generated_media_path("wav").unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "auto-tts: downloads dir unavailable, using temp");
+            std::env::temp_dir().join(format!(
+                "rsclaw_tts_{}.wav",
+                chrono::Utc::now().timestamp_millis()
+            ))
+        });
         let out_str = out_path.to_string_lossy().to_string();
 
         // Try sherpa-onnx first. Binary lives under
@@ -161,14 +177,13 @@ impl AgentRuntime {
         }
         #[cfg(target_os = "windows")]
         {
-            let safe_text = tts_text.replace('\'', "''");
-            let script = format!(
-                "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile('{}'); $s.Speak('{}')",
-                out_str.replace('\'', "''"),
-                safe_text
-            );
+            // Text and path travel via env vars, never interpolated into the
+            // script, so no quoting can break out of the string literal.
+            let script = "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile($env:RSCLAW_TTS_OUT); $s.Speak($env:RSCLAW_TTS_TEXT)";
             let output = powershell_hidden()
-                .args(["-Command", &script])
+                .env("RSCLAW_TTS_OUT", &out_str)
+                .env("RSCLAW_TTS_TEXT", tts_text)
+                .args(["-Command", script])
                 .output()
                 .await
                 .map_err(|e| anyhow!("auto-tts: SAPI failed: {e}"))?;
@@ -209,8 +224,14 @@ impl AgentRuntime {
 
         let ts = chrono::Utc::now().timestamp_millis();
         let tmp_dir = std::env::temp_dir();
-        // Final output is always mp3 for IM platform compatibility.
-        let out_path = tmp_dir.join(format!("rsclaw_tts_{ts}.mp3"));
+        // Final output is always mp3 for IM platform compatibility. It lands
+        // next to other generated media (~/Downloads/rsclaw/audios) under a
+        // canonical `dl_a_` name, so plugins can reuse it (e.g. as a
+        // voiceover for host compose-video) and users can `@` it.
+        let out_path = rsclaw_channel::generated_media_path("mp3").unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "tts: downloads dir unavailable, using temp");
+            tmp_dir.join(format!("rsclaw_tts_{ts}.mp3"))
+        });
         let out_path_str = out_path.to_string_lossy().to_string();
 
         let is_macos = cfg!(target_os = "macos");
@@ -223,6 +244,10 @@ impl AgentRuntime {
             let mut cmd = tokio::process::Command::new("say");
             if voice != "default" {
                 cmd.args(["-v", voice]);
+            } else if let Some(v) = macos_cjk_voice(text).await {
+                // The system default voice reads CJK as silence; pick an
+                // installed Chinese voice instead.
+                cmd.args(["-v", &v]);
             }
             cmd.args(["-o", &aiff_str, text]);
             let output = cmd
@@ -263,17 +288,20 @@ impl AgentRuntime {
                 }
             }
         } else if is_windows {
-            let script = format!(
-                r#"
+            // Text and output path are passed via env vars, never spliced
+            // into the script: `text` is model-controlled, and a `'` inside
+            // `Speak('...')` would end the literal and run arbitrary
+            // PowerShell.
+            let script = r#"
 Add-Type -AssemblyName System.Speech
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$synth.SetOutputToWaveFile('{}')
-$synth.Speak('{}')
-"#,
-                out_path_str, text
-            );
+$synth.SetOutputToWaveFile($env:RSCLAW_TTS_OUT)
+$synth.Speak($env:RSCLAW_TTS_TEXT)
+"#;
             let output = powershell_hidden()
-                .args(["-Command", &script])
+                .env("RSCLAW_TTS_OUT", &out_path_str)
+                .env("RSCLAW_TTS_TEXT", text)
+                .args(["-Command", script])
                 .output()
                 .await
                 .map_err(|e| anyhow!("tts: PowerShell SAPI failed: {e}"))?;
@@ -322,19 +350,27 @@ $synth.Speak('{}')
             .ok_or_else(|| anyhow!("message: `text` required"))?;
         let channel = args["channel"].as_str().unwrap_or("default");
 
-        // Try to POST to the gateway's own message-send endpoint.
+        // Try to POST to the gateway's own message-send endpoint. The
+        // handler reads `message`; `text` is kept for older gateways. The
+        // endpoint sits behind the gateway Bearer auth when a token is set.
         let port = self.config.gateway.port;
+        let auth_token = self.live.gateway.read().await.auth_token.clone();
 
         let client = reqwest::Client::new();
-        let resp = client
+        let mut req = client
             .post(format!("http://127.0.0.1:{port}/api/v1/message/send"))
+            .header("X-RsClaw-Request", "1")
+            .timeout(std::time::Duration::from_secs(30))
             .json(&json!({
                 "channel": channel,
                 "target": target,
+                "message": text,
                 "text": text
-            }))
-            .send()
-            .await;
+            }));
+        if let Some(token) = auth_token.as_deref().filter(|t| !t.is_empty()) {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
@@ -588,26 +624,27 @@ $synth.Speak('{}')
     // Document & PDF
     // -------------------------------------------------------------------
 
-    pub(crate) async fn tool_doc(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_doc(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let path_str = args["path"]
             .as_str()
             .ok_or_else(|| anyhow!("doc: `path` required"))?;
 
-        let workspace = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
-            .map(super::runtime::expand_tilde)
-            .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("workspace"));
+        // read_doc only reads: it goes through the read scope like
+        // read_file, not the write confinement (which refused to open a
+        // draft in a desktop folder the user had granted).
+        if args["action"].as_str() == Some("read_doc") {
+            let full = self.resolve_readable_path(ctx, path_str)?;
+            return super::doc::handle(&args, &full).await;
+        }
 
-        let pb = std::path::PathBuf::from(path_str);
-        let full = if pb.is_absolute() {
-            pb
-        } else {
-            workspace.join(path_str)
-        };
+        // The other actions create and edit files and are reachable by
+        // non-owners, so the target is confined like write_file (workspace,
+        // owner write roots, or a directory the owner approved) and vetted
+        // against the sensitive-name list.
+        let full = self.resolve_writable_path_approved(ctx, path_str).await?;
+        if self.exec_safety_enabled() || !ctx.turn_ctx.trust.is_owner() {
+            super::security::check_write_safety(path_str, &full, "")?;
+        }
         if let Some(parent) = full.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -615,72 +652,89 @@ $synth.Speak('{}')
         super::doc::handle(&args, &full).await
     }
 
-    pub(crate) async fn tool_pdf(&self, args: Value) -> Result<Value> {
-        let path = args["path"]
-            .as_str()
-            .ok_or_else(|| anyhow!("pdf: `path` required"))?;
+    pub(crate) async fn tool_pdf(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        // "case.pdf#pages=31-60" reads part of a long PDF.
+        let (path, path_pages) = super::tools_ocr::split_page_spec(
+            args["path"]
+                .as_str()
+                .ok_or_else(|| anyhow!("pdf: `path` required"))?
+                .trim(),
+        );
 
-        // If URL, download to temp file first.
+        // If URL, download (SSRF-checked, size-bounded) into a private,
+        // uniquely named temp file that is removed when this call returns.
+        // Otherwise the local path goes through the read scope.
+        let mut _tmp_guard: Option<tempfile::NamedTempFile> = None;
         let local_path = if path.starts_with("http://") || path.starts_with("https://") {
-            let tmp = std::env::temp_dir().join("rsclaw_pdf_download.pdf");
-            let client = reqwest::Client::new();
-            let bytes = client
-                .get(path)
-                .send()
+            let allow_private = super::tools_web::web_allow_private(ctx.turn_ctx.trust);
+            let mut req = rsclaw_util::net::SafeRequest::get(path);
+            req.timeout = std::time::Duration::from_secs(60);
+            let resp = super::tools_web::send_guarded(reqwest::Client::builder, req, allow_private)
                 .await
-                .map_err(|e| anyhow!("pdf: download failed: {e}"))?
-                .bytes()
-                .await
-                .map_err(|e| anyhow!("pdf: download read failed: {e}"))?;
-            tokio::fs::write(&tmp, &bytes)
+                .map_err(|e| anyhow!("pdf: download failed: {e}"))?;
+            if !resp.status().is_success() {
+                bail!("pdf: download failed: HTTP {}", resp.status());
+            }
+            let bytes = rsclaw_util::net::read_body_limited(
+                resp,
+                super::security::MAX_LOCAL_BINARY_READ_BYTES as usize,
+            )
+            .await
+            .map_err(|e| anyhow!("pdf: download read failed: {e}"))?;
+            let tmp = tempfile::Builder::new()
+                .prefix("rsclaw_pdf_")
+                .suffix(".pdf")
+                .tempfile()
+                .map_err(|e| anyhow!("pdf: create temp file failed: {e}"))?;
+            tokio::fs::write(tmp.path(), &bytes)
                 .await
                 .map_err(|e| anyhow!("pdf: write temp file failed: {e}"))?;
-            tmp
+            let p = tmp.path().to_path_buf();
+            _tmp_guard = Some(tmp);
+            p
         } else {
-            std::path::PathBuf::from(path)
+            let full = self.resolve_readable_path(ctx, path)?;
+            if let Some(note) = super::tools_file::missing_file_note(&full) {
+                bail!("pdf: {note}");
+            }
+            full
         };
 
-        // Pure Rust PDF extraction, with pdftotext CLI fallback.
-        let pdf_bytes = tokio::fs::read(&local_path)
-            .await
-            .map_err(|e| anyhow!("pdf: read failed: {e}"))?;
-        let text = match crate::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("pdf-extract failed ({e}), trying pdftotext CLI");
-                #[allow(unused_mut)]
-                let mut pdf_cmd = tokio::process::Command::new("pdftotext");
-                pdf_cmd.args([local_path.to_str().unwrap_or(""), "-"]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    pdf_cmd.creation_flags(0x08000000);
+        let pdf_bytes = super::security::read_regular_file_capped(
+            &local_path,
+            super::security::MAX_LOCAL_BINARY_READ_BYTES,
+        )
+        .await
+        .map_err(|e| anyhow!("pdf: read failed: {e}"))?;
+        // Not a PDF at all (a model handed it a .docx): read an Office file
+        // the way read_file does instead of failing on the header, and say
+        // which tool fits next time.
+        if !looks_like_pdf(&pdf_bytes) {
+            let name = local_path.to_string_lossy();
+            if super::tools_file::is_office_document(&name) {
+                if let Some(text) = super::tools_file::read_office_text(&name, &local_path).await? {
+                    return Ok(json!({
+                        "path": path,
+                        "content": text,
+                        "note": "This is not a PDF but an Office document; it was read as one. Use read_file for Word / Excel / PowerPoint files."
+                    }));
                 }
-                let output = pdf_cmd.output().await
-                    .map_err(|e2| anyhow!("pdf: built-in extraction failed ({e}) and the pdftotext fallback could not be run ({e2} — likely poppler-utils not installed). Install poppler-utils, or the PDF may be scanned/image-only and need OCR"))?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(anyhow!("pdf: extraction failed: {e}, pdftotext: {stderr}"));
-                }
-                String::from_utf8_lossy(&output.stdout).into_owned()
             }
-        };
-        // Truncate to 100k chars to avoid blowing up context.
-        let truncated = if text.len() > 100_000 {
-            let mut end = 100_000usize;
-            while end < text.len() && !text.is_char_boundary(end) {
-                end += 1;
-            }
-            format!("{}...\n[truncated at 100000 chars]", &text[..end])
-        } else {
-            text
-        };
-
-        Ok(json!({
-            "path": path,
-            "text": truncated,
-            "chars": truncated.len()
-        }))
+            return Ok(json!({
+                "error": format!("pdf: `{path}` is not a PDF file"),
+                "hint": "Use read_file for documents and text files, and ocr for images."
+            }));
+        }
+        // Each page's text layer; pages without one (scans) are rendered in
+        // pure Rust and read by OCR, so scanned case files need no
+        // pdftoppm / poppler and no page-by-page shell work.
+        Ok(super::tools_ocr::read_pdf(
+            path,
+            pdf_bytes,
+            args["pages"].as_str().or(path_pages),
+            super::tools_ocr::OcrRequest::from_config(),
+        )
+        .await)
     }
 
     // -------------------------------------------------------------------
@@ -701,7 +755,7 @@ $synth.Speak('{}')
         let action = args["action"].as_str().unwrap_or("search").trim();
         match action {
             "search" => self.tool_memory_search(ctx, args).await,
-            "get" => self.tool_memory_get(args).await,
+            "get" => self.tool_memory_get(ctx, args).await,
             "put" => self.tool_memory_put(ctx, args).await,
             "delete" => {
                 // Memory deletion only allowed from internal channels (meditation/cron).
@@ -713,7 +767,7 @@ $synth.Speak('{}')
                         "memory delete is not available in conversations. Use the /memory clear command instead."
                     )
                 }
-                self.tool_memory_delete(args).await
+                self.tool_memory_delete(ctx, args).await
             }
             _ => bail!("memory: unknown action '{action}' (search, get, put, delete)"),
         }
@@ -739,10 +793,12 @@ $synth.Speak('{}')
             );
         };
         let key = todo_kv_key(&ctx.session_key);
+        let at_key = todo_at_kv_key(&ctx.session_key);
         if items.is_empty() {
             if let Err(e) = self.store.db.kv_delete(&key) {
                 tracing::warn!("todo: clear failed for {key}: {e:#}");
             }
+            let _ = self.store.db.kv_delete(&at_key);
             return Ok(json!({"plan": "(cleared)", "items": 0}));
         }
         if items.len() > MAX_ITEMS {
@@ -772,6 +828,10 @@ $synth.Speak('{}')
         }
         let raw = serde_json::to_string(&clean)?;
         self.store.db.kv_set(&key, &raw)?;
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        if let Err(e) = self.store.db.kv_set(&at_key, &now) {
+            tracing::warn!("todo: timestamp write failed for {at_key}: {e:#}");
+        }
         Ok(json!({"plan": render_todo(&clean), "items": clean.len()}))
     }
 
@@ -806,26 +866,41 @@ $synth.Speak('{}')
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "rsclaw".to_owned());
 
+        let name = name.trim();
+        if name.is_empty() || name.starts_with('-') {
+            bail!("tool_install: invalid tool name {name:?}");
+        }
+
         let mut cmd = tokio::process::Command::new(&exe);
-        cmd.args(["tools", "install", name])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        cmd.args(["tools", "install", "--", name]);
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| anyhow!("tool_install: failed to run: {e}"))?;
+        // Bounded: large runtimes download for a while, but a wedged
+        // installer must not hang the turn forever (the tree is killed).
+        const INSTALL_TIMEOUT_SECS: u64 = 900;
+        let output = super::exec_pool::run_capped(
+            cmd,
+            std::time::Duration::from_secs(INSTALL_TIMEOUT_SECS),
+            super::exec_pool::EXEC_OUTPUT_CAP,
+            true,
+        )
+        .await
+        .map_err(|e| anyhow!("tool_install: failed to run: {e}"))?;
+        if output.timed_out {
+            bail!(
+                "tool_install: `{name}` did not finish within {INSTALL_TIMEOUT_SECS}s and was stopped. Check the network, then retry."
+            );
+        }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = output.stdout_text();
+        let stderr = output.stderr_text();
 
         // Post-install verification: check that the tool binary actually exists.
         // Prevents reporting success when only an empty directory was created.
-        let verified = if output.status.success() {
+        let verified = if output.status.is_some_and(|s| s.success()) {
             match name {
                 "chrome" => super::platform::detect_chrome().is_some(),
                 "ffmpeg" => super::platform::detect_ffmpeg().is_some(),
@@ -1042,6 +1117,7 @@ $synth.Speak('{}')
                 tool_log: vec![],
                 question: Some(prompt),
                 channel: None,
+                origin: None,
             });
         }
 
@@ -1270,4 +1346,68 @@ mod todo_tests {
     fn todo_kv_key_is_namespaced() {
         assert_eq!(todo_kv_key("telegram:123"), "todo:telegram:123");
     }
+}
+
+#[cfg(test)]
+mod pdf_header_tests {
+    use super::looks_like_pdf;
+
+    #[test]
+    fn pdf_header_tells_a_pdf_from_a_docx() {
+        assert!(looks_like_pdf(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj"));
+        assert!(looks_like_pdf(b"\xef\xbb\xbf\r\n%PDF-1.4"));
+        // A .docx is a zip.
+        assert!(!looks_like_pdf(b"PK\x03\x04\x14\x00\x06\x00"));
+        assert!(!looks_like_pdf(b""));
+    }
+}
+
+/// Pick an installed macOS `say` voice for Chinese text, or `None` when the
+/// text has no CJK characters or no Chinese voice is installed.
+async fn macos_cjk_voice(text: &str) -> Option<String> {
+    let has_cjk = text
+        .chars()
+        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3400}'..='\u{4dbf}').contains(&c));
+    if !has_cjk {
+        return None;
+    }
+    let out = tokio::process::Command::new("say")
+        .args(["-v", "?"])
+        .output()
+        .await
+        .ok()?;
+    let list = String::from_utf8_lossy(&out.stdout);
+    // Lines look like `Eddy (Chinese (China mainland)) zh_CN    # 你好！`;
+    // `say -v` needs the full name before the locale column.
+    let voices: Vec<(String, String)> = list
+        .lines()
+        .filter_map(|l| {
+            let head = l.split_once('#').map_or(l, |(h, _)| h).trim_end();
+            let (name, locale) = head.rsplit_once(char::is_whitespace)?;
+            Some((name.trim().to_string(), locale.trim().to_string()))
+        })
+        .filter(|(n, _)| !n.is_empty())
+        .collect();
+    // Newer macOS names voices `Tingting (Chinese (China mainland))`.
+    let by_name = |want: &str| {
+        let prefix = format!("{want} (");
+        voices
+            .iter()
+            .find(|(n, _)| n == want || n.starts_with(&prefix))
+            .map(|(n, _)| n.clone())
+    };
+    by_name("Tingting")
+        .or_else(|| {
+            voices
+                .iter()
+                .find(|(_, l)| l == "zh_CN")
+                .map(|(n, _)| n.clone())
+        })
+        .or_else(|| by_name("Meijia"))
+        .or_else(|| {
+            voices
+                .iter()
+                .find(|(_, l)| l.starts_with("zh_"))
+                .map(|(n, _)| n.clone())
+        })
 }

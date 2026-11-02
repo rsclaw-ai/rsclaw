@@ -83,6 +83,7 @@
 // The 7 root-knot modules (composition root + RPC handlers).
 // ---------------------------------------------------------------------------
 pub mod a2a;
+pub mod bundled_plugins;
 pub mod cmd;
 pub mod cron;
 pub mod gateway;
@@ -145,8 +146,8 @@ use tracing_subscriber::EnvFilter;
 ///   2. `--dev`     → ~/.rsclaw-dev,    port 18889
 ///   3. `--profile` → ~/.rsclaw-<name>, port 18890..N (deterministic hash)
 ///   4. default     → ~/.rsclaw,        port 18888
-const BASE_PORT: u16 = 18888;
-const DEV_PORT: u16 = 18889;
+const BASE_PORT: u16 = rsclaw_brand::DEFAULT_PORT;
+const DEV_PORT: u16 = rsclaw_brand::DEV_PORT;
 
 /// Best-effort read of `gateway.port` from `<base_dir>/rsclaw.json5`.
 /// Returns None when the file doesn't exist, doesn't parse, or doesn't set
@@ -154,7 +155,7 @@ const DEV_PORT: u16 = 18889;
 /// uses raw JSON5 here (not the schema deserializer) so a malformed
 /// unrelated config field never blocks port resolution.
 fn read_config_port(base_dir: &std::path::Path) -> Option<u16> {
-    let path = base_dir.join("rsclaw.json5");
+    let path = base_dir.join(rsclaw_brand::CONFIG_FILE);
     let text = std::fs::read_to_string(&path).ok()?;
     let value: serde_json::Value = json5::from_str(&text).ok()?;
     value
@@ -197,7 +198,7 @@ fn resolve_instance(cli: &Cli) -> (std::path::PathBuf, u16) {
                 root.file_name().unwrap_or_default().to_string_lossy()
             ))
         } else {
-            home.join(".rsclaw-dev")
+            home.join(rsclaw_brand::profile_home_dir("dev"))
         };
         return (dir, DEV_PORT);
     }
@@ -208,13 +209,22 @@ fn resolve_instance(cli: &Cli) -> (std::path::PathBuf, u16) {
                 root.file_name().unwrap_or_default().to_string_lossy()
             ))
         } else {
-            home.join(format!(".rsclaw-{name}"))
+            home.join(rsclaw_brand::profile_home_dir(name))
         };
         let offset =
             (name.bytes().fold(0u32, |a, b| a.wrapping_add(u32::from(b))) % 254) as u16 + 1;
         return (dir, DEV_PORT + offset);
     }
     (root, BASE_PORT)
+}
+
+/// Rewrite a top-level error's text (and its cause chain) into this build's
+/// brand before `main` prints it. Identity for the default brand.
+pub fn brand_error(e: anyhow::Error) -> anyhow::Error {
+    if rsclaw_brand::ID == "rsclaw" {
+        return e;
+    }
+    anyhow::anyhow!(rsclaw_brand::rebrand(&format!("{e:?}")).into_owned())
 }
 
 /// Top-level async dispatch. Called by `main.rs` inside the tokio runtime.
@@ -230,9 +240,9 @@ pub async fn run() -> Result<()> {
         let version = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
         match option_env!("RSCLAW_BUILD_COMMIT") {
             Some(commit) if !commit.is_empty() && commit != "unknown" => {
-                println!("rsclaw v{version} ({commit})")
+                println!("{} v{version} ({commit})", rsclaw_brand::CLI_NAME)
             }
-            _ => println!("rsclaw v{version}"),
+            _ => println!("{} v{version}", rsclaw_brand::CLI_NAME),
         }
         return Ok(());
     }
@@ -364,7 +374,7 @@ async fn cmd_pairing(sub: rsclaw_cli::PairingCommand) -> Result<()> {
             let port = std::env::var("RSCLAW_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
-                .unwrap_or_else(|| config.as_ref().map_or(18888, |c| c.gateway.port));
+                .unwrap_or_else(|| config.as_ref().map_or(BASE_PORT, |c| c.gateway.port));
             let auth_token_val = config
                 .as_ref()
                 .and_then(|c| c.gateway.auth_token.clone())
@@ -389,7 +399,7 @@ async fn cmd_pairing(sub: rsclaw_cli::PairingCommand) -> Result<()> {
                 }
                 _ => {
                     println!("  [!] Gateway not reachable at port {port}");
-                    println!("      Start the gateway first: rsclaw gateway start");
+                    println!("      Start the gateway first: {} gateway start", rsclaw_brand::CLI_NAME);
                 }
             }
         }
@@ -427,8 +437,7 @@ fn resolve_gateway_token(explicit: Option<String>) -> String {
                 .as_ref()
                 .and_then(|g| g.auth.as_ref())
                 .and_then(|a| a.token.as_ref())
-                .and_then(|s| s.as_plain())
-                .map(str::to_owned)
+                .and_then(|s| s.resolve_full(cfg.secrets.as_ref()))
             {
                 return t;
             }

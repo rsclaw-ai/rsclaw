@@ -49,7 +49,7 @@ pub async fn cmd_memory(sub: MemoryCommand) -> Result<()> {
             // workflow. When the gateway is up there is no safe way for
             // the CLI to grab the write lock; bail with a hint.
             if gateway_up {
-                anyhow::bail!(
+                brand_bail!(
                     "memory index requires exclusive access; stop the gateway first \
                      (`rsclaw gateway stop`) then re-run."
                 );

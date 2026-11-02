@@ -37,6 +37,7 @@ pub use rsclaw_cron::{
     export_cron_jobs_to_file, extract_saved_files_content, init_cron_store, install_reload_sender,
     load_cron_jobs, load_cron_jobs_from_file, reconcile_file_to_redb_on_boot,
     resolve_cron_store_path, save_cron_jobs, trigger_reload, validate_cron_expr,
+    validate_cron_expr_tz,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -68,11 +69,40 @@ const STUCK_RUN_MS: u64 = 2 * 60 * 60 * 1000; // 2 hours
 /// `consecutive_errors` is not bumped and the new job version starts clean.
 const CANCEL_BY_RELOAD: &str = "cron: cancelled by reload";
 
+/// A run whose scheduled time passed while the gateway was down fires once on
+/// startup when it is at most this late. Older one-shot runs are reported as
+/// missed and removed; older recurring runs skip to their next slot. The same
+/// window bounds how long an unfired one-shot may sit past due in the loop.
+const MISSED_RUN_GRACE_MS: u64 = 10 * 60 * 1000;
+
 /// Wake-mode prefix for a plugin-owned, read-only cron preflight.
 const PLUGIN_PREFLIGHT_WAKE_MODE_PREFIX: &str = "plugin-preflight:";
 
 /// Bound plugin preflights so an unavailable external UI cannot stall cron.
 const PLUGIN_PREFLIGHT_TIMEOUT_SECS: u64 = 180;
+/// Knowledge-base excerpts a preflight's `kbQuery` puts in front of the
+/// agent: how many hits, how long each may be, and how long the search may
+/// take before the turn goes ahead without them.
+const KB_PREFETCH_HITS: usize = 5;
+const KB_PREFETCH_HIT_BYTES: usize = 1200;
+const KB_PREFETCH_QUERY_BYTES: usize = 600;
+const KB_PREFETCH_TIMEOUT_SECS: u64 = 10;
+
+/// How long a run's delivery may take before it counts as failed.
+const DELIVERY_TIMEOUT_SECS: u64 = 60;
+
+/// What became of a run's delivery: `None` when it had nothing to deliver,
+/// `Ok(false)` when no recipient was set or found, `Ok(true)` when sent,
+/// `Err` with why it failed.
+type DeliveryOutcome = Option<std::result::Result<bool, String>>;
+
+/// Where deliveries addressed to a session go: its history and its
+/// `/api/v1/stream` subscribers.
+#[derive(Clone)]
+pub struct SessionSink {
+    pub db: Arc<rsclaw_store::redb_store::RedbStore>,
+    pub event_bus: broadcast::Sender<rsclaw_events::AgentEvent>,
+}
 
 // ---------------------------------------------------------------------------
 // CronRunner
@@ -98,6 +128,8 @@ pub struct CronRunner {
     default_delivery: Option<CronDelivery>,
     reload_tx: broadcast::Sender<()>,
     ws_conns: Arc<crate::ws::ConnRegistry>,
+    /// Deliveries addressed to a session; see [`SessionSink`].
+    session_sink: Option<SessionSink>,
     /// Optional graceful-shutdown coordinator. When draining, the scheduler
     /// loop exits at the next iteration without firing further jobs. Tests
     /// that don't care about graceful shutdown can pass `None`.
@@ -165,10 +197,19 @@ impl CronRunner {
             default_delivery: config.default_delivery.clone(),
             reload_tx,
             ws_conns,
+            session_sink: None,
             shutdown,
             parse_failed,
             daemon_agent_ids: Vec::new(),
         }
+    }
+
+    /// Deliver results addressed to a session (jobs made in the app's HTTP
+    /// chat) into that session.
+    #[must_use]
+    pub fn with_session_sink(mut self, sink: SessionSink) -> Self {
+        self.session_sink = Some(sink);
+        self
     }
 
     /// Agent IDs that run as long-lived daemon loops — their cron-triggered
@@ -222,6 +263,11 @@ impl CronRunner {
 
         // Fast path: redb available (production).
         if let Some(store) = cron_store() {
+            // Same lock as every other cron writer (HTTP / WS / agent tool):
+            // the merge below is a read-modify-write against redb, and the
+            // cron.json5 export must not land after (and overwrite) a newer
+            // write made by another writer.
+            let _guard = CRON_FILE_LOCK.lock().await;
             for mem_job in jobs {
                 let merged = match store.cron_get(&mem_job.id) {
                     Ok(Some(json)) => match serde_json::from_str::<CronJob>(&json) {
@@ -282,9 +328,15 @@ impl CronRunner {
                     .into_iter()
                     .filter_map(|(_, j)| serde_json::from_str(&j).ok())
                     .collect();
-                tokio::task::spawn_blocking(move || {
+                // Awaited (not detached) so the export completes while the
+                // lock is still held.
+                if let Err(e) = tokio::task::spawn_blocking(move || {
                     export_cron_jobs_to_file(&exported);
-                });
+                })
+                .await
+                {
+                    warn!(err = %e, "cron: export task failed");
+                }
             }
             return Ok(());
         }
@@ -313,6 +365,8 @@ impl CronRunner {
         let mut jobs = self.jobs.clone();
         let now_ms = current_timestamp_ms();
 
+        let mut missed_once: Vec<CronJob> = Vec::new();
+
         // Initialize state for each job
         for job in &mut jobs {
             if job.state.is_none() {
@@ -332,13 +386,63 @@ impl CronRunner {
                 }
             }
 
-            // Compute next_run_at_ms if not set OR if the stored value is in the past
-            // (may have been computed with the old buggy algorithm that ignored timezone)
-            if state.next_run_at_ms.is_none() || state.next_run_at_ms.is_some_and(|t| t <= now_ms) {
-                let old_ts = state.next_run_at_ms;
-                state.next_run_at_ms = job.schedule.compute_next_run(now_ms);
-                info!(job_id = %job.id, old = ?old_ts, new = ?state.next_run_at_ms, "cron: recomputed next_run_at_ms");
+            // Runs that came due while the gateway was down: fire once now if
+            // only slightly late; otherwise one-shots are reported as missed
+            // and removed, recurring jobs skip to their next slot.
+            match state.next_run_at_ms {
+                Some(t) if t <= now_ms && job.enabled && now_ms - t <= MISSED_RUN_GRACE_MS => {
+                    info!(
+                        job_id = %job.id,
+                        late_secs = (now_ms - t) / 1000,
+                        "cron: run came due during downtime, firing once now"
+                    );
+                }
+                Some(t) if t <= now_ms && job.enabled && job.schedule.is_once() => {
+                    warn!(
+                        job_id = %job.id,
+                        due_at_ms = t,
+                        "cron: one-shot job missed while the gateway was down; removing"
+                    );
+                    state.next_run_at_ms = None;
+                    job.enabled = false;
+                    missed_once.push(job.clone());
+                }
+                Some(t) if t > now_ms => {}
+                old_ts => {
+                    // Not set, or in the past (possibly computed by the old
+                    // algorithm that ignored timezone): recompute.
+                    state.next_run_at_ms = job.schedule.compute_next_run(now_ms);
+                    info!(job_id = %job.id, old = ?old_ts, new = ?state.next_run_at_ms, "cron: recomputed next_run_at_ms");
+                }
             }
+        }
+
+        // Tell the owners of missed one-shot jobs (best effort, detached).
+        for job in missed_once {
+            let channels = Arc::clone(&self.channels);
+            let agents = Arc::clone(&self.agents);
+            let default_delivery = self.default_delivery.clone();
+            let sink = self.session_sink.clone();
+            tokio::spawn(async move {
+                let name = job.name.clone().unwrap_or_else(|| job.id.clone());
+                let text = rsclaw_i18n::t_fmt(
+                    "cron_oneshot_missed",
+                    rsclaw_i18n::default_lang(),
+                    &[("name", &name)],
+                );
+                if let Err(e) = send_delivery(
+                    &channels,
+                    &agents,
+                    sink.as_ref(),
+                    &job,
+                    &default_delivery,
+                    &text,
+                )
+                .await
+                {
+                    warn!(job_id = %job.id, %e, "cron: missed-run notice delivery failed");
+                }
+            });
         }
 
         // Sweep zombie one-shot jobs left disabled by previous runs that
@@ -419,8 +523,14 @@ impl CronRunner {
         mut reload_rx: broadcast::Receiver<()>,
     ) {
         // Channel for collecting job results asynchronously.
-        let (result_tx, mut result_rx) =
-            tokio::sync::mpsc::channel::<(String, bool, u64, u64, Option<String>)>(64);
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<(
+            String,
+            bool,
+            u64,
+            u64,
+            Option<String>,
+            DeliveryOutcome,
+        )>(64);
 
         // Cancel flags for running jobs — set to true to signal abort on deletion.
         let mut cancel_flags: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = HashMap::new();
@@ -488,9 +598,11 @@ impl CronRunner {
 
             let next_wake = next_wake_job.map(|(t, _, _)| t);
 
-            // Auto-remove expired once jobs (past due by > 5 minutes).
-            // This prevents stale once jobs from spamming "next_wake in the past" warnings.
-            let expired_threshold_ms = 5 * 60 * 1000;
+            // Auto-remove expired once jobs (past due by > MISSED_RUN_GRACE_MS).
+            // This prevents stale once jobs from spamming "next_wake in the past"
+            // warnings. Must not be shorter than the startup catch-up window,
+            // or a caught-up one-shot would be removed before it fires.
+            let expired_threshold_ms = MISSED_RUN_GRACE_MS;
             let before_len = jobs.len();
             jobs.retain(|j| {
                 if !j.schedule.is_once() || !j.enabled { return true; }
@@ -652,7 +764,7 @@ impl CronRunner {
             // This is critical: if we skip try_recv when due.is_empty(), runningAtMs
             // will never be cleared, causing the job to be stuck forever.
             let mut collected_count = 0;
-            while let Ok((job_id, success, duration_ms, started_at, error_msg)) =
+            while let Ok((job_id, success, duration_ms, started_at, error_msg, delivered)) =
                 result_rx.try_recv()
             {
                 collected_count += 1;
@@ -663,6 +775,22 @@ impl CronRunner {
                         state.running_at_ms = None;
                         state.last_run_at_ms = Some(current_timestamp_ms());
                         state.last_duration_ms = Some(duration_ms);
+                        // Recorded apart from the run's own status: a reminder
+                        // that fired but reached nobody still ran.
+                        match &delivered {
+                            Some(Ok(true)) => {
+                                state.last_delivery_status = Some("ok".to_string());
+                                state.last_delivery_error = None;
+                            }
+                            Some(Err(e)) => {
+                                state.last_delivery_status = Some("error".to_string());
+                                state.last_delivery_error = Some(e.clone());
+                            }
+                            _ => {
+                                state.last_delivery_status = None;
+                                state.last_delivery_error = None;
+                            }
+                        }
 
                         let completion_time = started_at + duration_ms;
 
@@ -889,6 +1017,7 @@ impl CronRunner {
                 let channels = Arc::clone(&self.channels);
                 let run_log_dir = self.run_log_dir.clone();
                 let default_delivery = self.default_delivery.clone();
+                let session_sink = self.session_sink.clone();
                 let ws_conns = Arc::clone(&self.ws_conns);
                 // Track this job in the gateway's inflight count so a graceful
                 // restart waits for it (until drain timeout) before exiting.
@@ -905,8 +1034,9 @@ impl CronRunner {
                         .unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
+                    let mut after_turn: Option<AfterTurn> = None;
                     let preflight_result = match parse_plugin_preflight(job.wake_mode.as_deref()) {
-                        Ok(Some(preflight)) => {
+                        Ok(Some(_)) => {
                             // Read the CURRENT plugin registry at dispatch
                             // time, not whatever was live when the cron
                             // scheduler was constructed.
@@ -914,18 +1044,22 @@ impl CronRunner {
                                 Some(lock) => Some(lock.read().await.clone()),
                                 None => None,
                             };
-                            match run_plugin_preflight(wasm_plugins_now.as_deref(), &preflight)
-                                .await
+                            let kb_scope = agents
+                                .get(&job.agent_id)
+                                .ok()
+                                .and_then(|a| a.config.kb.as_ref()?.collections.clone());
+                            match preflight_message(
+                                job.wake_mode.as_deref(),
+                                job.effective_message(),
+                                wasm_plugins_now.as_deref(),
+                                kb_scope.as_deref(),
+                            )
+                            .await
                             {
-                                Ok(outcome) if !outcome.should_run => {
-                                    Some(Ok("plugin preflight: no work".to_string()))
-                                }
-                                Ok(outcome) => {
-                                    job.bake_message(format!(
-                                    "{}\n\nPlugin preflight result (already executed; do not call it again):\n{}",
-                                    job.effective_message(),
-                                    outcome.result
-                                ));
+                                Ok(None) => Some(Ok("plugin preflight: no work".to_string())),
+                                Ok(Some(preflighted)) => {
+                                    job.bake_message(preflighted.message);
+                                    after_turn = preflighted.after_turn;
                                     None
                                 }
                                 Err(error) => Some(Err(error)),
@@ -964,6 +1098,7 @@ impl CronRunner {
                             job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false),
                             &job,
                             &agents,
+                            Some(Arc::clone(&cancelled)),
                         )
                         .await
                     } else {
@@ -983,6 +1118,15 @@ impl CronRunner {
                             }
                         }
                     };
+                    // The turn has ended, however it ended: let the
+                    // preflight settle what it may have left open.
+                    if let Some(after) = &after_turn {
+                        let wasm_plugins_now = match &wasm_plugins {
+                            Some(lock) => Some(lock.read().await.clone()),
+                            None => None,
+                        };
+                        run_after_turn(after, wasm_plugins_now.as_deref(), &job.id).await;
+                    }
                     let duration_ms = current_timestamp_ms() - start_time;
                     drop(permit);
 
@@ -1018,12 +1162,25 @@ impl CronRunner {
                             let backoff = error_backoff_ms(consecutive);
                             let will_disable = consecutive >= MAX_CONSECUTIVE_ERRORS;
 
+                            let lang = rsclaw_i18n::default_lang();
                             let backoff_text = if backoff < 60_000 {
-                                format!("{}秒", backoff / 1000)
+                                rsclaw_i18n::t_fmt(
+                                    "cron_backoff_seconds",
+                                    lang,
+                                    &[("n", &(backoff / 1000).to_string())],
+                                )
                             } else if backoff < 3_600_000 {
-                                format!("{}分钟", backoff / 60_000)
+                                rsclaw_i18n::t_fmt(
+                                    "cron_backoff_minutes",
+                                    lang,
+                                    &[("n", &(backoff / 60_000).to_string())],
+                                )
                             } else {
-                                format!("{}小时", backoff / 3_600_000)
+                                rsclaw_i18n::t_fmt(
+                                    "cron_backoff_hours",
+                                    lang,
+                                    &[("n", &(backoff / 3_600_000).to_string())],
+                                )
                             };
 
                             let consecutive_str = consecutive.to_string();
@@ -1058,26 +1215,34 @@ impl CronRunner {
                     // separate direct broadcast here (would double-deliver).
                     let _ = &ws_conns; // kept in scope for future direct use
 
-                    // Spawn delivery as a detached task so it doesn't block.
-                    // The result is logged but we don't wait for it.
-                    if let Some(delivery_text) = delivery_text {
-                        let delivery_channels = Arc::clone(&channels);
-                        let delivery_agents = Arc::clone(&agents);
-                        let delivery_job = job.clone();
-                        let delivery_default = default_delivery.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = send_delivery(
-                                &delivery_channels,
-                                &delivery_agents,
-                                &delivery_job,
-                                &delivery_default,
-                                &delivery_text,
+                    // Awaited (bounded) so the job's state can say whether
+                    // the result reached anyone.
+                    let delivered: DeliveryOutcome = match delivery_text {
+                        Some(delivery_text) => Some(
+                            match tokio::time::timeout(
+                                Duration::from_secs(DELIVERY_TIMEOUT_SECS),
+                                send_delivery(
+                                    &channels,
+                                    &agents,
+                                    session_sink.as_ref(),
+                                    &job,
+                                    &default_delivery,
+                                    &delivery_text,
+                                ),
                             )
                             .await
                             {
-                                warn!(job_id = %delivery_job.id, %e, "delivery failed");
-                            }
-                        });
+                                Ok(Ok(sent)) => Ok(sent),
+                                Ok(Err(e)) => Err(format!("{e:#}")),
+                                Err(_) => Err(format!(
+                                    "delivery timed out after {DELIVERY_TIMEOUT_SECS}s"
+                                )),
+                            },
+                        ),
+                        None => None,
+                    };
+                    if let Some(Err(e)) = &delivered {
+                        warn!(job_id = %job.id, error = %e, "cron: delivery failed");
                     }
 
                     let entry = build_run_log_entry(
@@ -1096,6 +1261,7 @@ impl CronRunner {
                         duration_ms,
                         job_started_at,
                         error_msg,
+                        delivered,
                     )
                 });
 
@@ -1103,16 +1269,29 @@ impl CronRunner {
                 let result_tx = result_tx.clone();
                 tokio::spawn(async move {
                     let result = handle.await;
-                    match result {
+                    let r = match result {
                         Ok(r) => {
                             tracing::info!(job_id = %job_id_for_log, success = r.1, duration_ms = r.2, "cron: result sender got result, sending to channel");
-                            if let Err(e) = result_tx.send(r).await {
-                                tracing::warn!(job_id = %job_id_for_log, "cron: failed to send result to channel: {}", e);
-                            }
+                            r
                         }
                         Err(e) => {
-                            tracing::warn!(job_id = %job_id_for_log, "cron: handle.await failed (spawn error): {}", e);
+                            // The job task died (panic / runtime cancel). Report
+                            // a failure so running_at_ms is cleared instead of
+                            // leaving the job "running" forever.
+                            tracing::warn!(job_id = %job_id_for_log, "cron: job task failed to complete: {}", e);
+                            let duration_ms = current_timestamp_ms().saturating_sub(started_at);
+                            (
+                                job_id_for_log.clone(),
+                                false,
+                                duration_ms,
+                                started_at,
+                                Some(format!("cron job task aborted: {e}")),
+                                None,
+                            )
                         }
+                    };
+                    if let Err(e) = result_tx.send(r).await {
+                        tracing::warn!(job_id = %job_id_for_log, "cron: failed to send result to channel: {}", e);
                     }
                 });
             }
@@ -1176,6 +1355,7 @@ impl CronRunner {
                 job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false),
                 job,
                 &self.agents,
+                None,
             )
             .await
         } else {
@@ -1218,6 +1398,7 @@ impl CronRunner {
         if let Err(e) = send_delivery(
             &self.channels,
             &self.agents,
+            self.session_sink.as_ref(),
             job,
             &self.default_delivery,
             &delivery_text,
@@ -1330,6 +1511,7 @@ impl Clone for CronRunner {
             default_delivery: self.default_delivery.clone(),
             reload_tx: self.reload_tx.clone(),
             ws_conns: Arc::clone(&self.ws_conns),
+            session_sink: self.session_sink.clone(),
             shutdown: self.shutdown.clone(),
             parse_failed: self.parse_failed,
         }
@@ -1346,10 +1528,165 @@ struct PluginPreflight {
     tool_name: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 struct PluginPreflightOutcome {
     result: String,
     should_run: bool,
+    after_turn: Option<AfterTurn>,
+    kb_query: Option<String>,
+}
+
+/// A call the preflight asks for once the agent turn it fed has ended, on the
+/// preflight's own plugin: the preflight result's
+/// `afterTurn: {tool, arguments}`. It settles what the turn may have left
+/// open (a reply ticket nobody answered holds the phone otherwise).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AfterTurn {
+    plugin_name: String,
+    tool_name: String,
+    arguments: serde_json::Value,
+}
+
+/// A job message after its plugin preflight, and what to call when the turn
+/// it starts has ended.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PreflightedMessage {
+    pub(crate) message: String,
+    pub(crate) after_turn: Option<AfterTurn>,
+}
+
+fn parse_after_turn(plugin_name: &str, value: &serde_json::Value) -> Result<Option<AfterTurn>> {
+    let Some(spec) = value.get("afterTurn").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let tool_name = spec
+        .get("tool")
+        .and_then(serde_json::Value::as_str)
+        .filter(|t| !t.is_empty())
+        .context("plugin preflight afterTurn is missing its tool")?;
+    let arguments = match spec.get("arguments") {
+        None | Some(serde_json::Value::Null) => serde_json::json!({}),
+        Some(args @ serde_json::Value::Object(_)) => args.clone(),
+        Some(_) => {
+            return Err(anyhow!(
+                "plugin preflight afterTurn arguments must be an object"
+            ));
+        }
+    };
+    Ok(Some(AfterTurn {
+        plugin_name: plugin_name.to_owned(),
+        tool_name: tool_name.to_owned(),
+        arguments,
+    }))
+}
+
+/// The preflight result's `kbQuery`: what to look up in the knowledge base
+/// before the turn, so the agent can answer without a search round of its
+/// own. Blank or non-string values are ignored.
+fn parse_kb_query(value: &serde_json::Value) -> Option<String> {
+    let query = value.get("kbQuery")?.as_str()?.trim();
+    (!query.is_empty())
+        .then(|| rsclaw_util::truncate_str(query, KB_PREFETCH_QUERY_BYTES).to_owned())
+}
+
+/// The block appended to the job message for a `kbQuery`, from
+/// `(source title, chunk text)` hits; `None` when nothing was found.
+fn format_kb_prefetch<'a>(
+    query: &str,
+    hits: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
+    let lines: Vec<String> = hits
+        .into_iter()
+        .map(|(title, text)| {
+            let title = match title.trim() {
+                "" => "untitled",
+                title => title,
+            };
+            let text = rsclaw_util::truncate_str(text.trim(), KB_PREFETCH_HIT_BYTES);
+            format!("- ({title}) {text}")
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Knowledge base excerpts for kbQuery {query:?} (already searched; use what answers \
+         the question, call knowledge_base only if they don't cover it):\n{}",
+        lines.join("\n")
+    ))
+}
+
+/// Searches the knowledge base for a preflight's `kbQuery`, within the job
+/// agent's collections (`kb_scope`, None = all). Best effort: no knowledge
+/// base, no hits, an error or a slow search all give `None` and the turn goes
+/// ahead without excerpts.
+async fn kb_prefetch(query: &str, kb_scope: Option<&[String]>) -> Option<String> {
+    let kb = rsclaw_kb::global_service().filter(|kb| kb.has_content())?;
+    let started = std::time::Instant::now();
+    let search = {
+        let query = query.to_owned();
+        let scope = kb_scope.map(<[String]>::to_vec);
+        tokio::task::spawn_blocking(move || {
+            kb.search_scoped(&query, scope.as_deref(), &[], KB_PREFETCH_HITS, 0.0)
+        })
+    };
+    let hits =
+        match tokio::time::timeout(Duration::from_secs(KB_PREFETCH_TIMEOUT_SECS), search).await {
+            Ok(Ok(Ok(hits))) => hits,
+            Ok(Ok(Err(e))) => {
+                warn!(error = %e, "cron: kbQuery search failed");
+                return None;
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "cron: kbQuery search task failed");
+                return None;
+            }
+            Err(_) => {
+                warn!("cron: kbQuery search timed out");
+                return None;
+            }
+        };
+    info!(
+        hits = hits.len(),
+        ms = started.elapsed().as_millis() as u64,
+        "cron: kbQuery prefetched"
+    );
+    format_kb_prefetch(
+        query,
+        hits.iter()
+            .map(|h| (h.source_title.as_str(), h.chunk_text.as_str())),
+    )
+}
+
+/// Runs a preflight's after-turn call. Called once the turn has ended however
+/// it ended (reply, error, timeout, cancel); the outcome is only logged and
+/// never changes the run's result.
+pub(crate) async fn run_after_turn(
+    after: &AfterTurn,
+    plugins: Option<&Vec<rsclaw_plugin::WasmPlugin>>,
+    job_id: &str,
+) {
+    let Some(plugin) = plugins.and_then(|p| p.iter().find(|p| p.name == after.plugin_name)) else {
+        warn!(job_id, plugin = %after.plugin_name, "cron: after-turn plugin is not loaded");
+        return;
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(PLUGIN_PREFLIGHT_TIMEOUT_SECS),
+        plugin.call_tool(&after.tool_name, after.arguments.clone()),
+    )
+    .await
+    {
+        Ok(Ok(result)) => info!(
+            job_id,
+            tool = %after.tool_name,
+            result = %rsclaw_util::truncate_str(&result.to_string(), 300),
+            "cron: after-turn call done"
+        ),
+        Ok(Err(e)) => {
+            warn!(job_id, tool = %after.tool_name, error = %e, "cron: after-turn call failed")
+        }
+        Err(_) => warn!(job_id, tool = %after.tool_name, "cron: after-turn call timed out"),
+    }
 }
 
 fn parse_plugin_preflight(wake_mode: Option<&str>) -> Result<Option<PluginPreflight>> {
@@ -1410,12 +1747,225 @@ async fn run_plugin_preflight(
         .get("shouldRun")
         .and_then(serde_json::Value::as_bool)
         .context("plugin preflight result is missing boolean shouldRun")?;
-    Ok(PluginPreflightOutcome { result, should_run })
+    let after_turn = parse_after_turn(&preflight.plugin_name, &value)?;
+    let kb_query = parse_kb_query(&value);
+    Ok(PluginPreflightOutcome {
+        result,
+        should_run,
+        after_turn,
+        kb_query,
+    })
+}
+
+/// The message a job's agent turn receives once its plugin preflight
+/// (`wakeMode: plugin-preflight:<plugin>:<tool>`) has run: the job's message
+/// with the preflight result appended, or `None` when the preflight found no
+/// work. A job without a preflight gets its message unchanged. The scheduler
+/// and manual triggers both go through here, so a manual run never hands the
+/// agent a message that promises a result it does not carry. The preflight's
+/// `afterTurn`, if any, comes back for the caller to run once the turn ends.
+/// `kb_scope` is the job agent's knowledge-base collections, for `kbQuery`.
+pub(crate) async fn preflight_message(
+    wake_mode: Option<&str>,
+    message: &str,
+    plugins: Option<&Vec<rsclaw_plugin::WasmPlugin>>,
+    kb_scope: Option<&[String]>,
+) -> Result<Option<PreflightedMessage>> {
+    let Some(preflight) = parse_plugin_preflight(wake_mode)? else {
+        return Ok(Some(PreflightedMessage {
+            message: message.to_owned(),
+            after_turn: None,
+        }));
+    };
+    let outcome = run_plugin_preflight(plugins, &preflight).await?;
+    if !outcome.should_run {
+        return Ok(None);
+    }
+    let mut message = format!(
+        "{message}\n\nPlugin preflight result (already executed; do not call it again):\n{}",
+        outcome.result
+    );
+    if let Some(query) = &outcome.kb_query
+        && let Some(excerpts) = kb_prefetch(query, kb_scope).await
+    {
+        message.push_str("\n\n");
+        message.push_str(&excerpts);
+    }
+    Ok(Some(PreflightedMessage {
+        message,
+        after_turn: outcome.after_turn,
+    }))
+}
+
+/// Fill `state.nextRunAtMs` on an enabled job (raw JSON, as served by the
+/// HTTP / WS cron list). A future value the runner already persisted wins
+/// (it accounts for error backoff); otherwise the next fire time is computed
+/// from the schedule in the job's own timezone. Disabled jobs lose any stale
+/// persisted value; unparseable schedules and exhausted one-shots are left
+/// untouched.
+pub fn annotate_next_run(job: &mut serde_json::Value, now_ms: u64) {
+    if job.get("enabled").and_then(serde_json::Value::as_bool) != Some(true) {
+        if let Some(state) = job.get_mut("state").and_then(serde_json::Value::as_object_mut) {
+            state.remove("nextRunAtMs");
+        }
+        return;
+    }
+    let stored = job
+        .pointer("/state/nextRunAtMs")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|t| *t > now_ms);
+    let next = stored.or_else(|| {
+        let schedule: CronSchedule = serde_json::from_value(job.get("schedule")?.clone()).ok()?;
+        schedule.compute_next_run(now_ms)
+    });
+    let Some(next) = next else {
+        return;
+    };
+    if !job.get("state").is_some_and(serde_json::Value::is_object) {
+        job["state"] = serde_json::json!({});
+    }
+    job["state"]["nextRunAtMs"] = serde_json::json!(next);
+}
+
+#[cfg(test)]
+mod annotate_next_run_tests {
+    use super::annotate_next_run;
+
+    #[test]
+    fn enabled_job_gets_next_run_in_its_timezone() {
+        // 2026-01-01T00:00:00Z. "0 9 * * *" in Asia/Shanghai (UTC+8) fires at
+        // 01:00Z the same day.
+        let now = 1_767_225_600_000u64;
+        let mut job = serde_json::json!({
+            "id": "j1",
+            "enabled": true,
+            "schedule": {"kind": "cron", "expr": "0 9 * * *", "tz": "Asia/Shanghai"},
+        });
+        annotate_next_run(&mut job, now);
+        assert_eq!(job["state"]["nextRunAtMs"], serde_json::json!(now + 3_600_000));
+    }
+
+    #[test]
+    fn stored_future_value_wins_and_disabled_is_untouched() {
+        let now = 1_767_225_600_000u64;
+        let mut job = serde_json::json!({
+            "id": "j2",
+            "enabled": true,
+            "schedule": "*/5 * * * *",
+            "state": {"nextRunAtMs": now + 42, "consecutiveErrors": 2},
+        });
+        annotate_next_run(&mut job, now);
+        assert_eq!(job["state"]["nextRunAtMs"], serde_json::json!(now + 42));
+        assert_eq!(job["state"]["consecutiveErrors"], 2);
+
+        let mut off = serde_json::json!({"id": "j3", "enabled": false, "schedule": "*/5 * * * *"});
+        annotate_next_run(&mut off, now);
+        assert!(off.get("state").is_none());
+    }
 }
 
 #[cfg(test)]
 mod plugin_preflight_tests {
-    use super::{PluginPreflight, parse_plugin_preflight};
+    use super::{
+        AfterTurn, PluginPreflight, PreflightedMessage, format_kb_prefetch, parse_after_turn,
+        parse_kb_query, parse_plugin_preflight, preflight_message,
+    };
+
+    #[test]
+    fn kb_query_is_a_trimmed_non_blank_string() {
+        let query = |value| parse_kb_query(&value);
+        assert_eq!(
+            query(serde_json::json!({"kbQuery": "  宝宝吐奶怎么办 "})),
+            Some("宝宝吐奶怎么办".to_string())
+        );
+        assert_eq!(query(serde_json::json!({"kbQuery": "   "})), None);
+        assert_eq!(query(serde_json::json!({"kbQuery": 42})), None);
+        assert_eq!(query(serde_json::json!({"shouldRun": true})), None);
+        let long = "吐".repeat(2000);
+        let clipped = query(serde_json::json!({ "kbQuery": long })).expect("clipped query");
+        assert!(clipped.len() <= super::KB_PREFETCH_QUERY_BYTES);
+    }
+
+    #[test]
+    fn kb_prefetch_block_lists_each_hit_or_nothing() {
+        assert_eq!(format_kb_prefetch("q", Vec::<(&str, &str)>::new()), None);
+        let block = format_kb_prefetch("吐奶", [("溢奶护理", " 竖抱拍嗝 "), ("", "少量多餐")])
+            .expect("hits make a block");
+        assert!(block.starts_with("Knowledge base excerpts for kbQuery \"吐奶\""));
+        assert!(block.ends_with("- (溢奶护理) 竖抱拍嗝\n- (untitled) 少量多餐"));
+    }
+
+    #[tokio::test]
+    async fn message_without_preflight_passes_unchanged() {
+        for wake_mode in [None, Some("next-heartbeat")] {
+            let message = preflight_message(wake_mode, "run once", None, None)
+                .await
+                .expect("no preflight to run");
+            assert_eq!(
+                message,
+                Some(PreflightedMessage {
+                    message: "run once".to_string(),
+                    after_turn: None,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn after_turn_runs_on_the_preflights_own_plugin() {
+        let value = serde_json::json!({
+            "shouldRun": true,
+            "afterTurn": {"tool": "release_prepared", "arguments": {"reason": "retry"}},
+        });
+        assert_eq!(
+            parse_after_turn("sample-plugin", &value).expect("valid afterTurn"),
+            Some(AfterTurn {
+                plugin_name: "sample-plugin".to_string(),
+                tool_name: "release_prepared".to_string(),
+                arguments: serde_json::json!({"reason": "retry"}),
+            })
+        );
+        let bare = serde_json::json!({"afterTurn": {"tool": "settle"}});
+        assert_eq!(
+            parse_after_turn("sample-plugin", &bare)
+                .expect("arguments default to {}")
+                .map(|a| a.arguments),
+            Some(serde_json::json!({}))
+        );
+    }
+
+    #[test]
+    fn after_turn_absent_or_malformed() {
+        assert_eq!(
+            parse_after_turn("p", &serde_json::json!({"shouldRun": true})).expect("absent is fine"),
+            None
+        );
+        assert_eq!(
+            parse_after_turn("p", &serde_json::json!({"afterTurn": null})).expect("null is absent"),
+            None
+        );
+        assert!(parse_after_turn("p", &serde_json::json!({"afterTurn": {}})).is_err());
+        assert!(
+            parse_after_turn(
+                "p",
+                &serde_json::json!({"afterTurn": {"tool": "t", "arguments": "x"}})
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_without_its_plugin_fails_instead_of_running_bare() {
+        let error = preflight_message(
+            Some("plugin-preflight:sample-plugin:scan"),
+            "result attached below",
+            Some(&Vec::new()),
+            None,
+        )
+        .await
+        .expect_err("a missing plugin must not hand the agent the bare message");
+        assert!(error.to_string().contains("not loaded"));
+    }
 
     #[test]
     fn parses_plugin_and_tool_from_wake_mode() {
@@ -1504,12 +2054,26 @@ async fn run_cron_job(
             handle.as_ref(),
             preparse_channel,
             preparse_peer,
+            None,
             crate::gateway::preparse::PreparseOrigin::Cron,
+            rsclaw_agent::SenderTrust::Owner,
         )
         .await
         {
-            // Clear the abort flag (we never dispatched to the agent).
+            // We never dispatched to the agent, so the runtime's own cleanup
+            // won't run: drop the entry we created (per-run session keys
+            // would otherwise leak one entry per fire).
+            // A configured (shared) session key may have a live turn using
+            // the same entry, so only per-run keys are removed.
             abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            if job.session_key.is_none() {
+                match handle.abort_flags.write() {
+                    Ok(mut flags) => {
+                        flags.remove(&session_key);
+                    }
+                    Err(e) => warn!(job_id = %job.id, "cron: abort flag cleanup failed: {e}"),
+                }
+            }
             // Empty reply text = preparse handled silently (e.g. /watch dedup-hit
             // triggered by /loop replay). Skip delivery — don't send blank chat
             // messages or fall through to the agent.
@@ -1528,6 +2092,7 @@ async fn run_cron_job(
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
+        trust: rsclaw_agent::SenderTrust::Owner,
         session_key: session_key.clone(),
         text: job_text.to_owned(),
         channel: "cron".to_string(),
@@ -1811,31 +2376,52 @@ pub(crate) fn resolve_delivery_targets(
     targets
 }
 
+/// Send a run's result where the job delivers. `Ok(true)` once it went out,
+/// `Ok(false)` when there was no recipient to send to.
 async fn send_delivery(
     channels: &ChannelManager,
     agents: &AgentRegistry,
+    sink: Option<&SessionSink>,
     job: &CronJob,
     default_delivery: &Option<CronDelivery>,
     output_text: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let delivery = match job.delivery.as_ref().or(default_delivery.as_ref()) {
         Some(d) => d,
         None => {
             info!(job_id = %job.id, name = ?job.name, "cron: no delivery configured, result discarded. Set delivery on the job or configure default_delivery in cron config.");
-            return Ok(());
+            return Ok(false);
         }
     };
 
     let mode = delivery.mode.as_deref().unwrap_or("none");
     if mode == "none" {
         debug!(job_id = %job.id, "cron: delivery mode is 'none', skipping");
-        return Ok(());
+        return Ok(false);
     }
 
     let text = output_text.trim();
     if text.is_empty() && default_delivery.is_none() && job.delivery.is_none() {
         debug!(job_id = %job.id, "cron: output text is empty and no delivery configured");
-        return Ok(());
+        return Ok(false);
+    }
+
+    // A job made in a session with no channel of its own (the app's HTTP
+    // chat) delivers into that session.
+    if let Some(session_key) = delivery.session_key.as_deref().filter(|k| !k.is_empty()) {
+        if text.is_empty() {
+            return Ok(false);
+        }
+        let sink = sink.ok_or_else(|| anyhow!("no session delivery wired up"))?;
+        rsclaw_agent::tools_cron::post_to_session(
+            &sink.db,
+            Some(&sink.event_bus),
+            session_key,
+            text,
+            &job.id,
+        )?;
+        info!(job_id = %job.id, session = %session_key, "cron delivery added to the session");
+        return Ok(true);
     }
 
     let thread = delivery.thread_id.clone();
@@ -1846,12 +2432,13 @@ async fn send_delivery(
     // sentinel, and the no-`to` "reply to recent conversation" fallback.
     let targets = resolve_delivery_targets(agents, &job.agent_id, delivery);
     if targets.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     info!(job_id = %job.id, recipients = targets.len(), text_len = text.len(), "cron: sending delivery");
 
     // Send in concurrent batches of DELIVERY_BATCH.
+    let mut sent = false;
     for chunk in targets.chunks(DELIVERY_BATCH) {
         let futs = chunk.iter().map(|(channel_name, account, to, is_group)| {
             // Back-compat: legacy jobs carry channel="ws"; the desktop
@@ -1885,35 +2472,40 @@ async fn send_delivery(
                     },
                     None => {
                         warn!(job_id = %job_id, channel = %resolved_channel, "cron: channel not found in ChannelManager");
-                        Ok(())
+                        Err(anyhow!("channel {resolved_channel} is not connected"))
                     }
                 }
             }
         });
         let results = futures::future::join_all(futs).await;
         for r in results {
-            if let Err(e) = r {
-                if best_effort {
+            match r {
+                Ok(()) => sent = true,
+                Err(e) if best_effort => {
                     warn!(job_id = %job.id, error = %e, "cron delivery failed (best_effort)");
-                } else {
-                    return Err(e);
                 }
+                Err(e) => return Err(e),
             }
         }
     }
-    Ok(())
+    Ok(sent)
 }
 
 /// Execute a command directly without agent, returning real output.
 /// Used for execCommand payload type to bypass session history pollution.
 /// Uses background execution pattern to avoid blocking the spawned task.
 /// If summarize=true, sends output to agent for summarization.
+///
+/// `cancelled`, when given, is the scheduler's per-run cancel flag: once set
+/// (job deleted / disabled / edited via reload) the child process is killed
+/// and the run ends with [`CANCEL_BY_RELOAD`].
 async fn run_exec_command(
     command: &str,
     timeout_secs: Option<u64>,
     summarize: bool,
     job: &CronJob,
     agents: &AgentRegistry,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String> {
     let exec_timeout = Duration::from_secs(timeout_secs.unwrap_or(120));
     let task_id = format!("cron:{}:{}", job.id, chrono::Utc::now().timestamp_millis());
@@ -1948,7 +2540,30 @@ async fn run_exec_command(
     let cmd_timeout = exec_timeout;
     tokio::spawn(async move {
         let started_at = std::time::Instant::now();
-        let result = tokio::time::timeout(cmd_timeout, cmd.output()).await;
+        // Dropping the `output()` future drops the child, and `kill_on_drop`
+        // then kills it — that is how a reload cancel stops the command.
+        let cancel_watch = async {
+            match cancelled {
+                Some(flag) => loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                },
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let result = tokio::select! {
+            r = tokio::time::timeout(cmd_timeout, cmd.output()) => Some(r),
+            _ = cancel_watch => None,
+        };
+        let Some(result) = result else {
+            tracing::info!(task_id = %tid, "cron exec: cancelled by reload, child killed");
+            if result_tx.send(None).is_err() {
+                tracing::debug!(task_id = %tid, "cron exec: result receiver gone");
+            }
+            return;
+        };
 
         let (exit_code, stdout, stderr) = match result {
             Ok(Ok(output)) => {
@@ -1982,14 +2597,17 @@ async fn run_exec_command(
         );
 
         // Send result back via oneshot channel
-        let _ = result_tx.send((exit_code, stdout, stderr));
+        if result_tx.send(Some((exit_code, stdout, stderr))).is_err() {
+            tracing::debug!(task_id = %tid, "cron exec: result receiver gone");
+        }
     });
 
     // Wait for background task result (non-blocking for spawned task, but waits
     // here)
     let (exit_code, stdout, stderr) = result_rx
         .await
-        .map_err(|_| anyhow!("background exec channel closed"))?;
+        .map_err(|_| anyhow!("background exec channel closed"))?
+        .ok_or_else(|| anyhow!(CANCEL_BY_RELOAD))?;
 
     let exit_code = exit_code.unwrap_or(-1);
 
@@ -2076,6 +2694,7 @@ async fn run_exec_command(
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = AgentMessage {
+            trust: rsclaw_agent::SenderTrust::Owner,
             // `summarize:` prefix is detected by the agent runtime and disables
             // ALL tools for the turn — forces the LLM to return a text summary
             // instead of calling memory.put / write_file / etc. Without this,
@@ -2177,4 +2796,66 @@ pub async fn read_jobs_from_file(cron_dir: PathBuf) -> Result<Vec<CronJob>> {
     jobs.sort_by_key(|j| j.created_at_ms.unwrap_or(0));
 
     Ok(jobs)
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    fn job(delivery: serde_json::Value) -> CronJob {
+        serde_json::from_value(serde_json::json!({
+            "id": "j1",
+            "agentId": "main",
+            "enabled": true,
+            "schedule": "* * * * *",
+            "payload": {"kind": "systemEvent", "text": "该喝水啦"},
+            "delivery": delivery,
+        }))
+        .expect("job")
+    }
+
+    #[tokio::test]
+    async fn a_session_job_delivers_into_its_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            rsclaw_store::redb_store::RedbStore::open(
+                &dir.path().join("t.redb"),
+                crate::MemoryTier::Low,
+            )
+            .expect("open redb"),
+        );
+        let (event_bus, mut rx) = broadcast::channel(8);
+        let sink = SessionSink {
+            db: Arc::clone(&db),
+            event_bus,
+        };
+        let channels = ChannelManager::new(crate::MemoryTier::Low);
+        let agents = AgentRegistry::new();
+        let job = job(serde_json::json!({"mode": "always", "sessionKey": "desktop:main:048643"}));
+
+        let sent = send_delivery(&channels, &agents, Some(&sink), &job, &None, "该喝水啦").await;
+        assert!(sent.expect("delivered"));
+        let stored = db.load_messages("desktop:main:048643").expect("load");
+        assert_eq!(stored.last().expect("message")["content"], "该喝水啦");
+        assert_eq!(rx.try_recv().expect("text").delta, "该喝水啦");
+        assert!(rx.try_recv().expect("done").done);
+
+        // Without a sink nothing can take it: a failure, not a quiet success.
+        assert!(
+            send_delivery(&channels, &agents, None, &job, &None, "该喝水啦")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_channel_is_a_failed_delivery() {
+        let channels = ChannelManager::new(crate::MemoryTier::Low);
+        let agents = AgentRegistry::new();
+        let job = job(serde_json::json!({"mode": "always", "channel": "api", "to": "api-client"}));
+        let err = send_delivery(&channels, &agents, None, &job, &None, "该喝水啦")
+            .await
+            .expect_err("no such channel");
+        assert!(err.to_string().contains("api"), "{err}");
+    }
 }

@@ -245,7 +245,9 @@ async fn send_image_uploads_then_sends_attachment() {
 }
 
 #[tokio::test]
-async fn webhook_image_downloads_and_dispatches() {
+/// Image URLs come from the (untrusted) webhook payload, so downloads go
+/// through the SSRF guard: a loopback URL must be refused, never fetched.
+async fn webhook_image_loopback_url_is_refused() {
     use std::sync::Mutex;
     init_crypto();
 
@@ -255,7 +257,7 @@ async fn webhook_image_downloads_and_dispatches() {
     Mock::given(method("GET"))
         .and(path("/zalo-cdn/photo.jpg"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(fake_jpg.clone()))
-        .expect(1)
+        .expect(0)
         .mount(&server)
         .await;
 
@@ -284,13 +286,15 @@ async fn webhook_image_downloads_and_dispatches() {
         .expect("webhook should succeed");
 
     let msgs = received.lock().expect("lock");
-    assert_eq!(msgs.len(), 1, "image webhook should dispatch once");
-    assert_eq!(msgs[0].0, "Z77777");
-    assert_eq!(msgs[0].2, 1, "should attach exactly one image");
+    assert!(
+        msgs.iter().all(|m| m.2 == 0),
+        "loopback image URL must not be downloaded"
+    );
 }
 
 #[tokio::test]
-async fn webhook_image_via_attachments_array() {
+/// Same SSRF guarantee for the `attachments[]` payload shape.
+async fn webhook_image_via_attachments_loopback_is_refused() {
     use std::sync::Mutex;
     init_crypto();
 
@@ -300,7 +304,7 @@ async fn webhook_image_via_attachments_array() {
     Mock::given(method("GET"))
         .and(path("/zalo-cdn/att.png"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(fake_png.clone()))
-        .expect(1)
+        .expect(0)
         .mount(&server)
         .await;
 
@@ -334,8 +338,10 @@ async fn webhook_image_via_attachments_array() {
         .expect("webhook should succeed");
 
     let msgs = received.lock().expect("lock");
-    assert_eq!(msgs.len(), 1, "image-via-attachments should dispatch once");
-    assert_eq!(msgs[0].1, 1);
+    assert!(
+        msgs.iter().all(|m| m.1 == 0),
+        "loopback attachment URL must not be downloaded"
+    );
 }
 
 #[tokio::test]

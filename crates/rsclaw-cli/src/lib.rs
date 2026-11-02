@@ -7,6 +7,7 @@ pub mod agent_turn;
 pub mod agents;
 pub mod anycli;
 pub mod approvals;
+pub mod brand_help;
 pub mod browser;
 pub mod channels;
 pub mod completion;
@@ -30,6 +31,7 @@ pub mod ops;
 pub mod plugins;
 pub mod qr;
 pub mod sandbox;
+pub mod secret_input;
 pub mod secrets;
 pub mod security;
 pub mod sessions;
@@ -45,7 +47,7 @@ pub use agents::{AgentsCommand, BindArgs};
 pub use anycli::AnycliCommand;
 pub use approvals::ApprovalsCommand;
 pub use browser::BrowserCommand;
-pub use channels::ChannelsCommand;
+pub use channels::{ChannelsCommand, ChannelsOwnerCommand};
 pub use completion::CompletionArgs;
 pub use config::ConfigCommand;
 pub use cron::{CronAddArgs, CronCommand, CronEditArgs};
@@ -91,10 +93,12 @@ pub use webhooks::WebhooksCommand;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "rsclaw",
+    name = rsclaw_brand::CLI_NAME,
     version = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
-    about = "AI Agent Engine Compatible with OpenClaw",
+    about = rsclaw_brand::TAGLINE,
     long_about = None,
+    mut_args = brand_help::brand_arg,
+    mut_subcommands = brand_help::brand_command,
 )]
 pub struct Cli {
     /// Isolate state to ~/.rsclaw-dev, port offset applied.
@@ -329,7 +333,8 @@ pub enum Command {
     /// Generate app pairing QR code.
     Qr(QrArgs),
 
-    /// Migrate data from OpenClaw to rsclaw.
+    // Ends with the CLI name, which `rebrand` only rewrites mid-sentence.
+    #[command(about = concat!("Migrate data from OpenClaw to ", rsclaw_brand::brand_cli_name!()))]
     Migrate(MigrateArgs),
 
     /// Uninstall service and remove data.

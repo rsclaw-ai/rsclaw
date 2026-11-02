@@ -1814,7 +1814,7 @@ export function OnboardingPage() {
     // if it's actually invalid the user finds out at the
     // gateway-start step's health check.
     if (id === "rsclaw") {
-      const rdef = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v1";
+      const rdef = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v2";
       const fallback = [{ id: rdef, tag: "推荐", tagEn: "Recommended", rec: true }];
       const defaultModel = rdef;
       setProvs((prev) => {
@@ -1993,6 +1993,16 @@ export function OnboardingPage() {
             });
             return;
           }
+          if (status === "error") {
+            if (qrPollRef.current) clearInterval(qrPollRef.current);
+            qrPollRef.current = null;
+            setChs((prev) => {
+              const c = { ...prev };
+              c[channelId] = { ...c[channelId], qrStatus: "error" };
+              return c;
+            });
+            return;
+          }
           // Re-fetch the QR every iteration — the sidecar rotates the
           // file when the server-side QR expires (typically 60–90s).
           // Sticking with the first dataUri we saw means the rendered
@@ -2140,21 +2150,31 @@ export function OnboardingPage() {
       if (tauriInvoke) {
         try { await tauriInvoke("run_setup"); } catch {} // ensure dirs exist
         // Read existing config — this is the source of truth
+        // A config that exists but can't be read/parsed must abort the
+        // save — merging into `{}` would wipe the user's rsclaw.json5.
+        const raw: string = await tauriInvoke("read_config_file");
         let existing: any = {};
-        try {
-          const raw: string = await tauriInvoke("read_config_file");
-          existing = JSON5.parse(raw || "{}");
-        } catch {}
+        if (raw && raw.trim()) {
+          try {
+            existing = JSON5.parse(raw);
+          } catch (e: any) {
+            throw new Error(`rsclaw.json5 is not valid JSON5, refusing to overwrite it: ${e?.message || e}`);
+          }
+        }
         // Deep merge: existing config is base, new config overlays on top
         const merged = deepMerge(existing, newConfig);
         await tauriInvoke("write_config", { content: JSON.stringify(merged, null, 2) });
       } else {
         // Non-Tauri: fetch existing config, JSON5-parse, deep merge, save.
+        const data = await getConfig();
         let existing: any = {};
-        try {
-          const data = await getConfig();
-          existing = JSON5.parse(data.raw || "{}");
-        } catch {}
+        if (data?.raw && data.raw.trim()) {
+          try {
+            existing = JSON5.parse(data.raw);
+          } catch (e: any) {
+            throw new Error(`rsclaw.json5 is not valid JSON5, refusing to overwrite it: ${e?.message || e}`);
+          }
+        }
         const merged = deepMerge(existing, newConfig);
         await saveConfig({ raw: JSON.stringify(merged, null, 2) });
       }
@@ -2502,7 +2522,7 @@ export function OnboardingPage() {
                   // a "tested successfully" state so `canNextStep2`
                   // flips immediately — no need for the user to click
                   // 获取模型 (which would fail anyway, see below).
-                  const defaultModel = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v1";
+                  const defaultModel = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v2";
                   const rsclawModels = [
                     { id: defaultModel, tag: "推荐", tagEn: "Recommended", rec: true },
                   ];
@@ -2662,7 +2682,7 @@ export function OnboardingPage() {
                               style={plainInputStyle}
                               value={ps.userAgent}
                               onChange={(e) => setProvUserAgent(activeId, e.target.value)}
-                              placeholder={pDef.defaultUserAgent || "Mozilla/5.0 (compatible; rsclaw/2026.8.28)"}
+                              placeholder={pDef.defaultUserAgent || "Mozilla/5.0 (compatible; rsclaw/2026.10.1)"}
                             />
                           </div>
                         )}
@@ -2701,7 +2721,7 @@ export function OnboardingPage() {
                           style={plainInputStyle}
                           value={ps.userAgent}
                           onChange={(e) => setProvUserAgent(activeId, e.target.value)}
-                          placeholder="e.g. rsclaw/2026.8.28"
+                          placeholder="e.g. rsclaw/2026.10.1"
                         />
                       </div>
                     )}

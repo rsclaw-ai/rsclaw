@@ -47,50 +47,6 @@ export async function copyToClipboard(text: string) {
   }
 }
 
-export async function downloadAs(text: string, filename: string) {
-  if (isTauri) {
-    try {
-      const { save } = await import("@tauri-apps/plugin-dialog");
-      const { writeTextFile } = await import("@tauri-apps/plugin-fs");
-      const result = await save({
-        defaultPath: `${filename}`,
-        filters: [
-          {
-            name: `${filename.split(".").pop()} files`,
-            extensions: [`${filename.split(".").pop()}`],
-          },
-          {
-            name: "All Files",
-            extensions: ["*"],
-          },
-        ],
-      });
-      if (result !== null) {
-        await writeTextFile(result, text);
-        showToast(Locale.Download.Success);
-      } else {
-        showToast(Locale.Download.Failed);
-      }
-    } catch (error) {
-      showToast(Locale.Download.Failed);
-    }
-  } else {
-    const element = document.createElement("a");
-    element.setAttribute(
-      "href",
-      "data:text/plain;charset=utf-8," + encodeURIComponent(text),
-    );
-    element.setAttribute("download", filename);
-
-    element.style.display = "none";
-    document.body.appendChild(element);
-
-    element.click();
-
-    document.body.removeChild(element);
-  }
-}
-
 export function readFromFile() {
   return new Promise<string>((res, rej) => {
     const fileInput = document.createElement("input");

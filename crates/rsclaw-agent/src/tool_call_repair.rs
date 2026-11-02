@@ -107,17 +107,10 @@ pub enum RepairKind {
 /// before/after. Returns (json_string, start_index) or None if no valid JSON
 /// found.
 pub fn extract_balanced_json_prefix(raw: &str) -> Option<(String, usize)> {
-    let mut start = 0;
-    while start < raw.len() {
-        let c = raw[start..].chars().next()?;
-        if c == '{' || c == '[' {
-            break;
-        }
-        start += 1;
-    }
-    if start >= raw.len() {
-        return None;
-    }
+    // Locate the first opening bracket by char boundary. Byte-stepping here
+    // would land inside a multi-byte UTF-8 char (e.g. `参数：{...}` or a
+    // curly quote before `{`) and panic on the next slice.
+    let (start, _) = raw.char_indices().find(|&(_, c)| c == '{' || c == '[')?;
 
     let mut depth = 0;
     let mut in_string = false;
@@ -293,7 +286,7 @@ pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
         // Look for patterns like: "key": "value" or "key": number
         let fixed_incomplete = fix_incomplete_json(&incomplete);
         if let Ok(parsed) = serde_json::from_str::<Value>(&fixed_incomplete) {
-            if parsed.is_object() && !parsed.as_object().unwrap().is_empty() {
+            if parsed.as_object().is_some_and(|o| !o.is_empty()) {
                 return Some(ToolCallRepair {
                     args: parsed,
                     kind: RepairKind::Repaired,
@@ -601,9 +594,63 @@ pub fn rescue_tool_calls_from_text(text: &str, tools: &[ToolDef]) -> Vec<(String
     out
 }
 
+/// Recovers tool calls written as text in the `[tool_use NAME({json})]`
+/// form. The rsclaw worker renders tool calls in replayed history that way,
+/// and a model that has just seen dozens of them can answer with one as
+/// text instead of a real call; delivered as the reply, the user gets the
+/// raw command. Only names in `tools` with complete JSON arguments count.
+pub fn rescue_bracket_tool_calls(text: &str, tools: &[ToolDef]) -> Vec<(String, String, Value)> {
+    const OPEN: &str = "[tool_use ";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(OPEN) {
+        let after = &rest[at + OPEN.len()..];
+        let name_len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'))
+            .unwrap_or(after.len());
+        let name = &after[..name_len];
+        let Some(json_part) = after[name_len..].strip_prefix('(') else {
+            rest = after;
+            continue;
+        };
+        let mut stream = serde_json::Deserializer::from_str(json_part).into_iter::<Value>();
+        match stream.next() {
+            Some(Ok(args @ Value::Object(_)))
+                if json_part[stream.byte_offset()..].starts_with(")]")
+                    && tools.iter().any(|t| t.name == name) =>
+            {
+                out.push((format!("rescued_{name}_{}", out.len()), name.to_owned(), args));
+                rest = &json_part[stream.byte_offset() + 2..];
+            }
+            _ => rest = after,
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescue_bracket_tool_call_written_as_text() {
+        let tools = vec![ToolDef {
+            name: "shell".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let text = "[tool_use shell({\"command\":\"cd /a && python3 << 'PYEOF'\\nprint('x)]')\\nPYEOF\\n\"})]";
+        let calls = rescue_bracket_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "shell");
+        assert!(calls[0].2["command"].as_str().unwrap().contains("print('x)]')"));
+        // Unknown tools, truncated JSON and prose mentions are left alone.
+        assert!(rescue_bracket_tool_calls("[tool_use rm_rf({\"a\":1})]", &tools).is_empty());
+        assert!(rescue_bracket_tool_calls("[tool_use shell({\"command\":\"ls", &tools).is_empty());
+        assert!(rescue_bracket_tool_calls("the [tool_use shell] format", &tools).is_empty());
+        let two = "[tool_use shell({\"command\":\"a\"})]\n[tool_use shell({\"command\":\"b\"})]";
+        assert_eq!(rescue_bracket_tool_calls(two, &tools).len(), 2);
+    }
 
     fn ask_user_tool() -> ToolDef {
         ToolDef {
@@ -945,5 +992,22 @@ mod tests {
         assert_eq!(result.messages[0].role, Role::Assistant);
         // No synthetic messages added
         assert!(result.synthetic_messages.is_empty());
+    }
+
+    #[test]
+    fn extract_balanced_json_prefix_multibyte_prefix_no_panic() {
+        let raw = "参数：{\"a\":1}";
+        let (json, start) = extract_balanced_json_prefix(raw).expect("json found");
+        assert_eq!(json, "{\"a\":1}");
+        assert_eq!(&raw[start..], "{\"a\":1}");
+
+        let raw2 = "\u{201c}{\"b\":2}\u{201d}";
+        let (json2, _) = extract_balanced_json_prefix(raw2).expect("json found");
+        assert_eq!(json2, "{\"b\":2}");
+
+        // Must not panic on the full repair path either.
+        let _ = try_extract_usable_args(raw);
+        let _ = try_extract_usable_args(raw2);
+        assert!(extract_balanced_json_prefix("没有括号").is_none());
     }
 }

@@ -14,7 +14,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -27,32 +27,42 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{Mutex, oneshot},
     time,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const MCP_CALL_TIMEOUT_SECS: u64 = 60;
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// In-flight requests keyed by JSON-RPC id. The reader task removes the
+/// entry and fulfils the sender when the matching response arrives.
+type PendingMap = HashMap<u64, oneshot::Sender<std::result::Result<Value, String>>>;
+type SharedPending = Arc<std::sync::Mutex<PendingMap>>;
+
+fn lock_pending(pending: &SharedPending) -> std::sync::MutexGuard<'_, PendingMap> {
+    // A poisoned map only means another thread panicked while holding it;
+    // the map itself is still consistent (plain inserts/removes).
+    pending.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // ---------------------------------------------------------------------------
 // McpClient
 // ---------------------------------------------------------------------------
 
+/// Handle to one running MCP server subprocess. Cloning shares the same
+/// process, stdin writer and response demultiplexer.
 #[derive(Clone)]
 pub struct McpClient {
     pub name: String,
-    // TODO(H-19): stdin and stdout are independently locked, but JSON-RPC
-    // request/response pairing assumes serial access.  Concurrent rpc_call
-    // invocations may read each other's responses.  Needs a proper
-    // request-multiplexer (e.g. channel-per-id) if concurrency is required.
     stdin: Arc<Mutex<ChildStdin>>,
-    stdout: Arc<Mutex<BufReader<ChildStdout>>>,
     child: Arc<Mutex<Child>>,
     next_id: Arc<AtomicU64>,
     timeout: Duration,
-    /// D5: serialise all rpc_call invocations to prevent response interleaving.
-    rpc_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Requests awaiting a response, fulfilled by the stdout reader task.
+    pending: SharedPending,
+    /// Set by the reader task once stdout closes; new calls fail fast.
+    closed: Arc<AtomicBool>,
     /// Tools discovered via `tools/list`.
     pub tools: Vec<McpTool>,
 }
@@ -98,14 +108,25 @@ impl McpClient {
 
         info!(name = %config.name, command = %config.command, "MCP server process started");
 
+        let stdin = Arc::new(Mutex::new(stdin));
+        let pending: SharedPending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        tokio::spawn(reader_loop(
+            config.name.clone(),
+            BufReader::new(stdout),
+            Arc::clone(&stdin),
+            Arc::clone(&pending),
+            Arc::clone(&closed),
+        ));
+
         Ok(Self {
             name: config.name.clone(),
-            stdin: Arc::new(Mutex::new(stdin)),
-            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            stdin,
             child: Arc::new(Mutex::new(child)),
             next_id: Arc::new(AtomicU64::new(1)),
             timeout: Duration::from_secs(MCP_CALL_TIMEOUT_SECS),
-            rpc_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending,
+            closed,
             tools: Vec::new(),
         })
     }
@@ -194,7 +215,6 @@ impl McpClient {
     // -----------------------------------------------------------------------
 
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
-        let _lock = self.rpc_lock.lock().await; // D5: serialise access
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let request = json!({
@@ -204,29 +224,33 @@ impl McpClient {
             "params": params,
         });
 
-        self.send_line(&serde_json::to_string(&request)?).await?;
+        let (tx, rx) = oneshot::channel();
+        lock_pending(&self.pending).insert(id, tx);
+        // The reader sets `closed` before draining the map, so checking after
+        // the insert guarantees we either see the flag or get drained.
+        if self.closed.load(Ordering::SeqCst) {
+            lock_pending(&self.pending).remove(&id);
+            bail!("MCP `{}` stdout closed (server exited?)", self.name);
+        }
 
-        // Read response lines, skipping notifications (no "id" field).
-        let resp = time::timeout(self.timeout, async {
-            loop {
-                let line = self.read_line().await?;
-                let val: Value = serde_json::from_str(&line)
-                    .with_context(|| format!("MCP `{}` invalid JSON: {line}", self.name))?;
-                // Skip notifications (messages without "id").
-                if val.get("id").is_some() {
-                    return Ok::<Value, anyhow::Error>(val);
-                }
-                debug!(name = %self.name, "MCP notification (skipped): {}", rsclaw_util::truncate_str(&line, 200));
+        if let Err(e) = self.send_line(&serde_json::to_string(&request)?).await {
+            lock_pending(&self.pending).remove(&id);
+            return Err(e);
+        }
+
+        let resp = match time::timeout(self.timeout, rx).await {
+            Ok(Ok(Ok(val))) => val,
+            Ok(Ok(Err(e))) => bail!("MCP `{}` call `{method}` failed: {e}", self.name),
+            Ok(Err(_)) => bail!("MCP `{}` call `{method}` dropped (reader gone)", self.name),
+            Err(_) => {
+                lock_pending(&self.pending).remove(&id);
+                bail!(
+                    "MCP `{}` call `{method}` timed out after {}s",
+                    self.name,
+                    self.timeout.as_secs()
+                );
             }
-        })
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "MCP `{}` call `{method}` timed out after {}s",
-                self.name,
-                self.timeout.as_secs()
-            )
-        })??;
+        };
 
         if let Some(err) = resp.get("error") {
             bail!("MCP `{}` error: {err}", self.name);
@@ -245,27 +269,135 @@ impl McpClient {
     }
 
     async fn send_line(&self, line: &str) -> Result<()> {
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(line.as_bytes())
+        write_line(&self.stdin, line)
             .await
-            .with_context(|| format!("write to MCP `{}`", self.name))?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
-        Ok(())
+            .with_context(|| format!("write to MCP `{}`", self.name))
     }
+}
 
-    async fn read_line(&self) -> Result<String> {
-        let mut stdout = self.stdout.lock().await;
-        let mut line = String::new();
-        stdout
-            .read_line(&mut line)
-            .await
-            .with_context(|| format!("read from MCP `{}`", self.name))?;
-        if line.is_empty() {
-            bail!("MCP `{}` stdout closed (server exited?)", self.name);
+async fn write_line(stdin: &Mutex<ChildStdin>, line: &str) -> Result<()> {
+    let mut stdin = stdin.lock().await;
+    stdin.write_all(line.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Incoming message routing
+// ---------------------------------------------------------------------------
+
+/// What the reader task should do with one incoming JSON-RPC message.
+#[derive(Debug, PartialEq)]
+enum Routed {
+    /// A response that matched (and fulfilled) a pending request.
+    Delivered,
+    /// A response whose id is unknown (e.g. arrived after a timeout).
+    Unmatched,
+    /// Server-initiated `ping`; reply with an empty result.
+    Ping(Value),
+    /// Other server-initiated request; reply with "method not found".
+    ServerRequest(Value, String),
+    /// Notification (no id); nothing to do.
+    Notification,
+}
+
+/// Classify `msg` and, when it is a response, hand it to the matching
+/// pending request. Pure apart from the pending-map mutation, so it can be
+/// unit tested without a subprocess.
+fn route_message(pending: &SharedPending, msg: Value) -> Routed {
+    let method = msg.get("method").and_then(|m| m.as_str()).map(str::to_owned);
+    let id = msg.get("id").filter(|v| !v.is_null()).cloned();
+    match (method, id) {
+        (Some(m), Some(id)) if m == "ping" => Routed::Ping(id),
+        (Some(m), Some(id)) => Routed::ServerRequest(id, m),
+        (Some(_), None) => Routed::Notification,
+        (None, Some(id)) => {
+            let key = id
+                .as_u64()
+                .or_else(|| id.as_str().and_then(|s| s.parse::<u64>().ok()));
+            let sender = key.and_then(|k| lock_pending(pending).remove(&k));
+            match sender {
+                Some(tx) => {
+                    if tx.send(Ok(msg)).is_err() {
+                        debug!("MCP response receiver already dropped");
+                    }
+                    Routed::Delivered
+                }
+                None => Routed::Unmatched,
+            }
         }
-        Ok(line.trim_end().to_owned())
+        (None, None) => Routed::Notification,
+    }
+}
+
+/// Dedicated stdout reader: demultiplexes responses to pending requests and
+/// answers server-initiated requests. On exit every pending call is failed.
+async fn reader_loop(
+    name: String,
+    mut stdout: BufReader<ChildStdout>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: SharedPending,
+    closed: Arc<AtomicBool>,
+) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdout.read_line(&mut line).await {
+            Ok(0) => {
+                debug!(name = %name, "MCP stdout closed (EOF)");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(name = %name, "MCP stdout read error: {e:#}");
+                break;
+            }
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let val: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(name = %name, "MCP non-JSON line ignored ({e}): {}", rsclaw_util::truncate_str(trimmed, 200));
+                continue;
+            }
+        };
+        let reply = match route_message(&pending, val) {
+            Routed::Delivered => None,
+            Routed::Unmatched => {
+                warn!(name = %name, "MCP response with unknown id dropped (late after timeout?): {}", rsclaw_util::truncate_str(trimmed, 200));
+                None
+            }
+            Routed::Notification => {
+                debug!(name = %name, "MCP notification (ignored): {}", rsclaw_util::truncate_str(trimmed, 200));
+                None
+            }
+            Routed::Ping(id) => Some(json!({"jsonrpc": "2.0", "id": id, "result": {}})),
+            Routed::ServerRequest(id, method) => {
+                debug!(name = %name, method = %method, "MCP server request not supported");
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32601, "message": format!("method not found: {method}")},
+                }))
+            }
+        };
+        if let Some(reply) = reply {
+            let text = reply.to_string();
+            if let Err(e) = write_line(&stdin, &text).await {
+                warn!(name = %name, "MCP reply to server request failed: {e:#}");
+            }
+        }
+    }
+    closed.store(true, Ordering::SeqCst);
+    let drained: Vec<_> = lock_pending(&pending).drain().collect();
+    for (_, tx) in drained {
+        if tx.send(Err("server stdout closed (server exited?)".to_owned())).is_err() {
+            debug!(name = %name, "MCP pending receiver already dropped");
+        }
     }
 }
 
@@ -285,12 +417,14 @@ impl Default for McpRegistry {
 }
 
 impl McpRegistry {
+    /// Create an empty registry.
     pub fn new() -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Register (or replace) a client under its server name.
     pub async fn register(&self, client: Arc<McpClient>) {
         self.clients
             .lock()
@@ -300,15 +434,14 @@ impl McpRegistry {
 
     /// Find the MCP client that owns a given tool name (prefixed with
     /// `mcp_<server>_`).
+    ///
+    /// When several server names match (e.g. `github` and
+    /// `github_enterprise`), the longest one wins so routing is deterministic.
     pub async fn find_for_tool(&self, tool_name: &str) -> Option<Arc<McpClient>> {
         let clients = self.clients.lock().await;
-        for (server_name, client) in clients.iter() {
-            let prefix = format!("mcp_{}_", server_name);
-            if tool_name.starts_with(&prefix) {
-                return Some(Arc::clone(client));
-            }
-        }
-        None
+        let names: Vec<&String> = clients.keys().collect();
+        let best = longest_matching_server(&names, tool_name)?;
+        clients.get(best).map(Arc::clone)
     }
 
     /// Get all tool defs from all registered MCP servers.
@@ -329,5 +462,66 @@ impl McpRegistry {
             defs.extend(client.as_tool_defs());
         }
         defs
+    }
+}
+
+/// Pick the server whose `mcp_<server>_` prefix matches `tool_name`,
+/// preferring the longest server name.
+fn longest_matching_server<'a>(names: &[&'a String], tool_name: &str) -> Option<&'a String> {
+    names
+        .iter()
+        .filter(|n| {
+            tool_name
+                .strip_prefix("mcp_")
+                .and_then(|rest| rest.strip_prefix(n.as_str()))
+                .is_some_and(|rest| rest.starts_with('_'))
+        })
+        .max_by_key(|n| n.len())
+        .copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_route_message_matches_ids() {
+        let pending: SharedPending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (tx1, mut rx1) = oneshot::channel();
+        let (tx2, mut rx2) = oneshot::channel();
+        lock_pending(&pending).insert(1, tx1);
+        lock_pending(&pending).insert(2, tx2);
+
+        // Response for id 2 goes to the id-2 waiter only.
+        let r = route_message(&pending, json!({"jsonrpc":"2.0","id":2,"result":{"v":2}}));
+        assert_eq!(r, Routed::Delivered);
+        let got = rx2.try_recv().expect("id 2 delivered").expect("ok");
+        assert_eq!(got["result"]["v"], 2);
+        assert!(rx1.try_recv().is_err());
+
+        // Late response for an unknown id is not delivered to anyone.
+        let r = route_message(&pending, json!({"jsonrpc":"2.0","id":99,"result":{}}));
+        assert_eq!(r, Routed::Unmatched);
+        assert!(rx1.try_recv().is_err());
+
+        // Server ping / other requests / notifications are not responses.
+        let r = route_message(&pending, json!({"jsonrpc":"2.0","id":1,"method":"ping"}));
+        assert_eq!(r, Routed::Ping(json!(1)));
+        let r = route_message(&pending, json!({"jsonrpc":"2.0","id":"x","method":"roots/list"}));
+        assert_eq!(r, Routed::ServerRequest(json!("x"), "roots/list".to_owned()));
+        let r = route_message(&pending, json!({"jsonrpc":"2.0","method":"notifications/progress"}));
+        assert_eq!(r, Routed::Notification);
+        assert!(rx1.try_recv().is_err(), "id 1 still pending after ping");
+        assert_eq!(lock_pending(&pending).len(), 1);
+    }
+
+    #[test]
+    fn mcp_longest_prefix_routing() {
+        let a = "github".to_owned();
+        let b = "github_enterprise".to_owned();
+        let names = vec![&a, &b];
+        assert_eq!(longest_matching_server(&names, "mcp_github_enterprise_search"), Some(&b));
+        assert_eq!(longest_matching_server(&names, "mcp_github_search"), Some(&a));
+        assert_eq!(longest_matching_server(&names, "mcp_gitlab_search"), None);
     }
 }

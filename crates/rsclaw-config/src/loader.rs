@@ -23,37 +23,98 @@ static ENV_VAR_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").expect("valid regex")
 });
 
-/// Expand `${VAR}` references and `~/` tilde in a raw config string.
-/// Variables that are not set are left verbatim and a warning is emitted.
-/// `~/` is expanded to `$HOME/` so workspace and path values resolve correctly.
+/// Look up `${VAR}`; unset vars are left verbatim with a warning.
+fn lookup_env_placeholder(caps: &regex::Captures<'_>) -> Option<String> {
+    let var = &caps[1];
+    match std::env::var(var) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            // Promote from debug to warn: unresolved placeholders
+            // silently survive into runtime and surface as cryptic
+            // upstream errors (e.g. an apiKey of literal
+            // "${RSCLAW_API_KEY}" gets sent as a Bearer token →
+            // "invalid api key" 401 from the provider). The user
+            // needs to see this at gateway boot, not buried under
+            // debug-level traffic.
+            tracing::warn!(
+                var,
+                "env var referenced in config is not set; placeholder left verbatim"
+            );
+            None
+        }
+    }
+}
+
+/// Expand `${VAR}` references and a leading `~/` in a single config VALUE
+/// (an API key, a URL, a path). Variables that are not set are left
+/// verbatim and a warning is emitted. `~/` is expanded to `$HOME/` only
+/// when the value starts with it, so free text containing "~/" (prompts,
+/// descriptions) is not rewritten.
+///
+/// Do NOT use this on raw JSON5 text — see `expand_env_vars_json5`, which
+/// escapes substituted values for string context.
 pub fn expand_env_vars(raw: &str) -> String {
     let expanded = ENV_VAR_RE
         .replace_all(raw, |caps: &regex::Captures<'_>| {
-            let var = &caps[1];
-            std::env::var(var).unwrap_or_else(|_| {
-                // Promote from debug to warn: unresolved placeholders
-                // silently survive into runtime and surface as cryptic
-                // upstream errors (e.g. an apiKey of literal
-                // "${RSCLAW_API_KEY}" gets sent as a Bearer token →
-                // "invalid api key" 401 from the provider). The user
-                // needs to see this at gateway boot, not buried under
-                // debug-level traffic.
-                tracing::warn!(
-                    var,
-                    "env var referenced in config is not set; placeholder left verbatim"
-                );
-                caps[0].to_string()
-            })
+            lookup_env_placeholder(caps).unwrap_or_else(|| caps[0].to_string())
         })
         .into_owned();
+    match (expanded.strip_prefix("~/"), dirs_next::home_dir()) {
+        (Some(rest), Some(home)) => format!("{}/{rest}", path_to_forward_slash(&home)),
+        _ => expanded,
+    }
+}
 
-    // Expand ~/  →  $HOME/  so path values are absolute.
-    if let Some(home) = dirs_next::home_dir() {
-        let home_s = path_to_forward_slash(&home);
-        // Replace every occurrence of ~/ (covers paths inside JSON strings).
-        expanded.replace("~/", &format!("{home_s}/"))
-    } else {
-        expanded
+/// Escape a substituted value so it stays a single JSON5 string literal
+/// whether the placeholder sits inside `"..."` or `'...'`.
+fn escape_json5_string_fragment(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for ch in v.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Matches a `~/` that begins a JSON5 string literal (right after the
+/// opening quote).
+static QUOTED_TILDE_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r#"(["'])~/"#).expect("valid regex"));
+
+/// Expand `${VAR}` and `~/` in raw JSON5 config TEXT before parsing.
+///
+/// - Substituted values are escaped for JSON string context (`\`, quotes,
+///   control characters), so a secret containing `"` or `\` cannot break
+///   parsing or inject extra keys. Placeholders are expected inside string
+///   literals (`apiKey: "${KEY}"`); a bare `port: ${PORT}` still works for
+///   plain numeric values.
+/// - `~/` is expanded only when it starts a string literal (`"~/x"`), not
+///   anywhere in the text (prompt strings stay intact).
+pub fn expand_env_vars_json5(raw: &str) -> String {
+    let expanded = ENV_VAR_RE
+        .replace_all(raw, |caps: &regex::Captures<'_>| match lookup_env_placeholder(caps) {
+            Some(v) => escape_json5_string_fragment(&v),
+            None => caps[0].to_string(),
+        })
+        .into_owned();
+    match dirs_next::home_dir() {
+        Some(home) => {
+            let home_s = escape_json5_string_fragment(&path_to_forward_slash(&home));
+            QUOTED_TILDE_RE
+                .replace_all(&expanded, |caps: &regex::Captures<'_>| {
+                    format!("{}{home_s}/", &caps[1])
+                })
+                .into_owned()
+        }
+        None => expanded,
     }
 }
 
@@ -80,7 +141,7 @@ pub fn load_json5(path: &Path) -> Result<Config> {
     }
 
     // 1b. Expand env vars before any parsing.
-    let expanded = expand_env_vars(&raw);
+    let expanded = expand_env_vars_json5(&raw);
 
     // 2. Parse into a generic JSON value so we can handle $include.
     let mut value: serde_json::Value = json5::from_str(&expanded)
@@ -88,6 +149,12 @@ pub fn load_json5(path: &Path) -> Result<Config> {
 
     // 3. Resolve $include directives recursively.
     resolve_includes(&mut value, base_dir, 0)?;
+
+    // 3a. Brand layers: defaults under the user's file, locked policy over
+    //     it (no-op for the default brand). Keep the user's own value to
+    //     attribute a schema failure to the brand layer if needed.
+    let user_value = super::brand_layers::is_active().then(|| value.clone());
+    let mut value = super::brand_layers::apply(value);
 
     // 3b. Migrate legacy top-level credential fields → accounts.default.*
     //     so the startup code only reads `accounts` (no dual-path).
@@ -99,8 +166,24 @@ pub fn load_json5(path: &Path) -> Result<Config> {
     migrate_channel_env_fallback(&mut value);
 
     // 4. Deserialize into the typed schema.
-    let config: Config = serde_json::from_value(value)
-        .with_context(|| format!("schema error in {}", path.display()))?;
+    let config: Config = match serde_json::from_value(value) {
+        Ok(config) => config,
+        Err(e) => {
+            if let Some(mut own) = user_value {
+                migrate_channel_legacy_fields(&mut own);
+                migrate_channel_env_fallback(&mut own);
+                if serde_json::from_value::<Config>(own).is_ok() {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "schema error in {} caused by the brand config layer \
+                         (config.defaults.json5 / policy.locked.json5)",
+                        path.display()
+                    )));
+                }
+            }
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("schema error in {}", path.display()));
+        }
+    };
 
     Ok(config)
 }
@@ -186,7 +269,7 @@ fn load_include_file(path: &Path, depth: usize) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read $include: {}", path.display()))?;
 
-    let expanded = expand_env_vars(&raw);
+    let expanded = expand_env_vars_json5(&raw);
 
     let mut value: serde_json::Value = json5::from_str(&expanded)
         .with_context(|| format!("JSON5 parse error in $include {}", path.display()))?;
@@ -220,7 +303,7 @@ pub fn detect_config_path() -> Option<PathBuf> {
 
     // 2. Base dir config (set by --base-dir / --dev / --profile).
     if let Ok(bd) = std::env::var("RSCLAW_BASE_DIR") {
-        let p = expand_tilde_path(&bd).join("rsclaw.json5");
+        let p = expand_tilde_path(&bd).join(rsclaw_brand::CONFIG_FILE);
         if p.exists() {
             return Some(p);
         }
@@ -229,13 +312,13 @@ pub fn detect_config_path() -> Option<PathBuf> {
     let home = dirs_next::home_dir()?;
 
     // 3. rsclaw-native default.
-    let rsclaw = home.join(".rsclaw/rsclaw.json5");
+    let rsclaw = home.join(rsclaw_brand::HOME_DIR).join(rsclaw_brand::CONFIG_FILE);
     if rsclaw.exists() {
         return Some(rsclaw);
     }
 
     // 4. Current directory fallback.
-    let local = PathBuf::from(".rsclaw.json5");
+    let local = PathBuf::from(rsclaw_brand::local_config_file());
     if local.exists() {
         return Some(local);
     }
@@ -265,7 +348,7 @@ pub fn base_dir() -> PathBuf {
     }
 
     // 3. Default
-    dirs_next::home_dir().unwrap_or_default().join(".rsclaw")
+    dirs_next::home_dir().unwrap_or_default().join(rsclaw_brand::HOME_DIR)
 }
 
 /// Gateway PID file path: `$base_dir/var/run/gateway.pid`
@@ -412,8 +495,11 @@ pub fn cache_dir() -> PathBuf {
 
 /// Defaults bundled into this binary. Unlike [`load_defaults_toml`], this
 /// never reads the user-editable `$base_dir/defaults.toml`.
+///
+/// Built by `build.rs` from the workspace `defaults.toml`, shaped by the
+/// brand and an optional `RSCLAW_DEFAULTS_OVERRIDE` file.
 pub fn embedded_defaults_toml() -> &'static str {
-    include_str!("../../../defaults.toml")
+    include_str!(concat!(env!("OUT_DIR"), "/defaults.toml"))
 }
 
 /// Load defaults.toml: prefer external file at `$base_dir/defaults.toml`,
@@ -443,10 +529,33 @@ fn ensure_defaults_toml_up_to_date(path: &Path) -> Result<()> {
         return Ok(());
     };
 
-    backup_defaults_before_upgrade(path);
-    std::fs::write(path, merged)
+    backup_defaults_before_upgrade(path)?;
+    write_file_atomic(path, &merged)
         .with_context(|| format!("failed to write upgraded defaults.toml: {}", path.display()))?;
     debug!(path = %path.display(), "upgraded defaults.toml from embedded defaults");
+    Ok(())
+}
+
+/// Write `content` to `path` via a sibling temp file + rename so a crash or
+/// full disk never leaves a truncated file behind.
+///
+/// The temp file lives in the same directory as `path` (so the rename stays on
+/// one filesystem) and is removed if the rename fails. Use this for every
+/// rewrite of a user-owned config file (`rsclaw.json5`, `defaults.toml`, ...).
+pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_owned());
+    let tmp = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, content)
+        .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        if let Err(rm) = std::fs::remove_file(&tmp) {
+            tracing::warn!(path = %tmp.display(), error = %rm, "failed to remove temp file");
+        }
+        return Err(e).with_context(|| format!("failed to replace {}", path.display()));
+    }
     Ok(())
 }
 
@@ -490,21 +599,27 @@ pub fn merge_remote_defaults(remote_raw: &str) -> Result<bool> {
     };
 
     if path.exists() {
-        backup_defaults_before_upgrade(&path);
+        backup_defaults_before_upgrade(&path)?;
     }
-    std::fs::write(&path, merged)
+    write_file_atomic(&path, &merged)
         .with_context(|| format!("failed to write remote defaults.toml: {}", path.display()))?;
     tracing::info!(path = %path.display(), "applied remote defaults.toml update");
     Ok(true)
 }
 
-fn backup_defaults_before_upgrade(path: &Path) {
+/// Copy the current file to `defaults.toml.bak.<ts>`. A failed backup
+/// aborts the upgrade: the backup is the only way to recover hand-edits of
+/// shipped entries, so we never overwrite without one.
+fn backup_defaults_before_upgrade(path: &Path) -> Result<()> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let backup = path.with_extension(format!("toml.bak.{ts}"));
-    let _ = std::fs::copy(path, backup);
+    std::fs::copy(path, &backup).map(|_| ()).with_context(|| {
+        tracing::warn!(path = %path.display(), backup = %backup.display(), "defaults.toml backup failed; upgrade aborted");
+        format!("failed to back up defaults.toml to {}", backup.display())
+    })
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -572,7 +687,109 @@ fn merge_defaults_toml(user_raw: &str, builtin_raw: &str) -> Option<String> {
         merged.push('\n');
     }
 
+    let merged = preserve_user_policy_tables(&merged, user_raw).unwrap_or(merged);
+
     (merged != user_raw).then_some(merged)
+}
+
+/// `[exec_safety]` rules earlier releases shipped and later replaced with
+/// narrower ones. The deny/confirm union below would otherwise carry them
+/// forward forever, so an upgrade drops exactly these strings.
+const RETIRED_EXEC_SAFETY_RULES: [&str; 3] = [
+    // Matched `2>/dev/null`; replaced by device-only patterns (2026.10.13).
+    r">\s*/dev/",
+    r"tee\s+/dev/",
+    r"\bdd\b\s+if=.*of=/dev/",
+];
+
+/// Named-entry tables whose user-added entries / keys survive an upgrade.
+const KEYWISE_MERGED_TABLES: [&str; 3] = ["skill_registries", "direct_apis", "video_providers"];
+
+/// Carry user state from `user_raw` into the regenerated `merged` text:
+///
+/// - `[exec_safety]`: `deny` / `confirm` are the UNION of shipped and user
+///   rules (an upgrade — or a remote defaults payload — can add rules but
+///   never drop one the user has); every other key (`allow`, flags) keeps
+///   the user's value when the user has one, so an upgrade can't loosen it.
+/// - `skill_registries` / `direct_apis` / `video_providers`: shipped values
+///   are refreshed, but entries and keys that only exist in the user's file
+///   are kept (recursively).
+///
+/// Returns `None` if either side fails to parse (caller keeps `merged`).
+fn preserve_user_policy_tables(merged: &str, user_raw: &str) -> Option<String> {
+    use toml_edit::{DocumentMut, Item};
+
+    let mut doc: DocumentMut = merged.parse().ok()?;
+    let user: DocumentMut = user_raw.parse().ok()?;
+
+    if let Some(user_es) = user.get("exec_safety").and_then(Item::as_table_like) {
+        match doc.get_mut("exec_safety").and_then(Item::as_table_like_mut) {
+            Some(dst) => {
+                for (key, user_val) in user_es.iter() {
+                    let unioned = matches!(key, "deny" | "confirm")
+                        && match (dst.get_mut(key).and_then(Item::as_array_mut), user_val.as_array()) {
+                            (Some(dst_arr), Some(user_arr)) => {
+                                for v in user_arr.iter() {
+                                    if v
+                                        .as_str()
+                                        .is_some_and(|r| RETIRED_EXEC_SAFETY_RULES.contains(&r))
+                                    {
+                                        continue;
+                                    }
+                                    let exists = dst_arr
+                                        .iter()
+                                        .any(|d| d.as_str().is_some() && d.as_str() == v.as_str());
+                                    if !exists {
+                                        dst_arr.push(v.clone());
+                                    }
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                    if !unioned {
+                        dst.insert(key, user_val.clone());
+                    }
+                }
+            }
+            None => {
+                if let Some(item) = user.get("exec_safety") {
+                    doc.insert("exec_safety", item.clone());
+                }
+            }
+        }
+    }
+
+    for table in KEYWISE_MERGED_TABLES {
+        let Some(user_item) = user.get(table) else {
+            continue;
+        };
+        match doc.get_mut(table) {
+            Some(dst) => add_missing_keys(dst, user_item),
+            None => {
+                doc.insert(table, user_item.clone());
+            }
+        }
+    }
+
+    Some(doc.to_string())
+}
+
+/// Recursively insert keys present in `src` but missing from `dst`. Keys
+/// present in both keep `dst`'s value (the shipped one) unless both are
+/// tables, in which case the merge recurses.
+fn add_missing_keys(dst: &mut toml_edit::Item, src: &toml_edit::Item) {
+    let (Some(dst_t), Some(src_t)) = (dst.as_table_like_mut(), src.as_table_like()) else {
+        return;
+    };
+    for (key, src_val) in src_t.iter() {
+        match dst_t.get_mut(key) {
+            Some(d) => add_missing_keys(d, src_val),
+            None => {
+                dst_t.insert(key, src_val.clone());
+            }
+        }
+    }
 }
 
 fn defaults_version_is_legacy(user: &DefaultsIndex, builtin_version: &str) -> bool {
@@ -944,6 +1161,19 @@ mod tests {
     }
 
     #[test]
+    fn expand_json5_escapes_values_and_limits_tilde() {
+        // SAFETY: single-threaded test, no concurrent env access
+        unsafe { std::env::set_var("RSCLAW_TEST_TRICKY_SECRET", "a\"b\\c'd\ne") };
+        let raw = r#"{ apiKey: "${RSCLAW_TEST_TRICKY_SECRET}", other: 'x${RSCLAW_TEST_TRICKY_SECRET}', dir: "~/work", prompt: "see ~/notes" }"#;
+        let expanded = expand_env_vars_json5(raw);
+        let v: serde_json::Value = json5::from_str(&expanded).expect("still valid JSON5");
+        assert_eq!(v["apiKey"], "a\"b\\c'd\ne");
+        assert_eq!(v["other"], "xa\"b\\c'd\ne");
+        assert!(!v["dir"].as_str().unwrap_or("").starts_with("~/"));
+        assert_eq!(v["prompt"], "see ~/notes");
+    }
+
+    #[test]
     fn expand_missing_var_leaves_verbatim() {
         let input = r#"{"apiKey": "${RSCLAW_NONEXISTENT_XYZ}"}"#;
         let result = expand_env_vars(input);
@@ -1030,6 +1260,85 @@ label = "Feishu / Lark"
         assert!(merged.contains("name = \"mycorp\""));
         assert!(merged.contains("MyCorp Internal"));
         assert!(merged.contains("https://llm.mycorp.internal/v1"));
+    }
+
+    #[test]
+    fn merge_defaults_drops_retired_exec_safety_rules() {
+        let user = r#"
+[meta]
+defaults_version = "2026.9.30"
+
+[exec_safety]
+deny = [">\\s*/dev/", "tee\\s+/dev/", "user-rule"]
+"#;
+        let builtin = r#"
+[meta]
+defaults_version = "2026.10.13"
+
+[exec_safety]
+deny = ["new-shipped"]
+"#;
+        let merged = merge_defaults_toml(user, builtin).expect("upgrade");
+        let v: toml::Value = toml::from_str(&merged).expect("valid toml");
+        let deny: Vec<&str> = v["exec_safety"]["deny"]
+            .as_array()
+            .expect("deny")
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert_eq!(deny, vec!["new-shipped", "user-rule"]);
+    }
+
+    #[test]
+    fn merge_defaults_keeps_user_exec_safety_and_named_entries() {
+        let user = r#"
+[meta]
+defaults_version = "2026.5.10"
+
+[exec_safety]
+deny = ["old-shipped", "user-rule"]
+confirm = []
+allow = ["my-tool"]
+
+[video_providers.mine]
+label = "Mine"
+base_url = "https://example.invalid"
+
+[video_providers.shipped]
+label = "Old label"
+api_key_env = "USER_ADDED_KEY"
+"#;
+        let builtin = r#"
+[meta]
+defaults_version = "2026.5.20"
+
+[exec_safety]
+deny = ["new-shipped"]
+confirm = ["rm\\s+-rf"]
+allow = [".*"]
+
+[video_providers.shipped]
+label = "New label"
+"#;
+        let merged = merge_defaults_toml(user, builtin).expect("upgrade");
+        let v: toml::Value = toml::from_str(&merged).expect("valid toml");
+        let deny: Vec<&str> = v["exec_safety"]["deny"]
+            .as_array()
+            .expect("deny")
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert_eq!(deny, vec!["new-shipped", "old-shipped", "user-rule"]);
+        assert_eq!(v["exec_safety"]["confirm"].as_array().map(|a| a.len()), Some(1));
+        // A newer defaults payload can't loosen the user's allow list.
+        assert_eq!(v["exec_safety"]["allow"][0].as_str(), Some("my-tool"));
+        assert_eq!(v["video_providers"]["mine"]["label"].as_str(), Some("Mine"));
+        assert_eq!(v["video_providers"]["shipped"]["label"].as_str(), Some("New label"));
+        assert_eq!(
+            v["video_providers"]["shipped"]["api_key_env"].as_str(),
+            Some("USER_ADDED_KEY")
+        );
+        assert_eq!(v["meta"]["defaults_version"].as_str(), Some("2026.5.20"));
     }
 
     #[test]

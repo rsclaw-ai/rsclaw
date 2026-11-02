@@ -6,6 +6,30 @@
  */
 
 import { getGatewayUrl, getAuthToken, setAuthToken } from "./rsclaw-api";
+import { invoke as tauriInvoke, isTauriRuntime } from "../utils/tauri";
+
+/**
+ * Connection lifecycle as seen by the UI:
+ * - connecting:   first socket open / handshake in progress
+ * - connected:    handshake accepted; requests can be sent
+ * - reconnecting: socket dropped, backoff/retry in progress
+ * - error:        handshake rejected (e.g. bad auth token); retrying after
+ *                 a token refresh
+ * - disconnected: client destroyed / never started
+ */
+export type WsConnectionState =
+  | "connecting"
+  | "connected"
+  | "disconnected"
+  | "reconnecting"
+  | "error";
+
+/** How long chat frames for a not-yet-registered runId are kept. */
+const ORPHAN_CHAT_TTL_MS = 30_000;
+/** Upper bound on buffered orphan chat frames (all runs together). */
+const ORPHAN_CHAT_MAX = 2_000;
+/** Default time `send()` waits for the handshake before failing. */
+const SEND_READY_TIMEOUT_MS = 15_000;
 
 export type ChatCallbacks = {
   onDelta: (fullText: string, delta: string) => void;
@@ -161,6 +185,22 @@ export type RestartRequiredPayload = {
   reload_scopes?: string[];
 };
 
+/**
+ * Payload of a `restart.cleared` frame, mirrors rsclaw-events RestartCleared.
+ * Sent when the gateway withdraws a pending restart / reload offer.
+ */
+export type RestartClearedPayload = {
+  /** `at_ms` of the withdrawn request; absent = drop any banner. */
+  at_ms?: number;
+  reason: "auto_applied" | "dismissed";
+};
+
+type ReadyWaiter = {
+  resolve: () => void;
+  reject: (e: Error) => void;
+  timer: ReturnType<typeof setTimeout> | undefined;
+};
+
 class RsClawWsClient {
   private ws: WebSocket | null = null;
   private retryCount = 0;
@@ -174,14 +214,86 @@ class RsClawWsClient {
     (text: string, kind?: string, images?: string[]) => void
   >();
   private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
+  private restartClearedHandlers = new Set<(payload: RestartClearedPayload) => void>();
   private permissionHandlers = new Set<(payload: PermissionRequestPayload) => void>();
   private statusHandlers = new Set<(payload: ComputerUseStatusPayload) => void>();
   private askUserHandlers = new Set<(payload: AskUserPayload) => void>();
   private connectHandlers = new Set<() => void>();
   private tokenRefresh: Promise<void> | null = null;
+  /** True while `_doConnect` awaits a token refresh before opening. */
+  private connectInFlight = false;
+
+  private state: WsConnectionState = "disconnected";
+  private stateHandlers = new Set<(s: WsConnectionState) => void>();
+  private readyWaiters = new Set<ReadyWaiter>();
+  /**
+   * Chat frames whose runId has no registered handler yet. The gateway can
+   * emit `text_delta`/`done` before the `chat.send` response reaches us
+   * (e.g. preparse fast path); without buffering those frames were dropped
+   * and the UI spun forever. Replayed by `onChatEvent`.
+   */
+  private orphanChat = new Map<string, { at: number; frames: any[] }>();
+  private orphanCount = 0;
+
+  /** Current connection state. */
+  getState(): WsConnectionState {
+    return this.state;
+  }
+
+  /** Subscribe to connection-state changes. Returns an unsubscribe function. */
+  onStateChange(handler: (s: WsConnectionState) => void): () => void {
+    this.stateHandlers.add(handler);
+    return () => this.stateHandlers.delete(handler);
+  }
+
+  private _setState(next: WsConnectionState) {
+    if (this.state === next) return;
+    this.state = next;
+    this.stateHandlers.forEach((h) => {
+      try {
+        h(next);
+      } catch {
+        // subscriber errors must not break the WS pipeline
+      }
+    });
+  }
+
+  private _isReady(): boolean {
+    return (
+      this.state === "connected" &&
+      !!this.ws &&
+      this.ws.readyState === WebSocket.OPEN
+    );
+  }
+
+  /** Resolve once the handshake has completed, or reject after `timeoutMs`. */
+  private _waitReady(timeoutMs: number): Promise<void> {
+    if (this._isReady()) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const waiter: ReadyWaiter = {
+        timer: undefined,
+        resolve: () => {
+          clearTimeout(waiter.timer);
+          this.readyWaiters.delete(waiter);
+          resolve();
+        },
+        reject: (e: Error) => {
+          clearTimeout(waiter.timer);
+          this.readyWaiters.delete(waiter);
+          reject(e);
+        },
+      };
+      waiter.timer = setTimeout(
+        () => waiter.reject(new Error("WebSocket not connected (timed out waiting for gateway)")),
+        timeoutMs,
+      );
+      this.readyWaiters.add(waiter);
+    });
+  }
 
   /** Ensure the WS is connected. Safe to call multiple times. */
   connect() {
+    if (this.connectInFlight) return;
     if (
       this.ws &&
       (this.ws.readyState === WebSocket.OPEN ||
@@ -192,24 +304,86 @@ class RsClawWsClient {
     this._doConnect();
   }
 
-  /** Send a method request, returns the response payload. */
-  send(method: string, params: Record<string, unknown>): Promise<any> {
+  /**
+   * Send a method request, returns the response payload. Waits (up to
+   * `readyTimeoutMs`) for the connect handshake instead of failing when the
+   * socket is still CONNECTING / in backoff.
+   */
+  async send(
+    method: string,
+    params: Record<string, unknown>,
+    readyTimeoutMs = SEND_READY_TIMEOUT_MS,
+  ): Promise<any> {
+    this.connect();
+    await this._waitReady(readyTimeoutMs);
     return new Promise((resolve, reject) => {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
         reject(new Error("WebSocket not connected"));
         return;
       }
       const id = String(this.reqCounter++);
       this.pendingReqs.set(id, { resolve, reject });
-      this.ws.send(
-        JSON.stringify({ type: "req", id, method, params }),
-      );
+      ws.send(JSON.stringify({ type: "req", id, method, params }));
     });
   }
 
-  /** Register chat-event callbacks for a specific runId. */
+  /**
+   * Register chat-event callbacks for a specific runId. Frames that arrived
+   * before registration (buffered for a short TTL) are replayed immediately.
+   */
   onChatEvent(runId: string, cb: ChatCallbacks) {
     this.chatHandlers.set(runId, { cb, fullText: "" });
+    const buffered = this.orphanChat.get(runId);
+    if (buffered) {
+      this.orphanChat.delete(runId);
+      this.orphanCount -= buffered.frames.length;
+      for (const p of buffered.frames) {
+        if (!this.chatHandlers.has(runId)) break;
+        this._dispatchChat(runId, p);
+      }
+    }
+  }
+
+  /** Drop the chat handler for `runId` (e.g. after the user aborts). */
+  offChatEvent(runId: string) {
+    this.chatHandlers.delete(runId);
+    const buffered = this.orphanChat.get(runId);
+    if (buffered) {
+      this.orphanChat.delete(runId);
+      this.orphanCount -= buffered.frames.length;
+    }
+  }
+
+  private _bufferOrphanChat(runId: string, p: any) {
+    const now = Date.now();
+    // Expire stale runs first.
+    this.orphanChat.forEach((v, k) => {
+      if (now - v.at > ORPHAN_CHAT_TTL_MS) {
+        this.orphanChat.delete(k);
+        this.orphanCount -= v.frames.length;
+      }
+    });
+    if (this.orphanCount >= ORPHAN_CHAT_MAX) return;
+    const entry = this.orphanChat.get(runId) || { at: now, frames: [] };
+    entry.frames.push(p);
+    this.orphanChat.set(runId, entry);
+    this.orphanCount++;
+  }
+
+  private _dispatchChat(runId: string, p: any) {
+    const entry = this.chatHandlers.get(runId);
+    if (!entry) return;
+    if (p.type === "text_delta") {
+      entry.fullText += p.delta || "";
+      entry.cb.onDelta(entry.fullText, p.delta || "");
+    } else if (p.type === "done") {
+      const files: [string, string, string][] = p.files || [];
+      const images: string[] = p.images || [];
+      const toolLog: [string, string, string][] = p.toolLog || [];
+      this.chatHandlers.delete(runId);
+      entry.cb.onDone(files, images, toolLog);
+    }
   }
 
   /** Register a notification handler. Returns an unsubscribe function. */
@@ -231,6 +405,18 @@ class RsClawWsClient {
   ): () => void {
     this.restartHandlers.add(handler);
     return () => this.restartHandlers.delete(handler);
+  }
+
+  /**
+   * Register a handler for `restart.cleared` event frames: the gateway
+   * withdrew its pending restart / reload offer (auto-applied or dismissed),
+   * so a visible banner should be dropped. Returns an unsubscribe function.
+   */
+  onRestartCleared(
+    handler: (payload: RestartClearedPayload) => void,
+  ): () => void {
+    this.restartClearedHandlers.add(handler);
+    return () => this.restartClearedHandlers.delete(handler);
   }
 
   /**
@@ -316,11 +502,20 @@ class RsClawWsClient {
 
     // Wait for any pending token refresh before reconnecting.
     if (this.tokenRefresh) {
-      await this.tokenRefresh;
+      this.connectInFlight = true;
+      try {
+        await this.tokenRefresh;
+      } finally {
+        this.connectInFlight = false;
+      }
     }
 
     const gwUrl = getGatewayUrl() || "http://localhost:18888";
     const wsUrl = gwUrl.replace(/^http/, "ws") + "/ws";
+
+    if (this.state !== "error") {
+      this._setState(this.retryCount > 0 ? "reconnecting" : "connecting");
+    }
 
     try {
       const ws = new WebSocket(wsUrl);
@@ -336,12 +531,34 @@ class RsClawWsClient {
       };
 
       ws.onclose = () => {
+        // A stale socket (replaced by a newer connect) must not tear down
+        // the live one's state.
+        if (this.ws !== ws) return;
         this.ws = null;
         // Reject all pending requests
         this.pendingReqs.forEach(({ reject }) =>
           reject(new Error("WebSocket closed")),
         );
         this.pendingReqs.clear();
+        // Fail in-flight chat runs: their remaining frames went to the dead
+        // connection and will never arrive, so leaving them registered
+        // leaves the UI spinning forever.
+        const handlers = Array.from(this.chatHandlers.values());
+        this.chatHandlers.clear();
+        this.orphanChat.clear();
+        this.orphanCount = 0;
+        handlers.forEach(({ cb }) => {
+          try {
+            cb.onError(new Error("WebSocket closed"));
+          } catch {
+            // handler errors must not break the WS pipeline
+          }
+        });
+        if (!this.mounted) {
+          this._setState("disconnected");
+          return;
+        }
+        if (this.state !== "error") this._setState("reconnecting");
         this._scheduleReconnect();
       };
 
@@ -362,8 +579,9 @@ class RsClawWsClient {
 
   /** Re-read auth token from Tauri config on auth failure. */
   private _refreshTokenFromTauri() {
-    const tauriInvoke = (window as any).__TAURI__?.invoke;
-    if (!tauriInvoke) return;
+    // Tauri v2: `window.__TAURI__.invoke` does not exist (it moved to
+    // `__TAURI__.core.invoke`), so use the shared v2 wrapper.
+    if (!isTauriRuntime()) return;
     this.tokenRefresh = tauriInvoke("get_gateway_port")
       .then((gw: any) => {
         if (gw?.token) {
@@ -406,6 +624,8 @@ class RsClawWsClient {
     if (data.type === "res" && data.id === "1") {
       if (data.ok) {
         this.retryCount = 0;
+        this._setState("connected");
+        Array.from(this.readyWaiters).forEach((w) => w.resolve());
         // Notify subscribers that a fresh handshake completed. Any latched
         // events (e.g. restart.required) arrive in subsequent frames, so
         // subscribers can safely reset state here without losing real events.
@@ -419,6 +639,7 @@ class RsClawWsClient {
       } else {
         // Auth failed — refresh token from Tauri config before next retry.
         console.warn("[rsclaw-ws] connect failed:", data.error?.message);
+        this._setState("error");
         this._refreshTokenFromTauri();
       }
       return;
@@ -460,6 +681,12 @@ class RsClawWsClient {
     if (event === "restart.required") {
       const payload = (data.payload || data.data || {}) as RestartRequiredPayload;
       this.restartHandlers.forEach((h) => h(payload));
+      return;
+    }
+
+    if (event === "restart.cleared") {
+      const payload = (data.payload || data.data || {}) as RestartClearedPayload;
+      this.restartClearedHandlers.forEach((h) => h(payload));
       return;
     }
 
@@ -516,19 +743,13 @@ class RsClawWsClient {
         return;
       }
 
-      const entry = this.chatHandlers.get(runId);
-      if (!entry) return;
-
-      if (p.type === "text_delta") {
-        entry.fullText += p.delta || "";
-        entry.cb.onDelta(entry.fullText, p.delta || "");
-      } else if (p.type === "done") {
-        const files: [string, string, string][] = p.files || [];
-        const images: string[] = p.images || [];
-        const toolLog: [string, string, string][] = p.toolLog || [];
-        this.chatHandlers.delete(runId);
-        entry.cb.onDone(files, images, toolLog);
+      if (!this.chatHandlers.has(runId)) {
+        if (p.type === "text_delta" || p.type === "done") {
+          this._bufferOrphanChat(runId, p);
+        }
+        return;
       }
+      this._dispatchChat(runId, p);
     }
   }
 
@@ -537,6 +758,10 @@ class RsClawWsClient {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.ws?.close();
     this.ws = null;
+    Array.from(this.readyWaiters).forEach((w) =>
+      w.reject(new Error("WebSocket client destroyed")),
+    );
+    this._setState("disconnected");
   }
 }
 

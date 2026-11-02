@@ -23,6 +23,7 @@ const MAX_ARGS_BYTES: usize = 64 * 1024;
 const MAX_RAW_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
+const MAX_FALLBACK_CONTEXT_BYTES: usize = 512;
 const MAX_PATH_BYTES: usize = 512;
 const MAX_STRING_ARG_BYTES: usize = 4096;
 const MAX_SELECTOR_BYTES: usize = 64 * 1024;
@@ -34,6 +35,29 @@ const LATEST_MESSAGE_BUBBLE_COMMAND: &str = "latest-message-bubble";
 const INPUT_TEXT_COMMAND: &str = "input-text";
 const CLIPBOARD_SET_COMMAND: &str = "clipboard-set";
 const OCR_REGION_COMMAND: &str = "ocr-region";
+const KEY_REPEAT_COMMAND: &str = "key-repeat";
+const CLEAR_FOCUSED_COMMAND: &str = "clear-focused";
+/// Do one input, then return the first settled frame after it.
+const WAIT_CHANGE_COMMAND: &str = "wait-change";
+/// Longest wait the device service grants one `wait-change`.
+const MAX_WAIT_CHANGE_MS: u64 = 5_000;
+/// Most regions one `wait-change` may watch.
+const MAX_WAIT_CHANGE_REGIONS: usize = 8;
+/// Frames are asked for as JPEG at this quality: about a quarter of the PNG's
+/// size, so each frame crosses the transport faster and a relay with a small
+/// message limit is less likely to cut it.
+const FRAME_JPEG_QUALITY: u8 = 90;
+/// Ctrl+A, then Delete: select the focused field's text and delete it.
+const SELECT_ALL_DELETE_BODY: &str = r#"{"keys":[[113,29],[67]]}"#;
+/// Most presses one `key-repeat` call may carry.
+const MAX_KEY_REPEAT: u64 = 500;
+/// Describe the screen with the installed screen observer (`vision_observer`).
+const VISION_OBSERVE_COMMAND: &str = "vision-observe";
+/// A full screenshot may travel inside `vision-observe`'s args.
+const MAX_VISION_ARGS_BYTES: usize = 16 * 1024 * 1024;
+/// Recent screenshots kept by `frameId`, so `vision-observe` can describe the
+/// very frame a plugin already holds without the plugin sending it back.
+const FRAME_CACHE_LEN: usize = 3;
 const WAKEUP_SCREEN_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(500),
     Duration::from_millis(750),
@@ -233,12 +257,16 @@ impl Drop for TempJsonFile {
 
 /// Run one allowlisted Android operation through the requested CLS transport.
 pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, String> {
-    if args_json.len() > MAX_ARGS_BYTES {
-        return Err(format!(
-            "android uiauto: args exceed {MAX_ARGS_BYTES} bytes"
-        ));
+    let max_args = if command == VISION_OBSERVE_COMMAND {
+        MAX_VISION_ARGS_BYTES
+    } else {
+        MAX_ARGS_BYTES
+    };
+    if args_json.len() > max_args {
+        return Err(format!("android uiauto: args exceed {max_args} bytes"));
     }
-    let (args_json, options) = split_operation_options(args_json)?;
+    let (args_json, frame_jpeg) = take_frame_format(args_json)?;
+    let (args_json, options) = split_operation_options(&args_json)?;
     validate_operation_mode(command, options)?;
     let config = Config::from_env()?;
     if command == CONTACT_BADGE_COMMAND {
@@ -258,13 +286,16 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         return detect_latest_message_bubble(&config, options.op_type).await;
     }
     if command == INPUT_TEXT_COMMAND {
-        return input_text(&args_json, &config, options.op_type).await;
+        return input_text(&args_json, &config, options.op_type, options.op_mode).await;
     }
     if command == CLIPBOARD_SET_COMMAND {
         return clipboard_set(&args_json, &config).await;
     }
     if command == OCR_REGION_COMMAND {
         return ocr_region(&args_json, &config, options.op_type).await;
+    }
+    if command == VISION_OBSERVE_COMMAND {
+        return vision_observe(&args_json, &config, options.op_type).await;
     }
     if command == "foreground-package" {
         validate_no_args(command, &args_json)?;
@@ -279,11 +310,44 @@ pub(crate) async fn call(command: &str, args_json: &str) -> Result<String, Strin
         let keycode = keyevent_keycode(&args_json)?;
         return run_keycode(&config, options.op_type, keycode).await;
     }
+    if command == KEY_REPEAT_COMMAND {
+        return key_repeat(&args_json, &config, options.op_type).await;
+    }
+    if command == CLEAR_FOCUSED_COMMAND {
+        validate_no_args(command, &args_json)?;
+        return clear_focused(&config, options.op_type).await;
+    }
+    if command == WAIT_CHANGE_COMMAND {
+        return wait_change(&args_json, &config, options.op_type, frame_jpeg).await;
+    }
     if command == "screenshot" {
         validate_no_args(command, &args_json)?;
-        return screenshot_with_wakeup(&config, options.op_type).await;
+        return screenshot_with_wakeup(&config, options.op_type, frame_jpeg).await;
     }
     run_high_level_operation(&config, options.op_type, command, &args_json).await
+}
+
+/// Take the `frameFormat` option (`"jpeg"` or `"png"`, default png) off the
+/// args. A plugin asks for JPEG frames only when it decodes JPEG itself.
+fn take_frame_format(args_json: &str) -> Result<(String, bool), String> {
+    if !args_json.contains("frameFormat") {
+        return Ok((args_json.to_string(), false));
+    }
+    let mut value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android operation: invalid args JSON: {error}"))?;
+    let jpeg = match value
+        .as_object_mut()
+        .and_then(|object| object.remove("frameFormat"))
+        .as_ref()
+        .map(|v| v.as_str())
+    {
+        None | Some(Some("png")) => false,
+        Some(Some("jpeg")) => true,
+        Some(_) => {
+            return Err("android operation: `frameFormat` must be \"jpeg\" or \"png\"".to_string());
+        }
+    };
+    Ok((value.to_string(), jpeg))
 }
 
 fn split_operation_options(args_json: &str) -> Result<(String, AndroidOperationOptions), String> {
@@ -323,6 +387,9 @@ fn validate_operation_mode(command: &str, options: AndroidOperationOptions) -> R
                 | "drag"
                 | "key"
                 | "keyevent"
+                | KEY_REPEAT_COMMAND
+                | CLEAR_FOCUSED_COMMAND
+                | WAIT_CHANGE_COMMAND
                 | "launch"
                 | "relaunch"
                 | INPUT_TEXT_COMMAND
@@ -331,6 +398,7 @@ fn validate_operation_mode(command: &str, options: AndroidOperationOptions) -> R
                 | KEYBOARD_VISIBLE_COMMAND
                 | SEND_BUTTON_COMMAND
                 | LATEST_MESSAGE_BUBBLE_COMMAND
+                | VISION_OBSERVE_COMMAND
         )
     {
         return Err(format!(
@@ -346,6 +414,7 @@ async fn input_text(
     args_json: &str,
     config: &Config,
     op_type: AndroidOpType,
+    op_mode: Option<AndroidOpMode>,
 ) -> Result<String, String> {
     let input = input_text_value(args_json)?;
     match op_type {
@@ -367,8 +436,27 @@ async fn input_text(
             run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
         }
         AndroidOpType::U2 => {
-            let args = uiauto_visual_text_args(config, input)?;
-            run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+            let args = uiauto_visual_text_args(config, input.clone())?;
+            match run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await {
+                Ok(response) => Ok(response),
+                Err(original)
+                    if op_mode == Some(AndroidOpMode::Vision)
+                        && is_webdriver_no_such_element_error(&original) =>
+                {
+                    u2_active_element_clipboard_fallback(config, &input.text)
+                        .await
+                        .map_err(|fallback| {
+                            let fallback = rsclaw_util::truncate_str(
+                                &fallback,
+                                MAX_FALLBACK_CONTEXT_BYTES,
+                            );
+                            format!(
+                                "{original}; U2 active-element clipboard fallback failed: {fallback}"
+                            )
+                        })
+                }
+                Err(error) => Err(error),
+            }
         }
         AndroidOpType::Adb => Err(
             "android operation: input-text is unavailable for opType=adb in vision mode"
@@ -423,12 +511,87 @@ fn clipboard_request(args_json: &str) -> Result<(String, String), String> {
     ))
 }
 
-async fn clipboard_set(args_json: &str, _config: &Config) -> Result<String, String> {
+async fn clipboard_set(args_json: &str, config: &Config) -> Result<String, String> {
     let (path, body) = clipboard_request(args_json)?;
-    raw("POST", &path, Some(&body)).await
+    raw_with_config(config, "POST", &path, Some(&body)).await
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// Paste through the already-running UIAutomator2 session only after CLS's
+/// canonical coordinate type-at reports the precise WebDriver active-element
+/// failure. This intentionally creates no session and exposes no new command.
+async fn u2_active_element_clipboard_fallback(
+    config: &Config,
+    text: &str,
+) -> Result<String, String> {
+    let sessions = raw_with_config(config, "GET", "/sessions", None).await?;
+    let session_id = single_u2_session_id(&sessions)?;
+    let clipboard_args = serde_json::json!({ "sessionId": session_id, "text": text }).to_string();
+    clipboard_set(&clipboard_args, config).await?;
+    let path = format!("/session/{session_id}/appium/device/press_keycode");
+    raw_with_config(config, "POST", &path, Some(r#"{"keycode":279}"#)).await
+}
+
+/// Extract exactly one UiAutomator2 session from the W3C GET /sessions
+/// response.
+fn single_u2_session_id(response: &str) -> Result<String, String> {
+    let response: Value = serde_json::from_str(response)
+        .map_err(|error| format!("android uiauto: invalid U2 sessions response: {error}"))?;
+    let sessions = response
+        .as_object()
+        .and_then(|response| response.get("value"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "android uiauto: malformed U2 sessions response".to_string())?;
+    let [session] = sessions.as_slice() else {
+        return Err(format!(
+            "android uiauto: needs exactly one existing U2 session (got {})",
+            sessions.len()
+        ));
+    };
+    let session_id = session
+        .as_object()
+        .and_then(|session| session.get("sessionId").or_else(|| session.get("id")))
+        .and_then(Value::as_str)
+        .filter(|session_id| is_identifier(session_id))
+        .ok_or_else(|| "android uiauto: malformed U2 session entry".to_string())?;
+    Ok(session_id.to_string())
+}
+
+/// Match only a structured W3C WebDriver `no such element` error, never a
+/// coincidental substring in CLS diagnostics.
+fn is_webdriver_no_such_element_error(error: &str) -> bool {
+    contains_webdriver_no_such_element_json(error)
+        || error.char_indices().any(|(index, character)| {
+            if character != '"' {
+                return false;
+            }
+            let mut strings =
+                serde_json::Deserializer::from_str(&error[index..]).into_iter::<String>();
+            let Some(Ok(decoded)) = strings.next() else {
+                return false;
+            };
+            contains_webdriver_no_such_element_json(&decoded)
+        })
+}
+
+fn contains_webdriver_no_such_element_json(error: &str) -> bool {
+    error.char_indices().any(|(index, character)| {
+        if character != '{' {
+            return false;
+        }
+        let mut values = serde_json::Deserializer::from_str(&error[index..]).into_iter::<Value>();
+        let Some(Ok(value)) = values.next() else {
+            return false;
+        };
+        value
+            .get("value")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+            == Some("no such element")
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct InputText {
     text: String,
     point: Option<(u32, u32)>,
@@ -506,6 +669,360 @@ async fn run_keycode(
         }
     };
     run_cls(&config.cls_bin, &args, Duration::from_secs(15)).await
+}
+
+/// Clear the focused text field in one request: cls-service presses Ctrl+A
+/// then Delete through UiAutomation (no adb). A cls-service without the
+/// session-less `/appium/device/keys` route answers 404, so this fails and
+/// the caller falls back to deleting key by key. Callers check the field is
+/// empty afterwards: with nothing focused, Delete removes one character.
+async fn clear_focused(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
+    if !matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
+        return Err("android clear-focused: supports only opType=auto or u2".to_string());
+    }
+    run_raw_request(
+        config,
+        "POST",
+        "/appium/device/keys",
+        Some(SELECT_ALL_DELETE_BODY),
+        Duration::from_secs(15),
+    )
+    .await
+}
+
+/// `wait-change`: one input (tap, long press, swipe, keycode, key chords or a
+/// paste) and then, on the device, a look every `intervalMs` at `regions`
+/// until they have changed and settled (`until: "stable"`: only settled),
+/// or `timeoutMs` runs out. One round trip replaces a fixed sleep and the
+/// screenshot after it. The answer is a screenshot answer (`data`,
+/// `frameId`, …) plus how the wait went: `changed`, `stable`, `timedOut`,
+/// `elapsedMs` (input done to answer), `frameMs`, `actionMs`, `frames`,
+/// `changedRegions`. A timeout is not an error. A device service without the
+/// route answers 404; the caller then falls back to sleeping.
+async fn wait_change(
+    args_json: &str,
+    config: &Config,
+    op_type: AndroidOpType,
+    jpeg: bool,
+) -> Result<String, String> {
+    if !matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
+        return Err("android wait-change: supports only opType=auto or u2".to_string());
+    }
+    let (body, timeout_ms) = wait_change_request(args_json)?;
+    let deadline = Duration::from_millis(timeout_ms) + Duration::from_secs(20);
+    let started = std::time::Instant::now();
+    let response = if !jpeg || lacks_jpeg_frames(&config.node) {
+        run_raw_request(
+            config,
+            "POST",
+            "/appium/device/wait_change",
+            Some(&body),
+            deadline,
+        )
+        .await?
+    } else {
+        let jpeg_body = with_jpeg_frame(&body);
+        match run_raw_request(
+            config,
+            "POST",
+            "/appium/device/wait_change",
+            Some(&jpeg_body),
+            deadline,
+        )
+        .await
+        {
+            Ok(response) => response,
+            // A 400 is answered before the input is performed, so the call
+            // can be made again without the format.
+            Err(error) if rejects_frame_format(&error) => {
+                tracing::info!(node = %config.node, %error, "device service sends no JPEG frames; asking for PNG");
+                remember_lacks_jpeg_frames(&config.node);
+                run_raw_request(
+                    config,
+                    "POST",
+                    "/appium/device/wait_change",
+                    Some(&body),
+                    deadline,
+                )
+                .await?
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let total_ms = started.elapsed().as_millis() as u64;
+    let answer = wait_change_answer(&response)?;
+    log_wait_change_split(&answer, response.len(), total_ms);
+    annotate_screenshot(answer)
+}
+
+/// `body` asking for the frame as JPEG.
+fn with_jpeg_frame(body: &str) -> String {
+    let mut value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("format".to_string(), serde_json::json!("jpeg"));
+        object.insert("quality".to_string(), serde_json::json!(FRAME_JPEG_QUALITY));
+        value.to_string()
+    } else {
+        body.to_string()
+    }
+}
+
+/// Where a `wait-change` round trip went: the device's own time (input plus
+/// watching) against the rest, which is the request and the frame crossing
+/// the transport.
+fn log_wait_change_split(answer: &str, response_bytes: usize, total_ms: u64) {
+    let Ok(value) = serde_json::from_str::<Value>(answer) else {
+        return;
+    };
+    let ms = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let device_ms = ms("actionMs") + ms("elapsedMs");
+    tracing::info!(
+        total_ms,
+        device_ms,
+        transport_ms = total_ms.saturating_sub(device_ms),
+        response_kb = response_bytes / 1024,
+        "android wait-change round trip"
+    );
+}
+
+/// Check `wait-change` args and build the device service's request body (always
+/// asking for the frame). Returns the body and the wait's timeout.
+fn wait_change_request(args_json: &str) -> Result<(String, u64), String> {
+    let mut value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android wait-change: invalid args JSON: {error}"))?;
+    let object = object_with_keys(
+        &value,
+        &[
+            "action",
+            "regions",
+            "until",
+            "minMs",
+            "timeoutMs",
+            "intervalMs",
+            "stableFrames",
+            "cell",
+            "cellDelta",
+            "threshold",
+            "ignoreCaret",
+        ],
+    )
+    .map_err(|error| error.replace("android uiauto raw: body", "android wait-change: arg"))?;
+    if let Some(action) = object.get("action") {
+        validate_wait_change_action(action)?;
+    }
+    if let Some(regions) = object.get("regions") {
+        let regions = regions
+            .as_array()
+            .filter(|r| !r.is_empty() && r.len() <= MAX_WAIT_CHANGE_REGIONS)
+            .ok_or_else(|| {
+                format!(
+                    "android wait-change: `regions` must list 1-{MAX_WAIT_CHANGE_REGIONS} regions"
+                )
+            })?;
+        for region in regions {
+            let region = region
+                .as_object()
+                .filter(|r| r.len() == 4)
+                .ok_or("android wait-change: a region is exactly {x, y, w, h}")?;
+            let size = |key: &str| region.get(key).and_then(Value::as_u64);
+            if size("x").is_none()
+                || size("y").is_none()
+                || !size("w").is_some_and(|w| w > 0)
+                || !size("h").is_some_and(|h| h > 0)
+            {
+                return Err(
+                    "android wait-change: a region's x, y need to be >= 0 and w, h > 0".to_string(),
+                );
+            }
+        }
+    }
+    if let Some(until) = object.get("until")
+        && !matches!(until.as_str(), Some("change" | "stable"))
+    {
+        return Err("android wait-change: `until` must be \"change\" or \"stable\"".to_string());
+    }
+    for key in ["minMs", "intervalMs", "stableFrames", "cell", "cellDelta"] {
+        if object.get(key).is_some_and(|v| v.as_u64().is_none()) {
+            return Err(format!(
+                "android wait-change: `{key}` must be a whole number"
+            ));
+        }
+    }
+    if object
+        .get("threshold")
+        .is_some_and(|v| !v.as_f64().is_some_and(|t| (0.0..=1.0).contains(&t)))
+    {
+        return Err("android wait-change: `threshold` must be between 0 and 1".to_string());
+    }
+    if object.get("ignoreCaret").is_some_and(|v| !v.is_boolean()) {
+        return Err("android wait-change: `ignoreCaret` must be true or false".to_string());
+    }
+    let timeout_ms = match object.get("timeoutMs") {
+        None => 2_500,
+        Some(v) => v
+            .as_u64()
+            .filter(|ms| (1..=MAX_WAIT_CHANGE_MS).contains(ms))
+            .ok_or_else(|| {
+                format!("android wait-change: `timeoutMs` must be 1-{MAX_WAIT_CHANGE_MS}")
+            })?,
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("returnImage".to_string(), Value::Bool(true));
+    }
+    Ok((value.to_string(), timeout_ms))
+}
+
+/// A `wait-change` action is one of the device service's: tap, longpress, swipe,
+/// keycode, keys or paste, with exactly that action's fields.
+fn validate_wait_change_action(action: &Value) -> Result<(), String> {
+    let object = action
+        .as_object()
+        .ok_or("android wait-change: `action` must be an object")?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or("android wait-change: `action.type` is required")?;
+    let (required, optional): (&[&str], &[&str]) = match kind {
+        "tap" | "longpress" => (&["x", "y"], &["durationMs"]),
+        "swipe" => (&["x", "y", "x2", "y2"], &["durationMs"]),
+        "keycode" => (&["keycode"], &[]),
+        "keys" => (&["keys"], &[]),
+        "paste" => (&["text"], &["x", "y"]),
+        other => {
+            return Err(format!(
+                "android wait-change: unknown action type `{other}`"
+            ));
+        }
+    };
+    for key in object.keys().filter(|key| key.as_str() != "type") {
+        if !required.contains(&key.as_str()) && !optional.contains(&key.as_str()) {
+            return Err(format!(
+                "android wait-change: `{key}` does not belong to a `{kind}` action"
+            ));
+        }
+    }
+    for key in required {
+        if !object.contains_key(*key) {
+            return Err(format!(
+                "android wait-change: a `{kind}` action needs `{key}`"
+            ));
+        }
+    }
+    for (key, value) in object {
+        let ok = match key.as_str() {
+            "type" => true,
+            "text" => value
+                .as_str()
+                .is_some_and(|t| !t.is_empty() && t.len() <= MAX_INPUT_TEXT_BYTES),
+            "keys" => value.as_array().is_some_and(|chords| {
+                !chords.is_empty()
+                    && chords.len() <= 16
+                    && chords.iter().all(|chord| {
+                        chord.as_array().is_some_and(|keys| {
+                            !keys.is_empty() && keys.len() <= 4 && keys.iter().all(Value::is_u64)
+                        })
+                    })
+            }),
+            _ => value.as_u64().is_some(),
+        };
+        if !ok {
+            return Err(format!(
+                "android wait-change: bad `{key}` in a `{kind}` action"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The device service's `{"value": {..., "image": "<base64 PNG>"}}` in the shape a
+/// screenshot answer has, with the wait's outcome alongside.
+fn wait_change_answer(response: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(response)
+        .map_err(|error| format!("android wait-change: answer: {error}"))?;
+    let mut outcome = value
+        .get("value")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| "android wait-change: answer without a value".to_string())?;
+    let image = outcome
+        .remove("image")
+        .and_then(|image| image.as_str().map(str::to_string))
+        .filter(|image| !image.is_empty())
+        .ok_or_else(|| "android wait-change: answer without a frame".to_string())?;
+    // The annotation measures the frame itself.
+    outcome.remove("width");
+    outcome.remove("height");
+    outcome.insert("ok".to_string(), Value::Bool(true));
+    outcome.insert("source".to_string(), serde_json::json!("cls-service"));
+    outcome.insert("data".to_string(), Value::String(image));
+    Ok(Value::Object(outcome).to_string())
+}
+
+/// Parse `key-repeat` args: a deletion keycode (67 backspace, 112 forward
+/// delete) and a press count. Returns the W3C key value and the count.
+fn key_repeat_request(args_json: &str) -> Result<(&'static str, u64), String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("android key-repeat: invalid args JSON: {error}"))?;
+    let object = object_with_keys(&value, &["keycode", "count"])?;
+    let key = match object.get("keycode").and_then(Value::as_i64) {
+        Some(67) => "\u{E003}",
+        Some(112) => "\u{E017}",
+        _ => {
+            return Err(
+                "android key-repeat: `keycode` must be 67 (backspace) or 112 (forward delete)"
+                    .to_string(),
+            );
+        }
+    };
+    let count = object
+        .get("count")
+        .and_then(Value::as_u64)
+        .filter(|count| (1..=MAX_KEY_REPEAT).contains(count))
+        .ok_or_else(|| format!("android key-repeat: `count` must be 1-{MAX_KEY_REPEAT}"))?;
+    Ok((key, count))
+}
+
+/// One W3C key source pressing `key` `count` times.
+fn key_repeat_body(key: &str, count: u64) -> String {
+    let press = [
+        serde_json::json!({ "type": "keyDown", "value": key }),
+        serde_json::json!({ "type": "keyUp", "value": key }),
+    ];
+    let actions: Vec<Value> = (0..count).flat_map(|_| press.clone()).collect();
+    serde_json::json!({
+        "actions": [{ "type": "key", "id": "keyboard", "actions": actions }]
+    })
+    .to_string()
+}
+
+/// About 45 ms a press measured on a Pixel, with room for a slow tunnel.
+fn key_repeat_timeout(count: u64) -> Duration {
+    Duration::from_secs(5) + Duration::from_millis(100 * count)
+}
+
+/// Press one deletion key many times in a single UIAutomator2 actions
+/// request, instead of one CLS round trip a key. The body is built here, so
+/// it skips the raw-endpoint allowlist, which keeps key sources closed.
+async fn key_repeat(
+    args_json: &str,
+    config: &Config,
+    op_type: AndroidOpType,
+) -> Result<String, String> {
+    if !matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
+        return Err("android key-repeat: supports only opType=auto or u2".to_string());
+    }
+    let (key, count) = key_repeat_request(args_json)?;
+    let sessions = raw_with_config(config, "GET", "/sessions", None).await?;
+    let session_id = single_u2_session_id(&sessions)?;
+    let body = key_repeat_body(key, count);
+    run_raw_request(
+        config,
+        "POST",
+        &format!("/session/{session_id}/actions"),
+        Some(&body),
+        key_repeat_timeout(count),
+    )
+    .await
 }
 
 async fn run_high_level_operation(
@@ -596,7 +1113,7 @@ async fn run_high_level_operation(
             } else {
                 build_explicit_call_args(config, op_type, command, args_json)?
             };
-            if command == "relaunch" && op_type == AndroidOpType::Auto {
+            if command == "relaunch" && matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2) {
                 return relaunch_with_adb_foreground_fallback(config, &args).await;
             }
             run_cls(&config.cls_bin, &args, deadline_for(command)).await
@@ -632,7 +1149,7 @@ async fn ocr_region(
         let height = r.get("height")?.as_u64()? as u32;
         Some((x, y, width, height))
     });
-    let response = screenshot_with_wakeup(config, op_type).await?;
+    let response = screenshot_with_wakeup(config, op_type, false).await?;
     let png = screenshot_png(&response)?;
     tokio::task::spawn_blocking(move || rsclaw_desktop::ocr_image_region(&png, rect))
         .await
@@ -700,7 +1217,7 @@ fn keyevent_keycode(args_json: &str) -> Result<i32, String> {
 }
 
 async fn detect_contact_badge(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config, op_type).await?;
+    let response = screenshot_with_wakeup(config, op_type, false).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -723,7 +1240,7 @@ async fn detect_contact_badge(config: &Config, op_type: AndroidOpType) -> Result
 }
 
 async fn detect_send_button(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config, op_type).await?;
+    let response = screenshot_with_wakeup(config, op_type, false).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -748,7 +1265,7 @@ async fn detect_latest_message_bubble(
     config: &Config,
     op_type: AndroidOpType,
 ) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config, op_type).await?;
+    let response = screenshot_with_wakeup(config, op_type, false).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -913,7 +1430,7 @@ async fn detect_keyboard_visible(
     config: &Config,
     op_type: AndroidOpType,
 ) -> Result<String, String> {
-    let response = screenshot_with_wakeup(config, op_type).await?;
+    let response = screenshot_with_wakeup(config, op_type, false).await?;
     let png = screenshot_png(&response)?;
     let image = rsclaw_platform::capture::png_to_rgba(&png)
         .map_err(|error| format!("android uiauto: decode screenshot PNG: {error}"))?;
@@ -1230,9 +1747,29 @@ fn bottom_tab_active_probe(
     }
 }
 
-async fn screenshot_with_wakeup(config: &Config, op_type: AndroidOpType) -> Result<String, String> {
-    let args = explicit_base_args(config, op_type, "screenshot")?;
-    let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
+/// A screenshot (woken if black). With a screen observer installed, the
+/// foreground package is read alongside and kept with the frame:
+/// `vision-observe` on that frame then needs no read of its own, which through
+/// the relay takes seconds.
+async fn screenshot_with_wakeup(
+    config: &Config,
+    op_type: AndroidOpType,
+    jpeg: bool,
+) -> Result<String, String> {
+    let foreground = crate::vision_observer::observer_path().map(|_| read_foreground_soon(config));
+    let response = screenshot_taken(config, op_type, jpeg).await?;
+    if let (Some(foreground), Some(id)) = (foreground, frame_id_of(&response)) {
+        attach_foreground(&id, foreground);
+    }
+    Ok(response)
+}
+
+async fn screenshot_taken(
+    config: &Config,
+    op_type: AndroidOpType,
+    jpeg: bool,
+) -> Result<String, String> {
+    let response = capture_screenshot(config, op_type, jpeg).await?;
     if !screenshot_is_black(&response)? {
         return annotate_screenshot(response);
     }
@@ -1251,8 +1788,7 @@ async fn screenshot_with_wakeup(config: &Config, op_type: AndroidOpType) -> Resu
 
     for (index, delay) in WAKEUP_SCREEN_RETRY_DELAYS.iter().enumerate() {
         tokio::time::sleep(*delay).await;
-        let retry = explicit_base_args(config, op_type, "screenshot")?;
-        let response = run_cls(&config.cls_bin, &retry, deadline_for("screenshot")).await?;
+        let response = capture_screenshot(config, op_type, jpeg).await?;
         if !screenshot_is_black(&response)? {
             return annotate_screenshot(response);
         }
@@ -1267,6 +1803,353 @@ async fn screenshot_with_wakeup(config: &Config, op_type: AndroidOpType) -> Resu
         "android uiauto: screenshot remains black after CLS power-wake retries; device may be locked or its display unavailable"
             .to_string(),
     )
+}
+
+/// A screenshot through cls-service's session-less endpoint: one round trip
+/// and a quickly encoded PNG, against three round trips (a session created
+/// and deleted around it) and Android's slow encoder for
+/// `cls android uiauto screenshot`, which a cls-service without the endpoint
+/// still gets.
+async fn capture_screenshot(
+    config: &Config,
+    op_type: AndroidOpType,
+    jpeg: bool,
+) -> Result<String, String> {
+    let uiauto = matches!(op_type, AndroidOpType::Auto | AndroidOpType::U2);
+    if uiauto && !lacks_quick_screenshot(&config.node) {
+        match screenshot_from_service(config, jpeg).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                tracing::debug!(node = %config.node, %error, "quick screenshot unavailable");
+                if error.contains("404") {
+                    remember_lacks_quick_screenshot(&config.node);
+                }
+            }
+        }
+    }
+    let args = explicit_base_args(config, op_type, "screenshot")?;
+    run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await
+}
+
+/// `jpeg` asks for a JPEG frame; only a caller that decodes JPEG itself asks.
+async fn screenshot_from_service(config: &Config, jpeg: bool) -> Result<String, String> {
+    if jpeg && !lacks_jpeg_frames(&config.node) {
+        let path = format!("/appium/device/screenshot?format=jpeg&quality={FRAME_JPEG_QUALITY}");
+        match screenshot_at(config, &path).await {
+            Ok(response) => return Ok(response),
+            // A screenshot is read-only, so any 404 is worth one plain retry
+            // before the route itself is judged missing.
+            Err(error) if rejects_frame_format(&error) || error.contains("404") => {
+                tracing::info!(node = %config.node, %error, "device service sends no JPEG frames; asking for PNG");
+                remember_lacks_jpeg_frames(&config.node);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    screenshot_at(config, "/appium/device/screenshot").await
+}
+
+async fn screenshot_at(config: &Config, path: &str) -> Result<String, String> {
+    let mut args = uiauto_base_args(config, "raw");
+    args.extend(["--method".to_string(), "GET".to_string()]);
+    args.push(path.to_string());
+    let response = run_cls(&config.cls_bin, &args, deadline_for("screenshot")).await?;
+    screenshot_from_service_response(&response)
+}
+
+/// An answer saying the device service did not take the frame-format
+/// parameters (an older one): a 400 naming them, or a 404 for the route with
+/// a query string. Nothing was done on the device, so asking again without
+/// them is safe.
+fn rejects_frame_format(error: &str) -> bool {
+    (error.contains("400") && (error.contains("format") || error.contains("quality")))
+        || (error.contains("404") && error.contains("format=jpeg"))
+}
+
+/// Nodes whose device service sends PNG frames only.
+fn nodes_without_jpeg_frames() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static NODES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NODES.get_or_init(Default::default)
+}
+
+fn lacks_jpeg_frames(node: &str) -> bool {
+    nodes_without_jpeg_frames()
+        .lock()
+        .is_ok_and(|nodes| nodes.contains(node))
+}
+
+fn remember_lacks_jpeg_frames(node: &str) {
+    if let Ok(mut nodes) = nodes_without_jpeg_frames().lock() {
+        nodes.insert(node.to_string());
+    }
+}
+
+/// The media type of encoded image bytes, by their signature.
+fn image_mime(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else {
+        "image/png"
+    }
+}
+
+/// cls-service's `{"value": "<base64 PNG>"}` in the shape
+/// `cls android uiauto screenshot` prints.
+fn screenshot_from_service_response(response: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(response)
+        .map_err(|error| format!("android uiauto: screenshot answer: {error}"))?;
+    let data = value
+        .get("value")
+        .and_then(Value::as_str)
+        .filter(|data| !data.is_empty())
+        .ok_or_else(|| "android uiauto: screenshot answer without an image".to_string())?;
+    Ok(serde_json::json!({ "ok": true, "source": "cls-service", "data": data }).to_string())
+}
+
+/// Nodes whose cls-service predates `/appium/device/screenshot`.
+fn nodes_without_quick_screenshot() -> &'static std::sync::Mutex<std::collections::HashSet<String>>
+{
+    static NODES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NODES.get_or_init(Default::default)
+}
+
+fn lacks_quick_screenshot(node: &str) -> bool {
+    nodes_without_quick_screenshot()
+        .lock()
+        .is_ok_and(|nodes| nodes.contains(node))
+}
+
+fn remember_lacks_quick_screenshot(node: &str) {
+    if let Ok(mut nodes) = nodes_without_quick_screenshot().lock() {
+        nodes.insert(node.to_string());
+    }
+}
+
+/// The foreground package being read (or read) for a frame.
+type Foreground = futures::future::Shared<futures::future::BoxFuture<'static, Option<String>>>;
+
+/// A recent screenshot, with the foreground read alongside it when one was.
+struct CachedFrame {
+    id: String,
+    png: Vec<u8>,
+    foreground: Option<Foreground>,
+}
+
+/// Recent screenshots, oldest first, by `frameId`.
+type FrameCache = std::sync::Mutex<VecDeque<CachedFrame>>;
+
+/// Start reading the foreground package now; the result can be awaited later,
+/// any number of times.
+fn read_foreground_soon(config: &Config) -> Foreground {
+    use futures::FutureExt as _;
+    let config = config.clone();
+    let task = tokio::spawn(async move { foreground_package_name(&config).await });
+    async move { task.await.ok().flatten() }.boxed().shared()
+}
+
+fn frame_id_of(response: &str) -> Option<String> {
+    serde_json::from_str::<Value>(response)
+        .ok()?
+        .get("frameId")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn attach_foreground(id: &str, foreground: Foreground) {
+    if let Ok(mut cache) = frame_cache().lock()
+        && let Some(frame) = cache.iter_mut().find(|f| f.id == id)
+    {
+        frame.foreground = Some(foreground);
+    }
+}
+
+fn frame_foreground(id: &str) -> Option<Foreground> {
+    frame_cache()
+        .lock()
+        .ok()?
+        .iter()
+        .find(|f| f.id == id)
+        .and_then(|f| f.foreground.clone())
+}
+
+fn frame_cache() -> &'static FrameCache {
+    static CACHE: std::sync::OnceLock<FrameCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(VecDeque::new()))
+}
+
+/// Keep a screenshot for `vision-observe` and name it by its content.
+fn remember_frame(png: Vec<u8>) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(&png);
+    let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    match frame_cache().lock() {
+        Ok(mut cache) => {
+            cache.retain(|f| f.id != id);
+            cache.push_back(CachedFrame {
+                id: id.clone(),
+                png,
+                foreground: None,
+            });
+            while cache.len() > FRAME_CACHE_LEN {
+                cache.pop_front();
+            }
+        }
+        Err(error) => tracing::warn!(%error, "android screenshot frame cache poisoned"),
+    }
+    id
+}
+
+fn cached_frame(id: &str) -> Option<Vec<u8>> {
+    frame_cache()
+        .lock()
+        .ok()?
+        .iter()
+        .find(|f| f.id == id)
+        .map(|f| f.png.clone())
+}
+
+/// `vision-observe`: describe a screenshot with the installed screen observer.
+///
+/// The image is the plugin's (`image`: a data URI), a recent screenshot by its
+/// `frameId` (`frame`), or else one taken now — then the answer carries it
+/// (unless `return_image` is false) with its `frameId`. The answer always
+/// carries the foreground package, read while the observer works. Every other
+/// arg goes to the observer as it is.
+async fn vision_observe(
+    args_json: &str,
+    config: &Config,
+    op_type: AndroidOpType,
+) -> Result<String, String> {
+    let mut args: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("vision-failed: invalid args JSON: {error}"))?;
+    let object = args
+        .as_object_mut()
+        .ok_or_else(|| "vision-failed: args must be an object".to_string())?;
+    let image = object.remove("image");
+    let frame = object.remove("frame");
+    let return_image = object.remove("return_image").and_then(|v| v.as_bool());
+    let (bytes, taken) = match (image.as_ref().and_then(Value::as_str), frame.as_ref().and_then(Value::as_str)) {
+        (Some(uri), _) => (decode_image_data_uri(uri)?, None),
+        (None, Some(id)) => (
+            cached_frame(id).ok_or_else(|| {
+                format!("vision-failed: frame {id} is no longer cached; send the image or take a new screenshot")
+            })?,
+            None,
+        ),
+        (None, None) => {
+            let response = screenshot_with_wakeup(config, op_type, false).await?;
+            let png = screenshot_png(&response)?;
+            let id = serde_json::from_str::<Value>(&response)
+                .ok()
+                .and_then(|v| v.get("frameId").and_then(Value::as_str).map(str::to_string));
+            (png, Some(id))
+        }
+    };
+    // The frame's foreground: read alongside the screenshot when the frame came
+    // from one, else now (the plugin calls with no input since its screenshot).
+    // A look-alike chat in another app must not pass for WeChat's.
+    let known = frame
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| taken.clone().flatten())
+        .and_then(|id| frame_foreground(&id));
+    let foreground = known.unwrap_or_else(|| read_foreground_soon(config));
+    let (answer, foreground) =
+        tokio::join!(crate::vision_observer::observe(&args, &bytes), async {
+            let started = std::time::Instant::now();
+            let package = tokio::time::timeout(Duration::from_secs(8), foreground)
+                .await
+                .ok()
+                .flatten();
+            if package.is_none() {
+                // The observer abstains on an unknown foreground; say why.
+                tracing::warn!(
+                    node = %config.node,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "vision-observe: foreground package unknown (read failed or timed out)"
+                );
+            }
+            package
+        });
+    let mut answer = answer?;
+    if let Some(object) = answer.as_object_mut() {
+        object.insert("foreground".to_string(), serde_json::json!(foreground));
+        if let Some(frame_id) = taken {
+            object.insert("host_frame_id".to_string(), serde_json::json!(frame_id));
+            if return_image.unwrap_or(true) {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                object.insert(
+                    "image".to_string(),
+                    serde_json::json!(format!("data:{};base64,{encoded}", image_mime(&bytes))),
+                );
+            }
+        }
+    }
+    serde_json::to_string(&answer).map_err(|error| format!("vision-failed: encode answer: {error}"))
+}
+
+/// The foreground package, or `None` when it cannot be read.
+async fn foreground_package_name(config: &Config) -> Option<String> {
+    foreground_now(config).await.ok().flatten()
+}
+
+/// The package owning Android's top resumed activity (or focused window).
+///
+/// cls-service reads it from the activity manager on the device and answers
+/// over the tunnel screenshots already keep warm. The ADB relay is the
+/// fallback for a cls-service without that endpoint: each of its commands
+/// opens a new Wireless Debugging connection, which can stall for seconds on
+/// the controller and which Android announces with a heads-up notification
+/// that lands in the next screenshot.
+async fn foreground_now(config: &Config) -> Result<Option<String>, String> {
+    if let Ok(package) = foreground_from_service(config).await {
+        return Ok(package);
+    }
+    Ok(foreground_package_from_dump(
+        &foreground_activity_dump(config).await?,
+    ))
+}
+
+/// cls-service's `GET /appium/device/foreground`: `Err` when it cannot answer
+/// (an older cls-service, a dead tunnel), `Ok(None)` when it found no app.
+async fn foreground_from_service(config: &Config) -> Result<Option<String>, String> {
+    let mut args = uiauto_base_args(config, "raw");
+    args.extend(["--method".to_string(), "GET".to_string()]);
+    args.push("/appium/device/foreground".to_string());
+    let response = run_cls(&config.cls_bin, &args, Duration::from_secs(10)).await?;
+    foreground_from_service_response(&response)
+}
+
+fn foreground_from_service_response(response: &str) -> Result<Option<String>, String> {
+    let value: Value = serde_json::from_str(response)
+        .map_err(|error| format!("android uiauto: foreground answer: {error}"))?;
+    let answer = value
+        .get("value")
+        .filter(|v| v.is_object() && v.get("package").is_some())
+        .ok_or_else(|| {
+            format!("android uiauto: foreground answer without a package: {response}")
+        })?;
+    Ok(answer
+        .get("package")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|package| !package.is_empty())
+        .map(str::to_string))
+}
+
+fn decode_image_data_uri(uri: &str) -> Result<Vec<u8>, String> {
+    let (header, data) = uri
+        .split_once(',')
+        .ok_or_else(|| "vision-failed: image is not a data URI".to_string())?;
+    if !(header.starts_with("data:image/") && header.ends_with(";base64")) {
+        return Err("vision-failed: image must be a base64 image data URI".to_string());
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .map_err(|error| format!("vision-failed: invalid image base64: {error}"))
 }
 
 fn annotate_screenshot(response: String) -> Result<String, String> {
@@ -1287,8 +2170,13 @@ fn annotate_screenshot(response: String) -> Result<String, String> {
     let object = value
         .as_object_mut()
         .ok_or_else(|| "android uiauto: screenshot response must be an object".to_string())?;
+    object.insert("mime".to_string(), serde_json::json!(image_mime(&png)));
     object.insert("width".to_string(), serde_json::json!(image.width()));
     object.insert("height".to_string(), serde_json::json!(image.height()));
+    object.insert(
+        "frameId".to_string(),
+        serde_json::json!(remember_frame(png)),
+    );
     object.insert(
         "contactBadge".to_string(),
         serde_json::json!({
@@ -1386,10 +2274,13 @@ fn contact_badge_probe(
 
     // The second item in WeChat's four-column bottom navigation is Contacts.
     // Ratios keep the probe independent of Android resolution and pixel density.
+    // A screenshot without the system navigation bar puts the tab bar at the
+    // very bottom (an Honor's Contacts badge sits at 94-96%), so the region
+    // runs to 98%.
     let left = width.saturating_mul(34) / 100;
     let right = width.saturating_mul(47) / 100;
     let top = height.saturating_mul(85) / 100;
-    let bottom = height.saturating_mul(94) / 100;
+    let bottom = height.saturating_mul(98) / 100;
     let roi_width = right.saturating_sub(left).max(1);
     let roi_height = bottom.saturating_sub(top).max(1);
     let mask_len = usize::try_from(roi_width)
@@ -1495,20 +2386,43 @@ pub(crate) async fn raw(
     json_body: Option<&str>,
 ) -> Result<String, String> {
     let config = Config::from_env()?;
+    raw_with_config(&config, method, path, json_body).await
+}
+
+/// Internal raw transport which shares the public raw endpoint validation and
+/// private request-file handling with host-only fallbacks.
+async fn raw_with_config(
+    config: &Config,
+    method: &str,
+    path: &str,
+    json_body: Option<&str>,
+) -> Result<String, String> {
     let method = validate_raw_request(method, path, json_body)?;
+    run_raw_request(config, &method, path, json_body, Duration::from_secs(30)).await
+}
+
+/// Send one raw request through CLS without endpoint validation; callers
+/// either validated it or built the body themselves.
+async fn run_raw_request(
+    config: &Config,
+    method: &str,
+    path: &str,
+    json_body: Option<&str>,
+    timeout: Duration,
+) -> Result<String, String> {
     let request_file = match json_body {
         Some(body) => Some(TempJsonFile::create(body.as_bytes())?),
         None => None,
     };
-    let mut args = uiauto_base_args(&config, "raw");
+    let mut args = uiauto_base_args(config, "raw");
     args.push("--method".to_string());
-    args.push(method);
+    args.push(method.to_string());
     if let Some(file) = request_file.as_ref() {
         args.push("--json-file".to_string());
         args.push(file.path.to_string_lossy().into_owned());
     }
     args.push(path.to_string());
-    run_cls(&config.cls_bin, &args, Duration::from_secs(30)).await
+    run_cls(&config.cls_bin, &args, timeout).await
 }
 
 /// Push a local artifact file to device shared storage through the CLS
@@ -1618,9 +2532,14 @@ async fn relaunch_with_adb_foreground_fallback(
 ) -> Result<String, String> {
     let package = command_option(relaunch_args, "--package")?;
     let cls_result = run_cls(&config.cls_bin, relaunch_args, Duration::from_secs(20)).await;
+    // A device service without app control refuses at once; nothing was
+    // started, so go straight to the launcher intent.
+    let refused = cls_result
+        .as_ref()
+        .is_err_and(|error| error.contains("unsupported"));
     // On this device CLS can complete the start but report an empty current
     // window. The activity manager is the authoritative foreground signal.
-    if wait_for_foreground_package(config, package).await? {
+    if !refused && wait_for_foreground_package(config, package).await? {
         return Ok(cls_result.unwrap_or_else(|_| {
             serde_json::json!({ "relaunch": "cls-verified-by-adb", "package": package }).to_string()
         }));
@@ -1669,8 +2588,8 @@ fn command_option<'a>(args: &'a [String], option: &str) -> Result<&'a str, Strin
 
 /// Return the package owning Android's resumed activity or focused window.
 async fn foreground_package(config: &Config) -> Result<String, String> {
-    let output = foreground_activity_dump(config).await?;
-    foreground_package_from_dump(&output)
+    foreground_now(config)
+        .await?
         .map(|package| serde_json::json!({ "package": package }).to_string())
         .ok_or_else(|| "android uiauto: foreground package is unavailable".to_string())
 }
@@ -1695,10 +2614,7 @@ async fn wait_for_foreground_package(config: &Config, package: &str) -> Result<b
 
 /// Verify the target package owns Android's resumed activity or focused window.
 async fn foreground_package_matches(config: &Config, package: &str) -> Result<bool, String> {
-    Ok(
-        foreground_package_from_dump(&foreground_activity_dump(config).await?).as_deref()
-            == Some(package),
-    )
+    Ok(foreground_now(config).await?.as_deref() == Some(package))
 }
 
 /// Read Android's current resumed/focused activity through the CLS ADB relay.
@@ -2394,7 +3310,9 @@ fn validate_raw_endpoint(method: &str, path: &str) -> Result<(), String> {
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     let allowed = match (method, segments.as_slice()) {
-        ("GET", ["status" | "sessions"]) | ("POST", ["session"]) => true,
+        ("GET", ["status" | "sessions"])
+        | ("GET", ["appium", "device", "foreground"])
+        | ("POST", ["session"]) => true,
         (_, ["session", session_id, rest @ ..]) if is_identifier(session_id) => {
             session_endpoint_allowed(method, rest)
         }
@@ -2678,6 +3596,49 @@ mod tests {
     }
 
     #[test]
+    fn u2_clipboard_fallback_requires_a_single_w3c_session() {
+        assert_eq!(
+            single_u2_session_id(r#"{"value":[{"id":"u2-session_1","capabilities":{}}]}"#)
+                .as_deref(),
+            Ok("u2-session_1")
+        );
+        assert_eq!(
+            single_u2_session_id(r#"{"value":[{"sessionId":"u2-session_2"}]}"#).as_deref(),
+            Ok("u2-session_2")
+        );
+        assert!(single_u2_session_id(r#"{"value":[]}"#).is_err());
+        assert!(single_u2_session_id(r#"{"value":[{"id":"one"},{"id":"two"}]}"#).is_err());
+        assert!(single_u2_session_id(r#"{"value":[{"session":"one"}]}"#).is_err());
+        assert!(single_u2_session_id(r#"{"value":"one"}"#).is_err());
+    }
+
+    #[test]
+    fn u2_clipboard_fallback_matches_only_structured_no_such_element() {
+        assert!(is_webdriver_no_such_element_error(
+            "cls failed: {\"value\":{\"error\":\"no such element\",\"message\":\"active element is unavailable\"}}"
+        ));
+        assert!(is_webdriver_no_such_element_error(
+            "cls failed: {\"value\":{\"error\":\"no such element\",\"message\":\"active element is unavailable\"}} ActiveElement.safeHandle"
+        ));
+        assert!(is_webdriver_no_such_element_error(
+            r#"android uiauto: cls exited with exit code: 1: Error: "cls-service HTTP error: HTTP/1.1 404 Not Found: {\"sessionId\":\"u2-session\",\"value\":{\"error\":\"no such element\",\"message\":\"active element is unavailable\",\"stacktrace\":\"ActiveElement.safeHandle\"}}""#
+        ));
+        assert!(!is_webdriver_no_such_element_error("no such element"));
+        assert!(!is_webdriver_no_such_element_error(
+            r#"Error: \"driver said no such element in plain text\""#
+        ));
+        assert!(!is_webdriver_no_such_element_error(
+            r#"{"value":{"error":"stale element reference"}}"#
+        ));
+        assert!(!is_webdriver_no_such_element_error(
+            r#"{"value":{"error":"no such elements"}}"#
+        ));
+        assert!(!is_webdriver_no_such_element_error(
+            r#"{"error":"no such element"}"#
+        ));
+    }
+
+    #[test]
     fn input_text_value_accepts_only_complete_optional_coordinates() {
         let input = input_text_value(r#"{"text":"ok","x":123,"y":456}"#)
             .expect("valid coordinate text entry");
@@ -2771,6 +3732,21 @@ mod tests {
         assert!(!probe.badge);
         assert_eq!(probe.red_pixels, 100);
         assert_eq!(probe.largest_cluster_pixels, 100);
+    }
+
+    #[test]
+    fn contact_badge_probe_finds_a_badge_on_a_tab_bar_at_the_bottom_edge() {
+        // Honor, 720x1600, no navigation bar in the screenshot.
+        let mut pixels = vec![[20, 20, 20, 255]; 720 * 1_600];
+        for y in 1_509..1_540 {
+            for x in 281..312 {
+                pixels[y * 720 + x] = [249, 146, 146, 255];
+            }
+        }
+
+        let probe = contact_badge_probe(720, 1_600, |x, y| pixels[y as usize * 720 + x as usize]);
+        assert!(probe.badge);
+        assert_eq!(probe.red_pixels, 31 * 31);
     }
 
     #[test]
@@ -3028,6 +4004,35 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_from_service_reads_the_image_or_says_it_cannot() {
+        let answer = screenshot_from_service_response(r#"{"sessionId":null,"value":"iVBORw0K"}"#)
+            .expect("an image");
+        let answer: Value = serde_json::from_str(&answer).expect("json");
+        assert_eq!(answer["ok"], true);
+        assert_eq!(answer["data"], "iVBORw0K");
+        assert!(
+            screenshot_from_service_response(r#"{"value":{"error":"unknown command"}}"#).is_err()
+        );
+        assert!(screenshot_from_service_response("not json").is_err());
+    }
+
+    #[test]
+    fn foreground_from_service_reads_the_package_or_says_it_cannot() {
+        let found = r#"{"sessionId":"None","value":{"activity":"com.tencent.mm.ui.LauncherUI","package":"com.tencent.mm","source":"activity"}}"#;
+        assert_eq!(
+            foreground_from_service_response(found),
+            Ok(Some("com.tencent.mm".to_string()))
+        );
+        let none = r#"{"sessionId":"None","value":{"activity":null,"package":null,"source":null}}"#;
+        assert_eq!(foreground_from_service_response(none), Ok(None));
+        // an older cls-service: unknown command, so the caller asks adb instead
+        let unknown = r#"{"sessionId":null,"value":{"error":"unknown command","message":"…"}}"#;
+        assert!(foreground_from_service_response(unknown).is_err());
+        assert!(validate_raw_endpoint("GET", "/appium/device/foreground").is_ok());
+        assert!(validate_raw_endpoint("POST", "/appium/device/foreground").is_err());
+    }
+
+    #[test]
     fn foreground_package_extracts_resumed_or_focused_app() {
         assert_eq!(
             foreground_package_from_dump(
@@ -3169,6 +4174,168 @@ mod tests {
         assert!(validate_raw_request("POST", "/session/abc/actions", Some(key_input)).is_err());
         let long_pause = r#"{"actions":[{"type":"pointer","id":"finger1","parameters":{"pointerType":"touch"},"actions":[{"type":"pause","duration":60001}]}]}"#;
         assert!(validate_raw_request("POST", "/session/abc/actions", Some(long_pause)).is_err());
+    }
+
+    #[test]
+    fn key_repeat_accepts_only_deletion_keys_and_a_bounded_count() {
+        assert_eq!(
+            key_repeat_request(r#"{"keycode":67,"count":3}"#),
+            Ok(("\u{E003}", 3))
+        );
+        assert_eq!(
+            key_repeat_request(r#"{"keycode":112,"count":500}"#),
+            Ok(("\u{E017}", 500))
+        );
+        for refused in [
+            r#"{"keycode":66,"count":3}"#,
+            r#"{"keycode":29,"count":1}"#,
+            r#"{"keycode":67,"count":0}"#,
+            r#"{"keycode":67,"count":501}"#,
+            r#"{"keycode":67}"#,
+            r#"{"keycode":67,"count":3,"metastate":4096}"#,
+        ] {
+            assert!(key_repeat_request(refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn key_repeat_body_presses_the_key_count_times_in_one_source() {
+        let body: Value = serde_json::from_str(&key_repeat_body("\u{E003}", 3)).unwrap();
+        let sources = body["actions"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["type"], "key");
+        let actions = sources[0]["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 6);
+        for pair in actions.chunks(2) {
+            assert_eq!(pair[0]["type"], "keyDown");
+            assert_eq!(pair[1]["type"], "keyUp");
+            assert_eq!(pair[0]["value"], "\u{E003}");
+            assert_eq!(pair[1]["value"], "\u{E003}");
+        }
+        // The public raw endpoint still refuses key sources.
+        assert!(
+            validate_raw_request("POST", "/session/abc/actions", Some(&body.to_string())).is_err()
+        );
+    }
+
+    #[test]
+    fn key_repeat_timeout_grows_with_the_count() {
+        assert_eq!(key_repeat_timeout(1), Duration::from_millis(5_100));
+        assert_eq!(key_repeat_timeout(500), Duration::from_secs(55));
+    }
+
+    #[test]
+    fn frames_are_asked_for_as_jpeg_and_named_by_their_bytes() {
+        let body: Value =
+            serde_json::from_str(&with_jpeg_frame(r#"{"until":"stable","returnImage":true}"#))
+                .unwrap();
+        assert_eq!(body["format"], "jpeg");
+        assert_eq!(body["quality"], FRAME_JPEG_QUALITY);
+        assert_eq!(body["until"], "stable");
+        assert_eq!(image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), "image/jpeg");
+        assert_eq!(image_mime(b"\x89PNG\r\n"), "image/png");
+    }
+
+    #[test]
+    fn frames_stay_png_unless_the_plugin_asks_for_jpeg() {
+        assert_eq!(take_frame_format("{}").unwrap(), ("{}".to_string(), false));
+        let (args, jpeg) = take_frame_format(r#"{"frameFormat":"jpeg","until":"stable"}"#).unwrap();
+        assert!(jpeg);
+        assert_eq!(args, r#"{"until":"stable"}"#);
+        assert!(!take_frame_format(r#"{"frameFormat":"png"}"#).unwrap().1);
+        assert!(take_frame_format(r#"{"frameFormat":"webp"}"#).is_err());
+    }
+
+    #[test]
+    fn only_a_refusal_of_the_format_falls_back_to_png() {
+        assert!(rejects_frame_format(
+            "android uiauto: cls exited with exit status: 1: HTTP 400: unknown field `format`"
+        ));
+        assert!(rejects_frame_format(
+            "HTTP 404 Not Found: /appium/device/screenshot?format=jpeg&quality=90"
+        ));
+        assert!(!rejects_frame_format(
+            "HTTP 404 Not Found: /appium/device/wait_change"
+        ));
+        assert!(!rejects_frame_format(
+            "truncated HTTP response from UIAutomator2"
+        ));
+    }
+
+    #[test]
+    fn wait_change_asks_for_the_frame_and_keeps_the_rest() {
+        let (body, timeout) = wait_change_request(
+            r#"{"action":{"type":"tap","x":540,"y":2210},"regions":[{"x":0,"y":1600,"w":1080,"h":700}],"timeoutMs":3000,"ignoreCaret":true}"#,
+        )
+        .unwrap();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(timeout, 3000);
+        assert_eq!(body["returnImage"], true);
+        assert_eq!(body["action"]["x"], 540);
+        assert_eq!(body["regions"][0]["h"], 700);
+        let (_, timeout) = wait_change_request(r#"{"until":"stable"}"#).unwrap();
+        assert_eq!(timeout, 2500);
+        assert!(
+            wait_change_request(r#"{"action":{"type":"paste","text":"好"},"cell":40}"#).is_ok()
+        );
+        assert!(
+            wait_change_request(r#"{"action":{"type":"keys","keys":[[113,29],[67]]}}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn wait_change_refuses_what_the_device_would_not_take() {
+        for args in [
+            r#"{"returnImage":false}"#,
+            r#"{"timeoutMs":9000}"#,
+            r#"{"until":"forever"}"#,
+            r#"{"regions":[]}"#,
+            r#"{"regions":[{"x":0,"y":0,"w":0,"h":10}]}"#,
+            r#"{"regions":[{"x":-1,"y":0,"w":5,"h":10}]}"#,
+            r#"{"threshold":2}"#,
+            r#"{"action":{"type":"shell","cmd":"rm"}}"#,
+            r#"{"action":{"type":"tap","x":1}}"#,
+            r#"{"action":{"type":"tap","x":1,"y":2,"text":"x"}}"#,
+            r#"{"action":{"type":"paste","text":""}}"#,
+            r#"{"action":{"type":"keys","keys":[["a"]]}}"#,
+        ] {
+            assert!(wait_change_request(args).is_err(), "{args} must be refused");
+        }
+    }
+
+    #[test]
+    fn wait_change_answers_like_a_screenshot_with_the_outcome() {
+        let answer = wait_change_answer(
+            r#"{"value":{"changed":true,"stable":true,"timedOut":false,"elapsedMs":290,"frameMs":250,"actionMs":172,"frames":4,"changedRegions":[0],"width":1080,"height":2424,"image":"iVBOR"}}"#,
+        )
+        .unwrap();
+        let answer: Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(answer["ok"], true);
+        assert_eq!(answer["data"], "iVBOR");
+        assert_eq!(answer["changed"], true);
+        assert_eq!(answer["elapsedMs"], 290);
+        assert!(answer.get("image").is_none() && answer.get("width").is_none());
+        assert!(wait_change_answer(r#"{"value":{"changed":false}}"#).is_err());
+    }
+
+    #[test]
+    fn clear_focused_presses_select_all_then_delete() {
+        let body: Value = serde_json::from_str(SELECT_ALL_DELETE_BODY).unwrap();
+        assert_eq!(body, serde_json::json!({"keys": [[113, 29], [67]]}));
+        let vision = AndroidOperationOptions {
+            op_type: AndroidOpType::U2,
+            op_mode: Some(AndroidOpMode::Vision),
+        };
+        assert!(validate_operation_mode(CLEAR_FOCUSED_COMMAND, vision).is_ok());
+    }
+
+    #[test]
+    fn key_repeat_is_allowed_in_vision_mode() {
+        let vision = AndroidOperationOptions {
+            op_type: AndroidOpType::U2,
+            op_mode: Some(AndroidOpMode::Vision),
+        };
+        assert!(validate_operation_mode(KEY_REPEAT_COMMAND, vision).is_ok());
     }
 
     #[test]
@@ -3333,5 +4500,23 @@ mod tests {
         );
         assert!(clipboard_request(r#"{"sessionId":"abc","text":""}"#).is_err());
         assert!(clipboard_request(r#"{"sessionId":"abc","text":"x","extra":1}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn vision_frame_keeps_the_foreground_read_with_it() {
+        use futures::FutureExt as _;
+        let id = remember_frame(b"frame-with-foreground".to_vec());
+        assert!(frame_foreground(&id).is_none());
+        let ready: Foreground = async { Some("com.tencent.mm".to_string()) }
+            .boxed()
+            .shared();
+        attach_foreground(&id, ready);
+        let fg = frame_foreground(&id).expect("attached");
+        assert_eq!(fg.await.as_deref(), Some("com.tencent.mm"));
+        assert_eq!(
+            cached_frame(&id).as_deref(),
+            Some(&b"frame-with-foreground"[..])
+        );
+        assert!(frame_foreground("no-such-frame").is_none());
     }
 }

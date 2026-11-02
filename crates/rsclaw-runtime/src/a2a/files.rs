@@ -132,9 +132,23 @@ fn ingest_raw(workspace: &Path, bytes_b64: &str, mime_type: &str) -> Result<Stri
     Ok(name)
 }
 
+/// Maximum size of a file fetched for an `A2aPart::Url`.
+const MAX_INGEST_URL_BYTES: usize = 32 * 1024 * 1024;
+
+/// Per-hop timeout for fetching an `A2aPart::Url`.
+const INGEST_URL_TIMEOUT_SECS: u64 = 60;
+
 /// Fetch `url`, infer mime + extension, write under the right bucket.
+///
+/// The URL is caller-controlled, so the fetch goes through the SSRF-safe
+/// client (public addresses only, redirects re-validated) with a timeout and
+/// a body size cap.
 async fn ingest_url(workspace: &Path, url: &str, mime_hint: Option<&str>) -> Result<String> {
-    let resp = reqwest::get(url).await.context("HTTP GET")?;
+    let mut req = rsclaw_util::net::SafeRequest::get(url);
+    req.timeout = std::time::Duration::from_secs(INGEST_URL_TIMEOUT_SECS);
+    let resp = rsclaw_util::net::safe_send(reqwest::Client::builder, req)
+        .await
+        .context("HTTP GET")?;
     let status = resp.status();
     if !status.is_success() {
         anyhow::bail!("HTTP {status} fetching {url}");
@@ -156,7 +170,9 @@ async fn ingest_url(workspace: &Path, url: &str, mime_hint: Option<&str>) -> Res
         .map(|(_, tail)| tail)
         .and_then(|tail| tail.split('?').next())
         .unwrap_or("");
-    let bytes = resp.bytes().await.context("read body")?;
+    let bytes = rsclaw_util::net::read_body_limited(resp, MAX_INGEST_URL_BYTES)
+        .await
+        .context("read body")?;
     let kind = kind_for_mime(&mime, original);
     let name = canonical_filename("a2a", &mime, original);
     let dir = a2a_dir(workspace, kind);

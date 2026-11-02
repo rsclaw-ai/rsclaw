@@ -7,10 +7,12 @@ rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+rsclaw-brand = { path = "../rsclaw-brand", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 json5 = "1"
 toml = "1"
+toml_edit = "0.22"
 anyhow = "1"
 thiserror = "2"
 regex = "1"
@@ -19,10 +21,16 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 tracing = "0.1"
 chrono-tz = "0.10"
+iana-time-zone = "0.1"
 dirs-next = "2"
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider", "socks"], default-features = false }
+
+[build-dependencies]
+rsclaw-brand = { path = "../rsclaw-brand", version = "0.1.0" }
+toml = "1"
+toml_edit = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

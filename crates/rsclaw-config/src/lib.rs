@@ -13,13 +13,13 @@
 //!         → cross-field validate
 //!           → into_runtime (unified RuntimeConfig)
 
+pub mod brand_layers;
 pub mod catalog;
 pub mod env_file;
 pub mod env_resolution;
 pub mod loader;
 pub mod runtime;
 pub mod schema;
-pub mod secrets;
 pub mod validator;
 
 use anyhow::{Context, Result};
@@ -30,9 +30,13 @@ use runtime::{IntoRuntime, RuntimeConfig};
 ///
 /// Panics-free: all errors are returned as `Err`.
 pub fn load() -> Result<RuntimeConfig> {
-    let path = detect_config_path().with_context(
-        || "no config file found. Run `rsclaw setup` to create one, or set RSCLAW_CONFIG_PATH.",
-    )?;
+    let path = detect_config_path().with_context(|| {
+        concat!(
+            "no config file found. Run `",
+            rsclaw_brand::brand_cli_name!(),
+            " setup` to create one, or set RSCLAW_CONFIG_PATH."
+        )
+    })?;
 
     tracing::info!(path = %path.display(), "loading config");
 
@@ -41,11 +45,75 @@ pub fn load() -> Result<RuntimeConfig> {
 
 /// Like `load()` but without INFO-level log (for CLI status commands).
 pub fn load_quiet() -> Result<RuntimeConfig> {
-    let path = detect_config_path().with_context(
-        || "no config file found. Run `rsclaw setup` to create one, or set RSCLAW_CONFIG_PATH.",
-    )?;
+    let path = detect_config_path().with_context(|| {
+        concat!(
+            "no config file found. Run `",
+            rsclaw_brand::brand_cli_name!(),
+            " setup` to create one, or set RSCLAW_CONFIG_PATH."
+        )
+    })?;
 
     load_from_path(&path)
+}
+
+/// Fingerprint of a config file on disk: (path, mtime, len).
+type ConfigFingerprint = (std::path::PathBuf, std::time::SystemTime, u64);
+
+/// Process-wide cache for [`load_cached`].
+static CONFIG_CACHE: std::sync::Mutex<Option<(ConfigFingerprint, RuntimeConfig)>> =
+    std::sync::Mutex::new(None);
+
+/// Like [`load()`], but reuses the last parsed config while the config file's
+/// path, mtime and length are unchanged, returning a clone.
+///
+/// Intended for per-call hot paths (KB search, OCR, transcription) that only
+/// need a fresh view of the file. Editing the file changes its mtime/len, so
+/// edits still take effect on the next call. Note that edits to `$include`d
+/// sub-files alone do not invalidate the cache. Any stat failure falls back to
+/// a plain [`load()`]; parse/validation errors are returned like [`load()`].
+/// Env reconcile is Once-guarded inside the loader, so a cache miss never
+/// repeats its side effects.
+pub fn load_cached() -> Result<RuntimeConfig> {
+    let Some(path) = detect_config_path() else {
+        return load();
+    };
+    load_cached_at(&path)
+}
+
+fn load_cached_at(path: &std::path::Path) -> Result<RuntimeConfig> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return load_from_path_logged(path);
+    };
+    let Ok(mtime) = meta.modified() else {
+        return load_from_path_logged(path);
+    };
+    let key: ConfigFingerprint = (path.to_path_buf(), mtime, meta.len());
+
+    {
+        let guard = CONFIG_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_key, cfg)) = guard.as_ref()
+            && *cached_key == key
+        {
+            return Ok(cfg.clone());
+        }
+    }
+
+    let result = load_from_path_logged(path);
+    let mut guard = CONFIG_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &result {
+        Ok(cfg) => *guard = Some((key, cfg.clone())),
+        Err(_) => *guard = None,
+    }
+    result
+}
+
+fn load_from_path_logged(path: &std::path::Path) -> Result<RuntimeConfig> {
+    tracing::info!(path = %path.display(), "loading config");
+    load_from_path(path)
 }
 
 fn load_from_path(path: &std::path::Path) -> Result<RuntimeConfig> {
@@ -239,39 +307,166 @@ pub fn build_proxy_client() -> reqwest::ClientBuilder {
     builder
 }
 
-/// Detect the system timezone from the `TZ` env var or the local UTC offset.
+/// Detect the system timezone.
+///
+/// Order: an explicit IANA name in the `TZ` env var (user override), then
+/// the OS-configured zone via `iana-time-zone` (`/etc/localtime` on Unix,
+/// the registry/ICU on Windows), then UTC. A UTC-offset heuristic is NOT
+/// used: an offset does not identify a zone (it cannot tell Europe/London
+/// from UTC, or pick the right DST rules).
 ///
 /// Shared helper used by heartbeat and cron modules to avoid duplication.
 pub fn system_tz() -> chrono_tz::Tz {
-    // Try TZ env var first (works on Linux/macOS with IANA names like
-    // "Asia/Shanghai")
     if let Ok(tz_name) = std::env::var("TZ") {
-        if let Ok(tz) = tz_name.parse() {
+        // POSIX allows a leading ':' ("TZ=:Asia/Shanghai").
+        if let Ok(tz) = tz_name.trim_start_matches(':').parse() {
             return tz;
         }
     }
-    // Fall back to detecting system offset and mapping to a timezone
-    let local_offset = chrono::Local::now().offset().local_minus_utc();
-    match local_offset {
-        25200 => chrono_tz::Asia::Bangkok,     // +07:00
-        28800 => chrono_tz::Asia::Shanghai,    // +08:00
-        32400 => chrono_tz::Asia::Tokyo,       // +09:00
-        36000 => chrono_tz::Australia::Sydney, // +10:00
-        -18000 => chrono_tz::US::Eastern,      // -05:00
-        -21600 => chrono_tz::US::Central,      // -06:00
-        -25200 => chrono_tz::US::Mountain,     // -07:00
-        -28800 => chrono_tz::US::Pacific,      // -08:00
-        0 => chrono_tz::UTC,
-        _ => {
+    // Detected once per process: the lookup is a syscall / FFI call and the
+    // failure warning should not repeat on every cron computation.
+    static DETECTED: std::sync::OnceLock<chrono_tz::Tz> = std::sync::OnceLock::new();
+    *DETECTED.get_or_init(|| match iana_time_zone::get_timezone() {
+        Ok(name) => name.parse().unwrap_or_else(|_| {
             tracing::warn!(
-                offset_secs = local_offset,
-                "unknown system timezone offset, using UTC. Set TZ env var for accuracy."
+                tz = %name,
+                "system timezone is not a known IANA name, using UTC. Set TZ env var for accuracy."
+            );
+            chrono_tz::UTC
+        }),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cannot detect system timezone, using UTC. Set TZ env var for accuracy."
             );
             chrono_tz::UTC
         }
-    }
+    })
 }
 
 pub mod config_json;
 
 pub mod live_config;
+
+#[cfg(test)]
+mod load_cached_tests {
+    use super::*;
+
+    fn write_with_mtime(path: &std::path::Path, content: &str, mtime: std::time::SystemTime) {
+        std::fs::write(path, content).expect("write config");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open config");
+        f.set_modified(mtime).expect("set mtime");
+    }
+
+    #[test]
+    fn load_cached_invalidates_on_mtime_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rsclaw.json5");
+        let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let t1 = t0 + std::time::Duration::from_secs(60);
+
+        write_with_mtime(&path, "{ gateway: { port: 18001 } }", t0);
+        let first = load_cached_at(&path).expect("first load");
+        assert_eq!(first.gateway.port, 18001);
+
+        // Same len + same mtime: served from cache even though bytes changed.
+        write_with_mtime(&path, "{ gateway: { port: 18002 } }", t0);
+        let cached = load_cached_at(&path).expect("cached load");
+        assert_eq!(cached.gateway.port, 18001);
+
+        // Same len, newer mtime: cache invalidated and file re-parsed.
+        write_with_mtime(&path, "{ gateway: { port: 18002 } }", t1);
+        let reloaded = load_cached_at(&path).expect("reload");
+        assert_eq!(reloaded.gateway.port, 18002);
+    }
+}
+
+#[cfg(test)]
+mod defaults_overlay_tests {
+    include!("defaults_overlay.rs");
+
+    const CATALOG: &str = r#"[meta]
+defaults_version = "1"
+
+# hosted fleet
+[[providers]]
+name     = "rsclaw"
+label    = "RsClaw (recommended)"
+base_url = "https://api.rsclaw.ai/v1"
+
+[[providers]]
+name     = "openai"
+base_url = "https://api.openai.com/v1"
+
+[exec_safety]
+deny = [
+  "cat.*/\\.rsclaw/credentials",
+  "cat.*rsclaw\\.json5",
+]
+"#;
+
+    #[test]
+    fn embedded_catalog_is_workspace_file_for_default_brand() {
+        let src = include_str!("../../../defaults.toml");
+        assert_eq!(crate::loader::embedded_defaults_toml(), src);
+    }
+
+    #[test]
+    fn rebrand_rewrites_urls_and_escaped_paths() {
+        let out = rebrand_catalog(
+            CATALOG,
+            &CatalogBrand {
+                api_url: "https://api.acme.example",
+                hub_url: "https://hub.acme.example",
+                app_url: "https://app.acme.example",
+                home_dir: ".acme-agent",
+                config_file: "acme-agent.json5",
+            },
+        );
+        assert!(out.contains(r#"base_url = "https://api.acme.example/v1""#));
+        assert!(out.contains(r#""cat.*/\\.acme-agent/credentials""#));
+        assert!(out.contains(r#""cat.*acme-agent\\.json5""#));
+        assert!(out.contains("# hosted fleet"));
+        assert!(out.contains(r#"label    = "RsClaw (recommended)""#));
+    }
+
+    #[test]
+    fn override_merges_by_name_removes_and_appends() {
+        let overlay = r#"[meta]
+defaults_version = "2"
+
+[[providers]]
+name  = "rsclaw"
+label = "Acme Cloud (recommended)"
+
+[[providers]]
+name    = "openai"
+_remove = true
+
+[[providers]]
+name     = "acme-private"
+base_url = "https://llm.acme.example/v1"
+"#;
+        let out = apply_override(CATALOG, overlay).expect("merge");
+        let t: toml::Table = out.parse().expect("valid toml");
+        assert_eq!(t["meta"]["defaults_version"].as_str(), Some("2"));
+        let providers = t["providers"].as_array().expect("providers");
+        let names: Vec<_> = providers.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["rsclaw", "acme-private"]);
+        assert_eq!(providers[0]["label"].as_str(), Some("Acme Cloud (recommended)"));
+        // untouched keys and comments survive
+        assert_eq!(providers[0]["base_url"].as_str(), Some("https://api.rsclaw.ai/v1"));
+        assert!(out.contains("# hosted fleet"));
+        assert!(!out.contains("_remove"));
+    }
+
+    #[test]
+    fn override_errors_are_reported() {
+        assert!(apply_override(CATALOG, "[[providers]]\nlabel = \"x\"\n").unwrap_err().contains("needs a string `name`"));
+        assert!(apply_override(CATALOG, "[[providers]]\nname = \"nope\"\n_remove = true\n").unwrap_err().contains("nothing to remove"));
+        assert!(apply_override(CATALOG, "not = [valid").is_err());
+    }
+}

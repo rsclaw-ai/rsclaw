@@ -164,6 +164,7 @@ async fn webhook_text_dispatches_to_callback() {
         entry: vec![WhatsAppEntry {
             changes: vec![WhatsAppChange {
                 value: WhatsAppValue {
+                    contacts: None,
                     messages: Some(vec![WhatsAppMessage {
                         from: "447911123456".to_owned(),
                         id: "wamid.xxx".to_owned(),
@@ -233,6 +234,7 @@ async fn webhook_image_downloads_and_dispatches() {
         entry: vec![WhatsAppEntry {
             changes: vec![WhatsAppChange {
                 value: WhatsAppValue {
+                    contacts: None,
                     messages: Some(vec![WhatsAppMessage {
                         from: "447911123456".to_owned(),
                         id: "wamid.img".to_owned(),
@@ -299,6 +301,7 @@ async fn webhook_document_text_file_dispatches_content() {
         entry: vec![WhatsAppEntry {
             changes: vec![WhatsAppChange {
                 value: WhatsAppValue {
+                    contacts: None,
                     messages: Some(vec![WhatsAppMessage {
                         from: "447911123456".to_owned(),
                         id: "wamid.doc".to_owned(),
@@ -346,6 +349,7 @@ async fn webhook_unsupported_type_is_skipped() {
         entry: vec![WhatsAppEntry {
             changes: vec![WhatsAppChange {
                 value: WhatsAppValue {
+                    contacts: None,
                     messages: Some(vec![WhatsAppMessage {
                         from: "447911123456".to_owned(),
                         id: "wamid.sticker".to_owned(),

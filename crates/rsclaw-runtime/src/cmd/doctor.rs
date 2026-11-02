@@ -13,6 +13,14 @@ const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") {
 // Issue -- a detected problem with an optional auto-fix
 // ---------------------------------------------------------------------------
 
+/// Issue messages are CLI prose written with the default brand's words.
+fn branded(msg: String) -> String {
+    match rsclaw_brand::rebrand(&msg) {
+        std::borrow::Cow::Owned(s) => s,
+        std::borrow::Cow::Borrowed(_) => msg,
+    }
+}
+
 struct Issue {
     message: String,
     /// A short description of what --fix will do.
@@ -24,7 +32,7 @@ struct Issue {
 impl Issue {
     fn warn(msg: impl Into<String>) -> Self {
         Self {
-            message: msg.into(),
+            message: branded(msg.into()),
             fix_hint: None,
             fix_fn: None,
         }
@@ -36,7 +44,7 @@ impl Issue {
         f: impl FnOnce() -> Result<String> + 'static,
     ) -> Self {
         Self {
-            message: msg.into(),
+            message: branded(msg.into()),
             fix_hint: Some(hint),
             fix_fn: Some(Box::new(f)),
         }
@@ -84,6 +92,18 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
             None
         }
     };
+
+    // -- 1b. Brand (shown for OEM builds only) --------------------------------
+    let has_policy = rsclaw_brand::prompt_policy(false).is_some();
+    if rsclaw_brand::ID != "rsclaw" || rsclaw_config::brand_layers::is_active() || has_policy {
+        println!(
+            "  {} brand {} \u{2014} {} locked config key(s){}",
+            dim("[--]"),
+            rsclaw_brand::ID,
+            rsclaw_config::brand_layers::locked_paths().len(),
+            if has_policy { ", distributor policy prompt" } else { "" },
+        );
+    }
 
     // -- 2. State directory ---------------------------------------------------
     let base_dir = config::loader::base_dir();
@@ -227,7 +247,7 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
         }
 
         if c.gateway.auth_token.is_none() {
-            let config_path = config::loader::base_dir().join("rsclaw.json5");
+            let config_path = config::loader::base_dir().join(rsclaw_brand::CONFIG_FILE);
             issues.push(Issue {
                 message: "gateway.auth.token not set \u{2014} gateway accepts all connections without auth".to_owned(),
                 fix_hint: Some("auto-generate a 64-char auth token"),
@@ -323,7 +343,11 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
 
     // -- env vars referenced in config ----------------------------------------
     println!();
-    println!("  {} env vars referenced in rsclaw.json5", bold("Env:"));
+    println!(
+        "  {} env vars referenced in {}",
+        bold("Env:"),
+        rsclaw_brand::CONFIG_FILE
+    );
     if let Some(cfg_path) = config::loader::detect_config_path() {
         match std::fs::read_to_string(&cfg_path) {
             Ok(raw) => {

@@ -24,6 +24,8 @@ const ZALO_API_BASE: &str = "https://openapi.zalo.me/v3.0/oa";
 #[derive(Debug, Deserialize)]
 pub struct ZaloWebhookBody {
     pub event_name: Option<String>,
+    pub app_id: Option<serde_json::Value>,
+    pub timestamp: Option<serde_json::Value>,
     pub sender: Option<ZaloSender>,
     pub message: Option<ZaloMessage>,
 }
@@ -61,6 +63,8 @@ pub struct ZaloAttachmentPayload {
 
 pub struct ZaloChannel {
     access_token: String,
+    /// OA secret key used to verify `X-ZEvent-Signature` on webhooks.
+    oa_secret: Option<String>,
     api_base: String,
     client: Client,
     #[allow(clippy::type_complexity)]
@@ -82,6 +86,7 @@ impl ZaloChannel {
     ) -> Self {
         Self {
             access_token: access_token.into(),
+            oa_secret: None,
             api_base: api_base.unwrap_or_else(|| ZALO_API_BASE.to_owned()),
             client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
@@ -91,10 +96,64 @@ impl ZaloChannel {
         }
     }
 
+    /// Set the OA secret key used to verify inbound webhook signatures.
+    pub fn with_oa_secret(mut self, secret: Option<String>) -> Self {
+        self.oa_secret = secret.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// Whether an OA secret is configured (webhook verification enabled).
+    pub fn has_oa_secret(&self) -> bool {
+        self.oa_secret.is_some()
+    }
+
+    /// Verify the `X-ZEvent-Signature` header per the Zalo OA docs:
+    /// `mac=sha256(appId + rawBody + timestamp + oaSecretKey)` (lower-case
+    /// hex), where `appId` / `timestamp` are the fields of the posted JSON.
+    /// Returns `true` when no secret is configured (verification disabled —
+    /// the gateway logs a startup warning in that case).
+    pub fn verify_signature(&self, signature: Option<&str>, body: &[u8]) -> bool {
+        let Some(secret) = self.oa_secret.as_deref() else {
+            return true;
+        };
+        let Some(sig) = signature else {
+            return false;
+        };
+        let provided = sig.trim();
+        let provided = provided.strip_prefix("mac=").unwrap_or(provided);
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return false;
+        };
+        let field = |name: &str| -> String {
+            match parsed.get(name) {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Number(n)) => n.to_string(),
+                _ => String::new(),
+            }
+        };
+        let app_id = field("app_id");
+        let timestamp = field("timestamp");
+        let expected = crate::sha256_hex(&[
+            app_id.as_bytes(),
+            body,
+            timestamp.as_bytes(),
+            secret.as_bytes(),
+        ]);
+        crate::constant_time_eq(expected.as_bytes(), provided.to_ascii_lowercase().as_bytes())
+    }
+
     /// Handle incoming webhook from Zalo.
     pub async fn handle_webhook(&self, body: &str) -> Result<()> {
         let webhook: ZaloWebhookBody =
             serde_json::from_str(body).context("Zalo: invalid webhook JSON")?;
+
+        // Zalo retries undelivered events; drop redeliveries by msg_id.
+        if let Some(mid) = webhook.message.as_ref().and_then(|m| m.msg_id.as_deref())
+            && crate::is_duplicate_inbound("zalo", mid)
+        {
+            debug!(msg_id = mid, "Zalo: duplicate event dropped");
+            return Ok(());
+        }
 
         let event = webhook.event_name.as_deref().unwrap_or("");
         let sender_id = webhook
@@ -112,11 +171,13 @@ impl ZaloChannel {
 
         match event {
             "user_send_text" => {
-                text = webhook
-                    .message
-                    .as_ref()
-                    .and_then(|m| m.text.clone())
-                    .unwrap_or_default();
+                text = crate::strip_inbound_sentinels(
+                    webhook
+                        .message
+                        .as_ref()
+                        .and_then(|m| m.text.as_deref())
+                        .unwrap_or_default(),
+                );
             }
             "user_send_image" => {
                 // Image URL may be in message.url or message.attachments[].payload.url

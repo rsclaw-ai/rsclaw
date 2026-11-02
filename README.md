@@ -450,6 +450,26 @@ For multi-agent platform deployments (one server hosting many rsclaw clients wit
 
 All string values support `${VAR}` env substitution. Config priority: CLI flag > `$RSCLAW_BASE_DIR/rsclaw.json5` > `~/.rsclaw/rsclaw.json5` > `./rsclaw.json5`.
 
+### Owners and sender trust
+
+Only **owners** may use high-risk tools (shell, file writes, cron, browser,
+...) and host slash commands (`/sh`, `/cat`, `/cron`, ...). Owners are local
+entry points (desktop, CLI, WebSocket, loopback HTTP), DM senders listed
+literally in a channel's `allowFrom`, and identities in `gateway.owners`.
+Paired users are **not** owners — if you paired your own account, add it:
+
+```json5
+gateway: { owners: ["telegram:123456789", "feishu:ou_abc123"] }
+```
+
+or run `rsclaw channels owner add telegram 123456789` (or
+`rsclaw channels pair <CODE> --owner`). Per-agent exceptions go in
+`agents.list[].nonOwnerTools`. Inbound webhooks for WhatsApp (`appSecret`),
+LINE (`channelSecret`) and Feishu HTTP mode (`verificationToken` /
+`encryptKey`) now require their secret. See [docs/security.md](docs/security.md)
+for the full trust model, `groupPolicy` defaults, plugin capabilities and the
+`RSCLAW_*` security environment variables.
+
 ### Upgrading from earlier A2A betas
 
 If your `rsclaw.json5` has `agents.external: [...]`, rename it to `agents.a2a: [...]` — the field shape is identical, only the key + struct name changed when A2A v1.0 landed:

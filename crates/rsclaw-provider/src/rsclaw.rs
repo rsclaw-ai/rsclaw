@@ -41,7 +41,7 @@ use super::{
 /// window (1h by default). First request through any provider
 /// instance pays the redirect cost; everything within the TTL after
 /// goes direct, so steady-state latency matches a direct deployment.
-pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1";
+pub const RSCLAW_DEFAULT_BASE: &str = rsclaw_brand::API_V1_URL;
 
 /// Default `prefix_id` per protocol §2.1.1 / §2.10.1 — namespaced
 /// `<ns>/<ver>` string the gateway sends on `POST /sessions`. It's a
@@ -66,7 +66,7 @@ pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1";
 /// `tests/fixtures/baseline-<ver>.json`) actually changes, and
 /// coordinate with rsclaw-llm to re-ingest the new fixture under
 /// the new identifier.
-pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.8.28";
+pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.10.24";
 
 /// Default HTTP timeout (seconds) for the `/sessions/<id>/compact` splice
 /// call. The server holds the per-session lock and dispatches the splice
@@ -89,7 +89,7 @@ pub const RSCLAW_DEFAULT_COMPACT_TIMEOUT_SECS: u64 = 180;
 /// a model name (e.g. `rsclaw-flash-v2`), bump both — clients on the
 /// new gateway version pick up the new defaults automatically without
 /// every user having to edit their config.
-pub const RSCLAW_DEFAULT_FLASH: &str = "rsclaw/rsclaw-flash-v1";
+pub const RSCLAW_DEFAULT_FLASH: &str = "rsclaw/rsclaw-flash-v2";
 pub const RSCLAW_DEFAULT_VISION: &str = "rsclaw/rsclaw-vision-v1";
 
 /// How long to wait for `/sessions/<id>/turn` to start responding
@@ -241,7 +241,7 @@ impl SseTerminalParser {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct SessionEntry {
     /// Server-issued, format `rs_<instance>_<random>`.
     session_id: String,
@@ -255,6 +255,76 @@ struct SessionEntry {
     /// longer matches what the gateway thinks the conversation is —
     /// trigger a re-hydrate via /sessions/replay.
     last_seen_msgs_len: usize,
+    /// Where the current turn started: the request length at its first
+    /// call (the one whose delta is the user message) and a fingerprint of
+    /// the history before that message. See [`turn_scratch_dropped`].
+    turn_base: Option<(usize, u64)>,
+    /// Tool results were sent on this session: the server holds tool calls
+    /// and results the runtime drops from its own history at turn end. Its
+    /// message indices no longer line up with ours, so an in-place
+    /// compaction splice must not run (compaction re-sends the history),
+    /// and its reported size is larger than the runtime's history.
+    scratch_kept: bool,
+    /// The last call's stream ended normally with a final reply (Done, no
+    /// tool call), so the server committed it. A turn that was cancelled,
+    /// timed out or failed leaves this false, and the next turn re-sends
+    /// the history rather than trust the server's partial state.
+    turn_finished: bool,
+}
+
+/// Whether `m` is part of a turn's tool scratch: a tool result (as a Tool
+/// message or a user message carrying results) or an assistant tool call.
+fn is_tool_step(m: &Message) -> bool {
+    matches!(m.role, Role::Tool)
+        || matches!(&m.content, MessageContent::Parts(parts)
+            if parts.iter().any(|p| matches!(p, ContentPart::ToolResult { .. } | ContentPart::ToolUse { .. })))
+}
+
+/// Whether the request starts a new turn: it ends in a person's message
+/// and carries no tool steps (the runtime keeps none across turns, so any
+/// tool step means this is a later call within a turn).
+fn starts_user_turn(msgs: &[Message]) -> bool {
+    msgs.last().is_some_and(|m| matches!(m.role, Role::User)) && !msgs.iter().any(is_tool_step)
+}
+
+/// The turn base to remember for a request that starts a turn.
+fn turn_base_of(msgs: &[Message]) -> Option<(usize, u64)> {
+    starts_user_turn(msgs).then(|| (msgs.len(), history_fingerprint(&msgs[..msgs.len() - 1])))
+}
+
+/// Fingerprint of `msgs` as sent (role, content, hidden replay state).
+fn history_fingerprint(msgs: &[Message]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for m in msgs {
+        serde_json::to_string(m).unwrap_or_default().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Why a request starting a new turn can't simply be appended, or `None`
+/// when it can: the last turn ended with a reply the server committed, the
+/// history before that turn's user message is unchanged, and since then
+/// the runtime added exactly that reply and the new user message. Whatever
+/// the runtime dropped of the last turn (its tool steps) the server keeps,
+/// which is harmless; anything the runtime added that the server never saw
+/// (a failed-turn note, a background writeback) needs a replay.
+fn turn_continuation_problem(entry: &SessionEntry, msgs: &[Message]) -> Option<String> {
+    let (base_len, base_fp) = entry.turn_base?;
+    if !entry.turn_finished {
+        return Some("the last turn did not end with a reply (cancelled, timed out or failed)".to_owned());
+    }
+    if base_len == 0
+        || msgs.len() != base_len + 2
+        || !matches!(msgs[base_len].role, Role::Assistant)
+    {
+        return Some(format!(
+            "expected the last turn's reply and a new message after {base_len} messages, got {}",
+            msgs.len()
+        ));
+    }
+    (history_fingerprint(&msgs[..base_len - 1]) != base_fp)
+        .then(|| "earlier history changed (compaction, repair or reset)".to_owned())
 }
 
 impl RsclawProvider {
@@ -424,22 +494,42 @@ impl RsclawProvider {
     /// incoming `msgs_len` (history was trimmed under our feet). On
     /// success bumps `last_seen_msgs_len` to the new value so the next
     /// call's comparison is against the most recent state.
+    /// The cached server session for `session_key`, when it still matches
+    /// `msgs`; `Err(reason)` when the history must be re-sent (replayed).
     fn lookup_and_bump(
         &self,
         session_key: &str,
         prefix_id: &str,
-        msgs_len: usize,
-    ) -> Option<SessionEntry> {
+        msgs: &[Message],
+    ) -> std::result::Result<SessionEntry, String> {
         let mut map = self.lock_sessions();
-        let entry = map.get_mut(session_key)?;
+        let Some(entry) = map.get_mut(session_key) else {
+            return Err("no open session (first call, evicted, or dropped)".to_owned());
+        };
         if entry.prefix_id != prefix_id {
-            return None;
+            return Err(format!("prefix changed ({} -> {prefix_id})", entry.prefix_id));
         }
-        if msgs_len < entry.last_seen_msgs_len {
-            return None;
+        let msgs_len = msgs.len();
+        let new_turn = starts_user_turn(msgs);
+        if new_turn && entry.turn_base.is_some() {
+            if let Some(problem) = turn_continuation_problem(entry, msgs) {
+                return Err(problem);
+            }
+        } else if msgs_len < entry.last_seen_msgs_len {
+            return Err(format!(
+                "history trimmed within a turn: {msgs_len} messages after {}",
+                entry.last_seen_msgs_len
+            ));
         }
+        if new_turn {
+            entry.turn_base = turn_base_of(msgs);
+        }
+        if msgs.last().is_some_and(is_tool_step) {
+            entry.scratch_kept = true;
+        }
+        entry.turn_finished = false;
         entry.last_seen_msgs_len = msgs_len;
-        Some(entry.clone())
+        Ok(entry.clone())
     }
 
     fn store(&self, session_key: &str, entry: SessionEntry) {
@@ -631,16 +721,30 @@ impl LlmProvider for RsclawProvider {
             // when history exists we go straight to replay; an empty
             // history list takes the cheaper open() path.
             let entry =
-                match self.lookup_and_bump(&session_key, &split.prefix_id, req.messages.len()) {
-                    Some(e) => e,
-                    None => {
+                match self.lookup_and_bump(&session_key, &split.prefix_id, &req.messages) {
+                    Ok(e) => e,
+                    Err(reason) => {
+                        tracing::info!(session = %session_key, %reason, "rsclaw: (re)opening the server session");
                         self.forget(&session_key);
                         let history = history_for_replay(&req.messages);
+                        let path = if history.is_empty() { "open" } else { "replay" };
                         let resp = if history.is_empty() {
                             self.open(&split).await?
                         } else {
                             self.replay(&split, history).await?
                         };
+                        // The server's id names the node serving the
+                        // session (rs_<host>_<random>): what to quote when a
+                        // fleet problem needs chasing.
+                        let (segment_cache, segment_promote_ms) = resp.user_segment_cache();
+                        tracing::info!(
+                            session = %session_key,
+                            server_session = %resp.session_id,
+                            path,
+                            segment_cache,
+                            segment_promote_ms,
+                            "rsclaw session started"
+                        );
                         let entry = SessionEntry {
                             session_id: resp.session_id.clone(),
                             // Cache key MUST be the request value, not the
@@ -662,6 +766,8 @@ impl LlmProvider for RsclawProvider {
                             // canonical here for freshness.
                             prefix_id: split.prefix_id.clone(),
                             last_seen_msgs_len: req.messages.len(),
+                            turn_base: turn_base_of(&req.messages),
+                            ..Default::default()
                         };
                         self.store(&session_key, entry.clone());
                         entry
@@ -679,7 +785,9 @@ impl LlmProvider for RsclawProvider {
             // vanilla `/v1/chat/completions`) to bisect protocol-vs-model
             // truncation behavior. No-op when the env var is unset, so
             // production stays untouched.
-            if std::env::var("RSCLAW_DUMP_TURN").is_ok() {
+            if std::env::var("RSCLAW_DUMP_TURN")
+                .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"))
+            {
                 dump_turn_for_debug(&session_key, &entry, &split, &delta, &req);
             }
 
@@ -716,6 +824,12 @@ impl LlmProvider for RsclawProvider {
                     self.forget(&session_key);
                     let replay_history = history_for_replay(&req.messages);
                     let replayed = self.replay(&split, replay_history).await?;
+                    tracing::info!(
+                        session = %session_key,
+                        server_session = %replayed.session_id,
+                        path = "replay",
+                        "rsclaw session started"
+                    );
                     let entry = SessionEntry {
                         session_id: replayed.session_id.clone(),
                         // Same rationale as the open/replay path above:
@@ -728,6 +842,8 @@ impl LlmProvider for RsclawProvider {
                         // single-sourced.)
                         prefix_id: split.prefix_id.clone(),
                         last_seen_msgs_len: req.messages.len(),
+                        turn_base: turn_base_of(&req.messages),
+                        ..Default::default()
                     };
                     self.store(&session_key, entry.clone());
                     // Same forget-on-Err treatment as the primary
@@ -766,6 +882,18 @@ impl LlmProvider for RsclawProvider {
         })
     }
 
+    fn holds_dropped_steps(&self, session_key: &str) -> bool {
+        self.lock_sessions().get(session_key).is_some_and(|e| e.scratch_kept)
+    }
+
+    /// The next call on `session_key` re-opens the session by
+    /// /sessions/replay from the request's history.
+    fn drop_session(&self, session_key: &str) {
+        if self.lock_sessions().remove(session_key).is_some() {
+            tracing::info!(session = session_key, "rsclaw: dropped the server session; next call replays");
+        }
+    }
+
     /// Resolve `session_key` → wire `session_id` via the cached
     /// `SessionEntry`, then delegate to the inner `compact_splice`
     /// helper. On HTTP success, update the cached entry's
@@ -797,14 +925,24 @@ impl LlmProvider for RsclawProvider {
             // the duration of the splice.
             let session_id = {
                 let map = self.lock_sessions();
-                map.get(session_key)
-                    .map(|e| e.session_id.clone())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "rsclaw compact splice: no cached session for key {session_key} — \
-                             falling back to replay"
-                        )
-                    })?
+                let mut map = map;
+                let entry = map.get(session_key).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "rsclaw compact splice: no cached session for key {session_key} — \
+                         falling back to replay"
+                    )
+                })?;
+                if entry.scratch_kept {
+                    // Our indices don't match the server's: re-send the
+                    // compacted history instead of splicing by count.
+                    map.remove(session_key);
+                    anyhow::bail!(
+                        "rsclaw compact splice: the server holds earlier turns' tool steps, \
+                         so its message indices differ from ours; replaying the compacted \
+                         history instead"
+                    );
+                }
+                entry.session_id.clone()
             };
 
             // Bounded optimistic-concurrency retry (protocol §6.3.1).
@@ -925,8 +1063,20 @@ fn invalidate_on_error(
 ) -> LlmStream {
     use futures::StreamExt;
     let mut errored = false;
+    let mut called_tool = false;
     Box::pin(inner.inspect(move |item| {
         if errored {
+            return;
+        }
+        if matches!(item, Ok(StreamEvent::ToolCall { .. })) {
+            called_tool = true;
+        }
+        // A final reply that streamed to its end: the server committed it.
+        if matches!(item, Ok(StreamEvent::Done { .. })) && !called_tool {
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = map.get_mut(&session_key) {
+                entry.turn_finished = true;
+            }
             return;
         }
         let invalidate = match item {
@@ -1019,6 +1169,7 @@ impl RsclawProvider {
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             options: Some(split.options.clone()),
         };
         // 180s caps the worst-case prefix-decode time for a fresh
@@ -1096,6 +1247,7 @@ impl RsclawProvider {
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             history,
             options: Some(split.options.clone()),
         };
@@ -1280,6 +1432,11 @@ impl RsclawProvider {
             anyhow::bail!("rsclaw {path}: empty prompt after flattening req.messages");
         }
 
+        let max_tokens = if path == "/fastshot" {
+            fastshot_max_tokens(req.max_tokens, &prompt)
+        } else {
+            req.max_tokens
+        };
         let mut body = serde_json::Map::new();
         body.insert("prompt".to_owned(), Value::String(prompt));
         // /vision wants a single complete result — the caller (e.g. vlm_parse)
@@ -1291,16 +1448,23 @@ impl RsclawProvider {
         // /oneshot where token-by-token delivery still matters.
         let use_stream = path != "/vision";
         body.insert("stream".to_owned(), Value::Bool(use_stream));
-        if let Some(mt) = req.max_tokens {
+        if let Some(mt) = max_tokens {
             body.insert("max_tokens".to_owned(), Value::from(mt));
         }
         // Bind the model id to the endpoint per the fleet's model-slot
         // whitelist. For /vision, prefer the caller's configured model
         // (from agents.defaults.model.vision) so upgrades like v2 take
         // effect without a code change. Fall back to the canonical slot
-        // name when the caller didn't specify a vision model.
+        // name when the caller didn't specify a vision model. /fastshot
+        // works the same way for the flash model.
         let canonical_model = match path {
-            "/fastshot" => "rsclaw-flash-v1".to_owned(),
+            "/fastshot" => req
+                .model
+                .rsplit('/')
+                .next()
+                .filter(|m| m.starts_with("rsclaw-flash-"))
+                .unwrap_or("rsclaw-flash-v2")
+                .to_owned(),
             "/vision" => req
                 .model
                 .rsplit('/')
@@ -1639,6 +1803,15 @@ struct CreateSessionReq<'a> {
     /// the prior byte shape.
     #[serde(skip_serializing_if = "str::is_empty")]
     user_system: &'a str,
+    /// The same registry-path segment under the field name the worker's
+    /// static (registered-prefix) create/replay path reads. Workers since
+    /// the v1.9 rename only consult `user_suffix` there, so sending
+    /// `user_system` alone silently dropped the persona, distributor policy, workspace instructions
+    /// and plugin/skill listings. Sent alongside `user_system` (identical
+    /// content) so both old and new workers overlay it; empty on the
+    /// dynamic path.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    user_suffix: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
 }
@@ -1665,6 +1838,15 @@ struct ReplayReq<'a> {
     /// `CreateSessionReq::user_system`.
     #[serde(skip_serializing_if = "str::is_empty")]
     user_system: &'a str,
+    /// The same registry-path segment under the field name the worker's
+    /// static (registered-prefix) create/replay path reads. Workers since
+    /// the v1.9 rename only consult `user_suffix` there, so sending
+    /// `user_system` alone silently dropped the persona, distributor policy, workspace instructions
+    /// and plugin/skill listings. Sent alongside `user_system` (identical
+    /// content) so both old and new workers overlay it; empty on the
+    /// dynamic path.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    user_suffix: &'a str,
     history: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
@@ -1809,6 +1991,29 @@ struct CreateSessionResp {
     #[serde(default)]
     #[allow(dead_code)]
     prefix_id: Option<String>,
+    /// What the worker did with the per-user segment (user_system + user
+    /// tools): `gpu_hit`, `cold_built`, ... Logged only: it tells a 3s
+    /// cold prefill apart from a cached open.
+    #[serde(default)]
+    cache_status: Option<Value>,
+}
+
+impl CreateSessionResp {
+    /// `user_system` placement and promote time, when the server reports them.
+    fn user_segment_cache(&self) -> (Option<&str>, Option<u64>) {
+        let segment = self
+            .cache_status
+            .as_ref()
+            .and_then(|c| c.get("user_system"));
+        (
+            segment
+                .and_then(|s| s.get("placement"))
+                .and_then(Value::as_str),
+            segment
+                .and_then(|s| s.get("promote_ms"))
+                .and_then(Value::as_u64),
+        )
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1949,6 +2154,12 @@ struct TurnOptions {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
+    /// Cap on reasoning tokens for the turn: the worker closes the
+    /// reasoning block once they are spent and goes on to the answer.
+    /// Sent only with thinking on; a worker that predates it ignores it
+    /// and thinks without a cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_budget_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1971,6 +2182,7 @@ impl TurnOptions {
             temperature: req.temperature,
             top_p: None,
             enable_thinking: req.thinking_budget.map(|b| b > 0),
+            thinking_budget_tokens: req.thinking_budget.filter(|b| *b > 0),
             stop: None,
             idle_ttl_secs: None,
             constrain_tool_calls: (constrain_tool_calls && !req.tools.is_empty()).then_some(true),
@@ -2039,7 +2251,7 @@ struct SplitRequest<'a> {
 /// Writes one JSON file per turn to:
 ///   `<base_dir>/debug/turn-<unix_ms>-<session_suffix>.json`
 ///
-/// Gated on `RSCLAW_DUMP_TURN` env var being set (any non-empty value).
+/// Gated on `RSCLAW_DUMP_TURN=1` (or `true`).
 /// Write failures are logged at WARN but don't abort the turn.
 fn dump_turn_for_debug(
     session_key: &str,
@@ -2324,6 +2536,41 @@ fn split_request<'a>(
     })
 }
 
+/// Total context of the fleet's `/fastshot` lane (`--rsclaw-fastshot-ctx`).
+/// Prompt plus `max_tokens` must fit, or the worker fails the call
+/// (`fastshot_ctx_exceeded`) — which every heartbeat did while it asked
+/// for the generic 8192.
+const FASTSHOT_CTX_TOKENS: u32 = 8192;
+
+/// `max_tokens` for a `/fastshot` call: what was asked, but never more
+/// than the lane has left after a generous estimate of the prompt (CJK
+/// counted as a token per character).
+fn fastshot_max_tokens(requested: Option<u32>, prompt: &str) -> Option<u32> {
+    let (cjk, other) = prompt.chars().fold((0u32, 0u32), |(c, o), ch| {
+        if ch as u32 >= 0x2E80 { (c + 1, o) } else { (c, o + 1) }
+    });
+    let prompt_tokens = cjk + other / 3;
+    let room = FASTSHOT_CTX_TOKENS.saturating_sub(prompt_tokens + prompt_tokens / 4 + 256).max(512);
+    Some(requested.map_or(room, |r| r.min(room)))
+}
+
+#[cfg(test)]
+mod fastshot_budget_tests {
+    use super::*;
+
+    #[test]
+    fn fastshot_max_tokens_fits_the_lane() {
+        // The heartbeat: a ~1.3k-token prompt asking for 8192.
+        let prompt = "检查待办".repeat(330);
+        let mt = fastshot_max_tokens(Some(8192), &prompt).unwrap();
+        assert!(mt + 1320 <= FASTSHOT_CTX_TOKENS, "{mt}");
+        assert!(mt > 4000, "{mt}");
+        // A small request is left alone; a huge prompt still gets 512.
+        assert_eq!(fastshot_max_tokens(Some(300), "hi"), Some(300));
+        assert_eq!(fastshot_max_tokens(None, &"字".repeat(9000)), Some(512));
+    }
+}
+
 /// Returns the history slice to send to `/sessions/replay`: every
 /// message except the trailing delta (which `turn()` will re-send).
 /// Empty input returns an empty slice — replay can still hydrate a
@@ -2395,30 +2642,11 @@ async fn parse_oneshot_sse_chunk(
     // Carry forward any UTF-8 continuation bytes that landed at the
     // tail of the previous chunk — without this, CJK / emoji
     // characters that straddle a chunk boundary corrupt into U+FFFD.
-    let mut remainder = utf8_remainder.lock().await;
-    let combined = if remainder.is_empty() {
-        bytes.to_vec()
-    } else {
-        let mut c = std::mem::take(&mut *remainder);
-        c.extend_from_slice(&bytes);
-        c
-    };
-    let text: String = match std::str::from_utf8(&combined) {
-        Ok(t) => {
-            drop(remainder);
-            t.to_owned()
-        }
-        Err(e) => {
-            let valid_up_to = e.valid_up_to();
-            *remainder = combined[valid_up_to..].to_vec();
-            drop(remainder);
-            if valid_up_to == 0 {
-                return Vec::new();
-            }
-            // SAFETY: valid_up_to is at a valid UTF-8 boundary by
-            // construction of the `Utf8Error`.
-            unsafe { std::str::from_utf8_unchecked(&combined[..valid_up_to]) }.to_owned()
-        }
+    // Invalid (never-completing) bytes are skipped rather than stashed, so
+    // one stray byte cannot make the remainder grow forever.
+    let text: String = {
+        let mut remainder = utf8_remainder.lock().await;
+        super::decode_utf8_chunk(&mut remainder, &bytes)
     };
 
     let mut buffer = line_buffer.lock().await;
@@ -2729,7 +2957,13 @@ fn serialize_history_message(msg: &Message) -> Value {
     let content = match &msg.content {
         MessageContent::Text(t) => json!(t),
         MessageContent::Parts(parts) => {
-            let mapped: Vec<Value> = parts.iter().map(serialize_history_part).collect();
+            // Replay-only reasoning blocks (redacted / display-omitted
+            // thinking from another provider) carry no text; skip them.
+            let mapped: Vec<Value> = parts
+                .iter()
+                .filter(|p| !matches!(p, ContentPart::Reasoning { text, .. } if text.is_empty()))
+                .map(serialize_history_part)
+                .collect();
             json!(mapped)
         }
     };
@@ -2769,7 +3003,7 @@ fn serialize_history_part(p: &ContentPart) -> Value {
             }
             obj
         }
-        ContentPart::Reasoning { text } => json!({"type":"thinking","text":text}),
+        ContentPart::Reasoning { text, .. } => json!({"type":"thinking","text":text}),
     }
 }
 
@@ -3080,14 +3314,18 @@ async fn parse_sse_chunk(
                     }
                     BlockKind::ToolCall => {
                         b.buf.push_str(delta);
+                        // A long tool input (a whole script, a document)
+                        // can take minutes; an empty delta tells the
+                        // caller's idle watchdog the stream is alive.
+                        events.push(Ok(StreamEvent::TextDelta(String::new())));
                     }
                 }
             }
             // Close a block. For tool_call: parse the accumulated buf
             // as JSON and emit a single ToolCall event. Malformed JSON
-            // collapses to an empty object so downstream `.as_object()`
-            // consumers never have to match Null; the empty-args path
-            // is the runtime's existing "tool with no args" branch.
+            // is passed through as the raw string: the agent runtime
+            // repairs it or flags `_parse_error` and tells the model,
+            // instead of silently dispatching the tool with no args.
             // Text/thinking already emitted incrementally — block_stop
             // is just a no-op cleanup for them.
             "block_stop" => {
@@ -3100,8 +3338,14 @@ async fn parse_sse_chunk(
                     let input: Value = if b.buf.is_empty() {
                         Value::Object(Default::default())
                     } else {
-                        serde_json::from_str(&b.buf)
-                            .unwrap_or_else(|_| Value::Object(Default::default()))
+                        serde_json::from_str(&b.buf).unwrap_or_else(|e| {
+                            tracing::warn!(
+                                tool = %b.tool_name,
+                                error = %e,
+                                "rsclaw: tool_call arguments are not valid JSON; passing raw string to the runtime"
+                            );
+                            Value::String(b.buf.clone())
+                        })
                     };
                     events.push(Ok(StreamEvent::ToolCall {
                         id: b.tool_id,
@@ -3555,6 +3799,22 @@ data: {"type":"block_stop","index":0}
     }
 
     #[tokio::test]
+    async fn parse_sse_chunk_tool_call_input_keeps_the_stream_alive() {
+        // Each input shard yields an empty TextDelta, so the agent loop's
+        // idle watchdog sees progress while a long tool input streams.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let start = br#"data: {"type":"block_start","index":0,"block":{"type":"tool_call","id":"c","name":"shell"}}
+"#;
+        parse_sse_test(Ok(bytes::Bytes::copy_from_slice(start)), &buf, &rem, &state).await;
+        let shard = br#"data: {"type":"block_delta","index":0,"delta":"{\"command\":\"python3"}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(shard)), &buf, &rem, &state).await;
+        assert!(matches!(evs.as_slice(), [Ok(StreamEvent::TextDelta(t))] if t.is_empty()));
+    }
+
+    #[tokio::test]
     async fn parse_sse_chunk_native_tool_call_missing_input_defaults_empty_object() {
         // A tool_call block that gets `block_stop` without any
         // `block_delta` (worker had no input args) must emit
@@ -3925,11 +4185,12 @@ data: [DONE]
             &state,
         )
         .await;
-        // Exactly one ToolCall, no intermediate TextDelta events.
+        // Exactly one ToolCall; the input shards yield only the empty
+        // keep-alive deltas, no text.
         let mut tool_calls = Vec::new();
         for e in &evs {
-            if let Ok(StreamEvent::TextDelta(_)) = e {
-                panic!("tool_call deltas must NOT emit TextDelta");
+            if let Ok(StreamEvent::TextDelta(t)) = e {
+                assert!(t.is_empty(), "tool_call deltas must NOT emit text: {t:?}");
             }
             if let Ok(StreamEvent::ToolCall { id, name, input }) = e {
                 tool_calls.push((id.clone(), name.clone(), input.clone()));
@@ -3971,7 +4232,8 @@ data: {"type":"block_stop","index":0}
         let mut tool_calls = Vec::new();
         for e in evs {
             match e.unwrap() {
-                StreamEvent::TextDelta(s) => texts.push(s),
+                // Empty deltas are the keep-alives a tool input's shards send.
+                StreamEvent::TextDelta(s) if !s.is_empty() => texts.push(s),
                 StreamEvent::ToolCall { id, name, input } => tool_calls.push((id, name, input)),
                 _ => {}
             }
@@ -4141,10 +4403,11 @@ data: {"type":"block_stop","index":99}
     }
 
     #[tokio::test]
-    async fn parse_v1_tool_call_malformed_json_falls_back_to_empty_object() {
+    async fn parse_v1_tool_call_malformed_json_passes_raw_string() {
         // Malformed tool_call input must not panic / surface as Err —
-        // the parser falls back to {} so downstream consumers don't
-        // crash. Matches the runtime's "no-args" branch behavior.
+        // the parser passes the raw string through so the runtime's
+        // repair / `_parse_error` path handles it (instead of silently
+        // dispatching the tool with empty args).
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let state = new_state();
@@ -4166,8 +4429,7 @@ data: {"type":"block_stop","index":0}
                 _ => None,
             })
             .expect("expected one ToolCall event");
-        assert!(input.is_object());
-        assert_eq!(input.as_object().unwrap().len(), 0);
+        assert_eq!(input.as_str(), Some("{not valid json"));
     }
 
     #[test]
@@ -4576,6 +4838,7 @@ data: {"type":"block_stop","index":0}
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -4595,9 +4858,9 @@ data: {"type":"block_stop","index":0}
             v.get("rsclaw_version").is_none(),
             "rsclaw_version is the pre-rename name; never send"
         );
-        assert!(
-            v.get("user_suffix").is_none(),
-            "user_suffix is the legacy name; never send (top-level or otherwise)"
+        assert_eq!(
+            v["user_suffix"], "<suf>",
+            "registry path also sends the segment as user_suffix, the field the worker's static path reads"
         );
         // Registry path lifts the per-session system segment to the top
         // level (dynamic_prefix is omitted, so it has nowhere else to go).
@@ -4651,6 +4914,7 @@ data: {"type":"block_stop","index":0}
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -4700,6 +4964,7 @@ data: {"type":"block_stop","index":0}
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -4756,6 +5021,7 @@ data: {"type":"block_stop","index":0}
             dynamic_prefix,
             user_tools: top_level_user_tools,
             user_system: top_level_user_system,
+            user_suffix: top_level_user_system,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -5143,6 +5409,22 @@ data: {"type":"block_stop","index":0}
         assert_eq!(body["tool_results"][0]["tool_use_id"], "toolu_1");
     }
 
+    fn msgs(roles: &str) -> Vec<Message> {
+        roles
+            .chars()
+            .enumerate()
+            .map(|(i, r)| Message {
+                role: match r {
+                    'u' => Role::User,
+                    'a' => Role::Assistant,
+                    _ => Role::Tool,
+                },
+                content: MessageContent::Text(format!("m{i}")),
+                rsclaw_hidden: None,
+            })
+            .collect()
+    }
+
     #[test]
     fn lookup_and_bump_evicts_on_history_shrink() {
         let provider = RsclawProvider::new("http://x", None);
@@ -5151,39 +5433,157 @@ data: {"type":"block_stop","index":0}
             SessionEntry {
                 session_id: "rs_w7_abc".into(),
                 prefix_id: "rsclaw/2026.5.28".into(),
-                last_seen_msgs_len: 12,
+                last_seen_msgs_len: 3,
+                ..Default::default()
             },
         );
-        // Same len → cached entry returned, last_seen unchanged.
-        assert!(
-            provider
-                .lookup_and_bump("k", "rsclaw/2026.5.28", 12)
-                .is_some()
-        );
-        // Growth → bumped, returned.
-        assert!(
-            provider
-                .lookup_and_bump("k", "rsclaw/2026.5.28", 14)
-                .is_some()
-        );
-        // Shrink (compaction trimmed history) → None, caller re-hydrates.
-        assert!(
-            provider
-                .lookup_and_bump("k", "rsclaw/2026.5.28", 8)
-                .is_none()
-        );
-        // Version drift → None even if len matches.
-        assert!(
-            provider
-                .lookup_and_bump("k", "rsclaw/2026.5.6", 14)
-                .is_none()
-        );
-        // Missing key → None.
-        assert!(
-            provider
-                .lookup_and_bump("missing", "rsclaw/2026.5.28", 14)
-                .is_none()
-        );
+        let p = "rsclaw/2026.5.28";
+        // Same len, then growth → cached entry returned.
+        assert!(provider.lookup_and_bump("k", p, &msgs("uau")).is_ok());
+        assert!(provider.lookup_and_bump("k", p, &msgs("uauat")).is_ok());
+        // Shrink that isn't a dropped scratch (compaction) → re-hydrate.
+        assert!(provider.lookup_and_bump("k", p, &msgs("u")).is_err());
+        // Version drift → Err even if len matches.
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.6", &msgs("uauat")).is_err());
+        // Missing key → Err.
+        assert!(provider.lookup_and_bump("missing", p, &msgs("u")).is_err());
+    }
+
+    fn msg(role: Role, text: &str) -> Message {
+        Message { role, content: MessageContent::Text(text.into()), rsclaw_hidden: None }
+    }
+
+    fn mark_finished(provider: &RsclawProvider, key: &str) {
+        provider.lock_sessions().get_mut(key).expect("entry").turn_finished = true;
+    }
+
+    #[test]
+    fn a_dropped_turn_scratch_keeps_the_server_session() {
+        let provider = RsclawProvider::new("http://x", None);
+        // Turn 2 starts after "u a" and opened the session, then runs two
+        // tool rounds.
+        let turn = msgs("uau");
+        provider.store("k", SessionEntry {
+            session_id: "rs_a".into(),
+            prefix_id: "p".into(),
+            last_seen_msgs_len: turn.len(),
+            turn_base: turn_base_of(&turn),
+            ..Default::default()
+        });
+        let mut call = turn.clone();
+        call.extend(msgs("at"));
+        assert!(provider.lookup_and_bump("k", "p", &call).is_ok());
+        assert!(provider.lock_sessions()["k"].scratch_kept, "tool results were sent");
+        call.extend(msgs("at"));
+        assert!(provider.lookup_and_bump("k", "p", &call).is_ok());
+        mark_finished(&provider, "k");
+        // Turn 3: the runtime kept "u a u" + the final reply, dropped the
+        // scratch, and adds the new user message: shorter, but appended.
+        let mut next = turn.clone();
+        next.push(msg(Role::Assistant, "final"));
+        next.push(msg(Role::User, "发"));
+        let entry = provider.lookup_and_bump("k", "p", &next).expect("appended");
+        assert!(entry.scratch_kept);
+        assert!(!entry.turn_finished, "reset for the call now running");
+
+        // Turn 4 after a turn that never finished (cancelled / timed out,
+        // the runtime wrote a failed-turn note the server never saw).
+        let mut after_fail = next.clone();
+        after_fail.push(msg(Role::Assistant, "⚠️ 这一轮没有完成"));
+        after_fail.push(msg(Role::User, "继续"));
+        assert!(provider.lookup_and_bump("k", "p", &after_fail).is_err());
+    }
+
+    #[test]
+    fn only_the_last_reply_may_sit_between_turns() {
+        let provider = RsclawProvider::new("http://x", None);
+        let turn = msgs("uau");
+        provider.store("k", SessionEntry {
+            session_id: "rs_a".into(),
+            prefix_id: "p".into(),
+            last_seen_msgs_len: turn.len(),
+            turn_base: turn_base_of(&turn),
+            turn_finished: true,
+            ..Default::default()
+        });
+        // A background writeback the server never saw, between the reply
+        // and the new message.
+        let mut extra = turn.clone();
+        extra.push(msg(Role::Assistant, "final"));
+        extra.push(msg(Role::Assistant, "图片已生成：/d/images/dl_i_1a.png"));
+        extra.push(msg(Role::User, "好"));
+        assert!(provider.lookup_and_bump("k", "p", &extra).is_err());
+
+        // An earlier message changed (compaction) at the right length.
+        provider.store("k", SessionEntry {
+            session_id: "rs_a".into(),
+            prefix_id: "p".into(),
+            last_seen_msgs_len: turn.len(),
+            turn_base: turn_base_of(&turn),
+            turn_finished: true,
+            ..Default::default()
+        });
+        let mut compacted = turn.clone();
+        compacted[0] = msg(Role::User, "[summary]");
+        compacted.push(msg(Role::Assistant, "final"));
+        compacted.push(msg(Role::User, "x"));
+        assert!(provider.lookup_and_bump("k", "p", &compacted).is_err());
+    }
+
+    #[test]
+    fn clear_after_a_first_turn_replays() {
+        let provider = RsclawProvider::new("http://x", None);
+        let first = msgs("u");
+        provider.store("k", SessionEntry {
+            session_id: "rs_a".into(),
+            prefix_id: "p".into(),
+            last_seen_msgs_len: 1,
+            turn_base: turn_base_of(&first),
+            turn_finished: true,
+            ..Default::default()
+        });
+        // /clear leaves a summary, then the new message.
+        let cleared = vec![msg(Role::User, "[summary of the cleared chat]"), msg(Role::User, "hi")];
+        assert!(provider.lookup_and_bump("k", "p", &cleared).is_err());
+    }
+
+    #[tokio::test]
+    async fn splice_is_skipped_once_the_server_holds_tool_steps() {
+        let provider = RsclawProvider::new("http://x", None);
+        provider.store("k", SessionEntry {
+            session_id: "rs_a".into(),
+            prefix_id: "p".into(),
+            scratch_kept: true,
+            ..Default::default()
+        });
+        assert!(provider.holds_dropped_steps("k"));
+        let err = provider.compact_splice("k", 2, "summary", 2, Some(9)).await.unwrap_err();
+        assert!(err.to_string().contains("replaying"), "{err}");
+        assert!(provider.lock_sessions().get("k").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_final_reply_marks_the_turn_finished() {
+        use futures::StreamExt;
+        let provider = RsclawProvider::new("http://x", None);
+        let store = |p: &RsclawProvider| {
+            p.store("k", SessionEntry { session_id: "rs_a".into(), prefix_id: "p".into(), ..Default::default() })
+        };
+        store(&provider);
+        let reply: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::TextDelta("ok".into())),
+            Ok(StreamEvent::Done { usage: None }),
+        ]));
+        let _: Vec<_> = invalidate_on_error(reply, Arc::clone(&provider.sessions), "k".into()).collect().await;
+        assert!(provider.lock_sessions()["k"].turn_finished);
+
+        store(&provider);
+        let tool_call: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::ToolCall { id: "t1".into(), name: "exec".into(), input: serde_json::json!({}) }),
+            Ok(StreamEvent::Done { usage: None }),
+        ]));
+        let _: Vec<_> = invalidate_on_error(tool_call, Arc::clone(&provider.sessions), "k".into()).collect().await;
+        assert!(!provider.lock_sessions()["k"].turn_finished);
     }
 
     #[test]
@@ -5201,6 +5601,7 @@ data: {"type":"block_stop","index":0}
                     session_id: format!("rs_w_{i}"),
                     prefix_id: "rsclaw/test".into(),
                     last_seen_msgs_len: 1,
+                    ..Default::default()
                 },
             );
         }
@@ -5222,6 +5623,7 @@ data: {"type":"block_stop","index":0}
                     session_id: format!("rs_{i}"),
                     prefix_id: "rsclaw/test".into(),
                     last_seen_msgs_len: 1,
+                    ..Default::default()
                 },
             );
         }
@@ -5241,6 +5643,7 @@ data: {"type":"block_stop","index":0}
                 session_id: "rs_w7_xyz".into(),
                 prefix_id: "rsclaw/test".into(),
                 last_seen_msgs_len: 5,
+                ..Default::default()
             },
         );
         let inner: LlmStream = Box::pin(futures::stream::iter(vec![
@@ -5273,6 +5676,7 @@ data: {"type":"block_stop","index":0}
                 session_id: "rs_w7_abc".into(),
                 prefix_id: "rsclaw/test".into(),
                 last_seen_msgs_len: 5,
+                ..Default::default()
             },
         );
         let inner: LlmStream = Box::pin(futures::stream::iter(vec![Ok(StreamEvent::Error(
@@ -5295,6 +5699,7 @@ data: {"type":"block_stop","index":0}
                 session_id: "rs_w7_abc".into(),
                 prefix_id: "rsclaw/test".into(),
                 last_seen_msgs_len: 5,
+                ..Default::default()
             },
         );
         let inner: LlmStream = Box::pin(futures::stream::iter(vec![
@@ -5651,6 +6056,7 @@ data: {"type":"block_stop","index":0}
             temperature: Some(0.6),
             top_p: Some(0.95),
             enable_thinking: None,
+            thinking_budget_tokens: None,
             stop: None,
             idle_ttl_secs: None,
             constrain_tool_calls: None,
@@ -5680,6 +6086,7 @@ data: {"type":"block_stop","index":0}
             temperature: None,
             top_p: None,
             enable_thinking: None,
+            thinking_budget_tokens: None,
             stop: None,
             idle_ttl_secs: None,
             constrain_tool_calls: None,
@@ -5719,6 +6126,34 @@ data: {"type":"block_stop","index":0}
         req.tools.clear();
         let no_tools = serde_json::to_value(TurnOptions::from_request(&req, true)).unwrap();
         assert!(no_tools.get("constrain_tool_calls").is_none());
+    }
+
+    #[test]
+    fn turn_options_carry_explicit_thinking_off() {
+        let mut req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("你是啥模型？".into()),
+                rsclaw_hidden: None,
+            }],
+            2,
+            Some("k"),
+        );
+        // Thinking explicitly off (budget 0) must reach the worker as false.
+        req.thinking_budget = Some(0);
+        let off = serde_json::to_value(TurnOptions::from_request(&req, false)).unwrap();
+        assert_eq!(off["enable_thinking"], false);
+        assert!(off.get("thinking_budget_tokens").is_none());
+        // On: the budget travels with the switch so the worker can cap it.
+        req.thinking_budget = Some(4096);
+        let on = serde_json::to_value(TurnOptions::from_request(&req, false)).unwrap();
+        assert_eq!(on["enable_thinking"], true);
+        assert_eq!(on["thinking_budget_tokens"], 4096);
+        // Not configured: omitted, the worker default applies.
+        req.thinking_budget = None;
+        let unset = serde_json::to_value(TurnOptions::from_request(&req, false)).unwrap();
+        assert!(unset.get("enable_thinking").is_none());
+        assert!(unset.get("thinking_budget_tokens").is_none());
     }
 
     #[test]
@@ -6115,6 +6550,28 @@ data: {"type":"block_stop","index":0}
         );
     }
 
+    #[test]
+    fn drop_session_makes_the_next_call_replay() {
+        // Shrinking messages the server already holds changes nothing
+        // there; dropping the cached entry sends the next call down the
+        // replay path with the history as it is now.
+        use crate::LlmProvider;
+        let provider = RsclawProvider::new("http://nonexistent-host.invalid", None);
+        provider.lock_sessions().insert(
+            "k".to_owned(),
+            SessionEntry {
+                session_id: "rs_w7_abc".to_owned(),
+                prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
+                last_seen_msgs_len: 40,
+                ..Default::default()
+            },
+        );
+        provider.drop_session("k");
+        assert!(provider.lock_sessions().get("k").is_none());
+        // Dropping an unknown session is harmless.
+        provider.drop_session("k");
+    }
+
     #[tokio::test]
     async fn compact_splice_errs_when_no_cached_session() {
         // Splice short-circuits BEFORE any HTTP call when the cached
@@ -6176,6 +6633,7 @@ data: {"type":"block_stop","index":0}
                     session_id: session_id.to_owned(),
                     prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
                     last_seen_msgs_len: 50,
+                    ..Default::default()
                 },
             );
         }
@@ -6267,6 +6725,7 @@ data: {"type":"block_stop","index":0}
                     session_id: session_id.to_owned(),
                     prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
                     last_seen_msgs_len: 50,
+                    ..Default::default()
                 },
             );
         }
@@ -6286,5 +6745,21 @@ data: {"type":"block_stop","index":0}
             entry.last_seen_msgs_len, 15,
             "last_seen recomputed from the GROWN tail: head(2)+summary(1)+tail(12)"
         );
+    }
+}
+
+#[cfg(test)]
+mod create_session_resp_tests {
+    use super::CreateSessionResp;
+
+    #[test]
+    fn reads_the_user_segment_placement_when_reported() {
+        let resp: CreateSessionResp = serde_json::from_str(
+            r#"{"session_id":"rs_a_1","cache_status":{"user_system":{"placement":"gpu_hit","promote_ms":0}}}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.user_segment_cache(), (Some("gpu_hit"), Some(0)));
+        let bare: CreateSessionResp = serde_json::from_str(r#"{"session_id":"rs_a_2"}"#).unwrap();
+        assert_eq!(bare.user_segment_cache(), (None, None));
     }
 }

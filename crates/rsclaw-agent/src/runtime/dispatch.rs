@@ -40,6 +40,60 @@ async fn open_outbound_a2a_transport(
 }
 
 impl AgentRuntime {
+    /// Wait for a person to approve a gated call. In a chat channel the
+    /// turn's sender is asked there and may reply 同意 / 拒绝; any app
+    /// showing approvals can answer too. `Err` (the tool's error) unless
+    /// approved.
+    async fn ask_tool_approval(&self, ctx: &RunContext, tool: &str, summary: &str) -> Result<()> {
+        use crate::approvals::{APPROVAL_WAIT, Decision, broker};
+        let refused = |why: &str| {
+            anyhow!(
+                "负责人未批准：{tool} 没有执行（{why}）。This call needs the owner's approval. \
+                 Do not retry it or work around it with another tool; tell the user plainly \
+                 that this step was not done and why."
+            )
+        };
+        let local = matches!(
+            ctx.channel.as_str(),
+            "api" | "desktop" | "ws" | "webchat" | "web" | "cron" | "heartbeat" | "system"
+        );
+        let approver = (!local && !ctx.peer_id.is_empty()).then(|| ctx.peer_id.clone());
+        if approver.is_none() && !broker().has_listener() {
+            return Err(refused("没有能审批的地方：桌面端没有打开"));
+        }
+        if approver.is_some()
+            && let Some(ref ntx) = self.notification_tx
+        {
+            let lang = rsclaw_i18n::default_lang();
+            let minutes = (APPROVAL_WAIT.as_secs() / 60).to_string();
+            let _ = ntx.send(rsclaw_channel::OutboundMessage {
+                target_id: if ctx.chat_id.is_empty() { ctx.peer_id.clone() } else { ctx.chat_id.clone() },
+                is_group: false,
+                text: rsclaw_i18n::t_fmt(
+                    "tool_approval_prompt",
+                    lang,
+                    &[("tool", tool), ("summary", summary), ("minutes", &minutes)],
+                ),
+                reply_to: None,
+                images: vec![],
+                files: vec![],
+                channel: Some(ctx.channel.clone()),
+                account: ctx.account.clone(),
+            });
+        }
+        info!(tool, session = %ctx.session_key, "approvals.tools: waiting for approval");
+        let decision = broker()
+            .request_tool(&ctx.session_key, &ctx.agent_id, tool, summary, approver, APPROVAL_WAIT)
+            .await;
+        info!(tool, session = %ctx.session_key, ?decision, "approvals.tools: answered");
+        match decision {
+            Decision::Allow(_) => Ok(()),
+            Decision::Deny => Err(refused("被拒绝")),
+            Decision::TimedOut => Err(refused("没有在时限内答复")),
+            Decision::NoClient => Err(refused("没有能审批的地方：桌面端没有打开")),
+        }
+    }
+
     pub(super) fn allowed_tools_for_dispatch(&self) -> Option<std::collections::HashSet<String>> {
         let model_cfg = self.handle.config.model.as_ref()?;
         let explicit_toolset = model_cfg.toolset.as_deref();
@@ -110,6 +164,61 @@ impl AgentRuntime {
             }
         }
 
+        // Sender-trust gate: non-owner senders (paired users, group members,
+        // A2A peers, webhooks) cannot reach host-level tools unless this
+        // agent lists them in `nonOwnerTools`. Enforced here, not only in the
+        // tool list, because models call tools they were never shown.
+        if !crate::trust::tool_allowed(
+            ctx.turn_ctx.trust,
+            name,
+            self.handle.config.non_owner_tools.as_deref(),
+        ) {
+            tracing::warn!(
+                tool = name,
+                channel = %ctx.channel,
+                peer = %ctx.peer_id,
+                "owner-only tool refused for non-owner sender"
+            );
+            return Err(anyhow!(
+                "tool '{name}' is restricted to the owner of this assistant and \
+                 cannot be used in this conversation. Do not retry it; answer \
+                 with the tools that are available or explain the limitation."
+            ));
+        }
+
+        // Approval gate (`approvals.tools`): a listed tool runs only after a
+        // person says yes, whatever the model was told or remembers.
+        {
+            let (tool_id, call_args) = crate::tool_approval::call_identity(name, &args);
+            let gate = self.config.raw.approvals.as_ref().and_then(|a| a.tools.as_ref());
+            if crate::tool_approval::needs_approval(gate, &tool_id, &ctx.channel, &ctx.session_key) {
+                // No person started this turn, so nobody here can have asked
+                // for it: refuse without raising a prompt.
+                if crate::tool_approval::blocked_without_person(gate, &ctx.channel, &ctx.user_text) {
+                    tracing::warn!(tool = %tool_id, session = %ctx.session_key, "approvals.tools: refused in a turn no person started");
+                    return Err(anyhow!(
+                        "这是生成完成后的自动轮次（不是负责人发起的），不能执行 {tool_id}。请把结果发给负责人，\
+                         等负责人在对话里确认后，由那一轮来执行。Do not call {tool_id} again in this turn \
+                         and do not work around it; tell the owner the result is ready and wait."
+                    ));
+                }
+                // A call naming a file that isn't there can only fail:
+                // send it back to the model instead of asking anyone.
+                let missing = crate::tool_approval::missing_files(call_args);
+                if !missing.is_empty() {
+                    return Err(anyhow!(
+                        "{tool_id} was not run: these files do not exist: {}. Do not guess \
+                         file names. Use the exact path from the earlier result or the \
+                         [attachments] list in the conversation, or list the folder, then \
+                         call again.",
+                        missing.join(", ")
+                    ));
+                }
+                let summary = crate::tool_approval::summary(call_args);
+                self.ask_tool_approval(ctx, &tool_id, &summary).await?;
+            }
+        }
+
         // Per-session filter: even when no explicit whitelist is configured,
         // run_turn strips certain tools for special sessions (cap-followup
         // bans research/exec/chain tools so it can briefly summarise without
@@ -169,6 +278,7 @@ impl AgentRuntime {
                     session_key: ctx.session_key.clone(),
                     is_group: false,
                     account: ctx.account.clone(),
+                    event_bus: self.event_bus.clone(),
                 }
             });
             return wp.call_tool_with_ctx(plugin_tool, args, notify_ctx).await;
@@ -362,7 +472,7 @@ impl AgentRuntime {
                     "size": full.metadata().map(|m| m.len()).unwrap_or(0),
                 }));
             }
-            "read_file" | "read" => return self.tool_read(args).await,
+            "read_file" | "read" => return self.tool_read(ctx, args).await,
             "read_artifact" => return self.tool_read_artifact(ctx, args).await,
             "read_session_archive" => return self.tool_read_session_archive(ctx, args).await,
             "knowledge_base" | "kb_search" => return self.tool_knowledge_base(args).await,
@@ -388,15 +498,15 @@ impl AgentRuntime {
             }
             "research_ingest_wechat" => return self.tool_research_ingest_wechat(args).await,
             "research_analyze_charts" => return self.tool_research_analyze_charts(args).await,
-            "write_file" | "write" => return self.tool_write(args).await,
-            "edit_file" | "edit" => return self.tool_edit(args).await,
+            "write_file" | "write" => return self.tool_write(ctx, args).await,
+            "edit_file" | "edit" => return self.tool_edit(ctx, args).await,
             "shell" | "execute_command" | "exec" => {
                 return self.tool_exec(ctx, tool_call_id, args).await;
             }
             "skill_use" => return self.tool_use_skill(args),
             "skill_list" => return self.tool_skill_list(args),
             "skill_search" => return self.tool_skill_search(args).await,
-            "skill_install" => return self.tool_skill_install(args).await,
+            "skill_install" => return self.tool_skill_install(ctx, args).await,
             "skill_remove" => return self.tool_skill_remove(args).await,
             // Canonical (current): underscored, vendor-regex-compliant.
             // Legacy aliases kept for sessions whose model emits the old
@@ -416,12 +526,16 @@ impl AgentRuntime {
             "task_finish" => return self.tool_task_finish(ctx, args).await,
             "ask_user" => return self.tool_ask_user(ctx, args).await,
             "install_tool" | "tool_install" => return self.tool_install(args).await,
-            "list_dir" => return self.tool_list_dir(args).await,
-            "search_file" => return self.tool_search_file(args).await,
-            "search_content" => return self.tool_search_content(args).await,
+            "list_dir" => return self.tool_list_dir(ctx, args).await,
+            "search_file" => return self.tool_search_file(ctx, args).await,
+            "search_content" => return self.tool_search_content(ctx, args).await,
             "web_search" => {
                 // Inject the last user message so the query planner can work
                 // with the original intent rather than the agent's rewritten query.
+                // A long user message (a cron or plugin prompt, a pasted
+                // document) is no search intent: the planner would time out
+                // on it, so the agent's own query is planned instead.
+                const MAX_USER_QUERY_CHARS: usize = 500;
                 let mut args = args;
                 if args.get("_user_query").is_none() {
                     if let Some(msgs) = self.sessions.get(&ctx.session_key) {
@@ -433,6 +547,7 @@ impl AgentRuntime {
                                 rsclaw_provider::MessageContent::Text(t) => Some(t.as_str()),
                                 _ => None,
                             })
+                            .filter(|t| t.chars().count() <= MAX_USER_QUERY_CHARS)
                         {
                             args["_user_query"] = serde_json::Value::String(uq.to_owned());
                         }
@@ -441,18 +556,18 @@ impl AgentRuntime {
                 return self.tool_web_search(args).await;
             }
             "web_fetch" => return self.tool_web_fetch(ctx, args).await,
-            "web_download" => return self.tool_web_download(args).await,
+            "web_download" => return self.tool_web_download(ctx, args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(ctx, args).await,
             "image_gen" | "image" => return self.tool_image(args, ctx).await,
-            "ocr" => return self.tool_ocr(args).await,
+            "ocr" => return self.tool_ocr(ctx, args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx, tool_call_id).await,
-            "video_status" => return self.tool_video_status(args).await,
+            "gen_status" | "video_status" => return self.tool_gen_status(args).await,
             "avatar_gen" | "avatar" => return self.tool_avatar_gen(args, ctx).await,
             "mv_gen" | "mv" => return self.tool_mv_gen(args, ctx).await,
             "music_gen" | "music" => return self.tool_music(args).await,
-            "voice_gen" | "voice" => return self.tool_voice(args).await,
-            "pdf" => return self.tool_pdf(args).await,
+            "voice_gen" | "voice" => return self.tool_voice(ctx, args).await,
+            "pdf" => return self.tool_pdf(ctx, args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,
             "anycli" | "opencli" => return self.tool_anycli(args).await,
@@ -513,26 +628,26 @@ impl AgentRuntime {
             "cron" => return self.tool_cron(args, ctx).await,
             "gateway" => return self.tool_gateway(args).await,
             "pairing" => return self.tool_pairing(args).await,
-            "doc" => return self.tool_doc(args).await,
+            "doc" => return self.tool_doc(ctx, args).await,
             "create_docx" => {
                 let mut a = args.clone();
                 a["action"] = serde_json::json!("create_word");
-                return self.tool_doc(a).await;
+                return self.tool_doc(ctx, a).await;
             }
             "create_pdf" => {
                 let mut a = args.clone();
                 a["action"] = serde_json::json!("create_pdf");
-                return self.tool_doc(a).await;
+                return self.tool_doc(ctx, a).await;
             }
             "create_xlsx" => {
                 let mut a = args.clone();
                 a["action"] = serde_json::json!("create_excel");
-                return self.tool_doc(a).await;
+                return self.tool_doc(ctx, a).await;
             }
             "create_pptx" => {
                 let mut a = args.clone();
                 a["action"] = serde_json::json!("create_ppt");
-                return self.tool_doc(a).await;
+                return self.tool_doc(ctx, a).await;
             }
             "cap" => return self.tool_cap(ctx, args).await,
             "cap_live" => return self.tool_cap_live(ctx, args).await,
@@ -597,6 +712,7 @@ impl AgentRuntime {
                         session_key: ctx.session_key.clone(),
                         is_group: false,
                         account: ctx.account.clone(),
+                        event_bus: self.event_bus.clone(),
                     }
                 });
                 return wp.call_tool_with_ctx(tool_name, args, notify_ctx).await;
@@ -657,11 +773,34 @@ impl AgentRuntime {
         if let Some(ref registry) = self.agents
             && let Ok(target) = registry.get(agent_id)
         {
+            // Local agents process their mailbox serially: calling yourself,
+            // or any agent that is upstream in the current call chain (and
+            // therefore blocked awaiting this very call), can never be served
+            // and would just hang until the A2A timeout.
+            if target.id == self.handle.id {
+                return Err(anyhow!(
+                    "A2A: agent `{agent_id}` cannot call itself; do the work directly"
+                ));
+            }
+            let depth = a2a_chain_depth(&ctx.session_key);
+            if depth >= MAX_LOCAL_A2A_DEPTH {
+                return Err(anyhow!(
+                    "A2A: call chain too deep ({depth} hops, max {MAX_LOCAL_A2A_DEPTH}); \
+                     answer with what you have instead of delegating further"
+                ));
+            }
+            if a2a_target_is_upstream(&target, &ctx.session_key) {
+                return Err(anyhow!(
+                    "A2A: agent `{agent_id}` is already waiting on this call chain \
+                     (cyclic delegation would deadlock); answer directly instead"
+                ));
+            }
             // Derive a child session key so A2A calls have isolated context.
             let child_session = format!("{}:a2a:{agent_id}", ctx.session_key);
 
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
             let msg = AgentMessage {
+                trust: ctx.turn_ctx.trust,
                 session_key: child_session,
                 text,
                 channel: format!("a2a:{}", ctx.agent_id),
@@ -815,6 +954,7 @@ impl AgentRuntime {
                                             tool_log: vec![],
                                             question: None,
                                             channel: None,
+                                            origin: None,
                                         });
                                     }
                                 }
@@ -988,3 +1128,26 @@ mod tests {
         server.await.expect("test HTTP server completed");
     }
 }
+
+/// Maximum number of nested local A2A hops (`agent_<id>` calls) in one chain.
+const MAX_LOCAL_A2A_DEPTH: usize = 3;
+
+/// Number of local A2A hops already taken, read from the child-session key
+/// suffixes (`<parent>:a2a:<callee>`) that `dispatch_a2a` appends per hop.
+fn a2a_chain_depth(session_key: &str) -> usize {
+    session_key.matches(":a2a:").count()
+}
+
+/// True when `target` currently runs a turn for a session on this call
+/// chain — i.e. `session_key` itself or one of its ancestors
+/// (`session_key == k` or `session_key` starts with `k + ":a2a:"`). Such an
+/// agent is blocked awaiting this call, so sending it a message deadlocks.
+fn a2a_target_is_upstream(target: &crate::AgentHandle, session_key: &str) -> bool {
+    let Ok(flags) = target.abort_flags.read() else {
+        return false;
+    };
+    flags
+        .keys()
+        .any(|k| session_key == k.as_str() || session_key.starts_with(&format!("{k}:a2a:")))
+}
+

@@ -29,6 +29,13 @@ const DEFAULT_WS_URL: &str = "wss://openws.work.weixin.qq.com";
 /// Heartbeat interval (30 seconds as per protocol).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Outbound WS frame queue capacity.
+const OUTBOUND_QUEUE_CAP: usize = 1024;
+
+/// Reconnect when no frame (incl. pong replies to our 30s pings) arrives
+/// within this window — detects half-open connections.
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Maximum back-off delay on reconnect.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -53,9 +60,9 @@ pub struct WeComChannel {
     client: Client,
     /// Sender half for writing frames to the WebSocket.
     /// Populated once `run()` is called.
-    ws_tx: mpsc::UnboundedSender<String>,
+    ws_tx: mpsc::Sender<String>,
     /// Receiver half -- moved into the run loop.
-    ws_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    ws_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
     /// Pending upload RPC responses keyed by req_id.
     /// The read loop delivers matching frames here so upload steps can await.
     pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
@@ -98,7 +105,9 @@ impl WeComChannel {
                 + Sync,
         >,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Bounded: while the WS is down frames queue up to this cap, then
+        // sends fail loudly instead of growing memory without limit.
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAP);
         Self {
             bot_id: bot_id.into(),
             secret: secret.into(),
@@ -118,7 +127,7 @@ impl WeComChannel {
     // WebSocket reconnect loop
     // -----------------------------------------------------------------------
 
-    async fn ws_loop(self: &Arc<Self>, mut outbound_rx: mpsc::UnboundedReceiver<String>) -> ! {
+    async fn ws_loop(self: &Arc<Self>, mut outbound_rx: mpsc::Receiver<String>) -> ! {
         let mut backoff_secs: u64 = 1;
 
         loop {
@@ -148,7 +157,7 @@ impl WeComChannel {
     /// receive.
     async fn run_single_connection(
         self: &Arc<Self>,
-        outbound_rx: &mut mpsc::UnboundedReceiver<String>,
+        outbound_rx: &mut mpsc::Receiver<String>,
     ) -> Result<()> {
         let (ws_stream, _resp) = connect_async(&self.ws_url)
             .await
@@ -171,7 +180,7 @@ impl WeComChannel {
             .await
             .context("WeCom WS: send auth")?;
 
-        debug!(frame = %auth_frame, "WeCom WS: auth frame sent");
+        debug!(bot_id = %self.bot_id, req_id = %auth_req_id, "WeCom WS: auth frame sent");
         info!("WeCom WS: auth frame sent, waiting for response...");
 
         // Wait for auth response (first frame should be the reply).
@@ -212,24 +221,32 @@ impl WeComChannel {
                     "cmd": "ping",
                     "headers": { "req_id": uuid::Uuid::new_v4().to_string() }
                 });
-                if heartbeat_tx.send(ping.to_string()).is_err() {
-                    break;
+                match heartbeat_tx.try_send(ping.to_string()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        debug!("WeCom WS: outbound queue full, heartbeat skipped");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
 
         // --- Main loop: multiplex inbound WS frames and outbound sends ---
         let this = Arc::clone(self);
+        let mut idle_deadline = tokio::time::Instant::now() + WS_IDLE_TIMEOUT;
         loop {
             tokio::select! {
                 frame = ws_source.next() => {
+                    idle_deadline = tokio::time::Instant::now() + WS_IDLE_TIMEOUT;
                     match frame {
                         Some(Ok(WsMessage::Text(txt))) => {
                             let txt_str: &str = &txt;
                             this.handle_frame(txt_str).await;
                         }
                         Some(Ok(WsMessage::Ping(data))) => {
-                            ws_sink.send(WsMessage::Pong(data)).await.ok();
+                            if let Err(e) = ws_sink.send(WsMessage::Pong(data)).await {
+                                warn!("WeCom WS: pong failed: {e}");
+                            }
                         }
                         Some(Ok(WsMessage::Close(_))) | None => {
                             info!("WeCom WS: connection closed by server");
@@ -243,6 +260,10 @@ impl WeComChannel {
                             break;
                         }
                     }
+                }
+                () = tokio::time::sleep_until(idle_deadline) => {
+                    warn!("WeCom WS: idle timeout ({}s), reconnecting", WS_IDLE_TIMEOUT.as_secs());
+                    break;
                 }
                 outbound = outbound_rx.recv() => {
                     match outbound {
@@ -296,15 +317,21 @@ impl WeComChannel {
         {
             let mut pending = self.pending_responses.lock().await;
             if let Some(tx) = pending.remove(req_id) {
-                // Deliver response; ignore error if waiter already dropped.
-                let _ = tx.send(frame.clone());
+                if tx.send(frame.clone()).is_err() {
+                    debug!(req_id, "WeCom WS: RPC waiter already gone");
+                }
                 return;
             }
         }
 
         match cmd {
             "aibot_msg_callback" => {
-                self.handle_message(&frame).await;
+                // Media download / transcription must not stall the WS read
+                // loop (heartbeats, RPC responses).
+                let this = Arc::clone(self);
+                tokio::spawn(async move {
+                    this.handle_message(&frame).await;
+                });
             }
             "aibot_event_callback" => {
                 debug!("WeCom WS: event callback (ignored)");
@@ -330,6 +357,14 @@ impl WeComChannel {
             Some(b) => b,
             None => return,
         };
+
+        // Redelivered callbacks reuse msgid: dedup.
+        if let Some(mid) = body.get("msgid").and_then(|v| v.as_str())
+            && crate::is_duplicate_inbound("wecom", mid)
+        {
+            debug!(msg_id = mid, "WeCom: duplicate message dropped");
+            return;
+        }
 
         let from_userid = body
             .get("from")
@@ -367,12 +402,12 @@ impl WeComChannel {
 
         match msgtype {
             "text" => {
-                text = body
-                    .get("text")
-                    .and_then(|t| t.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_owned();
+                text = crate::strip_inbound_sentinels(
+                    body.get("text")
+                        .and_then(|t| t.get("content"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or(""),
+                );
             }
             "voice" => {
                 // Try platform transcription first.
@@ -650,7 +685,9 @@ impl WeComChannel {
             bail!("WeCom: media download failed: {}", resp.status());
         }
 
-        let bytes = resp.bytes().await.context("WeCom: media download body")?;
+        let bytes = crate::read_media_body(resp)
+            .await
+            .context("WeCom: media download body")?;
         debug!(size = bytes.len(), "WeCom: media downloaded");
 
         if aeskey.is_empty() {
@@ -700,7 +737,9 @@ impl WeComChannel {
             if chunk.len() < 16 {
                 break;
             }
-            let cipher_copy: [u8; 16] = chunk.try_into().unwrap();
+            let cipher_copy: [u8; 16] = chunk
+                .try_into()
+                .expect("chunk is exactly 16 bytes (checked above)");
             let block = aes::Block::from_mut_slice(chunk);
             cipher.decrypt_block(block);
             // XOR with previous ciphertext (CBC mode).
@@ -710,10 +749,11 @@ impl WeComChannel {
             prev_block = cipher_copy;
         }
 
-        // Remove PKCS7 padding.
+        // Remove PKCS7 padding. WeCom pads to a 32-byte block size, so pad
+        // values up to 32 are legal (not just the AES block size of 16).
         if let Some(&pad_len) = data.last() {
             let pad_len = pad_len as usize;
-            if pad_len > 0 && pad_len <= 16 && data.len() >= pad_len {
+            if pad_len > 0 && pad_len <= 32 && data.len() >= pad_len {
                 if data[data.len() - pad_len..]
                     .iter()
                     .all(|&b| b == pad_len as u8)
@@ -732,8 +772,9 @@ impl WeComChannel {
     // Active send via WS
     // -----------------------------------------------------------------------
 
-    /// Send a markdown message to a chat via `aibot_send_msg`.
-    fn send_markdown(&self, chat_id: &str, text: &str) {
+    /// Queue a markdown message to a chat via `aibot_send_msg`. Fails when
+    /// the outbound queue is full (WS down for a long time) or closed.
+    fn send_markdown(&self, chat_id: &str, text: &str) -> Result<()> {
         let frame = json!({
             "cmd": "aibot_send_msg",
             "headers": { "req_id": uuid::Uuid::new_v4().to_string() },
@@ -743,9 +784,9 @@ impl WeComChannel {
                 "markdown": { "content": text },
             }
         });
-        if self.ws_tx.send(frame.to_string()).is_err() {
-            error!("WeCom: failed to enqueue outbound message (WS not connected)");
-        }
+        self.ws_tx
+            .try_send(frame.to_string())
+            .map_err(|e| anyhow::anyhow!("WeCom: failed to enqueue outbound message: {e}"))
     }
 
     // -----------------------------------------------------------------------
@@ -762,7 +803,7 @@ impl WeComChannel {
             let mut pending = self.pending_responses.lock().await;
             pending.insert(req_id.to_owned(), tx);
         }
-        if self.ws_tx.send(frame.to_string()).is_err() {
+        if self.ws_tx.try_send(frame.to_string()).is_err() {
             // Remove the pending entry to avoid a leak.
             let mut pending = self.pending_responses.lock().await;
             pending.remove(req_id);
@@ -1014,7 +1055,7 @@ impl Channel for WeComChannel {
                 break_preference: BreakPreference::Paragraph,
             };
             for chunk in &chunk_text(&msg.text, &cfg) {
-                self.send_markdown(&msg.target_id, chunk);
+                self.send_markdown(&msg.target_id, chunk)?;
             }
             // Upload and send each image via the WS media upload protocol.
             for (idx, image) in msg.images.iter().enumerate() {
@@ -1115,12 +1156,14 @@ impl Channel for WeComChannel {
     fn run(self: Arc<Self>) -> BoxFuture<'static, Result<()>> {
         Box::pin(async move {
             // Take the outbound receiver -- this can only be called once.
-            let outbound_rx = self
+            let Some(outbound_rx) = self
                 .ws_rx
                 .lock()
-                .expect("ws_rx lock")
+                .map_err(|_| anyhow::anyhow!("WeCom: ws_rx lock poisoned"))?
                 .take()
-                .expect("WeComChannel::run() called more than once");
+            else {
+                anyhow::bail!("WeComChannel::run() called more than once");
+            };
 
             info!(bot_id = %self.bot_id, "WeCom AI Bot WS channel starting");
             self.ws_loop(outbound_rx).await;
@@ -1220,7 +1263,7 @@ mod tests {
             None,
             Arc::new(|_, _, _, _, _, _| {}),
         );
-        ch.send_markdown("chat_1", "hello");
+        ch.send_markdown("chat_1", "hello").expect("enqueue");
         // Verify the frame was enqueued (rx still exists in ws_rx).
         let mut rx = ch.ws_rx.lock().unwrap().take().unwrap();
         let frame_str = rx.try_recv().expect("should have a queued frame");

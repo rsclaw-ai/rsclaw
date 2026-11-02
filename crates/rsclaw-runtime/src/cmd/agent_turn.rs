@@ -4,7 +4,7 @@ use rsclaw_config as config;
 
 pub async fn cmd_agent_turn(args: AgentTurnArgs) -> Result<()> {
     let cfg = config::load().ok();
-    let port = cfg.as_ref().map_or(18888, |c| c.gateway.port);
+    let port = cfg.as_ref().map_or(rsclaw_brand::DEFAULT_PORT, |c| c.gateway.port);
     let auth_token = cfg
         .as_ref()
         .and_then(|c| c.gateway.auth_token.as_deref())
@@ -51,7 +51,7 @@ pub async fn cmd_agent_turn(args: AgentTurnArgs) -> Result<()> {
     }
 
     let url = format!("http://127.0.0.1:{port}/api/v1/agent/turn");
-    let client = reqwest::Client::new();
+    let client = crate::cmd::gateway_http::local_client();
     let timeout_dur = std::time::Duration::from_secs(args.timeout.unwrap_or(120));
 
     let resp = client
@@ -92,7 +92,7 @@ pub async fn cmd_agent_turn(args: AgentTurnArgs) -> Result<()> {
             anyhow::bail!("gateway returned {status}: {body}");
         }
         Err(e) => {
-            anyhow::bail!(
+            brand_bail!(
                 "gateway not reachable at port {port}: {e}\nstart it with: rsclaw gateway start"
             );
         }

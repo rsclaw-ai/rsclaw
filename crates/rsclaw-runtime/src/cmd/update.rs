@@ -10,11 +10,15 @@ pub async fn cmd_update(sub: UpdateCommand) -> Result<()> {
         UpdateCommand::Status => update_status().await?,
         UpdateCommand::Wizard => {
             banner(&format!(
-                "rsclaw update wizard v{}",
+                "{} update wizard v{}",
+                rsclaw_brand::CLI_NAME,
                 option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
             ));
             warn_msg("update wizard: not yet implemented");
-            println!("  {}", dim("use `rsclaw update run` for now"));
+            println!(
+                "  {}",
+                dim(&format!("use `{} update run` for now", rsclaw_brand::CLI_NAME))
+            );
         }
     }
     Ok(())
@@ -36,7 +40,21 @@ fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     parse(a).cmp(&parse(b))
 }
 
-pub(crate) const RSCLAW_VERSION_URL: &str = "https://app.rsclaw.ai/api/version";
+pub(crate) const RSCLAW_VERSION_URL: &str = rsclaw_brand::VERSION_URL;
+
+/// Release metadata sources in priority order: the brand's version endpoint,
+/// then (when the brand names a release repo) the GitHub releases list via
+/// `GITHUB_PROXY`.
+fn release_sources() -> Vec<String> {
+    let mut sources = Vec::new();
+    if !RSCLAW_VERSION_URL.is_empty() {
+        sources.push(RSCLAW_VERSION_URL.to_owned());
+    }
+    if !rsclaw_brand::RELEASES_API_URL.is_empty() {
+        sources.push(proxy_url(rsclaw_brand::RELEASES_API_URL));
+    }
+    sources
+}
 
 /// Apply GITHUB_PROXY env to a URL: proxy + "/" + url
 fn proxy_url(url: &str) -> String {
@@ -51,7 +69,7 @@ fn proxy_url(url: &str) -> String {
 
 fn build_update_client(timeout_secs: u64) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent("rsclaw/dev")
+        .user_agent(concat!(rsclaw_brand::brand_user_agent!(), "/dev"))
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()?)
 }
@@ -65,9 +83,19 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
 
     if !quiet {
         banner(&format!(
-            "rsclaw update v{}",
+            "{} update v{}",
+            rsclaw_brand::CLI_NAME,
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         ));
+    }
+
+    if release_sources().is_empty() {
+        if quiet {
+            println!("{}", serde_json::json!({"updated": false, "reason": "updates_managed_by_distributor"}));
+        } else {
+            println!("  {}", dim("Updates for this build are delivered by its distributor."));
+        }
+        return Ok(());
     }
 
     let timeout_secs = args.timeout.unwrap_or(30);
@@ -92,13 +120,7 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     // the binary.
     let release: serde_json::Value = {
         let mut data = None;
-        let sources = [
-            RSCLAW_VERSION_URL.to_owned(),
-            proxy_url(&format!(
-                "https://api.github.com/repos/{}/releases?per_page=10",
-                "rsclaw-ai/rsclaw"
-            )),
-        ];
+        let sources = release_sources();
         for url in &sources {
             if let Ok(resp) = client.get(url).send().await {
                 if resp.status().is_success() {
@@ -247,7 +269,14 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     } else {
         url.clone()
     };
-    let downloaded = client.get(&download).send().await?.bytes().await?;
+    let downloaded = client
+        .get(&download)
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| anyhow::anyhow!("download failed: {e}"))?
+        .bytes()
+        .await?;
 
     if downloaded.is_empty() {
         anyhow::bail!("downloaded binary is empty");
@@ -272,7 +301,14 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
             }
         })
     });
-    if let Some(su) = sum_url {
+    // Refuse to install an unverified binary: a missing SHA256SUMS asset or
+    // entry is treated like a mismatch.
+    let Some(su) = sum_url else {
+        anyhow::bail!(
+            "release has no SHA256SUMS asset; refusing to install an unverified binary"
+        );
+    };
+    {
         let su_dl = if su.contains("github.com") || su.contains("githubusercontent.com") {
             proxy_url(&su)
         } else {
@@ -282,9 +318,10 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
             .get(&su_dl)
             .send()
             .await?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("SHA256SUMS download failed: {e}"))?
             .text()
-            .await
-            .unwrap_or_default();
+            .await?;
         let asset_filename = url.rsplit('/').next().unwrap_or("");
         let expected = sums.lines().find_map(|line| {
             let mut parts = line.split_whitespace();
@@ -320,19 +357,11 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
                 }
             }
             None => {
-                if !quiet {
-                    println!(
-                        "  {} no SHA256 entry for {asset_filename} in SHA256SUMS — proceeding without verify",
-                        yellow("[!]")
-                    );
-                }
+                anyhow::bail!(
+                    "no SHA256 entry for {asset_filename} in SHA256SUMS; refusing to install an unverified binary"
+                );
             }
         }
-    } else if !quiet {
-        println!(
-            "  {} release has no SHA256SUMS asset — proceeding without verify",
-            yellow("[!]")
-        );
     }
 
     // 5. Extract binary from archive (tar.gz / zip) if needed.
@@ -342,16 +371,16 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     // archive's gzipped/zipped bytes as the executable, then chmod +x'd
     // it — a pretty reliable way to brick the install.
     let binary_name = if std::env::consts::OS == "windows" {
-        "rsclaw.exe"
+        format!("{}.exe", rsclaw_brand::CLI_NAME)
     } else {
-        "rsclaw"
+        rsclaw_brand::CLI_NAME.to_owned()
     };
     let url_lower = download.to_lowercase();
     let looks_archived = url_lower.ends_with(".tar.gz")
         || url_lower.ends_with(".tgz")
         || url_lower.ends_with(".zip");
     let binary = if looks_archived {
-        extract_binary(&downloaded, binary_name, &download)?
+        extract_binary(&downloaded, &binary_name, &download)?
     } else {
         downloaded.to_vec()
     };
@@ -406,20 +435,48 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
                 println!("  {} restarting gateway...", dim("[..]"));
             }
             if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-                if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                    let _ = rsclaw_platform::process_terminate(pid as u32);
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    #[allow(unused_mut)]
-                    let mut upd = std::process::Command::new(&current_exe);
-                    upd.arg("gateway").arg("start");
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::process::CommandExt;
-                        upd.creation_flags(0x08000000);
-                    }
-                    let _ = upd.spawn();
-                    if !quiet {
-                        println!("  {} gateway restarted", green("[ok]"));
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    // process_terminate refuses pids that are not rsclaw (stale
+                    // pid file). Never start a second gateway when the old one
+                    // could not be stopped — two gateways on one profile fight
+                    // over the redb lock.
+                    match rsclaw_platform::process_terminate(pid) {
+                        Err(e) => {
+                            tracing::warn!(pid, error = %e, "update: could not stop running gateway; skipping restart");
+                            if !quiet {
+                                println!(
+                                    "  {} could not stop gateway (pid {pid}): {e}; restart it manually",
+                                    yellow("[!!]")
+                                );
+                            }
+                        }
+                        Ok(()) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            #[allow(unused_mut)]
+                            let mut upd = std::process::Command::new(&current_exe);
+                            upd.arg("gateway").arg("start");
+                            #[cfg(windows)]
+                            {
+                                use std::os::windows::process::CommandExt;
+                                upd.creation_flags(0x08000000);
+                            }
+                            match upd.spawn() {
+                                Ok(_) => {
+                                    if !quiet {
+                                        println!("  {} gateway restarted", green("[ok]"));
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "update: failed to start gateway");
+                                    if !quiet {
+                                        println!(
+                                            "  {} failed to start gateway: {e}",
+                                            yellow("[!!]")
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -513,9 +570,16 @@ fn extract_binary(data: &[u8], filename: &str, url: &str) -> Result<Vec<u8>> {
 
 async fn update_status() -> Result<()> {
     banner(&format!(
-        "rsclaw update status v{}",
+        "{} update status v{}",
+        rsclaw_brand::CLI_NAME,
         option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
     ));
+
+    if release_sources().is_empty() {
+        kv("Current:", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"));
+        println!("  {}", dim("Updates for this build are delivered by its distributor."));
+        return Ok(());
+    }
 
     let client = build_update_client(10)?;
 
@@ -527,13 +591,7 @@ async fn update_status() -> Result<()> {
     // Try app.rsclaw.ai first (object or array), fallback GitHub releases list
     // (array)
     let mut latest_tag: Option<String> = None;
-    let sources = [
-        RSCLAW_VERSION_URL.to_owned(),
-        proxy_url(&format!(
-            "https://api.github.com/repos/{}/releases?per_page=10",
-            "rsclaw-ai/rsclaw"
-        )),
-    ];
+    let sources = release_sources();
     for url in &sources {
         if let Ok(resp) = client.get(url).send().await {
             if resp.status().is_success() {
@@ -557,7 +615,7 @@ async fn update_status() -> Result<()> {
             let current = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
             if version_cmp(latest, current) == std::cmp::Ordering::Greater {
                 println!("  {} update available: {latest}", yellow("[!]"));
-                println!("  Run: rsclaw update");
+                println!("  Run: {} update", rsclaw_brand::CLI_NAME);
             } else {
                 println!("  {} up to date", green("[ok]"));
             }

@@ -1113,6 +1113,22 @@ const en: LocaleType = {
       NotRun: "Click \"Check\" to start diagnostics.",
     },
 
+    Pairing: {
+      ApproveAsOwner: "Approve as owner",
+      Owner: "Owner",
+      Owners: "Owners",
+      OwnersHint:
+        "Owners can use high-risk capabilities: shell, file writes, cron and local slash commands. Only mark your own accounts as owners; paired users are not owners by default.",
+      NoOwners: "No owners in gateway.owners",
+      MakeOwner: "Make owner",
+      RemoveOwner: "Remove owner",
+      OwnerAdded: "Added to gateway.owners",
+      OwnerRemoved: "Removed from gateway.owners",
+      OwnerUpdateFailed: "Failed to update gateway.owners",
+      ConfigUnreadable: "Config file could not be parsed; nothing was changed",
+      DesktopOnly: "Owners can only be managed in the desktop app",
+    },
+
     Wizard: {
       PageTitle: "Setup Wizard",
       PageSub: "5 steps to configure, no command line needed",

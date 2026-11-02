@@ -12,7 +12,8 @@ use rsclaw_a2a_types::types::{
 use thiserror::Error;
 
 const TASKS: TableDefinition<&str, &str> = TableDefinition::new("a2a_tasks");
-/// Push configs keyed by "{task_id}:{config_id}".
+/// Push configs keyed by `composite_key(&[task_id, config_id])` (length
+/// prefixed, so one task's key range can never contain another task's).
 const PUSH_CONFIGS: TableDefinition<&str, &str> = TableDefinition::new("a2a_push_configs");
 /// Task owner index: task_id -> A2A principal id that created it. Kept out of
 /// the `A2aTask` wire type so the owning principal never leaks in responses;
@@ -244,13 +245,40 @@ impl TaskStore {
         Ok(all.into_iter().skip(offset).take(limit).collect())
     }
 
+    /// Set a task's status in one write transaction. A task already in a
+    /// terminal state (Completed / Failed / Canceled / Rejected) is left
+    /// untouched, so e.g. a late `Failed` from an aborted turn cannot replace
+    /// a user's `Canceled`.
     pub fn set_status(&self, id: &str, state: TaskState) -> Result<()> {
-        let mut task = self
-            .get(id)?
-            .ok_or_else(|| anyhow!("task not found: {id}"))?;
-        task.status.state = state;
-        task.status.timestamp = Some(chrono::Utc::now().to_rfc3339());
-        self.put(&task)
+        let txn = self.db.begin_write()?;
+        let changed = {
+            let mut tbl = txn.open_table(TASKS)?;
+            let mut task: A2aTask = match tbl.get(id)? {
+                Some(v) => serde_json::from_str(v.value())?,
+                None => return Err(anyhow!("task not found: {id}")),
+            };
+            if task.status.state.is_terminal() {
+                if task.status.state != state {
+                    tracing::debug!(
+                        task_id = %id,
+                        current = ?task.status.state,
+                        requested = ?state,
+                        "set_status: task already terminal, ignoring transition"
+                    );
+                }
+                false
+            } else {
+                task.status.state = state;
+                task.status.timestamp = Some(chrono::Utc::now().to_rfc3339());
+                let json = serde_json::to_string(&task)?;
+                tbl.insert(id, json.as_str())?;
+                true
+            }
+        };
+        if changed {
+            txn.commit()?;
+        }
+        Ok(())
     }
 
     /// Merge `{ outcome: ... }` into the task's `metadata` object. Creates
@@ -316,7 +344,7 @@ impl TaskStore {
     // -----------------------------------------------------------------------
 
     pub fn put_push_config(&self, cfg: &PushNotificationConfig) -> Result<()> {
-        let key = format!("{}:{}", cfg.task_id, cfg.id);
+        let key = composite_key(&[&cfg.task_id, &cfg.id]);
         let json = serde_json::to_string(cfg)?;
         let txn = self.db.begin_write()?;
         {
@@ -332,7 +360,7 @@ impl TaskStore {
         task_id: &str,
         config_id: &str,
     ) -> Result<Option<PushNotificationConfig>> {
-        let key = format!("{task_id}:{config_id}");
+        let key = composite_key(&[task_id, config_id]);
         let txn = self.db.begin_read()?;
         let tbl = txn.open_table(PUSH_CONFIGS)?;
         match tbl.get(key.as_str())? {
@@ -342,7 +370,7 @@ impl TaskStore {
     }
 
     pub fn list_push_configs(&self, task_id: &str) -> Result<Vec<PushNotificationConfig>> {
-        let prefix = format!("{task_id}:");
+        let prefix = composite_key(&[task_id]);
         let txn = self.db.begin_read()?;
         let tbl = txn.open_table(PUSH_CONFIGS)?;
         let mut out = Vec::new();
@@ -357,7 +385,7 @@ impl TaskStore {
     }
 
     pub fn delete_push_config(&self, task_id: &str, config_id: &str) -> Result<bool> {
-        let key = format!("{task_id}:{config_id}");
+        let key = composite_key(&[task_id, config_id]);
         let txn = self.db.begin_write()?;
         let removed = {
             let mut tbl = txn.open_table(PUSH_CONFIGS)?;
@@ -372,7 +400,7 @@ impl TaskStore {
     /// Canceled) so configs don't linger forever after delivery is done.
     /// Returns the number of configs removed.
     pub fn delete_push_configs_for_task(&self, task_id: &str) -> Result<usize> {
-        let prefix = format!("{task_id}:");
+        let prefix = composite_key(&[task_id]);
         // Collect keys to delete in a read txn, then delete them in a
         // write txn. redb doesn't allow holding a read iter while writing.
         let keys: Vec<String> = {
@@ -1295,6 +1323,40 @@ mod tests {
             artifacts: Vec::new(),
             metadata: None,
         }
+    }
+
+    #[test]
+    fn a2a_push_configs_do_not_leak_across_prefix_task_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(&tmp.path().join("tasks.redb")).unwrap();
+        let cfg = |task: &str, id: &str| PushNotificationConfig {
+            id: id.to_owned(),
+            task_id: task.to_owned(),
+            url: "https://example.com/hook".to_owned(),
+            token: "t".to_owned(),
+            authentication: None,
+        };
+        // "a" + config "b:c" used to collide with task "a:b" + config "c".
+        store.put_push_config(&cfg("a", "b:c")).unwrap();
+        store.put_push_config(&cfg("a:b", "c")).unwrap();
+        store.put_push_config(&cfg("ab", "x")).unwrap();
+        assert_eq!(store.list_push_configs("a").unwrap().len(), 1);
+        assert_eq!(store.list_push_configs("a:b").unwrap().len(), 1);
+        assert_eq!(store.delete_push_configs_for_task("a").unwrap(), 1);
+        assert!(store.get_push_config("a:b", "c").unwrap().is_some());
+        assert!(store.get_push_config("ab", "x").unwrap().is_some());
+    }
+
+    #[test]
+    fn a2a_set_status_keeps_terminal_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(&tmp.path().join("tasks.redb")).unwrap();
+        store.put(&task("t1", "ctx")).unwrap();
+        store.set_status("t1", TaskState::Working).unwrap();
+        store.set_status("t1", TaskState::Canceled).unwrap();
+        store.set_status("t1", TaskState::Failed).unwrap();
+        let t = store.get("t1").unwrap().unwrap();
+        assert_eq!(t.status.state, TaskState::Canceled);
     }
 
     #[test]

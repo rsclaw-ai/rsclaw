@@ -53,6 +53,7 @@ impl rsclaw_heartbeat::HeartbeatHost for RuntimeHeartbeatHost {
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = AgentMessage {
+            trust: rsclaw_agent::SenderTrust::Owner,
             session_key: session_key.to_owned(),
             text: content.to_owned(),
             channel: "heartbeat".to_owned(),

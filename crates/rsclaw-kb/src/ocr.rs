@@ -24,6 +24,7 @@ pub struct OcrClient {
     model: Option<String>,
     api_key: Option<String>,
     lang: Option<String>,
+    prompt: Option<String>,
 }
 
 impl OcrClient {
@@ -31,8 +32,8 @@ impl OcrClient {
     /// block is absent or disabled. base_url may be empty when `model` is
     /// a `rsclaw-*` name (defaults to the fleet API).
     pub fn from_config() -> Option<std::sync::Arc<Self>> {
-        let cfg = rsclaw_config::load().ok()?;
-        let oc = cfg.raw.kb.as_ref()?.ocr.clone()?;
+        let cfg = rsclaw_config::load_cached().ok()?;
+        let oc = effective_ocr_config(&cfg)?;
         if !oc.enabled.unwrap_or(true) {
             return None;
         }
@@ -44,7 +45,8 @@ impl OcrClient {
         let base_raw = oc.base_url.trim();
         let base = if base_raw.is_empty() {
             if model_is_rsclaw {
-                rsclaw_embed::RSCLAW_API_BASE_URL.to_owned()
+                rsclaw_provider_base_url(&cfg)
+                    .unwrap_or_else(|| rsclaw_embed::RSCLAW_API_BASE_URL.to_owned())
             } else {
                 return None;
             }
@@ -70,15 +72,16 @@ impl OcrClient {
             model: oc.model,
             api_key,
             lang: oc.lang,
+            prompt: oc.prompt.filter(|p| !p.trim().is_empty()),
         }))
     }
 
     /// Whether an OCR endpoint is configured (cheap check for callers that
     /// want to branch before assembling an image payload).
     pub fn is_configured() -> bool {
-        rsclaw_config::load()
+        rsclaw_config::load_cached()
             .ok()
-            .and_then(|c| c.raw.kb.as_ref().and_then(|k| k.ocr.clone()))
+            .and_then(|c| effective_ocr_config(&c))
             .map(|o| o.enabled.unwrap_or(true))
             .unwrap_or(false)
     }
@@ -110,7 +113,7 @@ impl OcrClient {
     ) -> Result<String> {
         let body = ocr_request_body(
             image,
-            prompt,
+            prompt.or(self.prompt.as_deref()),
             max_tokens,
             model.or(self.model.as_deref()),
             lang.or(self.lang.as_deref()),
@@ -179,6 +182,28 @@ fn ocr_request_body(
         body["max_tokens"] = serde_json::json!(max_tokens);
     }
     body
+}
+
+/// Default OCR model when `kb.ocr` is absent but an rsclaw key is configured.
+const DEFAULT_RSCLAW_OCR_MODEL: &str = "rsclaw-ocr-v1";
+
+/// `kb.ocr` as configured, or — when it is absent and an rsclaw key is
+/// available — the rsclaw OCR model on the rsclaw provider's base.
+fn effective_ocr_config(
+    cfg: &rsclaw_config::runtime::RuntimeConfig,
+) -> Option<rsclaw_config::schema::KbOcrConfig> {
+    if let Some(oc) = cfg.raw.kb.as_ref().and_then(|k| k.ocr.clone()) {
+        return Some(oc);
+    }
+    rsclaw_provider_key(cfg)?;
+    Some(rsclaw_config::schema::KbOcrConfig {
+        base_url: String::new(),
+        model: Some(DEFAULT_RSCLAW_OCR_MODEL.to_owned()),
+        api_key: None,
+        lang: None,
+        prompt: None,
+        enabled: None,
+    })
 }
 
 /// Pull the rsclaw provider's API key for fleet calls (OCR, embed, rerank —

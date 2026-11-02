@@ -53,6 +53,35 @@ struct HnswMeta {
     schema_version: u32,
     dimension: usize,
     id_to_chunk: Vec<String>,
+    /// Manifest of the chunk set the snapshot was taken from. `None` for
+    /// snapshots written by older binaries: those can't be validated and
+    /// are never restored by `restore_validated`.
+    #[serde(default)]
+    fingerprint: Option<IndexFingerprint>,
+    /// Embedder whose vectors the snapshot holds.
+    #[serde(default)]
+    embedder_id: Option<String>,
+}
+
+/// Order-independent manifest of a set of chunk ids: count plus a wrapping
+/// sum of a stable per-id hash. Two caches built from the same chunk set
+/// have equal fingerprints; any added / removed chunk changes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexFingerprint {
+    pub count: u64,
+    pub sum: u64,
+}
+
+impl IndexFingerprint {
+    /// Fold one chunk id into the fingerprint.
+    pub fn add(&mut self, chunk_id: &str) {
+        use sha2::{Digest, Sha256};
+        let h = Sha256::digest(chunk_id.as_bytes());
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&h[..8]);
+        self.count += 1;
+        self.sum = self.sum.wrapping_add(u64::from_le_bytes(b));
+    }
 }
 
 fn default_schema_version() -> u32 {
@@ -65,6 +94,11 @@ pub struct HnswCache {
     /// the active embedder; all insert / search / restore paths
     /// validate against it.
     dimension: usize,
+    /// Active embedder id. When set, `rebuild` only admits chunks embedded
+    /// by this embedder (or legacy rows with no id): a same-dimension model
+    /// change produces vectors in a different space that pass every length
+    /// check but make cosine scores meaningless.
+    embedder_id: Option<String>,
 }
 
 struct HnswInner {
@@ -93,10 +127,39 @@ impl HnswCache {
     /// Empty cache at the given vector dimension. Use `rebuild` to
     /// populate from redb.
     pub fn new(dimension: usize) -> Self {
+        Self::with_embedder(dimension, None)
+    }
+
+    /// Empty cache at `dimension` that only admits chunks embedded by
+    /// `embedder_id` (see the field docs).
+    pub fn with_embedder(dimension: usize, embedder_id: Option<String>) -> Self {
         Self {
             inner: RwLock::new(HnswInner::empty()),
             dimension,
+            embedder_id,
         }
+    }
+
+    /// Whether `rebuild` would load this chunk: right dimension, a real
+    /// (non-zero) vector, and embedded by the active embedder (legacy rows
+    /// with an empty `embedder_id` are admitted).
+    pub fn admits(&self, c: &crate::model::KbChunk) -> bool {
+        c.vector.len() == self.dimension
+            && !rsclaw_embed::is_zero_vector(&c.vector)
+            && match &self.embedder_id {
+                Some(id) => c.embedder_id.is_empty() || &c.embedder_id == id,
+                None => true,
+            }
+    }
+
+    /// Fingerprint of the chunk ids currently resolvable in the cache.
+    pub fn fingerprint(&self) -> IndexFingerprint {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut fp = IndexFingerprint::default();
+        for id in inner.chunk_to_id.keys() {
+            fp.add(id);
+        }
+        fp
     }
 
     /// Empty cache at `DEFAULT_DIMENSION` (1024). Back-compat shim for
@@ -165,9 +228,15 @@ impl HnswCache {
             };
             let tbl = rtx.open_table(KB_CHUNKS)?;
             for entry in tbl.iter()? {
-                let (_, v) = entry?;
-                let c: KbChunk = decode(v.value())?;
-                if c.vector.len() != self.dimension {
+                let (k, v) = entry?;
+                let c: KbChunk = match decode(v.value()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(chunk = %k.value(), "kb hnsw: skip undecodable chunk: {e:#}");
+                        continue;
+                    }
+                };
+                if !self.admits(&c) {
                     dim_skipped += 1;
                     continue;
                 }
@@ -187,9 +256,8 @@ impl HnswCache {
                 dim_skipped,
                 kept = vectors.len(),
                 expected_dim = self.dimension,
-                "kb hnsw: dropped chunks with wrong vector dimension — dense recall degraded; \
-                 likely a remote embedder returned bad vectors during ingest (re-ingest once \
-                 the endpoint is healthy)"
+                "kb hnsw: dropped chunks with wrong dimension, zero vector or another \
+                 embedder's vectors — dense recall degraded until they are re-embedded"
             );
         }
         let capacity = INITIAL_CAPACITY.max(vectors.len() * 2);
@@ -228,36 +296,95 @@ impl HnswCache {
     }
 
     /// Snapshot the current state to `<dir>/snapshot.hnsw.{graph,data}`
-    /// + a `snapshot.meta.json` sidecar carrying the `id_to_chunk` map.
-    /// Caller is responsible for ensuring `dir` exists. Empty caches
+    /// + a `snapshot.meta.json` sidecar carrying the `id_to_chunk` map and
+    /// the chunk-set fingerprint. Written into a sibling temp dir first and
+    /// swapped in with renames, so a crash mid-dump never leaves graph /
+    /// data / meta from different generations side by side. Empty caches
     /// still write a meta file so restore is symmetric.
     pub fn snapshot(&self, dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("create_dir_all {}", dir.display()))?;
-        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
-        // hnsw_rs's `file_dump` panics if there are zero data points,
-        // so skip it for the empty case — we still write meta so
-        // `restore` can detect an intentional empty snapshot.
-        if !inner.id_to_chunk.is_empty() {
-            inner
-                .hnsw
-                .file_dump(dir, SNAPSHOT_NAME)
-                .map_err(|e| anyhow::anyhow!("hnsw file_dump: {e}"))?;
+        let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("hnsw")
+            .to_owned();
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create_dir_all {}", parent.display()))?;
+        let tmp = parent.join(format!("{name}.tmp"));
+        let old = parent.join(format!("{name}.old"));
+        for stale in [&tmp, &old] {
+            if stale.exists() {
+                std::fs::remove_dir_all(stale)
+                    .with_context(|| format!("remove stale {}", stale.display()))?;
+            }
         }
-        let meta = HnswMeta {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            dimension: self.dimension,
-            id_to_chunk: inner.id_to_chunk.clone(),
+        std::fs::create_dir_all(&tmp)
+            .with_context(|| format!("create_dir_all {}", tmp.display()))?;
+        let n = {
+            let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+            // hnsw_rs's `file_dump` panics if there are zero data points,
+            // so skip it for the empty case — we still write meta so
+            // `restore` can detect an intentional empty snapshot.
+            if !inner.id_to_chunk.is_empty() {
+                inner
+                    .hnsw
+                    .file_dump(&tmp, SNAPSHOT_NAME)
+                    .map_err(|e| anyhow::anyhow!("hnsw file_dump: {e}"))?;
+            }
+            let mut fp = IndexFingerprint::default();
+            for id in inner.chunk_to_id.keys() {
+                fp.add(id);
+            }
+            let meta = HnswMeta {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                dimension: self.dimension,
+                id_to_chunk: inner.id_to_chunk.clone(),
+                fingerprint: Some(fp),
+                embedder_id: self.embedder_id.clone(),
+            };
+            let meta_path = tmp.join(format!("{SNAPSHOT_NAME}.meta.json"));
+            std::fs::write(&meta_path, serde_json::to_vec(&meta)?)
+                .with_context(|| format!("write {}", meta_path.display()))?;
+            inner.id_to_chunk.len()
         };
-        let meta_path = dir.join(format!("{SNAPSHOT_NAME}.meta.json"));
-        std::fs::write(&meta_path, serde_json::to_vec(&meta)?)
-            .with_context(|| format!("write {}", meta_path.display()))?;
-        tracing::info!(
-            n = inner.id_to_chunk.len(),
-            dir = %dir.display(),
-            "kb hnsw: snapshot written"
-        );
+        if dir.exists() {
+            std::fs::rename(dir, &old)
+                .with_context(|| format!("rename {} -> {}", dir.display(), old.display()))?;
+        }
+        std::fs::rename(&tmp, dir)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), dir.display()))?;
+        if old.exists()
+            && let Err(e) = std::fs::remove_dir_all(&old)
+        {
+            tracing::warn!(dir = %old.display(), "kb hnsw: failed to remove previous snapshot: {e}");
+        }
+        tracing::info!(n, dir = %dir.display(), "kb hnsw: snapshot written");
         Ok(())
+    }
+
+    /// Restore the snapshot only if it was taken from exactly the chunk set
+    /// described by `expected` (and by the same embedder). Returns
+    /// `Ok(false)` — caller rebuilds from redb — when the snapshot is
+    /// missing, predates manifests, or is stale (chunks ingested / purged
+    /// since it was written).
+    pub fn restore_validated(&self, dir: &Path, expected: &IndexFingerprint) -> Result<bool> {
+        let meta_path = dir.join(format!("{SNAPSHOT_NAME}.meta.json"));
+        if !meta_path.exists() {
+            return Ok(false);
+        }
+        let meta_bytes =
+            std::fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?;
+        let meta: HnswMeta = serde_json::from_slice(&meta_bytes)
+            .with_context(|| format!("decode {}", meta_path.display()))?;
+        if meta.fingerprint.as_ref() != Some(expected) || meta.embedder_id != self.embedder_id {
+            tracing::info!(
+                snapshot = ?meta.fingerprint,
+                expected = ?expected,
+                "kb hnsw: snapshot does not match redb chunk set; rebuilding"
+            );
+            return Ok(false);
+        }
+        self.restore(dir)
     }
 
     /// Try to load a previously-written snapshot. Returns `Ok(true)`

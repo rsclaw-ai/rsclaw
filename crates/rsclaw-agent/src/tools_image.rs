@@ -49,7 +49,7 @@ async fn save_generated_image_bytes(bytes: &[u8], mime: &str) -> Result<String> 
                 .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
-        .join("rsclaw")
+        .join(rsclaw_brand::CLI_NAME)
         .join(category);
     tokio::fs::create_dir_all(&save_dir)
         .await
@@ -72,7 +72,7 @@ async fn save_generated_image_bytes(bytes: &[u8], mime: &str) -> Result<String> 
 pub(crate) fn default_image_model(provider: &str) -> Option<&'static str> {
     match provider {
         "agnes" => Some("agnes/agnes-image-2.1-flash"),
-        "rsclaw" => Some("rsclaw/rsclaw-image-v1"),
+        "rsclaw" => Some("rsclaw/rsclaw-image-v3"),
         _ => None,
     }
 }
@@ -86,6 +86,7 @@ pub(crate) fn agnes_image_size(requested: &str) -> &'static str {
     let (w, h) = requested
         .split_once('x')
         .and_then(|(a, b)| Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?)))
+        .filter(|(w, h)| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0)
         .unwrap_or((1024.0, 1024.0));
     let ratio = w / h.max(1.0);
     if ratio > 1.15 {
@@ -97,26 +98,67 @@ pub(crate) fn agnes_image_size(requested: &str) -> &'static str {
     }
 }
 
+/// The entries of an image / asset argument: a single string, an array of
+/// strings, or an array serialized into a string. The tool schemas type
+/// these parameters as `string`, so under constrained tool-calls the model
+/// writes an array as `"[\"/path/a.png\"]"`; without unpacking it the whole
+/// string is treated as one path and the input is silently dropped.
+pub(crate) fn image_arg_entries(v: &Value) -> Vec<String> {
+    fn from_array(a: &[Value]) -> Vec<String> {
+        a.iter()
+            .filter_map(|x| x.as_str().map(str::trim).filter(|s| !s.is_empty()))
+            .map(str::to_owned)
+            .collect()
+    }
+    match v {
+        Value::String(s) => {
+            let s = s.trim();
+            if s.starts_with('[') {
+                if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(s) {
+                    return from_array(&a);
+                }
+            }
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s.to_owned()]
+            }
+        }
+        Value::Array(a) => from_array(a),
+        _ => Vec::new(),
+    }
+}
+
 /// Normalize image-to-image input(s): accept a single string or an array of
 /// strings. http(s)/data: entries pass through; a LOCAL FILE PATH (e.g. an
 /// earlier image_gen result) is read and base64-encoded into a `data:` URI so
 /// providers get self-contained input. Unreadable paths are dropped.
-pub(crate) async fn normalize_image_inputs(v: &Value) -> Vec<String> {
-    let raw: Vec<String> = match v {
-        Value::String(s) if !s.is_empty() => vec![s.clone()],
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|x| x.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
-            .collect(),
-        _ => Vec::new(),
-    };
+pub(crate) async fn normalize_image_inputs(
+    v: &Value,
+    scope: &super::security::ReadScope,
+) -> Vec<String> {
+    let raw = image_arg_entries(v);
     let mut out = Vec::with_capacity(raw.len());
     for img in raw {
         if img.starts_with("http://") || img.starts_with("https://") || img.starts_with("data:") {
             out.push(img);
             continue;
         }
-        match tokio::fs::read(&img).await {
+        // Local paths are scope-checked: the bytes leave the host (uploaded
+        // to the image provider).
+        let path = match scope.resolve(&img) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(path = %img, error = %e, "image_gen: input image refused, skipping");
+                continue;
+            }
+        };
+        match super::security::read_regular_file_capped(
+            &path,
+            super::security::MAX_LOCAL_BINARY_READ_BYTES,
+        )
+        .await
+        {
             Ok(bytes) => {
                 use base64::Engine;
                 let mime = match std::path::Path::new(&img)
@@ -176,7 +218,7 @@ impl super::runtime::AgentRuntime {
                     .as_ref()
                     .and_then(|m| m.primary_head())
             })
-            .unwrap_or("rsclaw/rsclaw-agent-v1");
+            .unwrap_or("rsclaw/rsclaw-agent-v2");
         Some(
             rsclaw_provider::registry::ProviderRegistry::parse_model(head)
                 .0
@@ -193,7 +235,8 @@ impl super::runtime::AgentRuntime {
         // base64 data URIs) so every provider branch sees ready-to-send
         // strings in args["image"].
         if !args["image"].is_null() {
-            let imgs = normalize_image_inputs(&args["image"]).await;
+            let scope = self.read_scope(ctx);
+            let imgs = normalize_image_inputs(&args["image"], &scope).await;
             args["image"] = if imgs.is_empty() {
                 Value::Null
             } else {
@@ -234,7 +277,7 @@ impl super::runtime::AgentRuntime {
 
         // No explicit image model configured? If the primary LLM provider
         // ships a first-party image model (agnes → agnes-image-2.1-flash,
-        // rsclaw → rsclaw-image-v1), default to it instead of erroring.
+        // rsclaw → rsclaw-image-v3), default to it instead of erroring.
         // The primary provider's key is already configured, so this stays
         // within the user's chosen vendor — no surprise cross-billing.
         if image_chain.is_empty()
@@ -400,7 +443,7 @@ impl super::runtime::AgentRuntime {
             "provider": "rsclaw",
             "kind": "image",
             "job_id": job_id,
-            "message": "Image edit submitted to the rsclaw gen service (async, ~1–5min). The finished image will be delivered automatically when ready. The user has been informed; do NOT poll or wait — your turn is complete."
+            "message": "Image edit submitted to the rsclaw gen service (async, ~1–5min). The finished image will be delivered automatically when ready. The user has been informed; do not poll or wait — your turn is complete. If the user later asks about progress, call gen_status with this job_id."
         }))
     }
 
@@ -438,7 +481,7 @@ impl super::runtime::AgentRuntime {
             .as_ref()
             .and_then(|m| m.providers.get(prov_name))
             .and_then(|p| p.api_key.as_ref())
-            .and_then(|k| k.as_plain().map(str::to_owned));
+            .and_then(|k| k.resolve_full(self.config.ops.secrets.as_ref()));
         let cfg_url = self
             .config
             .model
@@ -522,21 +565,25 @@ impl super::runtime::AgentRuntime {
                 "qwen" => "qwen-image-2.0-pro",
                 "minimax" => "image-01",
                 "gemini" => "gemini-3-pro-image-preview",
-                "rsclaw" => "rsclaw-image-v1",
+                "rsclaw" => "rsclaw-image-v3",
                 "agnes" => "agnes-image-2.1-flash",
                 _ => "gpt-image-2",
             });
 
         // rsclaw: a reference image means image-edit, but the t2i model
-        // produces garbage on edit requests (gen-api.md note #4). When the
+        // produces garbage on edit requests (gen-api.md note #4), and v3 is a
+        // strict lane that refuses a reference image outright. When the
         // caller didn't name an explicit model and supplied a ref image, swap
-        // the default t2i model for the edit model.
+        // the default t2i model for its edit model.
         let image_model = if img_prov == "rsclaw"
             && args.get("model").and_then(|m| m.as_str()).is_none()
             && !args["image"].is_null()
-            && image_model == "rsclaw-image-v1"
         {
-            "rsclaw-image-edit-v1"
+            match image_model {
+                "rsclaw-image-v1" => "rsclaw-image-edit-v1",
+                "rsclaw-image-v3" => "rsclaw-image-edit-v3",
+                other => other,
+            }
         } else {
             image_model
         };
@@ -619,8 +666,17 @@ impl super::runtime::AgentRuntime {
             let aspect = if size.contains('x') {
                 let parts: Vec<&str> = size.split('x').collect();
                 if parts.len() == 2 {
-                    let w = parts[0].parse::<f32>().unwrap_or(1024.0);
-                    let h = parts[1].parse::<f32>().unwrap_or(1024.0);
+                    // Reject NaN / inf / non-positive sizes ("NaNxNaN" parses
+                    // as f32 NaN) — fall back to square.
+                    let dim = |p: &str| {
+                        p.trim()
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|v| v.is_finite() && *v > 0.0)
+                            .unwrap_or(1024.0)
+                    };
+                    let w = dim(parts[0]);
+                    let h = dim(parts[1]);
                     let ratio = w / h.max(1.0);
                     let candidates = [
                         (1.0_f32, "1:1"),
@@ -633,12 +689,7 @@ impl super::runtime::AgentRuntime {
                     ];
                     candidates
                         .iter()
-                        .min_by(|a, b| {
-                            (a.0 - ratio)
-                                .abs()
-                                .partial_cmp(&(b.0 - ratio).abs())
-                                .unwrap()
-                        })
+                        .min_by(|a, b| (a.0 - ratio).abs().total_cmp(&(b.0 - ratio).abs()))
                         .map(|c| c.1)
                         .unwrap_or("1:1")
                         .to_owned()
@@ -683,9 +734,12 @@ impl super::runtime::AgentRuntime {
                 "1:1"
             };
             let gemini_base = img_url.trim_end_matches('/');
-            let url = format!("{gemini_base}/models/{image_model}:generateContent?key={api_key}");
+            // Key goes in the `x-goog-api-key` header, never the query string
+            // (reqwest error text would otherwise leak it).
+            let url = format!("{gemini_base}/models/{image_model}:generateContent");
             let resp = client
                 .post(&url)
+                .header("x-goog-api-key", api_key.as_str())
                 .json(&json!({
                     "contents": [{ "parts": [{ "text": prompt }] }],
                     "generationConfig": {
@@ -695,12 +749,12 @@ impl super::runtime::AgentRuntime {
                 }))
                 .send()
                 .await
-                .map_err(|e| anyhow!("image: gemini request failed: {e}"))?;
+                .map_err(|e| anyhow!("image: gemini request failed: {}", e.without_url()))?;
             let st = resp.status();
             let body_bytes = resp
                 .bytes()
                 .await
-                .map_err(|e| anyhow!("image: gemini read body: {e}"))?;
+                .map_err(|e| anyhow!("image: gemini read body: {}", e.without_url()))?;
             let body = parse_response_body(st, &body_bytes)?;
             (st, body)
         } else if is_agnes {
@@ -1025,5 +1079,30 @@ impl super::runtime::AgentRuntime {
             "size": size,
             "model": image_model
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_arg_entries_unpacks_stringified_arrays() {
+        assert_eq!(image_arg_entries(&json!("/a.png")), vec!["/a.png"]);
+        assert_eq!(
+            image_arg_entries(&json!(["/a.png", "", "https://x/b.png"])),
+            vec!["/a.png", "https://x/b.png"]
+        );
+        assert_eq!(
+            image_arg_entries(&json!("[\n  \"/a.png\",\n  \"/b.png\"\n]")),
+            vec!["/a.png", "/b.png"]
+        );
+        // Not valid JSON: keep it as a single path rather than dropping it.
+        assert_eq!(
+            image_arg_entries(&json!("[draft].png")),
+            vec!["[draft].png"]
+        );
+        assert!(image_arg_entries(&json!("  ")).is_empty());
+        assert!(image_arg_entries(&Value::Null).is_empty());
     }
 }

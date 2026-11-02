@@ -65,7 +65,39 @@ pub fn validate(cfg: &RuntimeConfig) -> Result<()> {
     validate_agents(cfg)?;
     validate_session(cfg)?;
     validate_hooks(cfg)?;
+    warn_unimplemented_sections(cfg);
     Ok(())
+}
+
+/// Config sections accepted for OpenClaw compatibility that RsClaw does not
+/// implement. Setting them has no effect; warn so nobody believes, e.g.,
+/// that `web.tlsEnabled` turned on TLS.
+fn warn_unimplemented_sections(cfg: &RuntimeConfig) {
+    let raw = &cfg.raw;
+    if raw.web.as_ref().and_then(|w| w.tls_enabled) == Some(true) {
+        warn!(
+            "web.tlsEnabled is set but TLS is NOT implemented — the gateway still serves plain HTTP. \
+             Terminate TLS in a reverse proxy (Caddy / nginx) instead."
+        );
+    }
+    let ignored: Vec<&str> = [
+        ("talk", raw.talk.is_some()),
+        ("canvasHost", raw.canvas_host.is_some()),
+        ("web", raw.web.is_some()),
+        ("cli", raw.cli.is_some()),
+        ("discovery", raw.discovery.is_some()),
+        ("broadcast", raw.broadcast.is_some()),
+        ("nodeHost", raw.node_host.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect();
+    if !ignored.is_empty() {
+        warn!(
+            sections = ?ignored,
+            "config sections are accepted for compatibility but not implemented; they have no effect"
+        );
+    }
 }
 
 fn validate_gateway(cfg: &RuntimeConfig) -> Result<()> {
@@ -89,6 +121,12 @@ fn validate_gateway(cfg: &RuntimeConfig) -> Result<()> {
         if exposes_non_loopback {
             bail!(
                 "effective gateway bind exposes a non-loopback listener and requires gateway.auth.token"
+            );
+        }
+        if bind_address.is_none() && matches!(cfg.gateway.bind, crate::schema::BindMode::Tailnet) {
+            warn!(
+                "gateway.bind is \"tailnet\" but gateway.auth.token is not set — every device on the tailnet \
+                 can drive the agent without authentication. Set gateway.auth.token."
             );
         }
         warn!(

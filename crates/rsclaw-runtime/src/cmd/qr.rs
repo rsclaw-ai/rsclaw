@@ -4,7 +4,7 @@ use rsclaw_config as config;
 
 pub async fn cmd_qr(args: QrArgs) -> Result<()> {
     let cfg = config::load().ok();
-    let port = cfg.as_ref().map_or(18888, |c| c.gateway.port);
+    let port = cfg.as_ref().map_or(rsclaw_brand::DEFAULT_PORT, |c| c.gateway.port);
     let default_url = format!("http://127.0.0.1:{port}");
 
     let url = if args.remote {

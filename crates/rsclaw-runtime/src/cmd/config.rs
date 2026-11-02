@@ -37,13 +37,13 @@ pub async fn cmd_config(sub: ConfigCommand) -> Result<()> {
             let new_val: serde_json::Value =
                 serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
             set_nested_value(&mut val, &key, new_val)?;
-            std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+            config::loader::write_file_atomic(&path, &serde_json::to_string_pretty(&val)?)?;
             ok(&format!("set {}", cyan(&key)));
         }
         ConfigCommand::Unset { key, section: _ } => {
             let (path, mut val) = load_config_json()?;
             remove_nested_value(&mut val, &key);
-            std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+            config::loader::write_file_atomic(&path, &serde_json::to_string_pretty(&val)?)?;
             ok(&format!("unset {}", cyan(&key)));
         }
     }

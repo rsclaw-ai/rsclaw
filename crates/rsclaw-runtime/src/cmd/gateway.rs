@@ -61,6 +61,14 @@ pub fn spawn_gateway_bg_pub() -> Result<std::process::Child> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
         const DETACHED_PROCESS: u32 = 0x00000008;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        // CreateProcess inherits every inheritable handle, including the
+        // caller's stdio pipes this `start` process was given. The daemon
+        // would then hold the caller's pipe open and anyone reading
+        // `gateway start` output (the desktop app, `| Out-String`) would
+        // block until the gateway exits. Our own std handles are not needed
+        // by the child (it gets the log file / NUL above), so stop them from
+        // being inherited.
+        clear_std_handle_inheritance();
     }
     #[cfg(unix)]
     {
@@ -76,6 +84,27 @@ pub fn spawn_gateway_bg_pub() -> Result<std::process::Child> {
     }
 
     Ok(cmd.spawn()?)
+}
+
+/// Mark this process's stdin/stdout/stderr handles non-inheritable so a
+/// detached child does not keep the caller's pipes open.
+#[cfg(windows)]
+fn clear_std_handle_inheritance() {
+    use winapi::um::{
+        handleapi::{INVALID_HANDLE_VALUE, SetHandleInformation},
+        processenv::GetStdHandle,
+        winbase::{HANDLE_FLAG_INHERIT, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+    };
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle/SetHandleInformation only read/modify handle
+        // flags of this process; null or invalid handles are skipped.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
@@ -240,7 +269,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
         }
         GatewayCommand::Reload { scope } => {
             let config = config::load_quiet().ok();
-            let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(18888);
+            let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(rsclaw_brand::DEFAULT_PORT);
             let auth_token = config
                 .and_then(|c| c.gateway.auth_token)
                 .unwrap_or_default();
@@ -248,7 +277,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 .map(|s| s.join(","))
                 .unwrap_or_else(|| "all".to_owned());
             let url = format!("http://127.0.0.1:{port}/api/v1/reload?scope={scope_param}");
-            let client = reqwest::Client::new();
+            let client = crate::cmd::gateway_http::local_client();
             let mut req = client.post(&url);
             if !auth_token.is_empty() {
                 req = req.bearer_auth(&auth_token);
@@ -278,9 +307,9 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
         GatewayCommand::Status => gateway_print_status().await,
         GatewayCommand::Health => {
             let config = config::load_quiet().ok();
-            let port = config.map(|c| c.gateway.port).unwrap_or(18888);
+            let port = config.map(|c| c.gateway.port).unwrap_or(rsclaw_brand::DEFAULT_PORT);
             let url = format!("http://127.0.0.1:{port}/api/v1/health");
-            match reqwest::Client::new().get(&url).send().await {
+            match crate::cmd::gateway_http::local_client().get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     println!("  [ok] Healthy -- {url}");
                 }
@@ -299,7 +328,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             let config = std::sync::Arc::new(config::load_quiet()?);
             let port = config.gateway.port;
             let url = format!("http://127.0.0.1:{port}/api/v1/health");
-            let resp = reqwest::Client::new()
+            let resp = crate::cmd::gateway_http::local_client()
                 .get(&url)
                 .send()
                 .await
@@ -315,12 +344,12 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
         }
         GatewayCommand::UsageCost => {
             let config = config::load_quiet().ok();
-            let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(18888);
+            let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(rsclaw_brand::DEFAULT_PORT);
             let auth_token = config
                 .and_then(|c| c.gateway.auth_token)
                 .unwrap_or_default();
             let url = format!("http://127.0.0.1:{port}/api/v1/usage");
-            let mut req = reqwest::Client::new().get(&url);
+            let mut req = crate::cmd::gateway_http::local_client().get(&url);
             if !auth_token.is_empty() {
                 req = req.bearer_auth(&auth_token);
             }
@@ -349,7 +378,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 serde_json::from_str(&args.join(" "))
                     .unwrap_or(serde_json::Value::String(args.join(" ")))
             };
-            let mut req = reqwest::Client::new().post(&url).json(&body);
+            let mut req = crate::cmd::gateway_http::local_client().post(&url).json(&body);
             if !auth_token.is_empty() {
                 req = req.bearer_auth(&auth_token);
             }
@@ -381,8 +410,12 @@ fn gateway_read_pid() -> Option<u32> {
         .ok()
 }
 
+/// True when `pid` is a live rsclaw process. A bare liveness check is not
+/// enough here: a stale PID file (or a port listener) may point at an
+/// unrelated process that reused the number, and we must never report it as
+/// the gateway or signal it.
 fn process_alive(pid: u32) -> bool {
-    rsclaw_platform::process_alive(pid)
+    rsclaw_platform::process_is_rsclaw(pid)
 }
 
 /// Scan for the process listening on this instance's configured gateway port.
@@ -510,11 +543,16 @@ fn detect_port() -> u16 {
 }
 
 fn detect_port_from_sources(instance_port: Option<u16>, configured_port: Option<u16>) -> u16 {
-    instance_port.or(configured_port).unwrap_or(18888)
+    instance_port.or(configured_port).unwrap_or(rsclaw_brand::DEFAULT_PORT)
 }
 
 fn gateway_target_pid() -> Option<u32> {
-    select_gateway_pid(gateway_read_pid(), find_gateway_pid())
+    // Ignore a PID-file entry that no longer names a live rsclaw process so a
+    // stale file cannot shadow the real port listener.
+    select_gateway_pid(
+        gateway_read_pid().filter(|&pid| process_alive(pid)),
+        find_gateway_pid(),
+    )
 }
 
 fn select_gateway_pid(pid_file_pid: Option<u32>, port_listener_pid: Option<u32>) -> Option<u32> {
@@ -733,7 +771,7 @@ fn gateway_auth_token() -> String {
 }
 
 async fn gateway_health_reachable(url: &str) -> bool {
-    reqwest::Client::new()
+    crate::cmd::gateway_http::local_client()
         .get(url)
         .send()
         .await
@@ -743,7 +781,7 @@ async fn gateway_health_reachable(url: &str) -> bool {
 
 async fn request_graceful_restart(url: &str) -> Result<()> {
     let token = gateway_auth_token();
-    let mut req = reqwest::Client::new().post(url);
+    let mut req = crate::cmd::gateway_http::local_client().post(url);
     if !token.is_empty() {
         req = req.bearer_auth(token);
     }
@@ -763,7 +801,7 @@ pub fn should_remove_pid_after_stop(outcome: &StopWaitOutcome) -> bool {
 }
 
 async fn wait_for_gateway_health(url: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = crate::cmd::gateway_http::local_client();
     let deadline = std::time::Instant::now() + START_HEALTH_TIMEOUT;
     let mut samples = Vec::new();
 
@@ -841,9 +879,16 @@ pub fn gateway_signal_stop() -> Result<()> {
 
     // Fallback: direct PID kill (for manual `gateway start` without service).
     // Try this instance's PID file first, then its configured port listener.
-    let pid = gateway_target_pid().ok_or_else(|| {
-        anyhow::anyhow!("gateway is not running (no PID file and no matching process)")
-    })?;
+    let Some(pid) = gateway_target_pid() else {
+        // A PID file whose process is gone (or was reused by a non-rsclaw
+        // process) is stale; clear it so later commands don't trust it.
+        if gateway_read_pid().is_some()
+            && let Err(e) = std::fs::remove_file(gateway_pid_file())
+        {
+            tracing::warn!("failed to remove stale gateway pid file: {e}");
+        }
+        anyhow::bail!("gateway is not running (no PID file and no matching process)");
+    };
     if !process_alive(pid) {
         let _ = std::fs::remove_file(gateway_pid_file());
         anyhow::bail!("gateway process {pid} is not running");
@@ -862,6 +907,18 @@ pub fn gateway_signal_stop() -> Result<()> {
     }
 }
 
+/// `Library/LaunchAgents/<service_label>.plist`, relative to `$HOME`.
+#[cfg(target_os = "macos")]
+fn launchd_plist_rel() -> String {
+    format!("Library/LaunchAgents/{}.plist", rsclaw_brand::SERVICE_LABEL)
+}
+
+/// `.config/systemd/user/<service_unit>.service`, relative to `$HOME`.
+#[cfg(target_os = "linux")]
+fn systemd_user_unit_rel() -> String {
+    format!(".config/systemd/user/{}.service", rsclaw_brand::SERVICE_UNIT)
+}
+
 /// Check if gateway is installed as a system service.
 /// Returns true if the service unit/plist/sc entry exists (even if not
 /// running).
@@ -869,7 +926,7 @@ fn service_installed() -> bool {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = dirs_next::home_dir() {
-            let plist = home.join("Library/LaunchAgents/ai.rsclaw.gateway.plist");
+            let plist = home.join(launchd_plist_rel());
             if plist.exists() {
                 return true;
             }
@@ -879,13 +936,14 @@ fn service_installed() -> bool {
     #[cfg(target_os = "linux")]
     {
         if let Some(home) = dirs_next::home_dir() {
-            let unit = home.join(".config/systemd/user/rsclaw-gateway.service");
+            let unit = home.join(systemd_user_unit_rel());
             if unit.exists() {
                 return true;
             }
         }
         // Also check system-level.
-        let sys_unit = std::path::Path::new("/etc/systemd/system/rsclaw-gateway.service");
+        let sys_unit_path = format!("/etc/systemd/system/{}.service", rsclaw_brand::SERVICE_UNIT);
+        let sys_unit = std::path::Path::new(&sys_unit_path);
         if sys_unit.exists() {
             return true;
         }
@@ -896,7 +954,7 @@ fn service_installed() -> bool {
         // sc query returns non-zero if service doesn't exist.
         #[allow(unused_mut)]
         let mut sc_cmd = std::process::Command::new("sc");
-        sc_cmd.args(["query", "rsclaw"]);
+        sc_cmd.args(["query", rsclaw_brand::WINDOWS_SERVICE]);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -919,7 +977,7 @@ fn try_service_start() -> bool {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = dirs_next::home_dir() {
-            let plist = home.join("Library/LaunchAgents/ai.rsclaw.gateway.plist");
+            let plist = home.join(launchd_plist_rel());
             if plist.exists() {
                 let status = std::process::Command::new("launchctl")
                     .args(["load", "-w"])
@@ -934,19 +992,20 @@ fn try_service_start() -> bool {
     {
         // Try user service first.
         if let Some(home) = dirs_next::home_dir() {
-            let unit = home.join(".config/systemd/user/rsclaw-gateway.service");
+            let unit = home.join(systemd_user_unit_rel());
             if unit.exists() {
                 let status = std::process::Command::new("systemctl")
-                    .args(["--user", "start", "rsclaw-gateway"])
+                    .args(["--user", "start", rsclaw_brand::SERVICE_UNIT])
                     .status();
                 return status.map(|s| s.success()).unwrap_or(false);
             }
         }
         // System-level.
-        let sys_unit = std::path::Path::new("/etc/systemd/system/rsclaw-gateway.service");
+        let sys_unit_path = format!("/etc/systemd/system/{}.service", rsclaw_brand::SERVICE_UNIT);
+        let sys_unit = std::path::Path::new(&sys_unit_path);
         if sys_unit.exists() {
             let status = std::process::Command::new("systemctl")
-                .args(["start", "rsclaw-gateway"])
+                .args(["start", rsclaw_brand::SERVICE_UNIT])
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
         }
@@ -956,7 +1015,7 @@ fn try_service_start() -> bool {
     {
         use std::os::windows::process::CommandExt;
         let status = std::process::Command::new("sc")
-            .args(["start", "rsclaw"])
+            .args(["start", rsclaw_brand::WINDOWS_SERVICE])
             .creation_flags(0x08000000)
             .status();
         return status.map(|s| s.success()).unwrap_or(false);
@@ -972,7 +1031,7 @@ fn try_service_stop() -> bool {
     #[cfg(target_os = "macos")]
     {
         let plist =
-            dirs_next::home_dir().map(|h| h.join("Library/LaunchAgents/ai.rsclaw.gateway.plist"));
+            dirs_next::home_dir().map(|h| h.join(launchd_plist_rel()));
         if let Some(ref path) = plist {
             if path.exists() {
                 // Use unload (without -w) to stop without disabling auto-start.
@@ -993,25 +1052,25 @@ fn try_service_stop() -> bool {
     {
         // Check if systemd service exists and is active.
         let is_active = std::process::Command::new("systemctl")
-            .args(["--user", "is-active", "rsclaw-gateway"])
+            .args(["--user", "is-active", rsclaw_brand::SERVICE_UNIT])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         if is_active {
             let status = std::process::Command::new("systemctl")
-                .args(["--user", "stop", "rsclaw-gateway"])
+                .args(["--user", "stop", rsclaw_brand::SERVICE_UNIT])
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
         }
         // Try system-level service too.
         let is_active = std::process::Command::new("systemctl")
-            .args(["is-active", "rsclaw-gateway"])
+            .args(["is-active", rsclaw_brand::SERVICE_UNIT])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         if is_active {
             let status = std::process::Command::new("systemctl")
-                .args(["stop", "rsclaw-gateway"])
+                .args(["stop", rsclaw_brand::SERVICE_UNIT])
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
         }
@@ -1021,14 +1080,14 @@ fn try_service_stop() -> bool {
     {
         use std::os::windows::process::CommandExt;
         let is_active = std::process::Command::new("sc")
-            .args(["query", "rsclaw"])
+            .args(["query", rsclaw_brand::WINDOWS_SERVICE])
             .creation_flags(0x08000000)
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
             .unwrap_or(false);
         if is_active {
             let status = std::process::Command::new("sc")
-                .args(["stop", "rsclaw"])
+                .args(["stop", rsclaw_brand::WINDOWS_SERVICE])
                 .creation_flags(0x08000000)
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
@@ -1064,7 +1123,7 @@ pub async fn gateway_print_status() -> Result<()> {
                 .ok()
                 .and_then(|c| c.gateway.auth_token.clone())
                 .unwrap_or_default();
-            let mut req = reqwest::Client::new().get(&url);
+            let mut req = crate::cmd::gateway_http::local_client().get(&url);
             if !auth_token.is_empty() {
                 req = req.bearer_auth(&auth_token);
             }
@@ -1101,7 +1160,7 @@ async fn cmd_gateway_install() -> Result<()> {
     let binary = std::env::current_exe()?;
     let plist_dir = home.join("Library/LaunchAgents");
     std::fs::create_dir_all(&plist_dir)?;
-    let plist_path = plist_dir.join("ai.rsclaw.gateway.plist");
+    let plist_path = plist_dir.join(format!("{}.plist", rsclaw_brand::SERVICE_LABEL));
 
     let log_path = rsclaw_config::loader::log_file();
     let plist = format!(
@@ -1111,7 +1170,7 @@ async fn cmd_gateway_install() -> Result<()> {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>ai.rsclaw.gateway</string>
+  <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
     <string>{binary}</string>
@@ -1131,6 +1190,7 @@ async fn cmd_gateway_install() -> Result<()> {
 "#,
         binary = binary.display(),
         log = log_path.display(),
+        label = rsclaw_brand::SERVICE_LABEL,
     );
 
     std::fs::write(&plist_path, &plist)?;
@@ -1152,7 +1212,7 @@ async fn cmd_gateway_install() -> Result<()> {
 #[cfg(target_os = "macos")]
 async fn cmd_gateway_uninstall() -> Result<()> {
     let home = dirs_next::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?;
-    let plist_path = home.join("Library/LaunchAgents/ai.rsclaw.gateway.plist");
+    let plist_path = home.join(launchd_plist_rel());
 
     let status = std::process::Command::new("launchctl")
         .args(["unload", "-w"])
@@ -1179,7 +1239,7 @@ async fn cmd_gateway_install() -> Result<()> {
     let log_path = rsclaw_config::loader::log_file();
     let unit = format!(
         "[Unit]\n\
-         Description=rsclaw AI gateway\n\
+         Description={cli} AI gateway\n\
          After=network.target\n\
          \n\
          [Service]\n\
@@ -1195,17 +1255,18 @@ async fn cmd_gateway_install() -> Result<()> {
          WantedBy=default.target\n",
         binary = binary.display(),
         log = log_path.display(),
+        cli = rsclaw_brand::CLI_NAME,
     );
 
     let unit_dir = home.join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
-    let unit_path = unit_dir.join("rsclaw-gateway.service");
+    let unit_path = unit_dir.join(format!("{}.service", rsclaw_brand::SERVICE_UNIT));
     std::fs::write(&unit_path, &unit)?;
     println!("  [+] {}", unit_path.display());
 
     for cmd in [
         vec!["systemctl", "--user", "daemon-reload"],
-        vec!["systemctl", "--user", "enable", "--now", "rsclaw-gateway"],
+        vec!["systemctl", "--user", "enable", "--now", rsclaw_brand::SERVICE_UNIT],
     ] {
         let status = std::process::Command::new(cmd[0])
             .args(&cmd[1..])
@@ -1221,10 +1282,10 @@ async fn cmd_gateway_install() -> Result<()> {
 #[cfg(target_os = "linux")]
 async fn cmd_gateway_uninstall() -> Result<()> {
     let home = dirs_next::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?;
-    let unit_path = home.join(".config/systemd/user/rsclaw-gateway.service");
+    let unit_path = home.join(systemd_user_unit_rel());
 
     for cmd in [
-        vec!["systemctl", "--user", "disable", "--now", "rsclaw-gateway"],
+        vec!["systemctl", "--user", "disable", "--now", rsclaw_brand::SERVICE_UNIT],
         vec!["systemctl", "--user", "daemon-reload"],
     ] {
         let _ = std::process::Command::new(cmd[0]).args(&cmd[1..]).status();
@@ -1250,13 +1311,13 @@ async fn cmd_gateway_install() -> Result<()> {
     let status = std::process::Command::new("sc")
         .args([
             "create",
-            "rsclaw",
+            rsclaw_brand::WINDOWS_SERVICE,
             "binPath=",
             &bin_path,
             "start=",
             "auto",
             "DisplayName=",
-            "RsClaw AI Gateway",
+            rsclaw_brand::SERVICE_DISPLAY,
         ])
         .creation_flags(0x08000000)
         .status()?;
@@ -1264,11 +1325,11 @@ async fn cmd_gateway_install() -> Result<()> {
         eprintln!("  [!] sc create failed. Try running as Administrator.");
         return Ok(());
     }
-    println!("  [+] Service registered: rsclaw");
+    println!("  [+] Service registered: {}", rsclaw_brand::WINDOWS_SERVICE);
 
     // Start the service.
     let _ = std::process::Command::new("sc")
-        .args(["start", "rsclaw"])
+        .args(["start", rsclaw_brand::WINDOWS_SERVICE])
         .creation_flags(0x08000000)
         .status();
     println!("  [ok] Service installed and started");
@@ -1280,13 +1341,13 @@ async fn cmd_gateway_uninstall() -> Result<()> {
     use std::os::windows::process::CommandExt;
     // Stop first.
     let _ = std::process::Command::new("sc")
-        .args(["stop", "rsclaw"])
+        .args(["stop", rsclaw_brand::WINDOWS_SERVICE])
         .creation_flags(0x08000000)
         .status();
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let status = std::process::Command::new("sc")
-        .args(["delete", "rsclaw"])
+        .args(["delete", rsclaw_brand::WINDOWS_SERVICE])
         .creation_flags(0x08000000)
         .status()?;
     if !status.success() {

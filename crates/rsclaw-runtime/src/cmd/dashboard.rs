@@ -3,7 +3,7 @@ use rsclaw_config as config;
 
 pub async fn cmd_dashboard(no_open: bool) -> Result<()> {
     let cfg = config::load().ok();
-    let port = cfg.as_ref().map_or(18888, |c| c.gateway.port);
+    let port = cfg.as_ref().map_or(rsclaw_brand::DEFAULT_PORT, |c| c.gateway.port);
     let auth_token = cfg
         .as_ref()
         .and_then(|c| c.gateway.auth_token.clone())

@@ -69,7 +69,7 @@
     "allow-test-provider",
     "allow-write-workspace-file",
     "allow-read-workspace-file",
-    "allow-run-rsclaw-cli",
+    "allow-run-doctor",
     "allow-migrate-openclaw",
     "allow-set-auto-start",
     "allow-get-auto-start",

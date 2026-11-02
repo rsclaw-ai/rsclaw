@@ -271,6 +271,22 @@ impl BrowserPool {
                 // and relaunch below.
                 *guard = None;
             }
+            // A Chrome rsclaw left running on this profile (e.g. across a
+            // gateway restart) keeps the user's pages and logins: register it
+            // as external instead of killing it to launch a fresh one.
+            if let Some(name) = profile
+                && let Some(ws) = crate::running_profile_chrome(name).await
+            {
+                let port = crate::parse_port_from_ws_url(&ws)?;
+                info!(port, profile = name, "pool: adopted running Chrome on profile");
+                *guard = Some(PooledChrome {
+                    process: None,
+                    port,
+                });
+                self.touch();
+                drop(guard);
+                return self.ws_url_for_port(port).await;
+            }
             can_launch_chrome()?;
             let process = ChromeProcess::launch(chrome_path, headed, profile).await?;
             let port = process.port()?;
@@ -360,7 +376,7 @@ impl BrowserPool {
         let profile = {
             let mut profile_guard = self.profile.lock().await;
             if profile_guard.is_none() {
-                let config_path = rsclaw_config::loader::base_dir().join("rsclaw.json5");
+                let config_path = rsclaw_config::loader::base_dir().join(rsclaw_brand::CONFIG_FILE);
                 let cfg_profile = rsclaw_config::loader::load_json5(&config_path)
                     .ok()
                     .and_then(|c| c.tools)
@@ -407,6 +423,11 @@ impl BrowserPool {
     }
 
     /// Shut down the shared Chrome if idle.
+    ///
+    /// A pool-owned *headed* Chrome (the visible browser `web_browser` uses,
+    /// typically on the user's real profile) is never reaped: killing it
+    /// throws away the user's open pages and session logins. Headless pool
+    /// Chrome is reaped, but closed gracefully so cookies are flushed.
     pub async fn reap_if_idle(&self) {
         if !self.is_idle_expired() {
             return;
@@ -419,9 +440,19 @@ impl BrowserPool {
         if !self.is_idle_expired() {
             return;
         }
-        if guard.is_some() {
+        let headed = guard
+            .as_ref()
+            .and_then(|p| p.process.as_ref())
+            .is_some_and(|proc| proc.headed);
+        if headed {
+            return;
+        }
+        if let Some(mut pooled) = guard.take() {
             info!("pool: idle timeout, shutting down shared Chrome");
-            *guard = None; // ChromeProcess::Drop kills the process
+            if let Some(ref mut proc) = pooled.process {
+                proc.close_gracefully(Duration::from_secs(5)).await;
+            }
+            drop(pooled); // ChromeProcess::Drop kills anything left
         }
     }
 }
@@ -453,7 +484,10 @@ impl TabSession {
             sel = serde_json::to_string(selector)?,
             ms = timeout_secs * 1000,
         );
-        let _ = tokio::time::timeout(
+        // Best-effort wait: a selector that never appears is not an error
+        // (callers proceed with whatever loaded), but a broken CDP transport
+        // is and must be surfaced.
+        match tokio::time::timeout(
             Duration::from_secs(timeout_secs + 1),
             self.cdp.send(
                 "Runtime.evaluate",
@@ -463,8 +497,20 @@ impl TabSession {
                 }),
             ),
         )
-        .await;
-        Ok(())
+        .await
+        {
+            Err(_) => {
+                tracing::debug!(selector, "wait_for_selector: timed out");
+                Ok(())
+            }
+            Ok(Ok(resp)) => {
+                if resp.get("exceptionDetails").is_some() {
+                    tracing::debug!(selector, "wait_for_selector: selector not found in time");
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e.context(format!("wait_for_selector `{selector}`"))),
+        }
     }
 
     /// Execute JavaScript and return the result.
@@ -583,6 +629,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_owned_chrome_reuse_refreshes_idle_clock() {
+        // reqwest is built without a default rustls provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (_server, port) = fake_chrome_endpoint().await;
         let pool = BrowserPool::new();
         *pool.chrome.lock().await = Some(PooledChrome {
@@ -638,6 +686,8 @@ mod tests {
 
     #[tokio::test]
     async fn chrome_ws_url_reuse_refreshes_idle_clock() {
+        // reqwest is built without a default rustls provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (_server, port) = fake_chrome_endpoint().await;
         let pool = BrowserPool::new();
         *pool.chrome.lock().await = Some(PooledChrome {

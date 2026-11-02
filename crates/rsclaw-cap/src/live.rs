@@ -44,15 +44,18 @@ use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use super::{
     AgentKind,
     runtime::{
-        NotifTarget, run_turn, spawn_driver, spawn_driver_acp, spawn_driver_continue_last,
+        NotifTarget, TURN_TIMEOUT, TurnProgress, run_turn_tracked, spawn_driver, spawn_driver_acp, spawn_driver_continue_last,
         spawn_driver_resume,
     },
 };
 
 const DEFAULT_MAX_SESSIONS: usize = 8;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
-/// Per-prompt timeout, matching cap task mode (`runtime.rs` actor).
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Caller-side wait for a live prompt. Must exceed the actor's own budget
+/// (one turn, plus at most one replay after a driver that died before
+/// producing output, plus respawn time) so the caller always receives the
+/// actor's real outcome instead of timing out while the actor keeps working.
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(TURN_TIMEOUT.as_secs() * 2 + 120);
 
 /// How a new live session should be opened — fresh, or resuming a
 /// prior agent session. Owned-string variant for the by-id case so
@@ -434,6 +437,11 @@ impl CapLiveManager {
                 )
             })?
             .map_err(|_| anyhow!("live session `{sid}`: actor dropped reply"))??;
+
+        // A long turn must not look idle to the GC right after it finishes.
+        if let Ok(mut g) = handle.last_active.lock() {
+            *g = Instant::now();
+        }
 
         Ok(LiveDispatchResult {
             session_id: sid,
@@ -922,32 +930,28 @@ async fn actor_loop(
         };
         match req {
             LiveRequest::Prompt { task, notif, reply } => {
-                // One automatic retry on driver death (send failure or
-                // mid-turn exit). The motivating case is the FIRST
+                // One automatic retry on driver death — only when the driver
+                // died BEFORE producing any output (send failure, or exit
+                // before the first event). The motivating case is the FIRST
                 // `opencode acp` launch on a cold machine: the handshake
-                // succeeds, then the server exits while handling the
-                // first prompt, so `run_turn` returns "exited mid-turn".
-                // Respawning a fresh driver and replaying the same prompt
-                // hides that one-time flake (and any transient CLI crash)
-                // from the user. Fresh respawn = lost in-process context,
-                // which is correct here: the dead driver already lost it,
-                // and the cold-start case has no prior turns to preserve.
+                // succeeds, then the server exits while handling the first
+                // prompt. Respawning a fresh driver and replaying the same
+                // prompt hides that one-time flake from the user. A turn that
+                // timed out or already emitted events is NEVER replayed: the
+                // agent may have edited files or run commands, and a silent
+                // replay would execute them twice.
                 // On the retry, respawn opencode via ACP rather than the
                 // stream-json path: opencode's stream-json/persist first turn is
-                // the flaky case (dies mid-turn, or the cold-start capture leaves
-                // it emitting nothing), and ACP is the resilient fallback. Other
+                // the flaky case, and ACP is the resilient fallback. Other
                 // agents just respawn same-kind.
                 let retry_acp = kind == AgentKind::Opencode;
                 // Two INDEPENDENT budgets:
-                //  - `respawned`: a DEAD driver (send fail / mid-turn exit) gets one respawn —
-                //    opencode via ACP, the resilient path.
+                //  - `respawned`: a DEAD driver (send fail / exit before output) gets one
+                //    respawn — opencode via ACP, the resilient path.
                 //  - `empty_resends`: an ALIVE-but-empty turn is the opencode cold-start
                 //    "produced nothing" flake. RE-SEND to the SAME, now-warm driver —
-                //    respawning there just cold-starts again and re-emits nothing. (Observed:
-                //    the death-respawn burned the single old retry, so the empty post-respawn
-                //    turn slipped through as "(no output)" while the user's very next message
-                //    worked on the warm driver.) An empty turn ran no tools, so replaying the
-                //    prompt is safe.
+                //    respawning there just cold-starts again and re-emits nothing. Only
+                //    done when the turn showed no tool activity, so the replay is safe.
                 let mut respawned = false;
                 let mut empty_resends = 0u8;
                 let outcome = loop {
@@ -975,28 +979,37 @@ async fn actor_loop(
                         break Err(anyhow!("cap_live driver send: {e}"));
                     }
                     let mut reply_buf = String::new();
+                    let mut progress = TurnProgress::default();
+                    let mut timed_out = false;
                     let turn = match tokio::time::timeout(
-                        super::runtime::TURN_TIMEOUT,
-                        run_turn(
+                        TURN_TIMEOUT,
+                        run_turn_tracked(
                             driver.as_mut(),
                             &bus,
                             &pseudo_session_id,
                             "cap-live",
                             notif.as_ref(),
                             &mut reply_buf,
+                            &mut progress,
                         ),
                     )
                     .await
                     {
                         Ok(r) => r,
-                        Err(_) => Err(anyhow!(
-                            "cap_live: turn timed out after {}s (driver hang?)",
-                            super::runtime::TURN_TIMEOUT.as_secs()
-                        )),
+                        Err(_) => {
+                            timed_out = true;
+                            Err(anyhow!(
+                                "cap_live: turn timed out after {}s (driver hang?)",
+                                TURN_TIMEOUT.as_secs()
+                            ))
+                        }
                     };
                     match turn {
                         Ok(()) => {
-                            if reply_buf.trim().is_empty() && empty_resends < 2 {
+                            if reply_buf.trim().is_empty()
+                                && !progress.tool_activity
+                                && empty_resends < 2
+                            {
                                 empty_resends += 1;
                                 tracing::info!(
                                     target: "cap",
@@ -1011,12 +1024,13 @@ async fn actor_loop(
                         }
                         Err(e) => {
                             if !respawned
+                                && progress.replay_safe(timed_out)
                                 && respawn_driver(
                                     &kind,
                                     &cwd,
                                     &mut driver,
                                     &sid,
-                                    "exited mid-turn",
+                                    "exited before output",
                                     &agent_sid_slot,
                                     retry_acp,
                                 )
@@ -1024,6 +1038,15 @@ async fn actor_loop(
                             {
                                 respawned = true;
                                 continue;
+                            }
+                            if !progress.replay_safe(timed_out) {
+                                tracing::warn!(
+                                    target: "cap",
+                                    session_id = %sid,
+                                    agent = kind.as_str(),
+                                    timed_out,
+                                    "cap_live turn failed after the agent started working; not replaying"
+                                );
                             }
                             break Err(anyhow!("cap_live driver: {e}"));
                         }

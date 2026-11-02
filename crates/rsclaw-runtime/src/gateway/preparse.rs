@@ -177,7 +177,10 @@ fn render_headlines_for_plugin(plugin: &str) -> String {
         .join("plugins")
         .join(plugin);
     if !plugin_dir.exists() {
-        return format!("plugin `{plugin}` not installed (no dir at ~/.rsclaw/plugins/{plugin})");
+        return format!(
+            "plugin `{plugin}` not installed (no dir at ~/{home}/plugins/{plugin})",
+            home = rsclaw_brand::HOME_DIR
+        );
     }
     let manifest = match rsclaw_plugin::manifest::load_manifest(&plugin_dir) {
         Ok(m) => m,
@@ -253,6 +256,21 @@ fn preparse_session_key(
     })
 }
 
+/// Local slash commands that act on the host (shell, filesystem, screen,
+/// schedulers, coding agents, model switching, memory dumps). Non-owner
+/// senders are refused before any of them runs.
+pub(crate) fn is_owner_only_command(lower: &str, raw: &str) -> bool {
+    const EXACT: &[&str] = &["/ls", "/ss", "/screenshot", "/webshot", "/cap-exit", "/cap-resume", "/cron", "/loop", "/watch"];
+    const PREFIX: &[&str] = &[
+        "/run ", "/sh ", "/exec ", "/ls ", "/cat ", "/ss ", "/webshot ", "/cap ", "/cap-resume ",
+        "/cron ", "/loop ", "/watch ", "/skill ", "/model ", "/remember ", "/recall ",
+    ];
+    raw.starts_with("! ")
+        || raw.starts_with("$ ")
+        || EXACT.contains(&lower)
+        || PREFIX.iter().any(|p| lower.starts_with(p))
+}
+
 /// Handle certain fast preparse commands locally — without going through the
 /// agent queue. Returns `Some(reply_text)` for commands that can be answered
 /// immediately, `None` otherwise. This avoids blocking on the agent's
@@ -263,14 +281,29 @@ fn preparse_session_key(
 /// channel/peer (e.g. `/loop`) can populate a `CronDelivery` correctly.
 /// `origin` tells preparse whether the call came from a real user or from
 /// cron's replay of `/loop`-scheduled text.
+/// `session_key` is the exact key the caller would dispatch the turn under
+/// (group / dmScope aware). When given, `/clear` and `/new` reset exactly that
+/// session; when `None`, they fall back to matching the same channel+sender.
 pub(crate) async fn try_preparse_locally(
     text: &str,
     handle: &rsclaw_agent::AgentHandle,
     channel: &str,
     peer_id: &str,
+    session_key: Option<&str>,
     origin: PreparseOrigin,
+    trust: rsclaw_agent::SenderTrust,
 ) -> Option<OutboundMessage> {
-    try_preparse_locally_with_account(text, handle, channel, peer_id, None, origin).await
+    try_preparse_locally_with_account(
+        text,
+        handle,
+        channel,
+        peer_id,
+        None,
+        session_key,
+        origin,
+        trust,
+    )
+    .await
 }
 
 /// Account-aware variant. Channels that need multi-account routing
@@ -279,17 +312,37 @@ pub(crate) async fn try_preparse_locally(
 /// route back through the SAME app that received the inbound message.
 /// Open IDs are per-app in feishu — sending via the wrong app fails
 /// with 99992361 "open_id cross app".
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_preparse_locally_with_account(
     text: &str,
     handle: &rsclaw_agent::AgentHandle,
     channel: &str,
     peer_id: &str,
     account: Option<&str>,
+    session_key: Option<&str>,
     origin: PreparseOrigin,
+    trust: rsclaw_agent::SenderTrust,
 ) -> Option<OutboundMessage> {
     use std::sync::atomic::Ordering;
     let t = text.trim();
     let lower = t.to_lowercase();
+
+    // Host-level commands (shell, file reads, screenshots, schedulers,
+    // coding agents) are owner-only. Channel membership decides who may
+    // talk to the bot; it does not grant access to the host.
+    if !trust.is_owner() && is_owner_only_command(&lower, t) {
+        tracing::warn!(channel, peer_id, "owner-only command refused for non-owner sender");
+        return Some(OutboundMessage {
+            target_id: String::new(),
+            is_group: false,
+            text: rsclaw_i18n::t("cmd_owner_only", rsclaw_i18n::default_lang()),
+            reply_to: None,
+            images: vec![],
+            files: vec![],
+            channel: None,
+            account: None,
+        });
+    }
 
     // Helper: text-only reply (target_id/is_group filled in by caller).
     let txt = |s: String| OutboundMessage {
@@ -321,12 +374,13 @@ pub(crate) async fn try_preparse_locally_with_account(
     // the reply. Make it a local fast response listing all preparse
     // slash commands, so it lands within milliseconds on every channel.
     if lower == "/help" || lower == "/?" {
-        return Some(txt(help_text(rsclaw_i18n::default_lang())));
+        return Some(txt(rsclaw_brand::rebrand(&help_text(rsclaw_i18n::default_lang())).into_owned()));
     }
     // /version
     if lower == "/version" {
         return Some(txt(format!(
-            "rsclaw v{}",
+            "{} v{}",
+            rsclaw_brand::CLI_NAME,
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         )));
     }
@@ -376,6 +430,12 @@ pub(crate) async fn try_preparse_locally_with_account(
         dm_scope: DmScope::PerChannelPeer,
     });
 
+    // The caller's exact session key (group / dmScope aware) when known;
+    // otherwise the DM-default guess above. /abort, /clear, /new and the
+    // /cap sticky binding all act on this key so they hit the same session
+    // the turn dispatcher (and `resolve_sticky` in run_turn) uses.
+    let target_key: &str = session_key.unwrap_or(&this_session_key);
+
     if let Some(reply) = try_plugin_slash(
         t,
         handle,
@@ -396,7 +456,7 @@ pub(crate) async fn try_preparse_locally_with_account(
             .abort_flags
             .read()
             .expect("abort_flags lock poisoned");
-        let hit = flags.get(&this_session_key).map(|f| {
+        let hit = flags.get(target_key).map(|f| {
             f.store(true, Ordering::SeqCst);
         });
         return Some(txt(if hit.is_some() {
@@ -405,6 +465,17 @@ pub(crate) async fn try_preparse_locally_with_account(
             "nothing to abort".to_owned()
         }));
     }
+    // /clear and /new target the caller's exact session key when known;
+    // otherwise the DM-default guess plus a channel+sender fallback match.
+    let reset_request = |kind: rsclaw_agent::SessionResetKind| match session_key {
+        Some(key) => rsclaw_agent::SessionResetRequest::exact(kind, key),
+        None => rsclaw_agent::SessionResetRequest::with_sender_fallback(
+            kind,
+            this_session_key.clone(),
+            channel,
+            peer_id,
+        ),
+    };
     // /clear — abort current session's running turn + signal session clear
     if lower == "/clear" {
         // 1. Abort the running turn FOR THIS SESSION only.
@@ -412,12 +483,13 @@ pub(crate) async fn try_preparse_locally_with_account(
             .abort_flags
             .read()
             .expect("abort_flags lock poisoned");
-        if let Some(f) = flags.get(&this_session_key) {
+        if let Some(f) = flags.get(target_key) {
             f.store(true, Ordering::SeqCst);
         }
         drop(flags);
-        // 2. Signal runtime to clear sessions at next opportunity
-        handle.clear_signal.store(true, Ordering::SeqCst);
+        // 2. Queue a clear for THIS session only. The runtime applies it at
+        //    this session's next turn (or mid-loop if it is running).
+        handle.request_session_reset(reset_request(rsclaw_agent::SessionResetKind::Clear));
         return Some(txt(rsclaw_i18n::t(
             "session_cleared",
             rsclaw_i18n::default_lang(),
@@ -430,11 +502,14 @@ pub(crate) async fn try_preparse_locally_with_account(
             .abort_flags
             .read()
             .expect("abort_flags lock poisoned");
-        if let Some(f) = flags.get(&this_session_key) {
+        if let Some(f) = flags.get(target_key) {
             f.store(true, Ordering::SeqCst);
         }
         drop(flags);
-        handle.new_session_signal.store(true, Ordering::SeqCst);
+        // Queue a new generation for THIS session only (see /clear above).
+        handle.request_session_reset(reset_request(
+            rsclaw_agent::SessionResetKind::NewGeneration,
+        ));
         return Some(txt(rsclaw_i18n::t(
             "session_new",
             rsclaw_i18n::default_lang(),
@@ -521,13 +596,13 @@ pub(crate) async fn try_preparse_locally_with_account(
         match manager.open_session(kind, cwd).await {
             Ok(sid) => {
                 manager
-                    .bind_sticky(this_session_key.clone(), sid.clone(), kind)
+                    .bind_sticky(target_key.to_owned(), sid.clone(), kind)
                     .await;
                 tracing::info!(
                     target: "cap",
                     session_id = %sid,
                     agent = kind.as_str(),
-                    im_session_key = %this_session_key,
+                    im_session_key = %target_key,
                     "cap_live sticky bind"
                 );
                 // Native session id is captured asynchronously by the
@@ -618,7 +693,7 @@ pub(crate) async fn try_preparse_locally_with_account(
         match spawn_result {
             Ok(sid) => {
                 manager
-                    .bind_sticky(this_session_key.clone(), sid.clone(), kind)
+                    .bind_sticky(target_key.to_owned(), sid.clone(), kind)
                     .await;
                 tracing::info!(
                     target: "cap",
@@ -626,7 +701,7 @@ pub(crate) async fn try_preparse_locally_with_account(
                     agent = kind.as_str(),
                     resume_id = %session_id,
                     continue_last = session_id.is_empty(),
-                    im_session_key = %this_session_key,
+                    im_session_key = %target_key,
                     "cap_live sticky bind via /cap-resume"
                 );
                 let label = if session_id.is_empty() {
@@ -662,7 +737,7 @@ pub(crate) async fn try_preparse_locally_with_account(
         let Some(manager) = rsclaw_cap::GLOBAL_CAP_LIVE.get() else {
             return Some(txt(rsclaw_i18n::t("cap_not_initialised", lang)));
         };
-        let Some((sid, kind)) = manager.unbind_sticky(&this_session_key).await else {
+        let Some((sid, kind)) = manager.unbind_sticky(target_key).await else {
             return Some(txt(rsclaw_i18n::t("cap_no_active", lang)));
         };
         // Capture the native session_id BEFORE tearing the actor down
@@ -677,7 +752,7 @@ pub(crate) async fn try_preparse_locally_with_account(
             session_id = %sid,
             agent = kind.as_str(),
             agent_session_id = ?native_sid,
-            im_session_key = %this_session_key,
+            im_session_key = %target_key,
             "cap_live sticky unbind + end"
         );
         // Build the close reply, append the resume hint if we have
@@ -1129,15 +1204,19 @@ $g.Dispose();$b.Dispose()"#
         return Some(txt(task_help_text(rsclaw_i18n::default_lang())));
     }
     // /model — show current model; /models — list providers; /model <name> — switch
-    if lower == "/model" || lower == "/models" {
-        // Single source of truth shared with the agent-queue __MODELS__ path.
-        return Some(txt(handle.format_models()));
-    }
-    if lower.starts_with("/model ") {
-        let model = t.get(7..).unwrap_or("").trim();
-        return Some(txt(format!(
-            "Model switched to: {model} (runtime only, use configure to persist)"
-        )));
+    if lower == "/model" || lower == "/models" || lower.starts_with("/model ") {
+        // The turn runs under this exact key, so the switch must use it too.
+        let session_key = session_key
+            .map(str::to_owned)
+            .unwrap_or_else(|| preparse_session_key(handle, channel, peer_id, account));
+        let reply = match t.get(7..).map(str::trim) {
+            Some(model) if lower.starts_with("/model ") => {
+                rsclaw_agent::model_switch::switch_session_model(handle, &session_key, model)
+            }
+            // Single source of truth shared with the agent-queue __MODELS__ path.
+            _ => handle.format_models_for(&session_key),
+        };
+        return Some(txt(reply));
     }
     // /plugin — session-scoped plugin activation control. See plugin_help_text.
     if lower == "/plugin" || lower.starts_with("/plugin ") {
@@ -1330,6 +1409,9 @@ $g.Dispose();$b.Dispose()"#
             ("sh", "-c")
         };
         let ws = workspace();
+        if let Err(e) = std::fs::create_dir_all(&ws) {
+            tracing::warn!(path = %ws.display(), "failed to create workspace for shell command: {e}");
+        }
         let mut proc = tokio::process::Command::new(shell);
         proc.args([arg, cmd])
             .current_dir(&ws)
@@ -1661,6 +1743,7 @@ async fn try_plugin_slash(
                 session_key: session_key.to_owned(),
                 is_group: false,
                 account: account.map(str::to_owned),
+                event_bus: None,
             });
             return Some(
                 match plugin
@@ -2178,7 +2261,7 @@ pub(crate) async fn btw_direct_call(
         .model
         .as_ref()
         .and_then(|m| m.primary_head())
-        .unwrap_or("rsclaw/rsclaw-agent-v1");
+        .unwrap_or("rsclaw/rsclaw-agent-v2");
 
     let system = format!(
         "You are answering a quick side question (/btw). Be concise and direct. \

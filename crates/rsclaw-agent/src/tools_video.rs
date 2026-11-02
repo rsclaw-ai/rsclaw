@@ -49,14 +49,7 @@ impl super::runtime::AgentRuntime {
         // a base64 Data URI here so the provider gets self-contained input.
         // Only providers whose submit adapter supports it (currently agnes)
         // consume these; others ignore.
-        let raw_images: Vec<String> = match &args["image"] {
-            Value::String(s) if !s.is_empty() => vec![s.clone()],
-            Value::Array(a) => a
-                .iter()
-                .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
-                .collect(),
-            _ => Vec::new(),
-        };
+        let raw_images = super::tools_image::image_arg_entries(&args["image"]);
         let mut images: Vec<String> = Vec::with_capacity(raw_images.len());
         for img in raw_images {
             if img.starts_with("http://") || img.starts_with("https://") || img.starts_with("data:")
@@ -64,8 +57,21 @@ impl super::runtime::AgentRuntime {
                 images.push(img);
                 continue;
             }
-            // Treat as a local file path → base64 Data URI.
-            match tokio::fs::read(&img).await {
+            // Treat as a local file path → base64 Data URI. Scope-checked:
+            // the bytes are uploaded to the video provider.
+            let local = match self.resolve_readable_path(ctx, &img) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(path = %img, error = %e, "video_gen: image refused, skipping");
+                    continue;
+                }
+            };
+            match super::security::read_regular_file_capped(
+                &local,
+                super::security::MAX_LOCAL_BINARY_READ_BYTES,
+            )
+            .await
+            {
                 Ok(bytes) => {
                     use base64::Engine;
                     let mime = match std::path::Path::new(&img)
@@ -92,7 +98,8 @@ impl super::runtime::AgentRuntime {
         // rsclaw-video-v3 and sends this as a typed structure reference. Local
         // path / data-URI / http URL are accepted; local files are normalized
         // to a data URI like reference images.
-        let video_assets = normalize_gen_assets(&args["video"]).await;
+        let scope = self.read_scope(ctx);
+        let video_assets = normalize_gen_assets(&args["video"], &scope).await;
         let video_ref = video_assets.first().map(|s| s.as_str());
 
         // Resolve the configured video chain (head + optional fallbacks)
@@ -157,7 +164,7 @@ impl super::runtime::AgentRuntime {
                 .as_ref()
                 .and_then(|m| m.providers.get(prov))
                 .and_then(|p| p.api_key.as_ref())
-                .and_then(|k| k.as_plain().map(str::to_owned))
+                .and_then(|k| k.resolve_full(self.config.ops.secrets.as_ref()))
                 .or_else(|| std::env::var(env_name).ok())
         };
 
@@ -256,7 +263,8 @@ impl super::runtime::AgentRuntime {
                     .await
                     .map(|id| ("seedance", id)),
                     None => Err(anyhow!(
-                        "video_gen: no API key for doubao/Seedance. Set `model.models.providers.doubao.apiKey` in rsclaw.json5 or export ARK_API_KEY, then retry — or tell the user the doubao key is missing."
+                        "video_gen: no API key for doubao/Seedance. Set `model.models.providers.doubao.apiKey` in {cfg} or export ARK_API_KEY, then retry — or tell the user the doubao key is missing.",
+                        cfg = rsclaw_brand::CONFIG_FILE
                     )),
                 },
                 "agnes" => match resolve_key("agnes", "AGNES_API_KEY") {
@@ -272,7 +280,8 @@ impl super::runtime::AgentRuntime {
                     .await
                     .map(|id| ("agnes", id)),
                     None => Err(anyhow!(
-                        "video_gen: no API key for Agnes. Set `model.models.providers.agnes.apiKey` in rsclaw.json5 or export AGNES_API_KEY, then retry — or tell the user the Agnes key is missing."
+                        "video_gen: no API key for Agnes. Set `model.models.providers.agnes.apiKey` in {cfg} or export AGNES_API_KEY, then retry — or tell the user the Agnes key is missing.",
+                        cfg = rsclaw_brand::CONFIG_FILE
                     )),
                 },
                 "openai" => match resolve_key("openai", "OPENAI_API_KEY") {
@@ -303,7 +312,8 @@ impl super::runtime::AgentRuntime {
                         .map(|id| ("openai", id))
                     }
                     None => Err(anyhow!(
-                        "video_gen: no API key for OpenAI. Set `model.models.providers.openai.apiKey` in rsclaw.json5 or export OPENAI_API_KEY, then retry — or tell the user the OpenAI key is missing."
+                        "video_gen: no API key for OpenAI. Set `model.models.providers.openai.apiKey` in {cfg} or export OPENAI_API_KEY, then retry — or tell the user the OpenAI key is missing.",
+                        cfg = rsclaw_brand::CONFIG_FILE
                     )),
                 },
                 "rsclaw" => match resolve_key("rsclaw", "RSCLAW_API_KEY") {
@@ -322,7 +332,8 @@ impl super::runtime::AgentRuntime {
                     .await
                     .map(|id| ("rsclaw_native", id)),
                     None => Err(anyhow!(
-                        "video_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in rsclaw.json5 or export RSCLAW_API_KEY, then retry — or tell the user the rsclaw key is missing."
+                        "video_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in {cfg} or export RSCLAW_API_KEY, then retry — or tell the user the rsclaw key is missing.",
+                        cfg = rsclaw_brand::CONFIG_FILE
                     )),
                 },
                 other => Err(anyhow!("video_gen: unsupported provider {other}")),
@@ -410,30 +421,32 @@ impl super::runtime::AgentRuntime {
             "provider": provider_key,
             "task_id": task_id,
             "job_id": job_id,
-            "message": "Video generation submitted. The finished video will be delivered automatically when ready (typically 30s–5min). The user has been informed; do NOT poll or wait — your turn is complete."
+            "message": "Video generation submitted. The finished video will be delivered automatically when ready (typically 30s–5min). The user has been informed; do not poll or wait — your turn is complete. If the user later asks about progress, call gen_status with this job_id."
         }))
     }
 
-    /// Query an existing video task without submitting or mutating it.
-    pub(crate) async fn tool_video_status(&self, args: Value) -> Result<Value> {
+    /// Query an existing generation task (image / video / avatar / MV)
+    /// without submitting or mutating it.
+    pub(crate) async fn tool_gen_status(&self, args: Value) -> Result<Value> {
         let job_id = args
             .get("job_id")
             .or_else(|| args.get("task_id"))
             .or_else(|| args.get("id"))
             .and_then(Value::as_str)
             .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| anyhow!("video_status: `job_id` is required"))?;
+            .ok_or_else(|| anyhow!("gen_status: `job_id` is required"))?;
 
-        // `video_gen` returns a gateway-internal UUID as `job_id`. This is the
-        // preferred provider-independent lookup: it works for Seedance, Agnes,
-        // OpenAI, native rsclaw and legacy avatar/MV jobs.
+        // Every async *_gen tool returns a gateway-internal UUID as `job_id`.
+        // This is the preferred provider-independent lookup: it works for
+        // rsclaw image jobs and for Seedance, Agnes, OpenAI, native rsclaw and
+        // legacy avatar/MV video jobs.
         if let Some(job) = self
             .store
             .db
             .get_external_job(job_id)
-            .map_err(|error| anyhow!("video_status: read local job: {error}"))?
+            .map_err(|error| anyhow!("gen_status: read local job: {error}"))?
         {
-            return Ok(local_video_job_status(&job));
+            return Ok(local_gen_job_status(&job));
         }
 
         // The tool also returns the provider `task_id`. Native rsclaw IDs are
@@ -446,11 +459,11 @@ impl super::runtime::AgentRuntime {
                 .as_ref()
                 .and_then(|models| models.providers.get("rsclaw"))
                 .and_then(|provider| provider.api_key.as_ref())
-                .and_then(|key| key.as_plain().map(str::to_owned))
+                .and_then(|key| key.resolve_full(self.config.ops.secrets.as_ref()))
                 .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
                 .ok_or_else(|| {
                     anyhow!(
-                        "video_status: no rsclaw API key configured; query with the internal `job_id` instead"
+                        "gen_status: no rsclaw API key configured; query with the internal `job_id` instead"
                     )
                 })
         };
@@ -460,10 +473,10 @@ impl super::runtime::AgentRuntime {
             rsclaw_jobs::poll_rsclaw_legacy(&api_key()?, job_id).await?
         } else {
             return Err(anyhow!(
-                "video_status: unknown job ID `{job_id}`; use the internal `job_id`, native `job_...`, or legacy `video_...` returned by video_gen"
+                "gen_status: unknown job ID `{job_id}`; use the internal `job_id` returned by the *_gen tool, or a native `job_...` / legacy `video_...` ID"
             ));
         };
-        Ok(provider_video_status(job_id, outcome))
+        Ok(provider_gen_status(job_id, outcome))
     }
 
     /// Avatar (数字人) generation — `POST /v1/videos/avatar` (gen-api.md §3).
@@ -477,8 +490,9 @@ impl super::runtime::AgentRuntime {
         args: Value,
         ctx: &super::runtime::RunContext,
     ) -> Result<Value> {
-        let images = normalize_gen_assets(&args["image"]).await;
-        let audio = normalize_gen_assets(&args["audio"]).await;
+        let scope = self.read_scope(ctx);
+        let images = normalize_gen_assets(&args["image"], &scope).await;
+        let audio = normalize_gen_assets(&args["audio"], &scope).await;
         let Some(image_url) = images.first() else {
             return Ok(
                 json!({ "error": "avatar_gen: a character `image` is required (local path, https URL, or data URI)" }),
@@ -487,7 +501,7 @@ impl super::runtime::AgentRuntime {
         // Driving video (animate lane) — local path / data-URI / http URL all
         // accepted (normalised to a data-URI for local files, same as image/
         // audio).
-        let drive = normalize_gen_assets(&args["video"]).await;
+        let drive = normalize_gen_assets(&args["video"], &scope).await;
         let drive_video = drive.first();
         if audio.first().is_none() && drive_video.is_none() {
             return Ok(
@@ -523,7 +537,8 @@ impl super::runtime::AgentRuntime {
         args: Value,
         ctx: &super::runtime::RunContext,
     ) -> Result<Value> {
-        let images = normalize_gen_assets(&args["image"]).await;
+        let scope = self.read_scope(ctx);
+        let images = normalize_gen_assets(&args["image"], &scope).await;
         let Some(image_url) = images.first() else {
             return Ok(
                 json!({ "error": "mv_gen: a character `image` is required (local path, https URL, or data URI)" }),
@@ -568,11 +583,12 @@ impl super::runtime::AgentRuntime {
             .as_ref()
             .and_then(|m| m.providers.get("rsclaw"))
             .and_then(|p| p.api_key.as_ref())
-            .and_then(|k| k.as_plain().map(str::to_owned))
+            .and_then(|k| k.resolve_full(self.config.ops.secrets.as_ref()))
             .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
             .ok_or_else(|| {
                 anyhow!(
-                    "{endpoint}_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in rsclaw.json5 or export RSCLAW_API_KEY, then retry."
+                    "{endpoint}_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in {cfg} or export RSCLAW_API_KEY, then retry.",
+                    cfg = rsclaw_brand::CONFIG_FILE
                 )
             })?;
 
@@ -609,7 +625,7 @@ impl super::runtime::AgentRuntime {
             "kind": endpoint,
             "task_id": task_id,
             "job_id": job_id,
-            "message": "Generation submitted to the rsclaw gen service. The finished video will be delivered automatically when ready. The user has been informed; do NOT poll or wait — your turn is complete."
+            "message": "Generation submitted to the rsclaw gen service. The finished video will be delivered automatically when ready. The user has been informed; do not poll or wait — your turn is complete. If the user later asks about progress, call gen_status with this job_id."
         }))
     }
 }
@@ -629,15 +645,11 @@ fn set_video_job_timeout(job: &mut rsclaw_types::ExternalJob) {
 /// URI with the mime inferred from the extension (image + audio + video).
 /// Unreadable paths are dropped. The rsclaw gen service accepts URL / data-URI
 /// / multipart for every asset slot, so a data-URI is always safe to send.
-pub(crate) async fn normalize_gen_assets(v: &Value) -> Vec<String> {
-    let raw: Vec<String> = match v {
-        Value::String(s) if !s.is_empty() => vec![s.clone()],
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|x| x.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
-            .collect(),
-        _ => Vec::new(),
-    };
+pub(crate) async fn normalize_gen_assets(
+    v: &Value,
+    scope: &super::security::ReadScope,
+) -> Vec<String> {
+    let raw = super::tools_image::image_arg_entries(v);
     let mut out = Vec::with_capacity(raw.len());
     for asset in raw {
         if asset.starts_with("http://")
@@ -647,7 +659,21 @@ pub(crate) async fn normalize_gen_assets(v: &Value) -> Vec<String> {
             out.push(asset);
             continue;
         }
-        match tokio::fs::read(&asset).await {
+        // Local paths are scope-checked: the bytes are uploaded to the gen
+        // service.
+        let local = match scope.resolve(&asset) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(path = %asset, error = %e, "gen: asset refused, skipping");
+                continue;
+            }
+        };
+        match super::security::read_regular_file_capped(
+            &local,
+            super::security::MAX_LOCAL_BINARY_READ_BYTES,
+        )
+        .await
+        {
             Ok(bytes) => {
                 use base64::Engine;
                 let mime = match std::path::Path::new(&asset)
@@ -717,7 +743,7 @@ async fn post_rsclaw_gen(endpoint: &str, api_key: &str, body: &Value) -> Result<
     Ok(id)
 }
 
-fn local_video_job_status(job: &rsclaw_types::ExternalJob) -> Value {
+fn local_gen_job_status(job: &rsclaw_types::ExternalJob) -> Value {
     let status = match job.status {
         rsclaw_types::ExternalJobStatus::Pending if job.progress.is_some() => "in_progress",
         rsclaw_types::ExternalJobStatus::Pending => "pending",
@@ -728,6 +754,10 @@ fn local_video_job_status(job: &rsclaw_types::ExternalJob) -> Value {
     };
     json!({
         "status": status,
+        "kind": match job.kind {
+            rsclaw_types::ExternalJobKind::VideoGen => "video",
+            rsclaw_types::ExternalJobKind::ImageGen => "image",
+        },
         "job_id": job.id,
         "task_id": job.external_task_id,
         "provider": job.provider,
@@ -741,7 +771,7 @@ fn local_video_job_status(job: &rsclaw_types::ExternalJob) -> Value {
     })
 }
 
-fn provider_video_status(task_id: &str, outcome: rsclaw_types::PollOutcome) -> Value {
+fn provider_gen_status(task_id: &str, outcome: rsclaw_types::PollOutcome) -> Value {
     match outcome {
         rsclaw_types::PollOutcome::Pending => json!({
             "status": "pending",
@@ -1002,22 +1032,22 @@ mod tests {
     }
 
     #[test]
-    fn video_status_maps_provider_outcomes_without_resubmitting() {
+    fn gen_status_maps_provider_outcomes_without_resubmitting() {
         assert_eq!(
-            provider_video_status("job_1", rsclaw_types::PollOutcome::Pending)["status"],
+            provider_gen_status("job_1", rsclaw_types::PollOutcome::Pending)["status"],
             "pending"
         );
         let running =
-            provider_video_status("job_1", rsclaw_types::PollOutcome::InProgress(Some(0.5)));
+            provider_gen_status("job_1", rsclaw_types::PollOutcome::InProgress(Some(0.5)));
         assert_eq!(running["status"], "in_progress");
         assert_eq!(running["progress"], 0.5);
-        let completed = provider_video_status(
+        let completed = provider_gen_status(
             "job_1",
             rsclaw_types::PollOutcome::Done("https://example.test/video.mp4".to_owned()),
         );
         assert_eq!(completed["status"], "completed");
         assert_eq!(completed["result_url"], "https://example.test/video.mp4");
-        let failed = provider_video_status(
+        let failed = provider_gen_status(
             "job_1",
             rsclaw_types::PollOutcome::Failed("backend_failure".to_owned()),
         );

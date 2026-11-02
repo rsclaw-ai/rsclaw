@@ -415,6 +415,13 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
       .catch(() => { setUserStopped(false); });
   }, []);
 
+  // The poller below is mounted once (`[]` deps); read `starting` /
+  // `doStart` through refs so it doesn't act on the first render's values.
+  const startingRef = React.useRef(starting);
+  startingRef.current = starting;
+  const doStartRef = React.useRef(doStart);
+  doStartRef.current = doStart;
+
   React.useEffect(() => {
     const check = () => {
       // Suppress this poll entirely while a panel-initiated restart is in
@@ -430,7 +437,7 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
           failCount.current = 0;
         })
         .catch(() => {
-          if (starting) return; // don't overwrite "starting" state
+          if (startingRef.current) return; // don't overwrite "starting" state
           if (globalRestartingRef.current) return; // late-resolving from before the signal flipped
 
           const tauriInvoke = isTauri ? tauriInvokeV2 : null;
@@ -451,7 +458,7 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
           // "starting" if we're about to auto-start).
           if (tauriInvoke && !autoStarted.current) {
             autoStarted.current = true;
-            doStart();
+            doStartRef.current();
             // doStart() already sets status="starting"; nothing else to do.
             return;
           }

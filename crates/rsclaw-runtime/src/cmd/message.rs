@@ -4,11 +4,13 @@ use rsclaw_config as config;
 
 /// Resolve gateway URL and auth token from config.
 fn gateway_client() -> Result<(reqwest::Client, String, String)> {
-    let cfg = config::load().context("failed to load config -- run `rsclaw setup` first")?;
+    let cfg = config::load().with_context(|| {
+        rsclaw_brand::rebrand("failed to load config -- run `rsclaw setup` first").into_owned()
+    })?;
     let port = cfg.gateway.port;
     let token = cfg.gateway.auth_token.unwrap_or_default();
     let base = format!("http://127.0.0.1:{port}");
-    Ok((reqwest::Client::new(), base, token))
+    Ok((crate::cmd::gateway_http::local_client(), base, token))
 }
 
 /// POST helper — sends JSON body and prints the response.

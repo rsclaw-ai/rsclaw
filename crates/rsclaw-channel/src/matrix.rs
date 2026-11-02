@@ -285,7 +285,19 @@ impl Channel for MatrixChannel {
 
     fn run(self: Arc<Self>) -> BoxFuture<'static, Result<()>> {
         Box::pin(async move {
-            let client = self.get_client().await?;
+            // Login / client construction can fail transiently (homeserver
+            // down); retry instead of leaving the channel dead forever.
+            let mut backoff = Duration::from_secs(5);
+            let client = loop {
+                match self.get_client().await {
+                    Ok(c) => break c,
+                    Err(e) => {
+                        warn!("Matrix: client init failed: {e:#}, retrying in {backoff:?}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(300));
+                    }
+                }
+            };
             info!("Matrix: SDK sync loop starting (E2EE enabled)");
 
             // Log joined rooms
@@ -296,6 +308,20 @@ impl Channel for MatrixChannel {
             }
 
             let sync_settings = SyncSettings::default().timeout(Duration::from_secs(30));
+
+            // Initial sync BEFORE registering handlers so room history
+            // delivered by the first sync is never answered.
+            let mut backoff = Duration::from_secs(5);
+            let mut sync_token = loop {
+                match client.sync_once(sync_settings.clone()).await {
+                    Ok(resp) => break resp.next_batch,
+                    Err(e) => {
+                        warn!("Matrix: initial sync failed: {e}, retrying in {backoff:?}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(300));
+                    }
+                }
+            };
 
             // Register message handler
             let on_msg = Arc::clone(&self.on_message);
@@ -321,7 +347,7 @@ impl Channel for MatrixChannel {
                     match event.content.msgtype {
                         MessageType::Text(text) => {
                             info!(from = %sender, room = %room_id, is_group, len = text.body.len(), "Matrix: text message (SDK)");
-                            on_msg(sender, text.body, room_id, is_group, vec![], vec![]);
+                            on_msg(sender, crate::strip_inbound_sentinels(&text.body), room_id, is_group, vec![], vec![]);
                         }
                         MessageType::Image(image) => {
                             info!(from = %sender, room = %room_id, "Matrix: image message (SDK)");
@@ -389,13 +415,13 @@ impl Channel for MatrixChannel {
                                         }
                                         Err(e) => {
                                             warn!("Matrix: voice transcription failed (SDK): {e}");
-                                            on_msg(sender, "[voice message - transcription failed]".to_owned(), room_id, is_group, vec![], vec![]);
+                                            on_msg(sender, rsclaw_i18n::t("matrix_voice_transcription_failed", rsclaw_i18n::default_lang()), room_id, is_group, vec![], vec![]);
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     warn!("Matrix: audio download failed (SDK): {e}");
-                                    on_msg(sender, "[voice message received]".to_owned(), room_id, is_group, vec![], vec![]);
+                                    on_msg(sender, rsclaw_i18n::t("matrix_voice_received", rsclaw_i18n::default_lang()), room_id, is_group, vec![], vec![]);
                                 }
                             }
                         }
@@ -450,14 +476,14 @@ impl Channel for MatrixChannel {
                                         sender,
                                         String::new(),
                                         room_id,
-                                        true,
+                                        is_group,
                                         vec![],
                                         vec![file_attachment],
                                     );
                                 }
                                 Err(e) => {
                                     warn!("Matrix: file download failed (SDK): {e}");
-                                    on_msg(sender, format!("[File received: {filename} but download failed]"), room_id, is_group, vec![], vec![]);
+                                    on_msg(sender, rsclaw_i18n::t_fmt("matrix_file_download_failed", rsclaw_i18n::default_lang(), &[("filename", &filename)]), room_id, is_group, vec![], vec![]);
                                 }
                             }
                         }
@@ -473,7 +499,10 @@ impl Channel for MatrixChannel {
                 |event: matrix_sdk::ruma::events::room::member::StrippedRoomMemberEvent,
                  room: Room,
                  client: MatrixSdkClient| async move {
-                    if event.state_key != *client.user_id().expect("user_id") {
+                    let Some(own_id) = client.user_id() else {
+                        return;
+                    };
+                    if event.state_key != *own_id {
                         return;
                     }
                     if room.state() == RoomState::Invited {
@@ -495,22 +524,30 @@ impl Channel for MatrixChannel {
                 );
             });
 
-            // Run sync loop with callback for visibility
-            client
-                .sync_with_callback(sync_settings, |response| async move {
-                    let room_count = response.rooms.join.len();
-                    if room_count > 0 {
-                        debug!(
-                            rooms = room_count,
-                            "Matrix: SDK sync response with room events"
-                        );
+            // Sync loop: resume from the last token and retry with backoff
+            // on errors instead of ending the channel for good.
+            let mut backoff = Duration::from_secs(5);
+            loop {
+                let settings = sync_settings.clone().token(sync_token.clone());
+                match client.sync_once(settings).await {
+                    Ok(resp) => {
+                        let room_count = resp.rooms.join.len();
+                        if room_count > 0 {
+                            debug!(
+                                rooms = room_count,
+                                "Matrix: SDK sync response with room events"
+                            );
+                        }
+                        sync_token = resp.next_batch;
+                        backoff = Duration::from_secs(5);
                     }
-                    matrix_sdk::LoopCtrl::Continue
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("Matrix: sync failed: {e}"))?;
-
-            Ok(())
+                    Err(e) => {
+                        warn!("Matrix: sync failed: {e}, retrying in {backoff:?}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(300));
+                    }
+                }
+            }
         })
     }
 }
@@ -775,6 +812,13 @@ impl Channel for MatrixChannel {
         Box::pin(async move {
             info!("Matrix long-poll sync loop started");
             let mut since: Option<String> = None;
+            // Rooms flagged as DMs via `m.direct` account data, and the last
+            // known joined-member count per room (from sync summaries). Used
+            // to tell 1:1 rooms from group rooms so DM policy applies to DMs.
+            let mut dm_rooms: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut member_counts: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
 
             loop {
                 let mut url = format!("{}/_matrix/client/v3/sync?timeout=30000", self.homeserver);
@@ -809,6 +853,31 @@ impl Channel for MatrixChannel {
                                     since = Some(nb.to_owned());
                                 }
 
+                                // Track DM rooms (m.direct account data).
+                                for ev in body
+                                    .pointer("/account_data/events")
+                                    .and_then(|v| v.as_array())
+                                    .into_iter()
+                                    .flatten()
+                                {
+                                    if ev.get("type").and_then(|v| v.as_str()) != Some("m.direct") {
+                                        continue;
+                                    }
+                                    dm_rooms.clear();
+                                    for ids in ev
+                                        .get("content")
+                                        .and_then(|v| v.as_object())
+                                        .into_iter()
+                                        .flat_map(|m| m.values())
+                                    {
+                                        for id in ids.as_array().into_iter().flatten() {
+                                            if let Some(id) = id.as_str() {
+                                                dm_rooms.insert(id.to_owned());
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Process room events
                                 let room_count = body
                                     .pointer("/rooms/join")
@@ -823,6 +892,14 @@ impl Channel for MatrixChannel {
                                     body.pointer("/rooms/join").and_then(|v| v.as_object())
                                 {
                                     for (room_id, room_data) in rooms {
+                                        if let Some(n) = room_data
+                                            .pointer("/summary/m.joined_member_count")
+                                            .and_then(|v| v.as_u64())
+                                        {
+                                            member_counts.insert(room_id.clone(), n);
+                                        }
+                                        let room_is_group = !(dm_rooms.contains(room_id)
+                                            || member_counts.get(room_id).is_some_and(|n| *n <= 2));
                                         let events = room_data
                                             .pointer("/timeline/events")
                                             .and_then(|v| v.as_array());
@@ -845,6 +922,12 @@ impl Channel for MatrixChannel {
                                                 );
 
                                                 if event_type != "m.room.message" {
+                                                    continue;
+                                                }
+                                                if let Some(eid) =
+                                                    event.get("event_id").and_then(|v| v.as_str())
+                                                    && crate::is_duplicate_inbound("matrix", eid)
+                                                {
                                                     continue;
                                                 }
 
@@ -875,9 +958,9 @@ impl Channel for MatrixChannel {
                                                         info!(from = %sender, room = %room_id, text_len = text.len(), "Matrix: text message");
                                                         (self.on_message)(
                                                             sender.to_owned(),
-                                                            text.to_owned(),
+                                                            crate::strip_inbound_sentinels(text),
                                                             room_id.clone(),
-                                                            true,
+                                                            room_is_group,
                                                             vec![],
                                                             vec![],
                                                         );
@@ -959,7 +1042,7 @@ impl Channel for MatrixChannel {
                                                                         sender.to_owned(),
                                                                         rsclaw_i18n::t("describe_image", rsclaw_i18n::default_lang()),
                                                                         room_id.clone(),
-                                                                        true,
+                                                                        room_is_group,
                                                                         vec![rsclaw_types::ImageAttachment {
                                                                             data: data_url,
                                                                             mime_type: final_mime,
@@ -1032,7 +1115,7 @@ impl Channel for MatrixChannel {
                                                                                 sender.to_owned(),
                                                                                 text,
                                                                                 room_id.clone(),
-                                                                                true,
+                                                                                room_is_group,
                                                                                 vec![],
                                                                                 vec![],
                                                                             );

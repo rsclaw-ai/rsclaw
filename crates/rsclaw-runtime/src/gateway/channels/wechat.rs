@@ -169,6 +169,7 @@ pub(crate) fn start_wechat_personal_if_configured(
         .and_then(|c| c.base_url.as_deref())
         .map(str::to_owned);
 
+    let bare_acct = super::bare_account_name(wc_accounts.iter().map(|(n, _)| n));
     for (acct_name, token) in wc_accounts {
         let enforcer = Arc::clone(&enforcer);
         let wechat_base_url = wechat_base_url.clone();
@@ -198,15 +199,13 @@ pub(crate) fn start_wechat_personal_if_configured(
         //   still find a sender. Without this guard each account overwrote the bare
         //   key, leaving the last-registered account routing replies for messages
         //   received via every other account.
-        {
-            let mut senders = channel_senders
-                .write()
-                .expect("channel_senders lock poisoned");
-            senders.insert(format!("wechat/{}", acct_name), out_tx.clone());
-            senders
-                .entry("wechat".to_string())
-                .or_insert_with(|| out_tx.clone());
-        }
+        super::register_outbound_sender(
+            &channel_senders,
+            "wechat",
+            &acct_name,
+            bare_acct.as_deref(),
+            &out_tx,
+        );
 
         // Per-user inbound queue: serializes messages so each user's messages
         // are processed one at a time, preventing reply channel drops when
@@ -422,7 +421,9 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 &handle,
                                 "wechat",
                                 &from_user,
+                                Some(session_key.as_str()),
                                 crate::gateway::preparse::PreparseOrigin::User,
+                                rsclaw_agent::trust::channel_trust("wechat", &from_user, false),
                             )
                             .await
                             {
@@ -437,6 +438,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
+                                trust: rsclaw_agent::trust::channel_trust("wechat", &from_user, false),
                                 session_key,
                                 text,
                                 channel: "wechat".to_string(),
@@ -526,8 +528,10 @@ pub(crate) fn start_wechat_personal_if_configured(
             },
         );
 
+        let run_status = rsclaw_channel::status::StatusHandle::new("wechat", &acct_name);
         let wc = Arc::new({
-            let ch = rsclaw_channel::wechat::WeChatPersonalChannel::new(token, on_message);
+            let ch = rsclaw_channel::wechat::WeChatPersonalChannel::new(token, on_message)
+                .with_status(run_status.clone());
             if let Some(url) = wechat_base_url {
                 ch.with_base_url(url)
             } else {
@@ -607,7 +611,7 @@ pub(crate) fn start_wechat_personal_if_configured(
         let shutdown_for_poll = shutdown.clone();
         tokio::spawn(async move {
             tokio::select! {
-                res = wc.run() => {
+                res = rsclaw_channel::status::track(run_status, wc.run()) => {
                     if let Err(e) = res {
                         error!("wechat channel error: {e:#}");
                     }

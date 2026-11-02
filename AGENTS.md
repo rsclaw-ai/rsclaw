@@ -95,7 +95,7 @@ src/
 
 ui/
   app/        Next.js 15 chat UI + control panel (NextChat-derived)
-  src-tauri/  Tauri v1 desktop shell + Rust commands
+  src-tauri/  Tauri v2 desktop shell + Rust commands
 
 tests/        Integration tests (one file per module)
 scripts/      Build, orchestration pipelines, install scripts
@@ -103,7 +103,7 @@ docs/         interfaces/ · ui-specs/ · adr/ · reviews/ · ROADMAP.md
 .claude/      roles/  ← sub-agent role definitions
 ```
 
-**Stack:** Rust 2024 · MSRV 1.91 · Tokio · Axum · Tauri v1 · Next.js 15 · redb · tantivy · JSON5
+**Stack:** Rust 2024 · MSRV 1.91 · Tokio · Axum · Tauri v2 · Next.js 15 · redb · tantivy · JSON5
 
 ---
 
@@ -229,6 +229,15 @@ it work") require constant clarification.
 - Config fields: camelCase in JSON5, snake_case in Rust via #[serde(rename_all = "camelCase")].
 - Secrets: SecretOrString — plain string or { source: "env", id: "VAR_NAME" }.
 - Channel handler order: group policy → DM policy (pairing/allowlist) → per-user queue → agent dispatch.
+- Sender trust: every `AgentMessage` carries `trust: SenderTrust` (see crates/rsclaw-agent/src/trust.rs).
+  Owners = local entry points (ws/desktop/cli/cron/heartbeat/api) + DM senders listed literally in a
+  channel's static `allowFrom` + `gateway.owners` ("<channel>:<peer>"). Paired users, group members,
+  A2A peers and webhooks are `User`. `OWNER_ONLY_TOOLS` are refused at dispatch for non-owners unless
+  the agent's `nonOwnerTools` allows them; host slash commands (/sh /cat /ls /ss /watch /loop /cron /cap …)
+  are refused in preparse. New entry points MUST set trust explicitly — never default to Owner.
+- Untrusted URLs (LLM / plugin / peer / webhook supplied) go through `rsclaw_util::net::safe_send`
+  (SSRF guard, per-hop redirect validation, DNS pinning). Untrusted paths go through
+  `rsclaw_util::fs_guard::resolve_within` / `sanitize_filename` / `is_safe_slug`.
 - Windows command spawns MUST use `creation_flags(0x08000000)` (CREATE_NO_WINDOW) to
   prevent console windows from flashing. For `std::process::Command`, wrap with a
   `hide_window()` helper or add a `#[cfg(windows)]` block. Exceptions: `cmd /C start`,
@@ -242,10 +251,10 @@ it work") require constant clarification.
 ### Frontend (ui/)
 
 ```
-- Tauri invoke: window.__TAURI__?.invoke (v1 API, NOT core?.invoke).
+- Tauri invoke: use `invoke` from ui/app/utils/tauri.ts (Tauri v2; `window.__TAURI__.invoke` is undefined in v2).
 - Hooks: all declared before any early return.
 - Data fetching: never fetch() inside components — use hooks or store.
-- WebSocket: all WS logic through ui/src/hooks/useRsClawSocket.ts.
+- WebSocket: all WS logic through ui/app/lib/rsclaw-ws.ts.
 - Config (desktop): Tauri commands read_config_file / write_config, not gateway API.
 - Auth token priority: gateway.auth.token config > RSCLAW_AUTH_TOKEN env > localStorage.
 - Components: Container (data) + Presenter (render) separation for complex views.

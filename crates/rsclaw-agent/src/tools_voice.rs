@@ -12,7 +12,11 @@ use serde_json::{Value, json};
 impl super::runtime::AgentRuntime {
     /// Voice generation — text → speech, with optional one-shot voice clone
     /// (`reference_audio`). `text` required.
-    pub(crate) async fn tool_voice(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_voice(
+        &self,
+        ctx: &super::runtime::RunContext,
+        args: Value,
+    ) -> Result<Value> {
         let input = args["text"]
             .as_str()
             .or_else(|| args["input"].as_str())
@@ -40,7 +44,9 @@ impl super::runtime::AgentRuntime {
         }
         // One-shot voice clone: reference_audio (URL / data-URI / local path →
         // base64). reference_text optionally improves fidelity.
-        let refs = super::tools_video::normalize_gen_assets(&args["reference_audio"]).await;
+        let scope = self.read_scope(ctx);
+        let refs =
+            super::tools_video::normalize_gen_assets(&args["reference_audio"], &scope).await;
         if let Some(r) = refs.first() {
             body["reference_audio"] = json!({ "audio_url": r });
             if let Some(rt) = args["reference_text"].as_str().filter(|s| !s.is_empty()) {

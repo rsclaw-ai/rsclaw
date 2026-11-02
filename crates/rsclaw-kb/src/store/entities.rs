@@ -22,9 +22,35 @@ use crate::{
     },
 };
 
+/// Insert an entity, merging into an existing row with the same
+/// `canonical_id`: surface forms are unioned (first-seen order kept) and the
+/// earliest `created_at` wins, so re-extracting a mention from a new chunk
+/// never erases aliases learned from earlier ones.
 pub fn put_entity(wtx: &WriteTransaction, e: &KbEntity) -> Result<()> {
-    let bytes = encode(e)?;
     let mut tbl = wtx.open_table(KB_ENTITIES)?;
+    let existing: Option<KbEntity> = match tbl.get(e.canonical_id.as_str())? {
+        Some(v) => match decode(v.value()) {
+            Ok(x) => Some(x),
+            Err(err) => {
+                tracing::warn!(entity = %e.canonical_id, "kb: overwriting undecodable entity: {err:#}");
+                None
+            }
+        },
+        None => None,
+    };
+    let merged = match existing {
+        Some(mut prev) => {
+            for s in &e.surface_forms {
+                if !prev.surface_forms.iter().any(|p| p == s) {
+                    prev.surface_forms.push(s.clone());
+                }
+            }
+            prev.created_at = prev.created_at.min(e.created_at);
+            prev
+        }
+        None => e.clone(),
+    };
+    let bytes = encode(&merged)?;
     tbl.insert(e.canonical_id.as_str(), bytes.as_slice())?;
     Ok(())
 }

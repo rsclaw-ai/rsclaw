@@ -63,7 +63,7 @@ pub fn cmd_tray() -> Result<()> {
 
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("RsClaw Gateway")
+        .with_tooltip(format!("{} Gateway", rsclaw_brand::PRODUCT_NAME))
         .with_icon(icon)
         .build()?;
 
@@ -229,7 +229,7 @@ fn open_terminal_with(args: &[&str]) {
 #[cfg(feature = "tray")]
 fn open_config() {
     let base = rsclaw_config::loader::base_dir();
-    let config_path = base.join("rsclaw.json5");
+    let config_path = base.join(rsclaw_brand::CONFIG_FILE);
 
     if !config_path.exists() {
         return;

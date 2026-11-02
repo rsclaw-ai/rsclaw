@@ -1,3 +1,51 @@
+// CLI output follows the build's brand. The `println!`/`eprintln!`/`print!`/
+// `eprint!` below shadow the std macros for every `cmd` submodule (declared
+// after them): when a line's format string contains default-brand words
+// ("run `rsclaw doctor --fix`", `~/.rsclaw`, `rsclaw.json5`, `RsClaw`), the
+// formatted line goes through `rsclaw_brand::rebrand`. Lines whose template
+// carries no brand words (JSON dumps, `"{text}"` passthrough of replies, page
+// text and file contents) print untouched. With the default brand both paths
+// print the same bytes as the std macros.
+macro_rules! println {
+    () => { ::std::println!() };
+    ($fmt:tt $($rest:tt)*) => {{
+        let line = ::std::format!($fmt $($rest)*);
+        ::std::println!("{}", ::rsclaw_brand::brand_line($fmt, &line))
+    }};
+}
+macro_rules! eprintln {
+    () => { ::std::eprintln!() };
+    ($fmt:tt $($rest:tt)*) => {{
+        let line = ::std::format!($fmt $($rest)*);
+        ::std::eprintln!("{}", ::rsclaw_brand::brand_line($fmt, &line))
+    }};
+}
+#[allow(unused_macros)]
+macro_rules! print {
+    ($fmt:tt $($rest:tt)*) => {{
+        let line = ::std::format!($fmt $($rest)*);
+        ::std::print!("{}", ::rsclaw_brand::brand_line($fmt, &line))
+    }};
+}
+#[allow(unused_macros)]
+macro_rules! eprint {
+    ($fmt:tt $($rest:tt)*) => {{
+        let line = ::std::format!($fmt $($rest)*);
+        ::std::eprint!("{}", ::rsclaw_brand::brand_line($fmt, &line))
+    }};
+}
+
+/// `anyhow::bail!` whose message follows the brand like printed output.
+#[allow(unused_macros)]
+macro_rules! brand_bail {
+    ($($arg:tt)+) => {
+        return ::std::result::Result::Err(::anyhow::anyhow!(
+            "{}",
+            ::rsclaw_brand::rebrand(&::std::format!($($arg)+))
+        ))
+    };
+}
+
 pub mod agent_turn;
 pub mod agents;
 pub mod anycli;

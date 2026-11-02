@@ -43,6 +43,20 @@ pub struct WhatsAppChange {
 #[derive(Debug, Deserialize)]
 pub struct WhatsAppValue {
     pub messages: Option<Vec<WhatsAppMessage>>,
+    /// Sender profiles delivered alongside `messages` (`contacts[].profile.name`).
+    #[serde(default)]
+    pub contacts: Option<Vec<WhatsAppContact>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WhatsAppContact {
+    pub wa_id: Option<String>,
+    pub profile: Option<WhatsAppProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WhatsAppProfile {
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +92,10 @@ pub struct WhatsAppMediaRef {
 pub struct WhatsAppChannel {
     phone_number_id: String,
     access_token: String,
+    /// Meta app secret used to verify `X-Hub-Signature-256` on webhooks.
+    app_secret: Option<String>,
+    /// Token Meta echoes in `hub.verify_token` on webhook GET verification.
+    verify_token: Option<String>,
     api_base: String,
     client: Client,
     #[allow(clippy::type_complexity)]
@@ -103,6 +121,8 @@ impl WhatsAppChannel {
         Self {
             phone_number_id: phone_number_id.into(),
             access_token: access_token.into(),
+            app_secret: None,
+            verify_token: None,
             api_base: api_base.unwrap_or_else(|| WHATSAPP_API_BASE.to_owned()),
             client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
@@ -112,6 +132,46 @@ impl WhatsAppChannel {
         }
     }
 
+    /// Set the Meta app secret used to verify inbound webhook signatures.
+    pub fn with_app_secret(mut self, secret: Option<String>) -> Self {
+        self.app_secret = secret.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// Set the webhook verify token expected in `hub.verify_token`.
+    pub fn with_verify_token(mut self, token: Option<String>) -> Self {
+        self.verify_token = token.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// Configured webhook verify token, if any.
+    pub fn verify_token(&self) -> Option<&str> {
+        self.verify_token.as_deref()
+    }
+
+    /// Whether an app secret is configured (webhook verification possible).
+    pub fn has_app_secret(&self) -> bool {
+        self.app_secret.is_some()
+    }
+
+    /// Verify the `X-Hub-Signature-256` header (`sha256=<hex HMAC-SHA256 of
+    /// the raw body keyed with the app secret>`). Returns `false` when no
+    /// secret is configured or the header is missing / wrong.
+    pub fn verify_signature(&self, signature: Option<&str>, body: &[u8]) -> bool {
+        let (Some(secret), Some(sig)) = (self.app_secret.as_deref(), signature) else {
+            return false;
+        };
+        let Some(hex_sig) = sig.trim().strip_prefix("sha256=") else {
+            return false;
+        };
+        let Ok(provided) = hex::decode(hex_sig) else {
+            return false;
+        };
+        let expected = crate::hmac_sha256(secret.as_bytes(), body);
+        crate::constant_time_eq(&expected, &provided)
+    }
+
+    /// Send a plain text message to `to`.
     pub async fn send_text(&self, to: &str, text: &str) -> Result<()> {
         let body = json!({
             "messaging_product": "whatsapp",
@@ -144,15 +204,28 @@ impl WhatsAppChannel {
     pub async fn handle_webhook(&self, payload: &WebhookPayload) {
         for entry in &payload.entry {
             for change in &entry.changes {
+                for contact in change.value.contacts.iter().flatten() {
+                    if let (Some(wa_id), Some(name)) = (
+                        contact.wa_id.as_deref(),
+                        contact.profile.as_ref().and_then(|p| p.name.as_deref()),
+                    ) {
+                        crate::peer_names::record_peer_name("whatsapp", wa_id, name);
+                    }
+                }
                 if let Some(messages) = &change.value.messages {
                     for msg in messages {
+                        // Meta retries webhooks; drop redeliveries by message id.
+                        if crate::is_duplicate_inbound("whatsapp", &msg.id) {
+                            debug!(id = %msg.id, "WhatsApp: duplicate message dropped");
+                            continue;
+                        }
                         let mut text = String::new();
                         let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
 
                         match msg.kind.as_str() {
                             "text" => {
                                 if let Some(t) = &msg.text {
-                                    text = t.body.clone();
+                                    text = crate::strip_inbound_sentinels(&t.body);
                                 }
                             }
                             "image" => {
@@ -341,7 +414,7 @@ impl WhatsAppChannel {
             bail!("WhatsApp media download failed: {}", resp.status());
         }
 
-        Ok(resp.bytes().await?.to_vec())
+        crate::read_media_body(resp).await
     }
 }
 
@@ -566,6 +639,7 @@ mod tests {
             entry: vec![WhatsAppEntry {
                 changes: vec![WhatsAppChange {
                     value: WhatsAppValue {
+                        contacts: None,
                         messages: Some(vec![WhatsAppMessage {
                             from: "447911123456".to_owned(),
                             id: "wamid.xxx".to_owned(),
@@ -593,5 +667,18 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].0, "447911123456");
         assert_eq!(msgs[0].1, "hello");
+    }
+
+    #[test]
+    fn verify_signature_hub_sha256() {
+        init_crypto();
+        let ch = WhatsAppChannel::new("123", "token", Arc::new(|_, _, _| {}))
+            .with_app_secret(Some("appsecret".to_owned()));
+        let body = br#"{"entry":[]}"#;
+        let sig = format!("sha256={}", hex::encode(crate::hmac_sha256(b"appsecret", body)));
+        assert!(ch.verify_signature(Some(&sig), body));
+        assert!(!ch.verify_signature(Some(&sig), b"other"));
+        assert!(!ch.verify_signature(Some("sha256=00"), body));
+        assert!(!ch.verify_signature(None, body));
     }
 }

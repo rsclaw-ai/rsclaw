@@ -54,7 +54,9 @@ impl Canonicalizer for PdfCanonicalizer {
 }
 
 fn extract_pages(bytes: &[u8]) -> Result<Vec<String>> {
-    let text = pdf_extract::extract_text_from_mem(bytes)
+    // pdf-extract panics on some font encodings (e.g. GBK-EUC-H).
+    let text = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes))
+        .map_err(|_| anyhow::anyhow!("pdf-extract panicked (unsupported font encoding)"))?
         .map_err(|e| anyhow::anyhow!("pdf-extract: {e:?}"))?;
     // PDF page separator is form-feed (U+000C)
     Ok(text.split('\u{0C}').map(|s| s.to_string()).collect())

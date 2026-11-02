@@ -9,59 +9,64 @@ use rsclaw_cli::ToolsCommand;
 // the tools install/manifest layer is reproduced.
 // ---------------------------------------------------------------------------
 
+// Printed lines follow the build's brand (see `rsclaw_brand::brand_line`);
+// these shadow the std print macros for the rest of this crate.
+macro_rules! println {
+    () => { ::std::println!() };
+    ($fmt:tt $($rest:tt)*) => {{
+        let line = ::std::format!($fmt $($rest)*);
+        ::std::println!("{}", ::rsclaw_brand::brand_line($fmt, &line))
+    }};
+}
+#[allow(unused_macros)]
+macro_rules! eprintln {
+    () => { ::std::eprintln!() };
+    ($fmt:tt $($rest:tt)*) => {{
+        let line = ::std::format!($fmt $($rest)*);
+        ::std::eprintln!("{}", ::rsclaw_brand::brand_line($fmt, &line))
+    }};
+}
+
 fn use_color() -> bool {
     std::env::var("NO_COLOR").is_err()
 }
 
-fn green(s: &str) -> String {
+/// Wrap `s` in an ANSI style; styled text is CLI prose and follows the brand.
+fn paint(code: &str, s: &str) -> String {
+    let s = rsclaw_brand::rebrand(s);
     if use_color() {
-        format!("\x1b[32m{s}\x1b[0m")
+        format!("\x1b[{code}m{s}\x1b[0m")
     } else {
-        s.to_owned()
+        s.into_owned()
     }
+}
+
+fn green(s: &str) -> String {
+    paint("32", s)
 }
 
 fn yellow(s: &str) -> String {
-    if use_color() {
-        format!("\x1b[33m{s}\x1b[0m")
-    } else {
-        s.to_owned()
-    }
+    paint("33", s)
 }
 
 fn red(s: &str) -> String {
-    if use_color() {
-        format!("\x1b[31m{s}\x1b[0m")
-    } else {
-        s.to_owned()
-    }
+    paint("31", s)
 }
 
 fn bold(s: &str) -> String {
-    if use_color() {
-        format!("\x1b[1m{s}\x1b[0m")
-    } else {
-        s.to_owned()
-    }
+    paint("1", s)
 }
 
 fn dim(s: &str) -> String {
-    if use_color() {
-        format!("\x1b[2m{s}\x1b[0m")
-    } else {
-        s.to_owned()
-    }
+    paint("2", s)
 }
 
 fn cyan(s: &str) -> String {
-    if use_color() {
-        format!("\x1b[36m{s}\x1b[0m")
-    } else {
-        s.to_owned()
-    }
+    paint("36", s)
 }
 
 fn banner(title: &str) {
+    let title = &*rsclaw_brand::rebrand(title);
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
     let c = use_color();
@@ -70,6 +75,21 @@ fn banner(title: &str) {
     let d = if c { "\x1b[2m" } else { "" }; // dim
     let n = if c { "\x1b[0m" } else { "" }; // reset
 
+    if !rsclaw_brand::is_default_text() {
+        // Other brands get a plain title instead of the RSCLAW word mark.
+        println!();
+        println!(
+            "    {b}{}{n}  {d}-- {title} --{n}",
+            rsclaw_brand::PRODUCT_NAME
+        );
+        println!();
+        println!("    {d}>{n} engine:   {title}");
+        println!("    {d}>{n} platform: {arch} on {os}");
+        println!();
+        println!("    {d}{}{n}", "-".repeat(56));
+        println!();
+        return;
+    }
     println!(
         r#"
     {r}.       .{n}
@@ -92,14 +112,17 @@ fn banner(title: &str) {
 }
 
 fn ok(msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!("  {} {msg}", green("[ok]"));
 }
 
 fn warn_msg(msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!("  {} {msg}", yellow("[warn]"));
 }
 
 fn err_msg(msg: &str) {
+    let msg = rsclaw_brand::rebrand(msg);
     println!("  {} {msg}", red("[error]"));
 }
 
@@ -109,11 +132,11 @@ fn err_msg(msg: &str) {
 
 /// Tools manifest — schema-2 JSON: `{schema, updated_at, tools:{name:{version,
 /// platforms:{platform:{url,sha256}}}}}`. All download metadata is explicit.
-const MANIFEST_URL: &str = "https://hub.rsclaw.ai/tools/manifest.json";
+const MANIFEST_URL: &str = rsclaw_brand::TOOLS_MANIFEST_URL;
 
 /// Signed hub meta — its `sha256.tools` (covered by the ed25519 signature) pins
 /// the tools manifest. The install path verifies the manifest against it.
-const META_URL: &str = "https://hub.rsclaw.ai/meta.json";
+const META_URL: &str = rsclaw_brand::HUB_META_URL;
 
 // ---------------------------------------------------------------------------
 // Tool definitions
@@ -132,8 +155,16 @@ struct ToolDef {
 const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "chrome",
-        display: "Chrome for Testing (browser automation)",
-        detect_cmd: &["google-chrome", "chromium", "chromium-browser", "chrome"],
+        display: "Chromium browser automation (Chrome/Edge/Brave)",
+        detect_cmd: &[
+            "google-chrome",
+            "chromium",
+            "chromium-browser",
+            "chrome",
+            "brave-browser",
+            "microsoft-edge",
+            "microsoft-edge-stable",
+        ],
         local_bin: "chrome",
         optional: false,
     },
@@ -600,6 +631,50 @@ fn is_tool_installed_locally(def: &ToolDef) -> bool {
     local_tool_binary_exists(&tools_dir(), def)
 }
 
+fn is_browser_in_standard_location() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let mut candidates = vec![
+            PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+            PathBuf::from(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            PathBuf::from(
+                r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+            ),
+        ];
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            candidates.extend([
+                PathBuf::from(&local).join(r"Google\Chrome\Application\chrome.exe"),
+                PathBuf::from(&local).join(r"Microsoft\Edge\Application\msedge.exe"),
+                PathBuf::from(local).join(r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+            ]);
+        }
+        return candidates.iter().any(|path| path.is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots = vec![PathBuf::from("/Applications")];
+        if let Some(home) = dirs_next::home_dir() {
+            roots.push(home.join("Applications"));
+        }
+        let applications = [
+            "Google Chrome.app/Contents/MacOS/Google Chrome",
+            "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "Brave Browser.app/Contents/MacOS/Brave Browser",
+            "Chromium.app/Contents/MacOS/Chromium",
+        ];
+        return roots
+            .iter()
+            .any(|root| applications.iter().any(|app| root.join(app).is_file()));
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    false
+}
+
 fn local_tool_binary_exists(tools_dir: &std::path::Path, def: &ToolDef) -> bool {
     local_tool_binary_probes(tools_dir, def)
         .iter()
@@ -650,14 +725,26 @@ fn local_tool_binary_probes(tools_dir: &std::path::Path, def: &ToolDef) -> Vec<P
     probes
 }
 
-fn tool_status(def: &ToolDef) -> &'static str {
-    if is_tool_installed_locally(def) {
+fn classify_tool_status(
+    installed_locally: bool,
+    found_in_path: bool,
+    browser_detected: bool,
+) -> &'static str {
+    if installed_locally {
         "installed"
-    } else if is_tool_in_path(def) {
+    } else if found_in_path || browser_detected {
         "system"
     } else {
         "missing"
     }
+}
+
+fn tool_status(def: &ToolDef) -> &'static str {
+    classify_tool_status(
+        is_tool_installed_locally(def),
+        is_tool_in_path(def),
+        def.name == "chrome" && is_browser_in_standard_location(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -758,7 +845,7 @@ fn cmd_status() {
         let status = tool_status(def);
         let (icon, label) = match (status, def.optional) {
             ("system", _) => (green("✓"), green("system PATH")),
-            ("installed", _) => (green("✓"), cyan("~/.rsclaw/tools")),
+            ("installed", _) => (green("✓"), cyan(&format!("~/{}/tools", rsclaw_brand::HOME_DIR))),
             ("missing", true) => (dim("·"), dim("not installed (optional)")),
             _ => (red("✗"), red("not found")),
         };
@@ -965,8 +1052,9 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
                 Ok(s) => bail!("{}: npm install exited with {s}", def.name),
                 Err(e) => {
                     bail!(
-                        "{}: npm not found ({e}). Install node first: rsclaw tools install node",
-                        def.name
+                        "{}: npm not found ({e}). Install node first: {} tools install node",
+                        def.name,
+                        rsclaw_brand::CLI_NAME
                     );
                 }
             }
@@ -991,7 +1079,9 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
         // when present (signed via the hub meta). Absent → unverified (legacy).
         let expected_sha = tool_platform(&manifest, def.name, platform)
             .and_then(|p| p.get("sha256"))
-            .and_then(|v| v.as_str());
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         match download_and_extract(&client, &url, &dest_dir, expected_sha).await {
             Ok(()) => {
@@ -1074,21 +1164,39 @@ fn resolve_download_url(
 // Download and extract archive
 // ---------------------------------------------------------------------------
 
-/// sha256 hex of a file (content-pin verification of downloads).
+/// sha256 hex of a file (content-pin verification of downloads). Streams the
+/// file so multi-hundred-MB model archives are not loaded into memory.
 fn sha256_file_hex(path: &std::path::Path) -> Result<String> {
     use sha2::{Digest, Sha256};
-    let data = std::fs::read(path)?;
-    Ok(format!("{:x}", Sha256::digest(&data)))
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Download an archive and extract to dest. Public so `cmd/models.rs` can
-/// reuse.
+/// reuse. No content pin: only the archive format is checked; prefer
+/// [`download_and_extract_verified`] when a sha256 is known.
 pub async fn download_and_extract_public(
     client: &reqwest::Client,
     url: &str,
     dest: &std::path::Path,
 ) -> Result<()> {
     download_and_extract(client, url, dest, None).await
+}
+
+/// Download an archive, verify it against `expected_sha256` (lowercase or
+/// uppercase hex) BEFORE extracting, and extract to dest. `None` or an empty
+/// string falls back to the unpinned behavior of
+/// [`download_and_extract_public`].
+pub async fn download_and_extract_verified(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> Result<()> {
+    let expected = expected_sha256.map(str::trim).filter(|s| !s.is_empty());
+    download_and_extract(client, url, dest, expected).await
 }
 
 async fn download_and_extract(
@@ -1110,6 +1218,13 @@ async fn download_and_extract(
         if !got.eq_ignore_ascii_case(exp) {
             bail!("sha256 mismatch for {filename}: expected {exp}, got {got} — refusing");
         }
+    } else {
+        // No content pin available (e.g. model archives: the model catalog
+        // carries no hashes yet). At minimum make sure we got a non-empty file
+        // whose magic bytes match the archive type the URL promises, so an
+        // HTML error page / captive-portal response is never extracted.
+        tracing::warn!(url, "download has no sha256 pin; verifying archive format only");
+        verify_archive_magic(&tmp_path, url)?;
     }
 
     if url.ends_with(".zip") {
@@ -1406,35 +1521,135 @@ fn extract_tar_bz2(archive_path: &std::path::Path, dest: &std::path::Path) -> Re
     extract_tar(bz2_reader, dest)
 }
 
+/// Check that the downloaded file is non-empty and starts with the magic bytes
+/// of the archive format implied by `url`. Unknown formats only need to be
+/// non-empty.
+fn verify_archive_magic(path: &std::path::Path, url: &str) -> Result<()> {
+    use std::io::Read;
+    let mut head = [0u8; 6];
+    let mut f = std::fs::File::open(path)?;
+    let n = f.read(&mut head)?;
+    if n == 0 {
+        bail!("downloaded file from {url} is empty — refusing");
+    }
+    let head = &head[..n];
+    let expected: Option<(&str, &[u8])> = if url.ends_with(".zip") {
+        Some(("zip", b"PK\x03\x04"))
+    } else if url.ends_with(".tar.xz") {
+        Some(("xz", b"\xFD7zXZ\x00"))
+    } else if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+        Some(("gzip", b"\x1F\x8B"))
+    } else if url.ends_with(".tar.bz2") {
+        Some(("bzip2", b"BZh"))
+    } else {
+        None
+    };
+    if let Some((kind, magic)) = expected
+        && !head.starts_with(magic)
+    {
+        bail!("downloaded file from {url} is not a {kind} archive (bad magic bytes) — refusing");
+    }
+    Ok(())
+}
+
+/// Validate a relative archive path: every component must be a plain name.
+fn is_plain_relative(p: &std::path::Path) -> bool {
+    !p.as_os_str().is_empty()
+        && p.components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// True when a symlink stored at `rel_path` (relative to the extraction root)
+/// pointing at `target` stays inside the extraction root.
+fn symlink_target_stays_inside(rel_path: &std::path::Path, target: &std::path::Path) -> bool {
+    use std::path::Component;
+    if target.is_absolute() {
+        return false;
+    }
+    // Depth of the directory that contains the link.
+    let mut depth: i64 = rel_path.components().count() as i64 - 1;
+    for c in target.components() {
+        match c {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
 fn extract_tar<R: std::io::Read>(reader: R, dest: &std::path::Path) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
+    std::fs::create_dir_all(dest)?;
+    let dest_canon = std::fs::canonicalize(dest)?;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = entry.path()?.to_owned();
+        let path = entry.path()?.to_path_buf();
+        let entry_type = entry.header().entry_type();
+
+        // Only regular files, directories and (in-tree) symlinks are
+        // extracted; pax/GNU metadata, devices, FIFOs and hardlinks are not.
+        if !(entry_type.is_file() || entry_type.is_dir() || entry_type.is_symlink()) {
+            if entry_type.is_hard_link() {
+                tracing::warn!(path = %path.display(), "tar: skipping hardlink entry");
+            }
+            continue;
+        }
 
         // Strip top-level directory
         let components: Vec<_> = path.components().collect();
         let rel_path = if components.len() > 1 {
             components[1..].iter().collect::<PathBuf>()
         } else {
-            path.to_path_buf()
+            path.clone()
         };
 
         if rel_path.as_os_str().is_empty() {
             continue;
         }
+        // Tar-slip guard: no `..`, root or prefix components.
+        if !is_plain_relative(&rel_path) {
+            bail!("refusing tar entry with unsafe path: {}", path.display());
+        }
 
         let out_path = dest.join(&rel_path);
 
-        if entry.header().entry_type().is_dir() {
+        if entry_type.is_dir() {
             std::fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            entry.unpack(&out_path)?;
+            continue;
         }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+            // Never write through a symlink that points outside `dest`.
+            let parent_canon = std::fs::canonicalize(parent)?;
+            if !parent_canon.starts_with(&dest_canon) {
+                bail!("refusing tar entry that escapes destination: {}", path.display());
+            }
+        }
+        if entry_type.is_symlink() {
+            // Toolchains (e.g. node's `bin/npm -> ../lib/...`) ship relative
+            // symlinks; keep those, but reject any that leave `dest`.
+            let target = entry
+                .link_name()?
+                .map(|t| t.to_path_buf())
+                .unwrap_or_default();
+            if !symlink_target_stays_inside(&rel_path, &target) {
+                tracing::warn!(
+                    path = %path.display(),
+                    target = %target.display(),
+                    "tar: skipping symlink that points outside the destination"
+                );
+                continue;
+            }
+        }
+        entry.unpack(&out_path)?;
     }
     Ok(())
 }
@@ -1451,6 +1666,17 @@ mod tests {
         let m = json!({"bun": {"version": "1.3.14"}});
         write_manifest_cache(tmp.path(), &m).unwrap();
         assert_eq!(load_manifest_cache(tmp.path()), Some(m));
+    }
+
+    #[test]
+    fn sha256_file_hex_streams_known_vector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            sha256_file_hex(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
@@ -1477,5 +1703,53 @@ mod tests {
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
         std::fs::write(&bin, b"").unwrap();
         assert!(local_tool_binary_exists(tmp.path(), bun));
+    }
+
+    #[test]
+    fn tar_extract_rejects_escaping_symlinks() {
+        assert!(symlink_target_stays_inside(
+            std::path::Path::new("bin/npm"),
+            std::path::Path::new("../lib/npm-cli.js")
+        ));
+        assert!(!symlink_target_stays_inside(
+            std::path::Path::new("bin/npm"),
+            std::path::Path::new("../../etc/passwd")
+        ));
+        assert!(!symlink_target_stays_inside(
+            std::path::Path::new("x"),
+            std::path::Path::new("/etc/passwd")
+        ));
+        assert!(!is_plain_relative(std::path::Path::new("a/../../b")));
+
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(2);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            b.append_data(&mut h, "top/lib/a.txt", &b"ok"[..]).unwrap();
+            let mut l = tar::Header::new_gnu();
+            l.set_size(0);
+            l.set_entry_type(tar::EntryType::Symlink);
+            b.append_link(&mut l, "top/bin/good", "../lib/a.txt").unwrap();
+            let mut e = tar::Header::new_gnu();
+            e.set_size(0);
+            e.set_entry_type(tar::EntryType::Symlink);
+            b.append_link(&mut e, "top/evil", "/etc").unwrap();
+            b.finish().unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tar(&buf[..], tmp.path()).unwrap();
+        assert!(tmp.path().join("lib/a.txt").exists());
+        assert!(tmp.path().join("bin/good").symlink_metadata().is_ok());
+        assert!(tmp.path().join("evil").symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn browser_detector_marks_system_browser_available() {
+        assert_eq!(classify_tool_status(false, false, true), "system");
+        assert_eq!(classify_tool_status(false, false, false), "missing");
+        assert_eq!(classify_tool_status(true, false, true), "installed");
     }
 }

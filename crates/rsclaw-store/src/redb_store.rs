@@ -329,6 +329,79 @@ fn seq_from_message_key(key: &str, session_key: &str) -> Option<u64> {
     None
 }
 
+/// Keys of `session_key`'s active (non-archive) messages, scanning both the
+/// `\0` and legacy `:` prefixes. The legacy `"{sk}:"` prefix also matches
+/// OTHER sessions' keys (`agent:a:c:group:G` is a prefix of
+/// `agent:a:c:group:G:topic:T\0...`), so a key only counts when its whole
+/// remainder parses as the seq — otherwise `/new` or delete on a group
+/// session would wipe its topic sub-sessions and loads would mix them in.
+fn own_active_message_keys<T>(table: &T, session_key: &str) -> Result<Vec<String>>
+where
+    T: ReadableTable<&'static str, &'static str>,
+{
+    let mut out = Vec::new();
+    for sep in [KEY_SEP, LEGACY_KEY_SEP] {
+        let prefix = format!("{session_key}{sep}");
+        for entry in table.range(prefix.as_str()..)? {
+            let (k, _) = entry?;
+            let key = k.value();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if seq_from_message_key(key, session_key).is_some() {
+                out.push(key.to_owned());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Active message keys of `session_key` sorted chronologically by seq.
+fn sorted_active_keys<T>(table: &T, session_key: &str) -> Result<Vec<String>>
+where
+    T: ReadableTable<&'static str, &'static str>,
+{
+    let mut keys = own_active_message_keys(table, session_key)?;
+    keys.sort_by_key(|k| seq_from_message_key(k, session_key).unwrap_or(0));
+    Ok(keys)
+}
+
+/// How many leading active messages are scanned for the first user message
+/// when deriving a title.
+const TITLE_SCAN_LIMIT: usize = 20;
+
+/// Derive an automatic title from the first real user message among the
+/// session's first [`TITLE_SCAN_LIMIT`] active messages. Compaction
+/// summaries are skipped and the runtime-injected context prefix is stripped.
+fn first_user_title<T>(table: &T, session_key: &str) -> Result<Option<String>>
+where
+    T: ReadableTable<&'static str, &'static str>,
+{
+    use rsclaw_util::session_text::{derive_title, message_text, strip_injected_context};
+
+    let keys = sorted_active_keys(table, session_key)?;
+    for key in keys.iter().take(TITLE_SCAN_LIMIT) {
+        let Some(v) = table.get(key.as_str())? else {
+            continue;
+        };
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(v.value()) else {
+            continue;
+        };
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let text = message_text(&msg);
+        if text.starts_with("[CONTEXT COMPACTION") {
+            continue;
+        }
+        let (_, body) = strip_injected_context(&text);
+        if let Some(title) = derive_title(body) {
+            return Ok(Some(title));
+        }
+    }
+    Ok(None)
+}
+
 /// Parse an archive key of shape
 /// `archive<sep><session_key><sep>gen<N><sep><seq>` (separator `\0` or `:`)
 /// into `(generation, seq)`. Returns `None` for keys that don't match the shape
@@ -405,6 +478,15 @@ impl RedbStore {
         }
     }
 
+    /// Number of active (non-archive) messages currently stored for
+    /// `session_key`, i.e. what `load_messages` would return. Unlike
+    /// `SessionMeta::message_count` this drops after compaction.
+    pub fn count_active_messages(&self, session_key: &str) -> Result<u64> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(MESSAGES)?;
+        Ok(own_active_message_keys(&table, session_key)?.len() as u64)
+    }
+
     pub fn put_session_meta(&self, session_key: &str, meta: &SessionMeta) -> Result<()> {
         let json = serde_json::to_string(meta)?;
         let write = self.db.begin_write()?;
@@ -424,22 +506,7 @@ impl RedbStore {
             // Also remove all messages for this session. Scan both `\0` (new)
             // and `:` (legacy) separator prefixes.
             let mut msgs = write.open_table(MESSAGES)?;
-            let keys: Vec<String> = [KEY_SEP, LEGACY_KEY_SEP]
-                .iter()
-                .flat_map(|sep| {
-                    let prefix = format!("{session_key}{sep}");
-                    msgs.range(prefix.as_str()..)
-                        .unwrap()
-                        .take_while(|r| {
-                            r.as_ref()
-                                .map(|(k, _)| k.value().starts_with(&prefix))
-                                .unwrap_or(false)
-                        })
-                        .filter_map(|r| r.ok())
-                        .map(|(k, _)| k.value().to_owned())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
+            let keys = own_active_message_keys(&msgs, session_key)?;
             for key in &keys {
                 msgs.remove(key.as_str())?;
             }
@@ -464,51 +531,243 @@ impl RedbStore {
     /// Called by `/new` to start a fresh conversation on the same session key.
     /// Active messages are deleted; archive is untouched.
     pub fn new_generation(&self, session_key: &str) -> Result<u32> {
-        let meta_opt = self.get_session_meta(session_key)?;
-        let mut meta = meta_opt.unwrap_or_else(|| SessionMeta {
-            session_key: session_key.to_owned(),
-            message_count: 0,
-            last_active: chrono::Utc::now().timestamp(),
-            created_at: chrono::Utc::now().timestamp(),
-            generation: 1,
-        });
-
-        meta.generation += 1;
-        meta.message_count = 0;
-        meta.last_active = chrono::Utc::now().timestamp();
-
-        // Delete active messages (not archive).
         let write = self.db.begin_write()?;
+        // Read meta INSIDE the write tx: reading it outside let a concurrent
+        // `append_message` bump message_count / generation in between, and
+        // this write then clobbered it with the stale copy.
+        let generation = {
+            let mut metas = write.open_table(SESSION_META)?;
+            let now = chrono::Utc::now().timestamp();
+            let mut meta: SessionMeta = metas
+                .get(session_key)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()?
+                .unwrap_or_else(|| SessionMeta::new(session_key, now));
+            meta.generation += 1;
+            meta.message_count = 0;
+            meta.last_active = now;
+            // A new conversation starts: automatic titles described the old
+            // one, user-chosen titles name the session itself and survive.
+            if !meta.has_user_title() {
+                meta.title = None;
+                meta.title_source = None;
+            }
+            let meta_json = serde_json::to_string(&meta)?;
+            metas.insert(session_key, meta_json.as_str())?;
+            meta.generation
+        };
         {
+            // Delete active messages (not archive). Scans both `\0` (new)
+            // and `:` (legacy) separator prefixes.
             let mut msgs = write.open_table(MESSAGES)?;
-            // Scan both `\0` (new) and `:` (legacy) separator prefixes.
-            let keys: Vec<String> = [KEY_SEP, LEGACY_KEY_SEP]
-                .iter()
-                .flat_map(|sep| {
-                    let prefix = format!("{session_key}{sep}");
-                    msgs.range(prefix.as_str()..)
-                        .unwrap()
-                        .take_while(|r| {
-                            r.as_ref()
-                                .map(|(k, _)| k.value().starts_with(&prefix))
-                                .unwrap_or(false)
-                        })
-                        .filter_map(|r| r.ok())
-                        .map(|(k, _)| k.value().to_owned())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
+            let keys = own_active_message_keys(&msgs, session_key)?;
             for key in &keys {
                 msgs.remove(key.as_str())?;
             }
-
-            let meta_json = serde_json::to_string(&meta)?;
-            let mut metas = write.open_table(SESSION_META)?;
-            metas.insert(session_key, meta_json.as_str())?;
         }
         write.commit()?;
 
-        Ok(meta.generation)
+        Ok(generation)
+    }
+
+    // -----------------------------------------------------------------------
+    // Session titles / user-editable metadata
+    // -----------------------------------------------------------------------
+
+    /// Read-modify-write one session's metadata inside a single write
+    /// transaction. `f` returns whether it changed anything; nothing is
+    /// written otherwise. Returns the resulting meta, or `None` when the
+    /// session does not exist.
+    fn update_session_meta<F>(&self, session_key: &str, f: F) -> Result<Option<SessionMeta>>
+    where
+        F: FnOnce(&mut SessionMeta, &redb::Table<'_, &'static str, &'static str>) -> Result<bool>,
+    {
+        let write = self.db.begin_write()?;
+        let result = {
+            let mut metas = write.open_table(SESSION_META)?;
+            let current: Option<SessionMeta> = metas
+                .get(session_key)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()?;
+            match current {
+                None => None,
+                Some(mut meta) => {
+                    let msgs = write.open_table(MESSAGES)?;
+                    let changed = f(&mut meta, &msgs)?;
+                    drop(msgs);
+                    if changed {
+                        let json = serde_json::to_string(&meta)?;
+                        metas.insert(session_key, json.as_str())?;
+                    }
+                    Some(meta)
+                }
+            }
+        };
+        write.commit()?;
+        Ok(result)
+    }
+
+    /// Set (`Some`) or clear (`None`) a session title.
+    ///
+    /// Clearing drops the current title and immediately re-derives an `Auto`
+    /// title from the session's first user message (if one exists). Returns
+    /// the updated meta, or `None` when the session does not exist.
+    pub fn set_session_title(
+        &self,
+        session_key: &str,
+        title: Option<&str>,
+        source: TitleSource,
+    ) -> Result<Option<SessionMeta>> {
+        self.update_session_meta(session_key, |meta, msgs| {
+            match title {
+                Some(t) => {
+                    meta.title = Some(t.to_owned());
+                    meta.title_source = Some(source);
+                }
+                None => {
+                    meta.title = first_user_title(msgs, session_key)?;
+                    meta.title_source = meta.title.as_ref().map(|_| TitleSource::Auto);
+                }
+            }
+            Ok(true)
+        })
+    }
+
+    /// Store `title` as an automatic title unless the user has set one.
+    /// Overwrites a previous automatic title. Returns `true` when written;
+    /// `false` when the session is unknown or carries a user title.
+    pub fn set_auto_title_if_absent(&self, session_key: &str, title: &str) -> Result<bool> {
+        self.set_auto_title_guarded(session_key, title, None)
+    }
+
+    /// Like [`Self::set_auto_title_if_absent`], but only while the session is
+    /// still in `generation` — a background title computed for a
+    /// conversation that `/new` has since replaced is dropped.
+    pub fn set_auto_title_for_generation(
+        &self,
+        session_key: &str,
+        title: &str,
+        generation: u32,
+    ) -> Result<bool> {
+        self.set_auto_title_guarded(session_key, title, Some(generation))
+    }
+
+    fn set_auto_title_guarded(
+        &self,
+        session_key: &str,
+        title: &str,
+        generation: Option<u32>,
+    ) -> Result<bool> {
+        let mut written = false;
+        self.update_session_meta(session_key, |meta, _| {
+            if meta.has_user_title()
+                || generation.is_some_and(|g| g != meta.generation)
+                || meta.title.as_deref() == Some(title)
+            {
+                return Ok(false);
+            }
+            meta.title = Some(title.to_owned());
+            meta.title_source = Some(TitleSource::Auto);
+            written = true;
+            Ok(true)
+        })?;
+        Ok(written)
+    }
+
+    /// Return the session title, lazily deriving and persisting an `Auto`
+    /// title from the first user message when none is stored yet (backfill
+    /// for sessions created before titles existed). `None` when the session
+    /// is unknown or no title can be derived.
+    pub fn ensure_session_title(&self, session_key: &str) -> Result<Option<String>> {
+        let Some(meta) = self.get_session_meta(session_key)? else {
+            return Ok(None);
+        };
+        if meta.title.is_some() {
+            return Ok(meta.title);
+        }
+        let derived = {
+            let read = self.db.begin_read()?;
+            let msgs = read.open_table(MESSAGES)?;
+            first_user_title(&msgs, session_key)?
+        };
+        let Some(derived) = derived else {
+            return Ok(None);
+        };
+        if self.set_auto_title_if_absent(session_key, &derived)? {
+            return Ok(Some(derived));
+        }
+        // Lost a race with a concurrent title write: report what is stored.
+        Ok(self.get_session_meta(session_key)?.and_then(|m| m.title))
+    }
+
+    /// Apply a [`SessionPatch`] atomically. Returns the updated meta, or
+    /// `None` when the session does not exist.
+    pub fn patch_session(&self, session_key: &str, patch: &SessionPatch) -> Result<Option<SessionMeta>> {
+        self.update_session_meta(session_key, |meta, msgs| {
+            match &patch.title {
+                Some(Some(t)) => {
+                    meta.title = Some(t.clone());
+                    meta.title_source = Some(TitleSource::User);
+                }
+                Some(None) => {
+                    meta.title = first_user_title(msgs, session_key)?;
+                    meta.title_source = meta.title.as_ref().map(|_| TitleSource::Auto);
+                }
+                None => {}
+            }
+            if let Some(p) = patch.pinned {
+                meta.pinned = p;
+            }
+            if let Some(a) = patch.archived {
+                meta.archived = a;
+            }
+            Ok(true)
+        })
+    }
+
+    /// Record the channel peer's display name on the session. Reads first and
+    /// only opens a write transaction when the name actually changed.
+    /// Returns `true` when written.
+    pub fn set_peer_name_if_changed(&self, session_key: &str, name: &str) -> Result<bool> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(false);
+        }
+        match self.get_session_meta(session_key)? {
+            Some(meta) if meta.peer_name.as_deref() != Some(name) => {}
+            _ => return Ok(false),
+        }
+        let mut written = false;
+        self.update_session_meta(session_key, |meta, _| {
+            if meta.peer_name.as_deref() == Some(name) {
+                return Ok(false);
+            }
+            meta.peer_name = Some(name.to_owned());
+            written = true;
+            Ok(true)
+        })?;
+        Ok(written)
+    }
+
+    /// Load up to `max` of the session's most recent active messages, in
+    /// chronological order. Read-only (unlike [`Self::load_messages`] it never
+    /// backfills the archive), for bounded scans such as session search.
+    pub fn load_recent_messages(&self, session_key: &str, max: usize) -> Result<Vec<serde_json::Value>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(MESSAGES)?;
+        let keys = sorted_active_keys(&table, session_key)?;
+        let skip = keys.len().saturating_sub(max);
+        let mut out = Vec::with_capacity(keys.len() - skip);
+        for key in &keys[skip..] {
+            let Some(v) = table.get(key.as_str())? else {
+                continue;
+            };
+            match serde_json::from_str::<serde_json::Value>(v.value()) {
+                Ok(val) => out.push(val),
+                Err(e) => tracing::warn!(key = %key.escape_debug(), "skip undecodable message: {e}"),
+            }
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -540,13 +799,7 @@ impl RedbStore {
                 .get(session_key)?
                 .map(|v| serde_json::from_str(v.value()))
                 .transpose()?
-                .unwrap_or_else(|| SessionMeta {
-                    session_key: session_key.to_owned(),
-                    message_count: 0,
-                    last_active: now,
-                    created_at: now,
-                    generation: 1,
-                });
+                .unwrap_or_else(|| SessionMeta::new(session_key, now));
 
             let seq = meta.message_count;
             meta.message_count += 1;
@@ -573,6 +826,61 @@ impl RedbStore {
         Ok(seq)
     }
 
+    /// Atomically replace a session's active messages (used by compaction).
+    ///
+    /// In ONE write transaction: removes every active message key of
+    /// `session_key` (both the `\0` and legacy `:` separators, exact-match so
+    /// sub-sessions sharing the prefix are untouched) and writes `messages`
+    /// under fresh seqs. A crash leaves either the old or the new history,
+    /// never neither.
+    ///
+    /// The archive is NOT touched: the replaced messages are already archived
+    /// and the compacted rewrite must not be archived again. Seqs continue
+    /// from `message_count` (which keeps increasing) so later appends never
+    /// collide with — and overwrite — existing archive rows of the current
+    /// generation.
+    pub fn replace_active_messages(
+        &self,
+        session_key: &str,
+        messages: &[serde_json::Value],
+    ) -> Result<()> {
+        // Serialize first: a failure aborts before anything is written.
+        let encoded: Vec<String> = messages
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<_, _>>()?;
+        let now = chrono::Utc::now().timestamp();
+
+        let write = self.db.begin_write()?;
+        let first_seq = {
+            let mut metas = write.open_table(SESSION_META)?;
+            let mut meta: SessionMeta = metas
+                .get(session_key)?
+                .map(|v| serde_json::from_str(v.value()))
+                .transpose()?
+                .unwrap_or_else(|| SessionMeta::new(session_key, now));
+            let first_seq = meta.message_count;
+            meta.message_count = meta.message_count.saturating_add(encoded.len() as u64);
+            meta.last_active = now;
+            let meta_json = serde_json::to_string(&meta)?;
+            metas.insert(session_key, meta_json.as_str())?;
+            first_seq
+        };
+        {
+            let mut msgs = write.open_table(MESSAGES)?;
+            for key in own_active_message_keys(&msgs, session_key)? {
+                msgs.remove(key.as_str())?;
+            }
+            for (i, json) in encoded.iter().enumerate() {
+                let seq = first_seq.saturating_add(i as u64);
+                let msg_key = format!("{session_key}{KEY_SEP}{seq:016}");
+                msgs.insert(msg_key.as_str(), json.as_str())?;
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     /// Load all messages for a session, in order.
     ///
     /// On first load, if no `archive:` copy exists yet (pre-upgrade sessions),
@@ -585,26 +893,16 @@ impl RedbStore {
         // The key carries the separator, so a backfill round-trip below can
         // re-derive it from the key itself (no need to remember which prefix
         // a row came from).
-        let mut messages: Vec<(String, serde_json::Value)> = [KEY_SEP, LEGACY_KEY_SEP]
-            .iter()
-            .flat_map(|sep| {
-                let prefix = format!("{session_key}{sep}");
-                table
-                    .range(prefix.as_str()..)
-                    .unwrap()
-                    .take_while(|r| {
-                        r.as_ref()
-                            .map(|(k, _)| k.value().starts_with(&prefix))
-                            .unwrap_or(false)
-                    })
-                    .filter_map(|r| r.ok())
-                    .filter_map(|(k, v)| {
-                        let val: serde_json::Value = serde_json::from_str(v.value()).ok()?;
-                        Some((k.value().to_owned(), val))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let mut messages: Vec<(String, serde_json::Value)> = Vec::new();
+        for key in own_active_message_keys(&table, session_key)? {
+            let Some(v) = table.get(key.as_str())? else {
+                continue;
+            };
+            match serde_json::from_str::<serde_json::Value>(v.value()) {
+                Ok(val) => messages.push((key, val)),
+                Err(e) => tracing::warn!(key = %key.escape_debug(), "skip undecodable message: {e}"),
+            }
+        }
         // Merge order is per-prefix (all `\0` rows then all `:` rows); sort
         // by seq so the final ordering is chronological regardless.
         messages.sort_by_key(|(k, _)| seq_from_message_key(k, session_key).unwrap_or(0));
@@ -617,18 +915,26 @@ impl RedbStore {
         // exist yet, copy all active messages to archive:...:gen1:... keys.
         // Detect archive rows under BOTH separators so sessions whose archive
         // predates the `\0` migration aren't re-backfilled.
-        let has_archive = [KEY_SEP, LEGACY_KEY_SEP].iter().any(|sep| {
+        let mut has_archive = false;
+        for sep in [KEY_SEP, LEGACY_KEY_SEP] {
             let archive_prefix = format!("archive{sep}{session_key}{sep}");
-            table
-                .range(archive_prefix.as_str()..)
-                .unwrap()
-                .next()
-                .is_some_and(|r| {
-                    r.as_ref()
-                        .map(|(k, _)| k.value().starts_with(&archive_prefix))
-                        .unwrap_or(false)
-                })
-        });
+            for entry in table.range(archive_prefix.as_str()..)? {
+                let (k, _) = entry?;
+                let key = k.value();
+                if !key.starts_with(&archive_prefix) {
+                    break;
+                }
+                // Same prefix-collision guard as the active scan: another
+                // session's archive rows can share this prefix.
+                if parse_archive_key(key, session_key).is_some() {
+                    has_archive = true;
+                    break;
+                }
+            }
+            if has_archive {
+                break;
+            }
+        }
 
         if !has_archive {
             drop(table);
@@ -644,7 +950,13 @@ impl RedbStore {
                             .to_string();
                         let archive_key =
                             format!("archive{KEY_SEP}{session_key}{KEY_SEP}gen1{KEY_SEP}{suffix}");
-                        let json_str = serde_json::to_string(val).unwrap_or_default();
+                        let json_str = match serde_json::to_string(val) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                tracing::warn!(key = %archive_key.escape_debug(), "skip archive backfill of unserializable message: {e}");
+                                continue;
+                            }
+                        };
                         if let Err(e) = msgs_table.insert(archive_key.as_str(), json_str.as_str()) {
                             tracing::error!(error = %e, key = %archive_key, "failed to insert archive entry");
                         }
@@ -760,22 +1072,21 @@ impl RedbStore {
         Ok(())
     }
 
-    /// List all approved peer IDs for a channel.
-    // TODO: use prefix range query (range(prefix..prefix_end)) instead of full
-    // table scan
+    /// List all approved peer IDs for a channel (prefix range scan).
     pub fn list_pairings(&self, channel: &str) -> Result<Vec<String>> {
         let prefix = format!("{channel}:");
         let read = self.db.begin_read()?;
         let table = read.open_table(PAIRING)?;
         let mut peers = Vec::new();
-        for entry in table.iter()? {
+        for entry in table.range(prefix.as_str()..)? {
             let (key, val) = entry?;
             let k = key.value();
-            if k.starts_with(&prefix) {
-                if let Ok(state) = serde_json::from_str::<PairingState>(val.value()) {
-                    if matches!(state, PairingState::Approved) {
-                        peers.push(k[prefix.len()..].to_owned());
-                    }
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            if let Ok(state) = serde_json::from_str::<PairingState>(val.value()) {
+                if matches!(state, PairingState::Approved) {
+                    peers.push(k[prefix.len()..].to_owned());
                 }
             }
         }
@@ -901,10 +1212,17 @@ impl RedbStore {
             let mut table = write.open_table(TASK_QUEUE)?;
             let mut best: Option<rsclaw_types::QueuedTask> = None;
 
-            // Scan all tasks to find the best candidate.
+            // Scan all tasks to find the best candidate. One corrupt row
+            // must not wedge the whole queue: skip it with a warning.
             for entry in table.iter()? {
-                let (_k, v) = entry?;
-                let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
+                let (k, v) = entry?;
+                let task: rsclaw_types::QueuedTask = match serde_json::from_str(v.value()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(task = %k.value(), "task queue: skip undecodable row: {e}");
+                        continue;
+                    }
+                };
                 if task.status != TaskStatus::Pending {
                     continue;
                 }
@@ -943,8 +1261,14 @@ impl RedbStore {
             let mut table = write.open_table(TASK_QUEUE)?;
             let mut to_revive = Vec::new();
             for entry in table.iter()? {
-                let (_k, v) = entry?;
-                let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
+                let (k, v) = entry?;
+                let task: rsclaw_types::QueuedTask = match serde_json::from_str(v.value()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(task = %k.value(), "task queue: skip undecodable row: {e}");
+                        continue;
+                    }
+                };
                 if task.status == TaskStatus::Running {
                     to_revive.push(task);
                 }
@@ -1115,8 +1439,14 @@ impl RedbStore {
             let mut table = write.open_table(TASK_QUEUE)?;
             let mut expired_ids = Vec::new();
             for entry in table.iter()? {
-                let (_k, v) = entry?;
-                let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
+                let (k, v) = entry?;
+                let task: rsclaw_types::QueuedTask = match serde_json::from_str(v.value()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(task = %k.value(), "task queue: skip undecodable row: {e}");
+                        continue;
+                    }
+                };
                 if task.is_expired() {
                     expired_ids.push(task.id);
                 }
@@ -1158,6 +1488,20 @@ impl RedbStore {
         session_key: &str,
         message: &rsclaw_types::QueuedMessage,
     ) -> Result<bool> {
+        self.merge_into_pending_with_budget(session_key, message, 0, 0)
+    }
+
+    /// Like [`Self::merge_into_pending`], but when `max_turns > 0` (a
+    /// task-mode message such as `/task -n 10 ...` or a follow-up task) the
+    /// pending task's `max_turns` / `ttl_secs` are raised so the merged
+    /// message keeps its requested budget instead of inheriting a smaller one.
+    pub fn merge_into_pending_with_budget(
+        &self,
+        session_key: &str,
+        message: &rsclaw_types::QueuedMessage,
+        max_turns: u32,
+        ttl_secs: u64,
+    ) -> Result<bool> {
         use rsclaw_types::TaskStatus;
 
         let write = self.db.begin_write()?;
@@ -1181,6 +1525,15 @@ impl RedbStore {
                 let mut task: rsclaw_types::QueuedTask = serde_json::from_str(guard.value())?;
                 drop(guard);
                 task.messages.push(message.clone());
+                if max_turns > 0 {
+                    task.max_turns = task.max_turns.max(max_turns);
+                    // ttl 0 means "no expiry": keep the more permissive one.
+                    task.ttl_secs = if task.ttl_secs == 0 || ttl_secs == 0 {
+                        0
+                    } else {
+                        task.ttl_secs.max(ttl_secs)
+                    };
+                }
                 task.updated_at = chrono::Utc::now().timestamp();
                 let json = serde_json::to_string(&task)?;
                 table.insert(id.as_str(), json.as_str())?;
@@ -1454,6 +1807,29 @@ impl RedbStore {
         Ok(due)
     }
 
+    /// How many of `session_key`'s jobs are not settled yet: still being
+    /// polled, or finished but not yet delivered (with retries left).
+    pub fn count_unsettled_external_jobs(&self, session_key: &str) -> Result<usize> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(EXTERNAL_JOBS)?;
+        let mut count = 0;
+        for entry in table.iter()? {
+            let (_k, v) = entry?;
+            let job: rsclaw_types::ExternalJob = serde_json::from_str(v.value())?;
+            if job.session_key != session_key {
+                continue;
+            }
+            let active = matches!(
+                job.status,
+                rsclaw_types::ExternalJobStatus::Pending | rsclaw_types::ExternalJobStatus::Polling
+            ) || job.needs_delivery();
+            if active && job.delivery_attempts < rsclaw_types::ExternalJob::MAX_DELIVERY_ATTEMPTS {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Delete a job by id (used after delivery + retention window).
     pub fn delete_external_job(&self, job_id: &str) -> Result<()> {
         let write = self.db.begin_write()?;
@@ -1512,6 +1888,10 @@ impl RedbStore {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionMeta {
     pub session_key: String,
+    /// Seq allocator for the current generation: the number of messages ever
+    /// written in it. Monotonic (compaction does not lower it), so it is NOT
+    /// the number of active messages; use `RedbStore::count_active_messages`
+    /// for that. Reset to 0 on `/new`.
     pub message_count: u64,
     pub last_active: i64, // Unix timestamp
     pub created_at: i64,
@@ -1520,6 +1900,68 @@ pub struct SessionMeta {
     /// Defaults to 1 for new sessions and pre-upgrade sessions (missing field).
     #[serde(default = "default_generation")]
     pub generation: u32,
+    /// Human-readable session title. `None` until derived from the first
+    /// user message (or set by the user).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Who set `title`. `User` titles are never overwritten by automatic
+    /// derivation and survive `/new`; `Auto` titles are cleared by `/new`.
+    #[serde(default)]
+    pub title_source: Option<TitleSource>,
+    /// Pinned sessions sort first in session lists.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Archived sessions are hidden from session lists by default.
+    #[serde(default)]
+    pub archived: bool,
+    /// Display name of the channel peer (e.g. Telegram first name), when the
+    /// inbound channel event carries one.
+    #[serde(default)]
+    pub peer_name: Option<String>,
+}
+
+impl SessionMeta {
+    /// Fresh metadata for a session first seen at `now` (Unix seconds).
+    pub fn new(session_key: &str, now: i64) -> Self {
+        Self {
+            session_key: session_key.to_owned(),
+            message_count: 0,
+            last_active: now,
+            created_at: now,
+            generation: 1,
+            title: None,
+            title_source: None,
+            pinned: false,
+            archived: false,
+            peer_name: None,
+        }
+    }
+
+    /// Whether the current title was set explicitly by the user.
+    pub fn has_user_title(&self) -> bool {
+        self.title_source == Some(TitleSource::User)
+    }
+}
+
+/// Origin of a session title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TitleSource {
+    /// Derived automatically (first user message or LLM refinement).
+    Auto,
+    /// Set explicitly by the user (rename).
+    User,
+}
+
+/// A partial update of user-editable session metadata, applied atomically
+/// by [`RedbStore::patch_session`]. `None` fields are left unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct SessionPatch {
+    /// `Some(Some(t))` sets a user title; `Some(None)` clears the user title
+    /// and re-derives an automatic one from the first user message.
+    pub title: Option<Option<String>>,
+    pub pinned: Option<bool>,
+    pub archived: Option<bool>,
 }
 
 fn default_generation() -> u32 {
@@ -1745,6 +2187,7 @@ mod tests {
             last_active: 1_700_000_000,
             created_at: 1_699_000_000,
             generation: 1,
+            ..SessionMeta::new("", 0)
         };
         store
             .put_session_meta(&meta.session_key, &meta)
@@ -1867,6 +2310,87 @@ mod tests {
     }
 
     #[test]
+    fn group_session_new_and_delete_keep_topic_sub_sessions() {
+        let (store, _dir) = open_tmp();
+        let group = "agent:a:c:group:G";
+        let topic = "agent:a:c:group:G:topic:T";
+        store
+            .append_message(group, &serde_json::json!({"text": "group"}))
+            .unwrap();
+        store
+            .append_message(topic, &serde_json::json!({"text": "topic"}))
+            .unwrap();
+        // Loads must not mix the topic's messages into the group session.
+        assert_eq!(store.load_messages(group).unwrap().len(), 1);
+        store.new_generation(group).unwrap();
+        assert_eq!(store.load_messages(topic).unwrap().len(), 1);
+        store.delete_session(group).unwrap();
+        let topic_msgs = store.load_messages(topic).unwrap();
+        assert_eq!(topic_msgs.len(), 1);
+        assert_eq!(topic_msgs[0]["text"], "topic");
+    }
+
+    #[test]
+    fn replace_active_messages_is_atomic_and_keeps_archive() {
+        let (store, _dir) = open_tmp();
+        let sk = "agent:a:c:group:R";
+        let topic = "agent:a:c:group:R:topic:T";
+        for i in 0..3 {
+            store
+                .append_message(sk, &serde_json::json!({"n": i}))
+                .unwrap();
+        }
+        store
+            .append_message(topic, &serde_json::json!({"text": "topic"}))
+            .unwrap();
+        // A legacy `:`-separated active row of the same session.
+        {
+            let write = store.db.begin_write().unwrap();
+            {
+                let mut msgs = write.open_table(MESSAGES).unwrap();
+                let legacy = format!("{sk}{LEGACY_KEY_SEP}{:016}", 99u64);
+                msgs.insert(legacy.as_str(), r#"{"n":"legacy"}"#).unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        store
+            .replace_active_messages(
+                sk,
+                &[
+                    serde_json::json!({"n": "summary"}),
+                    serde_json::json!({"n": "tail"}),
+                ],
+            )
+            .unwrap();
+
+        let msgs = store.load_messages(sk).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["n"], "summary");
+        assert_eq!(msgs[1]["n"], "tail");
+        // Active count follows the rewrite; the meta seq counter does not drop.
+        assert_eq!(store.count_active_messages(sk).unwrap(), 2);
+        // Sub-session sharing the prefix is untouched.
+        assert_eq!(store.load_messages(topic).unwrap().len(), 1);
+        assert_eq!(store.count_active_messages(topic).unwrap(), 1);
+        // Archive keeps exactly the original appends; the rewrite is not archived.
+        let archived = store.archive_load(sk, None).unwrap();
+        assert_eq!(archived.len(), 3);
+        assert!(archived.iter().all(|(_, _, m)| m["n"].is_number()));
+
+        // Later appends continue after the rewrite and never overwrite archive rows.
+        store
+            .append_message(sk, &serde_json::json!({"n": "next"}))
+            .unwrap();
+        let msgs = store.load_messages(sk).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["n"], "next");
+        let archived = store.archive_load(sk, None).unwrap();
+        assert_eq!(archived.len(), 4);
+        assert_eq!(archived[0].2["n"], 0);
+    }
+
+    #[test]
     fn delete_session_removes_messages() {
         let (store, _dir) = open_tmp();
         let sk = "agent:main:cli:direct:del_user";
@@ -1906,5 +2430,98 @@ mod tests {
         for k in &keys {
             assert!(listed.contains(&k.to_string()), "missing {k}");
         }
+    }
+
+    #[test]
+    fn session_title_lifecycle() {
+        let (store, _dir) = open_tmp();
+        let sk = "agent:main:feishu:direct:ou_title";
+
+        // Unknown session: nothing to title, nothing written.
+        assert!(store.ensure_session_title(sk).expect("ensure").is_none());
+        assert!(!store.set_auto_title_if_absent(sk, "x").expect("auto"));
+
+        // Legacy session (no title stored): lazy backfill from the first
+        // user message, with the injected context prefix stripped.
+        store
+            .append_message(sk, &serde_json::json!({"role": "user", "content":
+                "Now: 2026-10-06 07:23 Mon CST\n[Session started: 2026-10-06 07:23 Monday, CST, via feishu]\n帮我写一份周报"}))
+            .expect("append user");
+        store
+            .append_message(sk, &serde_json::json!({"role": "assistant", "content": "好的"}))
+            .expect("append assistant");
+        assert!(store.get_session_meta(sk).expect("meta").expect("some").title.is_none());
+        assert_eq!(
+            store.ensure_session_title(sk).expect("ensure").as_deref(),
+            Some("帮我写一份周报")
+        );
+        let meta = store.get_session_meta(sk).expect("meta").expect("some");
+        assert_eq!(meta.title_source, Some(TitleSource::Auto));
+
+        // Auto titles can be refined; a stale generation is ignored.
+        assert!(store.set_auto_title_if_absent(sk, "周报撰写").expect("auto"));
+        assert!(!store.set_auto_title_for_generation(sk, "旧的", 99).expect("gen guard"));
+
+        // User title wins over later automatic titles.
+        let meta = store
+            .set_session_title(sk, Some("我的周报"), TitleSource::User)
+            .expect("set")
+            .expect("exists");
+        assert_eq!(meta.title.as_deref(), Some("我的周报"));
+        assert!(!store.set_auto_title_if_absent(sk, "auto").expect("auto"));
+        assert_eq!(store.ensure_session_title(sk).expect("ensure").as_deref(), Some("我的周报"));
+
+        // Patch: flags + clearing the user title re-derives an Auto title.
+        let meta = store
+            .patch_session(sk, &SessionPatch { title: Some(None), pinned: Some(true), archived: Some(true) })
+            .expect("patch")
+            .expect("exists");
+        assert_eq!(meta.title.as_deref(), Some("帮我写一份周报"));
+        assert_eq!(meta.title_source, Some(TitleSource::Auto));
+        assert!(meta.pinned && meta.archived);
+        assert!(store.patch_session("nope", &SessionPatch::default()).expect("patch").is_none());
+
+        // Peer name: written once, unchanged name is a no-op.
+        assert!(store.set_peer_name_if_changed(sk, "张三").expect("peer"));
+        assert!(!store.set_peer_name_if_changed(sk, "张三").expect("peer"));
+
+        // /new clears an Auto title but keeps pin/archive/peer name.
+        store.new_generation(sk).expect("new gen");
+        let meta = store.get_session_meta(sk).expect("meta").expect("some");
+        assert!(meta.title.is_none() && meta.title_source.is_none());
+        assert!(meta.pinned);
+        assert_eq!(meta.peer_name.as_deref(), Some("张三"));
+
+        // /new keeps a User title.
+        store.set_session_title(sk, Some("固定标题"), TitleSource::User).expect("set");
+        store.new_generation(sk).expect("new gen");
+        let meta = store.get_session_meta(sk).expect("meta").expect("some");
+        assert_eq!(meta.title.as_deref(), Some("固定标题"));
+        assert_eq!(meta.title_source, Some(TitleSource::User));
+
+        // Recent-message window is bounded and chronological.
+        let sk2 = "api:recent";
+        for i in 0..5 {
+            store.append_message(sk2, &serde_json::json!({"role": "user", "content": format!("m{i}")})).expect("append");
+        }
+        let recent = store.load_recent_messages(sk2, 2).expect("recent");
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["content"], "m3");
+        assert_eq!(recent[1]["content"], "m4");
+    }
+
+    #[test]
+    fn session_meta_without_title_fields_deserializes() {
+        let legacy = r#"{"session_key":"k","message_count":3,"last_active":5,"created_at":1}"#;
+        let meta: SessionMeta = serde_json::from_str(legacy).expect("legacy meta");
+        assert_eq!(meta.generation, 1);
+        assert!(meta.title.is_none() && meta.title_source.is_none());
+        assert!(!meta.pinned && !meta.archived && meta.peer_name.is_none());
+        let json = serde_json::to_value(SessionMeta {
+            title_source: Some(TitleSource::User),
+            ..SessionMeta::new("k", 0)
+        })
+        .expect("ser");
+        assert_eq!(json["title_source"], "user");
     }
 }

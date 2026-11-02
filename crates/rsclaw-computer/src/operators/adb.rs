@@ -116,21 +116,27 @@ impl Operator for AdbOperator {
     fn screenshot(&self) -> ScreenshotFut<'_> {
         Box::pin(async move {
             let args = self.argv(&["exec-out", "screencap", "-p"]);
-            let mut child = tokio::process::Command::new("adb")
+            let mut child = adb_command()
                 .args(&args)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::null())
                 .spawn()
                 .context("adb screencap spawn failed (is `adb` in PATH?)")?;
 
             let mut png_bytes = Vec::with_capacity(2 * 1024 * 1024);
-            if let Some(mut stdout) = child.stdout.take() {
-                stdout
-                    .read_to_end(&mut png_bytes)
-                    .await
-                    .context("read adb screencap output")?;
-            }
-            let status = child.wait().await.context("wait adb screencap")?;
+            let capture = async {
+                if let Some(mut stdout) = child.stdout.take() {
+                    stdout
+                        .read_to_end(&mut png_bytes)
+                        .await
+                        .context("read adb screencap output")?;
+                }
+                child.wait().await.context("wait adb screencap")
+            };
+            // `kill_on_drop` reaps the child if the timeout fires.
+            let status = tokio::time::timeout(ADB_TIMEOUT, capture)
+                .await
+                .map_err(|_| anyhow!("adb screencap timed out after {}s", ADB_TIMEOUT.as_secs()))??;
             if !status.success() {
                 return Err(anyhow!("adb screencap failed (exit {status})"));
             }
@@ -335,21 +341,36 @@ impl Operator for AdbOperator {
 /// Run an `adb …` command, returning `ActionOutput::err` (not Err) on
 /// non-zero exit so the driver can feed the failure into the next turn.
 async fn run_adb(args: &[&str]) -> Result<ActionOutput> {
-    let out = tokio::process::Command::new("adb")
-        .args(args)
-        .output()
-        .await;
+    let out = tokio::time::timeout(ADB_TIMEOUT, adb_command().args(args).output()).await;
     match out {
-        Ok(o) if o.status.success() => Ok(ActionOutput::ok()),
-        Ok(o) => Ok(ActionOutput::err(format!(
+        Err(_) => Ok(ActionOutput::err(format!(
+            "adb timed out after {}s",
+            ADB_TIMEOUT.as_secs()
+        ))),
+        Ok(Ok(o)) if o.status.success() => Ok(ActionOutput::ok()),
+        Ok(Ok(o)) => Ok(ActionOutput::err(format!(
             "adb exit {}: {}",
             o.status,
             String::from_utf8_lossy(&o.stderr).trim()
         ))),
-        Err(e) => Ok(ActionOutput::err(format!(
+        Ok(Err(e)) => Ok(ActionOutput::err(format!(
             "adb spawn failed: {e} (is `adb` in PATH?)"
         ))),
     }
+}
+
+/// Upper bound for a single adb invocation. A wedged device or daemon would
+/// otherwise block the computer-use loop forever.
+const ADB_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Base `adb` command: killed when its future is dropped (timeouts) and
+/// without a console window on Windows.
+fn adb_command() -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("adb");
+    cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    cmd
 }
 
 #[cfg(test)]

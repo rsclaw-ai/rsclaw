@@ -4,19 +4,22 @@
 
 use std::time::Duration;
 
-use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use reqwest::header::{ETAG, LAST_MODIFIED};
+use rsclaw_util::net::{SafeRequest, read_body_limited, safe_send};
 
 use super::{KbSourceSyncer, SyncContext, SyncError, SyncOutcome, SyncReason};
 use crate::{
     canonicalize::{CanonicalizeInput, canonicalize_by_mime, canonicalize_url, detect_mime},
     content_store::atomic::sha256_hex,
-    model::{KbSource, KbSourceKind},
+    model::{KbSource, KbSourceKind, LogicalSourceId},
     pipeline::{IngestInput, ingest_canonicalized},
     store::seen::{SyncState, is_seen},
     sync::SyncRegistry,
 };
 
 const DEFAULT_TIMEOUT_S: u64 = 30;
+/// Upper bound on a fetched page / document body.
+const MAX_BODY_BYTES: usize = 20 * 1024 * 1024;
 
 pub struct UrlSyncer {
     pub url: String,
@@ -33,29 +36,39 @@ impl KbSourceSyncer for UrlSyncer {
     }
 
     async fn sync(&self, ctx: &SyncContext, _reason: SyncReason) -> Result<SyncOutcome, SyncError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_S))
-            .user_agent("rsclaw-kb-syncer/1.0")
-            .build()
-            .map_err(|e| SyncError::Network(format!("client build: {e}")))?;
-
         let canonical_url = canonicalize_url(&self.url)
             .map_err(|e| SyncError::Parse(format!("url canonicalize: {e}")))?;
+
         let prior = SyncRegistry::load(&ctx.store, &canonical_url)
             .map_err(|e| SyncError::Permanent(format!("load state: {e}")))?;
 
-        let mut req = client.get(&canonical_url);
+        // SSRF-safe fetch: the URL is user/agent supplied, so every hop is
+        // resolved, checked against private/loopback/link-local ranges and
+        // DNS-pinned, and redirects are re-validated per hop. `safe_send`
+        // returns 304 as-is, so conditional requests still work.
+        let mut req = SafeRequest::get(canonical_url.clone());
+        req.timeout = Duration::from_secs(DEFAULT_TIMEOUT_S);
         if let Some(state) = &prior {
-            if let Some(cur) = state.cursor.strip_prefix("etag:") {
-                req = req.header(IF_NONE_MATCH, cur);
-            } else if let Some(cur) = state.cursor.strip_prefix("lastmod:") {
-                req = req.header(IF_MODIFIED_SINCE, cur);
+            let cond = if let Some(cur) = state.cursor.strip_prefix("etag:") {
+                Some((reqwest::header::IF_NONE_MATCH, cur))
+            } else {
+                state
+                    .cursor
+                    .strip_prefix("lastmod:")
+                    .map(|cur| (reqwest::header::IF_MODIFIED_SINCE, cur))
+            };
+            if let Some((name, cur)) = cond
+                && let Ok(v) = reqwest::header::HeaderValue::from_str(cur)
+            {
+                req.headers.insert(name, v);
             }
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| SyncError::Network(format!("get {canonical_url}: {e}")))?;
+        let resp = safe_send(
+            || reqwest::Client::builder().user_agent("rsclaw-kb-syncer/1.0"),
+            req,
+        )
+        .await
+        .map_err(|e| SyncError::Network(format!("get {canonical_url}: {e:#}")))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(SyncOutcome {
@@ -105,11 +118,9 @@ impl KbSourceSyncer for UrlSyncer {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.split(';').next().unwrap_or(s).trim().to_string());
-        let bytes = resp
-            .bytes()
+        let bytes = read_body_limited(resp, MAX_BODY_BYTES)
             .await
-            .map_err(|e| SyncError::Network(format!("body: {e}")))?
-            .to_vec();
+            .map_err(|e| SyncError::Network(format!("body: {e:#}")))?;
 
         let raw_sha = sha256_hex(&bytes);
         {
@@ -134,7 +145,10 @@ impl KbSourceSyncer for UrlSyncer {
             bytes: &bytes,
             mime: &mime,
             hint_title: Some(&canonical_url),
-            logical_source_id_seed: None,
+            // Key the logical source on the URL, not the content hash, so a
+            // changed page becomes a new VERSION of the same source (the old
+            // one is superseded) instead of a second unrelated doc.
+            logical_source_id_seed: Some(LogicalSourceId::for_url(&canonical_url)),
         })
         .map_err(|e| SyncError::Parse(format!("canonicalize: {e}")))?
         .ok_or_else(|| SyncError::Parse(format!("no canonical output for mime={mime}")))?;

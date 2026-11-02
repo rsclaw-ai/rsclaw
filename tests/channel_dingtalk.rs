@@ -33,21 +33,19 @@ fn channel_name_is_dingtalk() {
     assert_eq!(ch.name(), "dingtalk");
 }
 
-/// Token refresh: mock the /gettoken endpoint, then verify send_text_to_user
+/// Token refresh: mock the v1.0 accessToken endpoint, then verify send_text_to_user
 /// calls the right API with a valid token.
 #[tokio::test]
 async fn token_refresh_and_send_to_user() {
     init_crypto();
     let server = MockServer::start().await;
 
-    // Mock gettoken (OAPI base)
-    Mock::given(method("GET"))
-        .and(path("/gettoken"))
+    // Mock v1.0 accessToken
+    Mock::given(method("POST"))
+        .and(path("/v1.0/oauth2/accessToken"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "access_token": "mock_token_123",
-            "expires_in": 7200,
-            "errcode": 0,
-            "errmsg": "ok"
+            "accessToken": "mock_token_123",
+            "expireIn": 7200
         })))
         .expect(1)
         .mount(&server)
@@ -93,13 +91,12 @@ async fn send_chunked_20000() {
     init_crypto();
     let server = MockServer::start().await;
 
-    // Mock gettoken
-    Mock::given(method("GET"))
-        .and(path("/gettoken"))
+    // Mock v1.0 accessToken
+    Mock::given(method("POST"))
+        .and(path("/v1.0/oauth2/accessToken"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "access_token": "tok",
-            "expires_in": 7200,
-            "errcode": 0,
+            "accessToken": "tok",
+            "expireIn": 7200,
         })))
         .mount(&server)
         .await;
@@ -147,12 +144,11 @@ async fn send_to_group() {
     init_crypto();
     let server = MockServer::start().await;
 
-    Mock::given(method("GET"))
-        .and(path("/gettoken"))
+    Mock::given(method("POST"))
+        .and(path("/v1.0/oauth2/accessToken"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "access_token": "tok",
-            "expires_in": 7200,
-            "errcode": 0,
+            "accessToken": "tok",
+            "expireIn": 7200,
         })))
         .mount(&server)
         .await;

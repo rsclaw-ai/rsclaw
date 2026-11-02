@@ -17,6 +17,74 @@ use serde_json::{Value, json};
 
 use super::runtime::{AgentRuntime, RunContext};
 
+/// Reject a `read_artifact` mode the tool does not understand. An unknown or
+/// incomplete mode (`grep` with no pattern, `query` with no question) used to
+/// fall through to cursor paging, silently advancing past content the model
+/// never asked for; it now gets an error that spells out the valid forms.
+pub(crate) fn validate_read_mode(mode: &str) -> Result<()> {
+    const PLAIN: &[&str] = &["", "next", "full", "reset", "stat"];
+    const PREFIXED: &[&str] = &["query:", "grep:", "lines:", "head:", "tail:"];
+    if PLAIN.contains(&mode) {
+        return Ok(());
+    }
+    if let Some(prefix) = PREFIXED.iter().find(|p| mode.starts_with(**p)) {
+        if mode[prefix.len()..].trim().is_empty() {
+            return Err(anyhow!(
+                "read_artifact: mode `{mode}` is missing its argument — write it as `{prefix}...` \
+                 (e.g. `query:which files are config files`, `grep:\\.toml`, `lines:1-80`, \
+                 `head:50`), or omit mode to read the next chunk"
+            ));
+        }
+        return Ok(());
+    }
+    let bare = mode.trim_end_matches(':');
+    if PREFIXED.iter().any(|p| p.trim_end_matches(':') == bare) {
+        return Err(anyhow!(
+            "read_artifact: mode `{mode}` needs an argument after a colon, e.g. `{bare}:...`; \
+             omit mode to read the next chunk"
+        ));
+    }
+    Err(anyhow!(
+        "read_artifact: unknown mode `{mode}`. Valid: omit (next chunk), reset, stat, \
+         query:QUESTION, grep:PATTERN, lines:A-B, head:N, tail:N"
+    ))
+}
+
+/// `mode`, with its argument joined back on when a model split it off:
+/// `{"mode": "query", "query": "合同金额"}` → `query:合同金额`, and the same
+/// for grep (`pattern`), lines (`range`), head / tail (`n`).
+pub(crate) fn joined_mode(args: &Value) -> String {
+    let mode = args["mode"].as_str().unwrap_or("").trim();
+    let bare = mode.trim_end_matches(':');
+    let keys: &[&str] = match bare {
+        "query" => &["query", "q", "question"],
+        "grep" => &["grep", "pattern"],
+        "lines" => &["lines", "range"],
+        "head" | "tail" => &[bare, "n", "count"],
+        _ => return mode.to_owned(),
+    };
+    if mode.len() > bare.len() + 1 {
+        return mode.to_owned();
+    }
+    let as_text = |v: &Value| match v {
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    // Known names first, then any other argument the model put it under
+    // ("keyword", "text", …).
+    let value = keys.iter().find_map(|k| as_text(&args[*k])).or_else(|| {
+        args.as_object()?
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "tool_result_id" | "id" | "mode"))
+            .find_map(|(_, v)| as_text(v))
+    });
+    match value {
+        Some(value) => format!("{bare}:{value}"),
+        None => mode.to_owned(),
+    }
+}
+
 /// Apply `mode` to `full` text and return the selected slice.
 ///
 /// Factored out from the tool handler so unit tests can hit the parser
@@ -284,7 +352,9 @@ impl AgentRuntime {
 
         // No mode = cursor mode (return the next unread chunk). The model
         // never has to compute line ranges; calling again always advances.
-        let mode = args["mode"].as_str().unwrap_or("").trim();
+        let mode = joined_mode(&args);
+        let mode = mode.as_str();
+        validate_read_mode(mode)?;
         let store = default_store();
         let full = store.read(&ctx.session_key, &id).map_err(|e| {
             anyhow!(
@@ -632,6 +702,30 @@ mod tests {
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn read_mode_validation_rejects_incomplete_modes() {
+        for ok in ["", "next", "full", "reset", "stat", "query:who", "grep:toml", "lines:1-5", "head:3", "tail:2"] {
+            assert!(validate_read_mode(ok).is_ok(), "{ok} should be accepted");
+        }
+        for bad in ["grep", "query", "grep:", "query: ", "lines", "summary", "page:2"] {
+            let err = validate_read_mode(bad).expect_err(bad).to_string();
+            assert!(err.contains("read_artifact"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_split_mode_argument_is_joined_back() {
+        let j = |v: serde_json::Value| joined_mode(&v);
+        assert_eq!(j(json!({"mode": "query", "query": "委托代理费用"})), "query:委托代理费用");
+        assert_eq!(j(json!({"mode": "grep:", "pattern": "陈东"})), "grep:陈东");
+        assert_eq!(j(json!({"mode": "head", "n": 40})), "head:40");
+        assert_eq!(j(json!({"mode": "lines:1-9", "range": "5-6"})), "lines:1-9");
+        assert_eq!(j(json!({"mode": "query:", "keyword": "委托代理费用"})), "query:委托代理费用");
+        assert_eq!(j(json!({"mode": "query"})), "query");
+        assert_eq!(j(json!({"mode": "query:", "tool_result_id": "tr_1"})), "query:");
+        assert_eq!(j(json!({})), "");
     }
 
     #[test]

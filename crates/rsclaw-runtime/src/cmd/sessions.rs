@@ -9,18 +9,18 @@ use super::style::*;
 fn gateway_url() -> String {
     let base = rsclaw_config::loader::base_dir();
     // Try to read port from config file.
-    let config_path = base.join("rsclaw.json5");
+    let config_path = base.join(rsclaw_brand::CONFIG_FILE);
     let port = rsclaw_config::loader::load_json5(&config_path)
         .ok()
         .and_then(|c| c.gateway.as_ref()?.port)
-        .unwrap_or(18888);
+        .unwrap_or(rsclaw_brand::DEFAULT_PORT);
     format!("http://127.0.0.1:{port}")
 }
 
 /// Resolve auth token from config.
 fn gateway_token() -> String {
     let base = rsclaw_config::loader::base_dir();
-    let config_path = base.join("rsclaw.json5");
+    let config_path = base.join(rsclaw_brand::CONFIG_FILE);
     rsclaw_config::loader::load_json5(&config_path)
         .ok()
         .and_then(|c| {
@@ -30,8 +30,7 @@ fn gateway_token() -> String {
                 .as_ref()?
                 .token
                 .as_ref()?
-                .as_plain()
-                .map(str::to_owned)
+                .resolve_full(c.secrets.as_ref())
         })
         .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
         .unwrap_or_default()
@@ -41,7 +40,7 @@ fn gateway_token() -> String {
 async fn api_get(path: &str) -> Result<serde_json::Value> {
     let url = format!("{}/api/v1{path}", gateway_url());
     let token = gateway_token();
-    let client = reqwest::Client::new();
+    let client = crate::cmd::gateway_http::local_client();
     let mut req = client.get(&url);
     if !token.is_empty() {
         req = req.header("Authorization", format!("Bearer {token}"));

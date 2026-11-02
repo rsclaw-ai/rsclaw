@@ -298,13 +298,13 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
         .unwrap_or_default();
 
     // Migrate config: extract compatible parts from openclaw.json -> rsclaw.json5
-    let rsclaw_config = rsclaw_dir.join("rsclaw.json5");
+    let rsclaw_config = rsclaw_dir.join(rsclaw_brand::CONFIG_FILE);
     if config_path.is_file() && !rsclaw_config.exists() {
         let mut rsclaw_cfg = serde_json::Map::new();
 
         // Gateway: migrate compatible fields, set port to 18888.
         let mut gw = serde_json::Map::new();
-        gw.insert("port".to_owned(), serde_json::json!(18888));
+        gw.insert("port".to_owned(), serde_json::json!(rsclaw_brand::DEFAULT_PORT));
         if let Some(oc_gw) = config.get("gateway").and_then(|v| v.as_object()) {
             // Supported gateway fields to migrate as-is.
             let supported = ["bind", "auth", "language", "mode", "controlUi"];
@@ -519,7 +519,10 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
 
         let pretty = serde_json::to_string_pretty(&serde_json::Value::Object(rsclaw_cfg))?;
         std::fs::write(&rsclaw_config, &pretty)?;
-        item("*", "config migrated: openclaw.json -> rsclaw.json5");
+        item(
+            "*",
+            &format!("config migrated: openclaw.json -> {}", rsclaw_brand::CONFIG_FILE),
+        );
         if config.get("bindings").is_some() {
             item(" ", "bindings converted to per-agent channels");
         }

@@ -425,6 +425,7 @@ async fn try_plan(
         match ev? {
             StreamEvent::TextDelta(t) => buf.push_str(&t),
             StreamEvent::ReasoningDelta(_) => {}
+            StreamEvent::ReasoningBlock { .. } => {}
             StreamEvent::ToolCall { .. } => { /* planner shouldn't emit tool calls */ }
             StreamEvent::Done { .. } => break,
             StreamEvent::Error(e) => return Err(anyhow!("planner stream error: {e}")),

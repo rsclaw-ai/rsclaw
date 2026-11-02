@@ -149,14 +149,29 @@ impl FileWatcher {
                 // re-trigger the same restart warning.
                 self.last_config = Some(new_cfg.clone());
 
+                // Restart-only gateway fields: surface the restart first, but
+                // still hand the new config to the bridge so the hot-safe
+                // changes from the same save are applied now instead of being
+                // dropped until the next edit.
                 if !restart_fields.is_empty() {
                     warn!(?restart_fields, "config change requires gateway restart");
-                    let _ = self.tx.send(ConfigChange::RequiresRestart(restart_fields));
-                    return;
+                    if self
+                        .tx
+                        .send(ConfigChange::RequiresRestart(restart_fields))
+                        .is_err()
+                    {
+                        debug!("hot-reload: no subscribers for restart notice");
+                    }
+                } else {
+                    info!("config hot-reloaded successfully");
                 }
-
-                info!("config hot-reloaded successfully");
-                let _ = self.tx.send(ConfigChange::FullReload(Arc::new(new_cfg)));
+                if self
+                    .tx
+                    .send(ConfigChange::FullReload(Arc::new(new_cfg)))
+                    .is_err()
+                {
+                    debug!("hot-reload: no subscribers for config change");
+                }
             }
             Err(e) => {
                 warn!("hot-reload failed (config error): {e:#}");
@@ -229,6 +244,24 @@ mod tests {
         match rx.try_recv() {
             Ok(ConfigChange::FullReload(_)) => {}
             other => panic!("expected FullReload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hot_reload_restart_fields_still_apply_hot_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cfg.json5");
+        std::fs::write(&path, r#"{ "gateway": { "port": 18888 } }"#).expect("write initial");
+        let (mut watcher, mut rx) = FileWatcher::new(path.clone());
+        std::fs::write(&path, r#"{ "gateway": { "port": 19000 } }"#).expect("write updated");
+        watcher.process_change().await;
+        match rx.try_recv() {
+            Ok(ConfigChange::RequiresRestart(fields)) => assert!(!fields.is_empty()),
+            other => panic!("expected RequiresRestart first, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(ConfigChange::FullReload(_)) => {}
+            other => panic!("expected FullReload after RequiresRestart, got {other:?}"),
         }
     }
 

@@ -28,7 +28,14 @@ pub struct LogsArgs {
     #[arg(long)]
     pub timeout: Option<u64>,
     /// Bearer token for remote gateway log access.
-    #[arg(long)]
+    /// Also read from `RSCLAW_AUTH_TOKEN` so the secret need not appear in
+    /// argv (visible in `ps` / shell history). Pass `-` to read it from stdin.
+    #[arg(
+        long,
+        env = "RSCLAW_AUTH_TOKEN",
+        hide_env_values = true,
+        value_parser = crate::secret_input::secret_value,
+    )]
     pub token: Option<String>,
     /// Remote gateway URL for log streaming.
     #[arg(long)]
@@ -104,10 +111,24 @@ pub struct TuiArgs {
     #[arg(long)]
     pub url: Option<String>,
     /// Bearer token for gateway authentication.
-    #[arg(long)]
+    /// Also read from `RSCLAW_AUTH_TOKEN` so the secret need not appear in
+    /// argv (visible in `ps` / shell history). Pass `-` to read it from stdin.
+    #[arg(
+        long,
+        env = "RSCLAW_AUTH_TOKEN",
+        hide_env_values = true,
+        value_parser = crate::secret_input::secret_value,
+    )]
     pub token: Option<String>,
     /// Password for gateway authentication.
-    #[arg(long)]
+    /// Also read from `RSCLAW_GATEWAY_PASSWORD` so the secret need not appear in
+    /// argv (visible in `ps` / shell history). Pass `-` to read it from stdin.
+    #[arg(
+        long,
+        env = "RSCLAW_GATEWAY_PASSWORD",
+        hide_env_values = true,
+        value_parser = crate::secret_input::secret_value,
+    )]
     pub password: Option<String>,
     /// Session ID to resume.
     #[arg(long)]

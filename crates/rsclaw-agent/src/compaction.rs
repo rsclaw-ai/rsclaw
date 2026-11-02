@@ -170,17 +170,9 @@ impl AgentRuntime {
         // Per-agent context window wins (agent.model.contextTokens), then
         // the global default, then 64K. handle.context_window already
         // resolved that chain at construction (0 = unset → use default).
-        let context_tokens = if self.handle.context_window > 0 {
-            self.handle.context_window
-        } else {
-            self.live
-                .agents
-                .read()
-                .await
-                .defaults
-                .context_tokens
-                .unwrap_or(128_000) as usize
-        };
+        // Unset, the model's own window (capped at the default) — a 32k
+        // model must compact well before 128k.
+        let context_tokens = self.context_window_for(model, true).await;
         // Used later to pick the splice strategy (mode 2 = rsclaw stateful).
         //
         // Mirror the auto-force at runtime.rs (~4277): the actual turn LLM
@@ -214,7 +206,8 @@ impl AgentRuntime {
         // (if configured) is authoritative; otherwise reserve 5% + a fixed
         // margin for the next inbound message.
         const NEXT_MSG_MARGIN: usize = 4_000;
-        let reply_reserve = (context_tokens / 20).max(2_000);
+        let reply_reserve =
+            crate::compaction_profile::reply_reserve(self.model_limits(model), context_tokens);
         let token_threshold = if let Some(floor) = cfg.reserve_tokens_floor {
             context_tokens.saturating_sub(floor as usize).max(16_000)
         } else {
@@ -274,6 +267,9 @@ impl AgentRuntime {
             session = session_key,
             trigger = trigger_reason,
             total_tokens,
+            token_threshold,
+            context_tokens,
+            reply_reserve,
             turns,
             "compaction triggered"
         );
@@ -285,7 +281,10 @@ impl AgentRuntime {
             .unwrap_or(CompactionMode::Layered);
         let compaction_model = cfg.model.as_deref().unwrap_or(model);
         // Dynamic keepRecentPairs: reduce when token pressure is high.
-        let configured_pairs = cfg.keep_recent_pairs.unwrap_or(5) as usize;
+        let configured_pairs = cfg.keep_recent_pairs.map_or_else(
+            || crate::compaction_profile::default_keep_recent_pairs(context_tokens),
+            |p| p as usize,
+        );
         let keep_pairs = if total_tokens > token_threshold * 3 {
             1.max(configured_pairs / 3) // extreme pressure: keep 1-2 pairs
         } else if total_tokens > token_threshold * 2 {
@@ -295,8 +294,16 @@ impl AgentRuntime {
         };
         let extract_facts = cfg.extract_facts.unwrap_or(true);
 
+        // The summarizer's own window bounds its transcript: a configured
+        // compaction model may be smaller than the turn model.
+        let summarizer_window = if cfg.model.is_some() {
+            self.context_window_for(compaction_model, false).await
+        } else {
+            context_tokens
+        };
         let msgs_to_text = |msgs: &[Message]| -> String {
-            let default_transcript = (context_tokens * 7 / 10).max(16_000);
+            let default_transcript =
+                crate::compaction_profile::default_transcript_tokens(summarizer_window);
             let max_total_tokens: usize = cfg
                 .max_transcript_tokens
                 .map(|t| t as usize)
@@ -308,7 +315,7 @@ impl AgentRuntime {
         // Head: first user-assistant pair (contains [Session started:...], preserved
         // verbatim) Middle: compressed into summary
         // Tail: recent N pairs (preserved verbatim)
-        let (head_msgs, old_text, recent_msgs) = if mode == CompactionMode::Layered {
+        let (head_msgs, old_text, recent_msgs, ledger_text) = if mode == CompactionMode::Layered {
             let msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
 
             // Head: protect first user + first assistant (2 messages).
@@ -392,12 +399,16 @@ impl AgentRuntime {
             if old_portion.is_empty() {
                 return; // not enough history to compact
             }
+            // Facts are read from the turns as the model saw them, before
+            // any shortening for the transcript.
+            let ledger_text = plain_text(&old_portion);
             compress_tool_results(&mut old_portion, 6);
-            (head, msgs_to_text(&old_portion), recent)
+            (head, msgs_to_text(&old_portion), recent, ledger_text)
         } else {
             let mut msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
+            let ledger_text = plain_text(&msgs);
             compress_tool_results(&mut msgs, 6);
-            (vec![], msgs_to_text(&msgs), vec![])
+            (vec![], msgs_to_text(&msgs), vec![], ledger_text)
         };
 
         // Pre-compaction entity preservation: deterministic extraction (phone/ID/email)
@@ -566,6 +577,30 @@ impl AgentRuntime {
 
         let Some(summary) = summary else { return };
 
+        // Whatever exact identifiers the model dropped (from these turns or
+        // from the previous summary) go back in verbatim.
+        let summary = {
+            let key_cfg = cfg.key_data.clone().unwrap_or_default();
+            let kinds: Vec<String> = key_cfg.kinds.unwrap_or_else(|| {
+                crate::key_data::DEFAULT_KINDS.iter().map(|k| (*k).to_owned()).collect()
+            });
+            let source = format!("{}\n{ledger_text}", previous_summary.as_deref().unwrap_or(""));
+            let facts = crate::key_data::extract(&source, &kinds);
+            let kept = crate::key_data::ensure_in_summary(
+                &summary,
+                &facts,
+                key_cfg.max_items.unwrap_or(crate::key_data::DEFAULT_MAX_ITEMS),
+            );
+            let restored = crate::key_data::missing_from(&summary, &facts).len();
+            info!(
+                session = session_key,
+                facts = facts.len(),
+                restored,
+                "compaction: key data checked against the summary"
+            );
+            kept
+        };
+
         // -- Entity extraction from summary's Entities section --
         // The summary prompt includes an Entities section (kind=value format).
         // Parse it and write as pinned memories — no extra LLM call needed.
@@ -711,6 +746,10 @@ impl AgentRuntime {
             sess.extend(recent_msgs);
         }
 
+        // The backend is re-sent (or spliced to) the compacted history; what
+        // it reported before no longer applies.
+        crate::runtime::forget_server_size(session_key);
+
         // Reset compaction state after successful compaction.
         self.compaction_state
             .insert(session_key.to_owned(), (std::time::Instant::now(), 0));
@@ -720,15 +759,27 @@ impl AgentRuntime {
         // the per-session user_system layer, and only if the set changed.
         self.reload_skills();
 
-        // Persist compacted session to redb (survives restarts).
+        // Persist compacted session to redb (survives restarts). One write
+        // transaction swaps the active messages, so a crash keeps either the
+        // old or the new history; the archive (already holding the originals)
+        // is left alone.
         if let Some(sess) = self.sessions.get(session_key) {
-            if let Err(e) = self.store.db.delete_session(session_key) {
-                tracing::warn!("compaction: failed to delete old session: {e:#}");
-            }
-            for msg in sess.iter() {
-                let val = serde_json::to_value(msg).unwrap_or_default();
-                if let Err(e) = self.store.db.append_message(session_key, &val) {
-                    tracing::warn!("compaction: failed to persist message: {e:#}");
+            let vals: Result<Vec<serde_json::Value>, _> =
+                sess.iter().map(serde_json::to_value).collect();
+            match vals {
+                Err(e) => {
+                    tracing::warn!(
+                        session = session_key,
+                        "compaction: serialize failed, persisted history left unchanged: {e:#}"
+                    );
+                }
+                Ok(vals) => {
+                    if let Err(e) = self.store.db.replace_active_messages(session_key, &vals) {
+                        tracing::warn!(
+                            session = session_key,
+                            "compaction: failed to persist compacted history, persisted history left unchanged: {e:#}"
+                        );
+                    }
                 }
             }
         }
@@ -753,12 +804,9 @@ impl AgentRuntime {
         // If compaction barely helped (still >80% of threshold), inject a
         // system hint so the agent will relay the /new suggestion to the user.
         if new_tokens > token_threshold * 4 / 5 {
-            let zh = rsclaw_i18n::default_lang() == "zh";
-            let hint = if zh {
-                "[system] 上下文压缩后仍然较大，响应可能变慢。请告知用户发送 /new 开启新会话以恢复正常速度。"
-            } else {
-                "[system] Context is still large after compaction and responses may slow down. Please tell the user to send /new to start a fresh session."
-            };
+            // LLM-facing instruction: English only (the model relays it in the
+            // user's language).
+            let hint = "[system] Context is still large after compaction and responses may slow down. Please tell the user to send /new to start a fresh session.";
             if let Some(sess) = self.sessions.get_mut(session_key) {
                 sess.push(Message {
                     role: Role::System,
@@ -980,7 +1028,7 @@ impl AgentRuntime {
         }
 
         // Build the summary instruction
-        let template = Self::summary_template();
+        let (template, summary_max_tokens) = self.summary_shape(model).await;
         let instruction = if let Some(prev) = previous_summary {
             format!(
                 "Ignore all previous instructions. You are now a summarization agent. \
@@ -1049,7 +1097,7 @@ impl AgentRuntime {
             messages,
             tools,
             system: Some(system_prompt),
-            max_tokens: Some(4096),
+            max_tokens: Some(summary_max_tokens),
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
@@ -1074,7 +1122,7 @@ impl AgentRuntime {
         while let Some(event) = stream.next().await {
             match event {
                 Ok(StreamEvent::TextDelta(d)) => summary.push_str(&d),
-                Ok(StreamEvent::ReasoningDelta(_)) => {}
+                Ok(StreamEvent::ReasoningDelta(_)) | Ok(StreamEvent::ReasoningBlock { .. }) => {}
                 Ok(StreamEvent::Done { .. }) | Ok(StreamEvent::Error(_)) => break,
                 Ok(StreamEvent::ToolCall { .. }) => {
                     // LLM tried to call a tool despite empty tools list — skip
@@ -1096,6 +1144,46 @@ impl AgentRuntime {
             );
             Some(summary)
         }
+    }
+
+    /// The summary template and output budget for `model` (the one
+    /// writing the summary): the short template on a small window, plus
+    /// the deployment's scenario section (`compaction.keyData.template`)
+    /// before its closing rule.
+    async fn summary_shape(&self, model: &str) -> (String, u32) {
+        let compaction = self.live.agents.read().await.defaults.compaction.clone();
+        // contextTokens describes the turn model; a separately configured
+        // compaction model goes by its own window.
+        let explicit = compaction.as_ref().is_none_or(|c| c.model.is_none());
+        let window = self.context_window_for(model, explicit).await;
+        let extra = compaction
+            .as_ref()
+            .and_then(|c| c.key_data.as_ref())
+            .and_then(|k| k.template.clone());
+        let base = if crate::compaction_profile::uses_short_template(window) {
+            Self::summary_template_short()
+        } else {
+            Self::summary_template()
+        };
+        let max_tokens = crate::compaction_profile::summary_max_tokens(self.model_limits(model), window);
+        (with_scenario_section(base, extra.as_deref()), max_tokens)
+    }
+
+    /// The summary template for a small window: what the next turn needs to
+    /// carry on, without the history sections.
+    fn summary_template_short() -> &'static str {
+        "Use this exact structure, briefly:\n\n\
+         ## Active Task\n\
+         [Copy the user's most recent unfulfilled request verbatim. If none, write \"None.\"]\n\n\
+         ## Goal\n[Overall goal, one line]\n\n\
+         ## Constraints & Preferences\n[User-stated constraints or preferences. If none: (none)]\n\n\
+         ## Plan\n[The working-plan checklist if one was provided, [x]/[>]/[ ] lines verbatim. \
+         If none: (none)]\n\n\
+         ## Key Data\n[Exact values verbatim: names, IDs, numbers, amounts, dates, paths]\n\n\
+         ## Pending\n[Blocked items or awaiting user]\n\n\
+         ## Entities\n[kind=value per line. Kinds: name, phone, id_card, email, birthday, \
+         age, zodiac, address, relationship, preference. If none: (none)]\n\n\
+         CRITICAL: Copy ALL values character-for-character. Be CONCRETE and SHORT."
     }
 
     /// Shared summary template used by both standalone and KV cache modes.
@@ -1145,7 +1233,7 @@ impl AgentRuntime {
             in the conversation - only output the structured summary. \
             Do NOT include any preamble, greeting, or prefix.";
 
-        let template = Self::summary_template();
+        let (template, summary_max_tokens) = self.summary_shape(model).await;
 
         let prompt = if let Some(prev) = previous_summary {
             format!(
@@ -1183,7 +1271,7 @@ impl AgentRuntime {
             }],
             tools: vec![], // no tools — compact must only produce text
             system: None,  // preamble is in the user message
-            max_tokens: Some(4096),
+            max_tokens: Some(summary_max_tokens),
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
@@ -1208,7 +1296,8 @@ impl AgentRuntime {
         while let Some(event) = stream.next().await {
             match event {
                 Ok(StreamEvent::TextDelta(d)) => summary.push_str(&d),
-                Ok(StreamEvent::ReasoningDelta(_)) => {} // ignore reasoning in compaction
+                // Ignore reasoning in compaction.
+                Ok(StreamEvent::ReasoningDelta(_)) | Ok(StreamEvent::ReasoningBlock { .. }) => {}
                 Ok(StreamEvent::Done { .. }) | Ok(StreamEvent::Error(_)) => break,
                 Ok(StreamEvent::ToolCall { .. }) => {} // unexpected in summarization
                 Err(e) => {
@@ -1370,6 +1459,60 @@ impl AgentRuntime {
 /// phone=18674030927
 /// birthday=1995年3月15日
 /// ```
+/// Everything said in `msgs`, untruncated: text, tool results, and the
+/// string arguments of tool calls (a drafted document's text lives there).
+fn plain_text(msgs: &[Message]) -> String {
+    fn strings(v: &Value, out: &mut String) {
+        match v {
+            Value::String(s) => {
+                out.push_str(s);
+                out.push('\n');
+            }
+            Value::Array(a) => a.iter().for_each(|v| strings(v, out)),
+            Value::Object(o) => o.values().for_each(|v| strings(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    for m in msgs {
+        match &m.content {
+            MessageContent::Text(t) => {
+                out.push_str(t);
+                out.push('\n');
+            }
+            MessageContent::Parts(parts) => {
+                for p in parts {
+                    match p {
+                        ContentPart::Text { text } => {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                        ContentPart::ToolResult { content, .. } => {
+                            out.push_str(content);
+                            out.push('\n');
+                        }
+                        ContentPart::ToolUse { input, .. } => strings(input, &mut out),
+                        #[allow(unreachable_patterns)]
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `template` with `extra` inserted before its closing "CRITICAL" rule.
+fn with_scenario_section(template: &str, extra: Option<&str>) -> String {
+    let Some(extra) = extra.map(str::trim).filter(|e| !e.is_empty()) else {
+        return template.to_owned();
+    };
+    match template.rfind("CRITICAL:") {
+        Some(i) => format!("{}{extra}\n\n{}", &template[..i], &template[i..]),
+        None => format!("{template}\n\n{extra}"),
+    }
+}
+
 fn parse_entities_from_summary(summary: &str) -> Vec<crate::context_mgr::KeyEntity> {
     let mut entities = Vec::new();
 
@@ -1436,6 +1579,43 @@ mod tests {
             content: MessageContent::Text(text.to_owned()),
             rsclaw_hidden: None,
         }
+    }
+
+    #[test]
+    fn compaction_scenario_section_goes_before_the_closing_rule() {
+        let t = with_scenario_section("## Goal\n[x]\n\nCRITICAL: copy values.", Some("## Case Facts\n[案号]"));
+        assert_eq!(t, "## Goal\n[x]\n\n## Case Facts\n[案号]\n\nCRITICAL: copy values.");
+        assert_eq!(with_scenario_section("T", None), "T");
+        assert_eq!(with_scenario_section("T", Some("  ")), "T");
+    }
+
+    #[test]
+    fn compaction_ledger_reads_tool_results_and_call_arguments() {
+        let msgs = vec![
+            msg(Role::User, "起诉华建"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                    id: "t1".into(),
+                    name: "create_docx".into(),
+                    input: json!({"content": "案号（2024）鄂0116民初1234号", "n": 3}),
+                }]),
+                rsclaw_hidden: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "统一社会信用代码 91420112MA4L12345X".into(),
+                    is_error: None,
+                }]),
+                rsclaw_hidden: None,
+            },
+        ];
+        let text = plain_text(&msgs);
+        assert!(text.contains("起诉华建"));
+        assert!(text.contains("（2024）鄂0116民初1234号"));
+        assert!(text.contains("91420112MA4L12345X"));
     }
 
     #[test]

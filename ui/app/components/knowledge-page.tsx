@@ -327,6 +327,10 @@ export function KnowledgePage() {
         toast.error(zh ? "请先选择一个知识库" : "Select a collection first");
         return;
       }
+      if (collections.find((c) => c.id === activeCollectionId)?.readOnly) {
+        toast.error(zh ? "这是服务器同步的知识包，只读" : "This knowledge pack is synced from its server and read-only");
+        return;
+      }
       for (const f of files) {
         if (f.bytes.byteLength > maxDocBytes) {
           toast.error(`${zh ? "文件过大" : "File too large"}: ${f.name} (${fmtBytes(f.bytes.byteLength)} > ${fmtBytes(maxDocBytes)})`);
@@ -353,6 +357,10 @@ export function KnowledgePage() {
     async (paths: string[]) => {
       if (!activeCollectionId) {
         toast.error(zh ? "请先选择一个知识库" : "Select a collection first");
+        return;
+      }
+      if (collections.find((c) => c.id === activeCollectionId)?.readOnly) {
+        toast.error(zh ? "这是服务器同步的知识包，只读" : "This knowledge pack is synced from its server and read-only");
         return;
       }
       // stat each path so a dropped folder goes to the recursive from-dir
@@ -843,6 +851,19 @@ export function KnowledgePage() {
                     </div>
                   )}
                 </div>
+                {activeCol.readOnly ? (
+                  <span
+                    style={{ fontSize: 11, color: V2.t3, whiteSpace: "nowrap" }}
+                    title={
+                      zh
+                        ? "订阅的知识包，由服务器同步更新，在服务器的控制台里修改"
+                        : "A subscribed knowledge pack, kept in sync from its server; edit it in the server console"
+                    }
+                  >
+                    {zh ? "服务器同步 · 只读" : "Synced · read-only"}
+                  </span>
+                ) : (
+                <>
                 <Menu
                   trigger={
                     <button style={{ ...btnPrimary, whiteSpace: "nowrap" }}>
@@ -902,6 +923,8 @@ export function KnowledgePage() {
                     },
                   ]}
                 />
+                </>
+                )}
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -1112,6 +1135,7 @@ export function KnowledgePage() {
         <DocDetailModal
           zh={zh}
           collectionId={activeCollectionId}
+          readOnly={!!activeCol?.readOnly}
           doc={detailDoc}
           onClose={() => setDetailDoc(null)}
           onDeleted={async () => {
@@ -1509,6 +1533,7 @@ function FetchUrlModal({
 function DocDetailModal({
   zh,
   collectionId,
+  readOnly,
   doc,
   onClose,
   onDeleted,
@@ -1516,6 +1541,7 @@ function DocDetailModal({
 }: {
   zh: boolean;
   collectionId: string;
+  readOnly: boolean;
   doc: KbDoc;
   onClose: () => void;
   onDeleted: () => Promise<void>;
@@ -1573,6 +1599,7 @@ function DocDetailModal({
         </pre>
       )}
       <div style={modalFooter}>
+        {!readOnly && (
         <button
           disabled={busy}
           onClick={async () => {
@@ -1596,6 +1623,7 @@ function DocDetailModal({
         >
           {zh ? "删除" : "Delete"}
         </button>
+        )}
         <button
           disabled={busy}
           onClick={async () => {

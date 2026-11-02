@@ -45,10 +45,25 @@ pub fn shell_snapshot() -> &'static HashMap<String, String> {
     SHELL_SNAPSHOT.get_or_init(|| std::env::vars().collect())
 }
 
-/// Run the bootstrap + reconcile pipeline. Idempotent: safe to call on
-/// every config (re)load. Best-effort — a write failure on `.env`
-/// surfaces as a warn-level log but does not block gateway startup.
+/// Set once the first `reconcile` has run in this process.
+static RECONCILED: OnceLock<()> = OnceLock::new();
+
+/// Run the bootstrap + reconcile pipeline ONCE per process. Safe to call
+/// on every config (re)load: only the first call does any work, later calls
+/// return immediately. Best-effort — a write failure on `.env` surfaces as
+/// a warn-level log but does not block gateway startup.
+///
+/// The pipeline mutates the process environment (`std::env::set_var`),
+/// which is undefined behaviour once other threads may read the env
+/// concurrently. `rsclaw_config::load()` is called from many hot paths
+/// after the tokio runtime is up, so only the first (boot-time) load may
+/// reconcile; `.env` edits made later take effect on the next restart
+/// (or via `rsclaw env sync`).
 pub fn reconcile(raw_config: &str, base_dir: &Path) -> Result<()> {
+    if RECONCILED.set(()).is_err() {
+        tracing::debug!("env reconcile already ran in this process; skipped");
+        return Ok(());
+    }
     // Force snapshot capture if not already done.
     let shell = shell_snapshot();
 
@@ -61,9 +76,9 @@ pub fn reconcile(raw_config: &str, base_dir: &Path) -> Result<()> {
     // hand-edited `.env` was silently reverted by a stale shell export.
     // Rotating a value from the shell is now an explicit `rsclaw env sync`.
     for (k, v) in &file {
-        // SAFETY: config load runs single-threaded during process
-        // startup, before any tokio worker is spawned. Re-loads on
-        // hot-reload are also serialized through the loader.
+        // SAFETY: guarded by `RECONCILED` so this only runs on the first
+        // config load, during process startup before worker threads that
+        // read the environment exist. Later loads return early above.
         unsafe { std::env::set_var(k, v) };
     }
 

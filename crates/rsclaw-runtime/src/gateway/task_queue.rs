@@ -454,6 +454,35 @@ impl TaskQueueManager {
         // Parse /task prefix to extract mode + overrides.
         let (max_turns, ttl_secs) = parse_task_prefix(&mut message.text);
 
+        // A 同意 / 拒绝 to a tool approval this session is waiting on answers
+        // it; the turn that asked is still running and carries on.
+        if let Some(allow) = rsclaw_agent::approvals::broker().answer_from_chat(
+            session_key,
+            &message.sender,
+            &message.text,
+        ) {
+            tracing::info!(session_key, allow, "task_queue: message answered a tool approval");
+            let key = if allow { "tool_approval_allowed" } else { "tool_approval_denied" };
+            let ack = OutboundMessage {
+                target_id: if message.chat_id.is_empty() {
+                    message.sender.clone()
+                } else {
+                    message.chat_id.clone()
+                },
+                is_group: message.is_group,
+                text: rsclaw_i18n::t(key, rsclaw_i18n::default_lang()),
+                reply_to: None,
+                images: vec![],
+                files: vec![],
+                channel: Some(message.channel.clone()),
+                account: message.account.clone(),
+            };
+            if let Err(e) = push_outbound(&message.channel, message.account.as_deref(), ack) {
+                tracing::debug!(session_key, "task_queue: approval ack not sent: {e}");
+            }
+            return Ok(("approval".to_string(), false));
+        }
+
         let hash = compute_hash(&message.text);
 
         // Dedup: same content within short window.
@@ -463,7 +492,12 @@ impl TaskQueueManager {
         }
 
         // Merge: if there is already a pending task for this session, append.
-        if self.store.merge_into_pending(session_key, &message)? {
+        // The pending task's max_turns / ttl are raised to this message's
+        // so a merged `/task` keeps the budget the user asked for.
+        if self
+            .store
+            .merge_into_pending_with_budget(session_key, &message, max_turns, ttl_secs)?
+        {
             tracing::info!(session_key, "task_queue: message merged into pending task");
             self.notify.notify_one();
             return Ok(("merged".to_string(), true));
@@ -504,7 +538,12 @@ impl TaskQueueManager {
             tracing::info!(session_key, "task_queue: duplicate task dropped");
             return Ok(("dedup".to_string(), false));
         }
-        if self.store.merge_into_pending(session_key, &message)? {
+        // Merge into a pending task for the same session, raising its
+        // max_turns / ttl so this task's budget is not lost.
+        if self
+            .store
+            .merge_into_pending_with_budget(session_key, &message, max_turns, ttl_secs)?
+        {
             tracing::info!(session_key, "task_queue: message merged into pending task");
             self.notify.notify_one();
             return Ok(("merged".to_string(), true));
@@ -587,9 +626,14 @@ impl TaskQueueManager {
         Ok(all)
     }
 
-    /// Mark a task as failed. Auto-retries up to `max_retries`; beyond that
-    /// the task moves to `Dead` status.
-    pub fn fail(&self, task_id: &str, _error: &str, max_retries: u32) -> Result<TaskStatus> {
+    /// Mark a task as failed. Failure is terminal: a failed turn has usually
+    /// already been reported to the user and may have had side effects, so
+    /// it is never re-run automatically (nothing re-dequeues `Failed`). The
+    /// store bumps `retries` and reports `Dead` once `max_retries` is reached;
+    /// callers must treat both `Failed` and `Dead` as final (e.g. clean up
+    /// staged files).
+    pub fn fail(&self, task_id: &str, error: &str, max_retries: u32) -> Result<TaskStatus> {
+        warn!(task_id, error, "task_queue: task failed");
         self.store.fail_task(task_id, max_retries)
     }
 
@@ -641,20 +685,17 @@ pub fn stage_file(filename: &str, data: &[u8], mime_type: &str) -> Result<Queued
     })
 }
 
-/// Read a staged file back into a [`FileAttachment`].
-fn unstage_file(qf: &QueuedFile) -> FileAttachment {
-    let data = match std::fs::read(&qf.path) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(path = %qf.path, err = %e, "staged file missing or unreadable");
-            Vec::new()
-        }
-    };
-    FileAttachment {
+/// Read a staged file back into a [`FileAttachment`]. A missing or
+/// unreadable file is an error: handing the agent an empty attachment would
+/// make it act on content the user never saw it receive.
+fn unstage_file(qf: &QueuedFile) -> Result<FileAttachment> {
+    let data = std::fs::read(&qf.path)
+        .map_err(|e| anyhow::anyhow!("staged file {} unreadable: {e}", qf.filename))?;
+    Ok(FileAttachment {
         filename: qf.filename.clone(),
         data,
         mime_type: qf.mime_type.clone(),
-    }
+    })
 }
 
 /// Remove staged files for a completed/dead task.
@@ -1046,11 +1087,15 @@ impl TaskQueueWorker {
                 Ok(h) => h,
                 Err(e) => {
                     error!(task_id = %task_id, "task queue worker: no agent for channel {channel_name}: {e:#}");
-                    if let Err(fe) =
-                        self.manager
-                            .fail(&task_id, &format!("{e:#}"), task.max_retries)
+                    match self
+                        .manager
+                        .fail(&task_id, &format!("{e:#}"), task.max_retries)
                     {
-                        error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
+                        Ok(TaskStatus::Dead | TaskStatus::Failed) => cleanup_staged_files(&task),
+                        Err(fe) => {
+                            error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}")
+                        }
+                        _ => {}
                     }
                     return;
                 }
@@ -1070,11 +1115,23 @@ impl TaskQueueWorker {
                 })
             })
             .collect();
-        let first_files: Vec<FileAttachment> = task
+        let first_files: Vec<FileAttachment> = match task
             .messages
             .iter()
             .flat_map(|m| m.files.iter().map(unstage_file))
-            .collect();
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(files) => files,
+            Err(e) => {
+                error!(task_id = %task_id, "task queue worker: {e:#}");
+                match self.manager.fail(&task_id, &format!("{e:#}"), task.max_retries) {
+                    Ok(TaskStatus::Dead | TaskStatus::Failed) => cleanup_staged_files(&task),
+                    Err(fe) => error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}"),
+                    _ => {}
+                }
+                return;
+            }
+        };
 
         let target = if chat_id.is_empty() {
             peer_id.clone()
@@ -1105,6 +1162,7 @@ impl TaskQueueWorker {
 
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             let msg = AgentMessage {
+                trust: rsclaw_agent::trust::queued_trust(&channel_name, &peer_id, is_group),
                 session_key: session_key.clone(),
                 text: next_text,
                 channel: channel_name.clone(),
@@ -1126,11 +1184,13 @@ impl TaskQueueWorker {
 
             if handle.tx.send(msg).await.is_err() {
                 error!(task_id = %task_id, "task queue worker: agent channel closed");
-                if let Err(fe) =
-                    self.manager
-                        .fail(&task_id, "agent channel closed", task.max_retries)
+                match self
+                    .manager
+                    .fail(&task_id, "agent channel closed", task.max_retries)
                 {
-                    error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
+                    Ok(TaskStatus::Dead | TaskStatus::Failed) => cleanup_staged_files(&task),
+                    Err(fe) => error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}"),
+                    _ => {}
                 }
                 break;
             }
@@ -1161,7 +1221,7 @@ impl TaskQueueWorker {
                         .manager
                         .fail(&task_id, "reply channel dropped", task.max_retries)
                     {
-                        Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
+                        Ok(TaskStatus::Dead | TaskStatus::Failed) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
                         _ => {}
                     }
@@ -1183,7 +1243,7 @@ impl TaskQueueWorker {
                         .manager
                         .fail(&task_id, "reply timeout", task.max_retries)
                     {
-                        Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
+                        Ok(TaskStatus::Dead | TaskStatus::Failed) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
                         _ => {}
                     }
@@ -1239,17 +1299,29 @@ impl TaskQueueWorker {
                     );
                     last_send_ok = true;
                 } else {
+                    // Chat channels never show reasoning; local surfaces
+                    // (desktop, ws, …) render it themselves.
+                    let text = if rsclaw_agent::trust::is_local_channel(&channel_name) {
+                        reply.text.clone()
+                    } else {
+                        rsclaw_provider::openai::strip_think_tags_pub(&reply.text)
+                    };
                     let out = OutboundMessage {
                         target_id: target.clone(),
                         is_group,
-                        text: reply.text.clone(),
+                        text,
                         reply_to: if turn == 1 { reply_to.clone() } else { None },
                         images: reply.images.clone(),
                         files: reply.files.clone(),
                         channel: Some(channel_name.clone()),
                         account: account.clone(),
                     };
-                    if let Some(tx) = self.channel_tx_for(&channel_name, account.as_deref()) {
+                    if channel_name == "api" {
+                        // The HTTP API has no push channel: its clients get
+                        // the reply from /api/v1/stream and the history.
+                        tracing::debug!(task_id = %task_id, "api channel: reply left to stream and history");
+                        last_send_ok = true;
+                    } else if let Some(tx) = self.channel_tx_for(&channel_name, account.as_deref()) {
                         match tx.send(out).await {
                             Ok(_) => {
                                 last_send_ok = true;

@@ -74,6 +74,7 @@ pub fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
                     tool_log: Vec::new(),
                     question: None,
                     channel: Some(delta_channel),
+                    origin: None,
                 });
             }
             false
@@ -101,6 +102,7 @@ pub fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
                     tool_log: Vec::new(),
                     question: None,
                     channel: Some(rsclaw_events::TextChannel::Thought),
+                    origin: None,
                 });
             }
             false

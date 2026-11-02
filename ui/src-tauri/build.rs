@@ -35,7 +35,7 @@ const APP_COMMANDS: &[&str] = &[
     "test_provider",
     "write_workspace_file",
     "read_workspace_file",
-    "run_rsclaw_cli",
+    "run_doctor",
     "migrate_openclaw",
     "set_auto_start",
     "get_auto_start",

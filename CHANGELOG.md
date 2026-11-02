@@ -4,6 +4,80 @@ All notable changes to RsClaw will be documented in this file.
 
 ## Unreleased
 
+### Security hardening — sender trust model and webhook verification
+
+Full details and examples: `docs/security.md`.
+
+**Breaking changes:**
+
+- **Sender trust.** Only owners may use high-risk tools and local slash
+  commands. Owners are local entry points (desktop, WebSocket, CLI,
+  loopback HTTP), DM senders listed literally in a channel's static
+  `allowFrom`, and identities in the new `gateway.owners`
+  (`["<channel>:<peer_id>"]`). **Paired users, group members, A2A peers
+  and webhook callers are no longer owners**: if you paired your own
+  account, add it to `gateway.owners` (or use
+  `rsclaw channels owner add <channel> <peer>` / the desktop Pairing page).
+- Owner-only tools (shell/exec, file writes, `send_file`, browser and
+  computer use, cron, cross-session and agent control, channel admin,
+  skill install) are refused for non-owners unless listed in
+  `agents.list[].nonOwnerTools` (`["*"]` lifts the restriction).
+- Owner-only slash commands: `!`/`$` shell, `/run`, `/sh`, `/exec`,
+  `/ls`, `/cat`, `/ss`, `/screenshot`, `/webshot`, `/cap*`, `/cron`,
+  `/loop`, `/watch`, `/skill`, `/model`, `/remember`, `/recall`.
+- **Webhook secrets required.** Inbound webhooks verify signatures and
+  stay disabled without their secret: WhatsApp
+  `accounts.<name>.appSecret`, LINE `channelSecret`, Feishu HTTP webhook
+  `verificationToken` / `encryptKey` (Feishu WS mode unaffected). The
+  WhatsApp subscription handshake (`GET /hooks/whatsapp`) now requires
+  `accounts.<name>.verifyToken` or env `WHATSAPP_VERIFY_TOKEN` (403
+  without it). The hooks endpoint and custom webhook channels require
+  `hooks.token` (503 without it).
+- `groupPolicy` for custom channels and WeCom now defaults to
+  `allowlist`; set `groupPolicy: "open"` to keep the old behaviour.
+- File writes are confined to the agent workspace (owners: plus
+  `RSCLAW_WRITE_ROOTS`); web tools refuse private/loopback targets
+  (owners may opt in with `RSCLAW_WEB_FETCH_ALLOW_PRIVATE=1`); commands
+  run by the agent no longer inherit secret-looking env vars (allow
+  names via `RSCLAW_EXEC_PASS_ENV`); `/watch` only expands
+  `${RSCLAW_WATCH_*}` variables.
+- WASM plugins must declare capabilities (`http`, `device`, `cron`,
+  `sse`, `pushOutbound`, `submitAgentTurn`, `desktop`, `vlmDrive`,
+  `vlmDriveBypass`) in `plugin.json5`; manifest env references are
+  limited to `RSCLAW_PLUGIN_<NAME>_*` and `<NAME>_*` (the latter not for
+  names in a reserved namespace such as `RSCLAW`, `OPENAI`, `GITHUB`,
+  `AWS`; see `docs/security.md` for the full list).
+- Background `exec` commands are capped by `tools.exec.maxBackground`
+  (default 4, `0` = unlimited); extra background commands are refused.
+- WebSocket device tokens are bound to the gateway auth token and expire
+  after 30 days; tokens from earlier versions are rejected, so paired
+  clients must log in again once.
+- The gateway rejects non-local `Host` headers while bound to loopback
+  (DNS-rebinding guard); allow extra names with `RSCLAW_ALLOWED_HOSTS`.
+
+**Additions:**
+
+- `rsclaw channels pair <CODE> --owner` and
+  `rsclaw channels owner add|remove|list` edit `gateway.owners`.
+- Desktop Pairing page: "Approve as owner", per-peer owner toggle and an
+  owners list.
+- CLI token/password flags accept `-` to read the secret from stdin.
+- `/clear`, `/new`, `/abort` and the `/cap` sticky binding act on the exact
+  session (group / `dmScope` aware) the command was sent from.
+- DingTalk fetches access tokens via `POST /v1.0/oauth2/accessToken`
+  (app secret in the body, never in a URL), including the login helper.
+- `rsclaw config set/unset`, `rsclaw channels ...` config edits and the
+  desktop config editor write `rsclaw.json5` atomically (temp file + rename).
+- Channel config edits that the gateway auto-applies no longer leave a
+  stale "reload available" banner: the latched offer is cleared and a new
+  `restart.cleared` WS event (also sent on `/api/v1/restart-dismiss`) drops
+  banners already open in the desktop UI.
+- Session `message_count` shown by `sessions.list`, the session tools and
+  `GET /api/v1/sessions/<id>` (`active_message_count`) is the active
+  message count; the stored counter is a monotonic seq allocator.
+- The CLI release ships `rsclaw-tray.ps1` (listed in `SHA256SUMS.txt`) so
+  the Windows installer can verify the tray script it installs.
+
 ### Knowledge Base MVP (Weeks 1–5 + polish) — spec §J/§K/§L/§S/§3/§5 complete
 
 Five-week build of the user-managed RAG knowledge base, plus polish.

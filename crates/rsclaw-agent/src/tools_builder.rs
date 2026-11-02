@@ -283,7 +283,6 @@ pub(crate) const COLD_TOOLS: &[&str] = &[
     "cap_bind_sticky",
     "cap_unbind_sticky",
     "video_gen",
-    "video_status",
     "avatar_gen",
     "mv_gen",
     "music_gen",
@@ -437,7 +436,7 @@ pub fn toolset_allowed_names(
         "image_gen",
         "ocr",
         "video_gen",
-        "video_status",
+        "gen_status",
         "avatar_gen",
         "mv_gen",
         "music_gen",
@@ -608,6 +607,8 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "skill_list".to_owned(),
+        // Tool definitions are part of the cached shared prefix: keep them
+        // byte-identical across brands (see tests/baseline_*.rs).
         description: "List installed local skills with pagination. Use query first to filter by skill name/description, then use limit/offset for more results. Do not use shell to run `rsclaw skills list`; this tool is the authoritative installed-skill listing.".to_owned(),
         parameters: json!({
             "type": "object",
@@ -1433,7 +1434,8 @@ pub fn build_tool_list(
             Screenshot routing: web page → `action=screenshot url=…` (navigates then \
             captures, one call). Desktop screenshot → NOT this tool; tell the user to type \
             `/ss`. Bare `action=screenshot` with no url captures the persistent session — \
-            usually a blank tab; don't.\n\n{}", crate::bootstrap::web_browser_guide()),
+            usually a blank tab; don't.\n\n{}", crate::bootstrap::web_browser_guide(),
+            ),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1500,12 +1502,12 @@ pub fn build_tool_list(
 
     tools.push(ToolDef {
         name: "computer_use".to_owned(),
-        description: "Open AND operate a desktop GUI application — this is THE tool for any 'open <app> and do X' request (e.g. 打开元宝/微信/浏览器 并操作、打开某桌面软件查/发/点某东西). Opening an app is almost always the first step of controlling it, so route the WHOLE task here — do NOT just launch it with a shell command. Actions cover launch + screenshot / click / type / scroll / keys; for anything beyond a single click prefer the `vlm_drive` action with a natural-language `instruction` (it drives the open→screenshot→act loop for you). Do NOT trigger merely because a message mentions 'screenshot'/'screen' in passing (e.g. discussing an image someone already sent) or for non-desktop tasks. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly).\n\nCRITICAL — App-Rule Loading (MANDATORY):\nBefore controlling ANY desktop application (WeChat, Finder, Safari, etc.), you MUST first load the app-specific automation guide.\n1. Call `get_app_rule` with the app name (e.g. name='wechat').\n2. Read and follow the returned guide EXACTLY.\n3. Only then proceed with screenshot/click/type actions.\nNEVER guess coordinates or workflows — the app-rule contains version-specific steps you cannot infer.\n\nEND-TO-END AUTOMATION — vlm_drive action:\nFor complex multi-step desktop tasks (e.g. 'Open WeChat, find a group, send a message'), use the `vlm_drive` action with a natural-language instruction instead of scripting individual click/type steps. The configured VLM will drive the loop internally: screenshot -> analyze -> execute -> repeat. This is more robust than hand-coding coordinates.".to_owned(),
+        description: "Open AND operate a desktop GUI application — this is THE tool for any 'open <app> and do X' request (e.g. 打开元宝/微信/浏览器 并操作、打开某桌面软件查/发/点某东西). Opening an app is almost always the first step of controlling it, so route the WHOLE task here — do NOT just launch it with a shell command. Actions cover launch + screenshot / click / type / scroll / keys; for anything beyond a single click prefer the `vlm_drive` action with a natural-language `instruction` (it drives the open→screenshot→act loop for you). Do NOT trigger merely because a message mentions 'screenshot'/'screen' in passing (e.g. discussing an image someone already sent) or for non-desktop tasks. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly). Do NOT use computer_use for a browser tab already opened by `web_browser` or a browser-backed plugin; continue through that same browser/plugin tool so clicks and screenshots stay inside its CDP-controlled tab instead of acting on an unrelated frontmost desktop app.\n\nCRITICAL — App-Rule Loading (MANDATORY):\nBefore controlling ANY desktop application (WeChat, Finder, Safari, etc.), you MUST first load the app-specific automation guide.\n1. Call `get_app_rule` with the app name (e.g. name='wechat').\n2. Read and follow the returned guide EXACTLY.\n3. Only then proceed with screenshot/click/type actions.\nNEVER guess coordinates or workflows — the app-rule contains version-specific steps you cannot infer.\n\nEND-TO-END AUTOMATION — vlm_drive action:\nFor complex multi-step desktop tasks (e.g. 'Open WeChat, find a group, send a message'), use the `vlm_drive` action with a natural-language instruction instead of scripting individual click/type steps. The configured VLM will drive the loop internally: screenshot -> analyze -> execute -> repeat. This is more robust than hand-coding coordinates.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action":    {"type": "string", "enum": [
-                    "screenshot", "mouse_move", "mouse_click", "left_click",
+                    "screenshot", "mouse_move", "mouse_click", "click", "left_click",
                     "double_click", "triple_click", "right_click", "middle_click",
                     "drag", "scroll", "type", "key", "hold_key",
                     "cursor_position", "get_active_window", "ui_tree",
@@ -1543,7 +1545,7 @@ pub fn build_tool_list(
 
     tools.push(ToolDef {
         name: "image_gen".to_owned(),
-        description: "Generate or EDIT an image with an AI image model. Text-to-image (prompt only) or image-to-image (pass `image` to transform/edit an existing picture). Pass the user's original description as-is (preserve their language, do not translate).".to_owned(),
+        description: "Generate or EDIT an image with an AI image model. Text-to-image (prompt only) or image-to-image (pass `image` to transform/edit an existing picture). Pass the user's original description as-is (preserve their language, do not translate). When the result is `status: submitted` with a `job_id`, the image is delivered automatically; check it with `gen_status` if the user asks.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1595,16 +1597,17 @@ pub fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "video_status".to_owned(),
-        description: "Query an existing video generation task without submitting a new one. \
-            Use this whenever the user asks for progress/status/result of a previously returned \
-            job ID. Pass the internal `job_id` returned by video_gen for any provider, or a native \
-            rsclaw `job_...` / legacy `video_...` task ID. Never call video_gen again merely to \
-            check status; duplicate submission may create a second billable task.".to_owned(),
+        name: "gen_status".to_owned(),
+        description: "Query an existing image / video / avatar / MV generation task without \
+            submitting a new one. Use this whenever the user asks for progress/status/result of a \
+            generation that returned a `job_id` (image_gen, video_gen, avatar_gen, mv_gen). Pass \
+            that internal `job_id`, or a native rsclaw `job_...` / legacy `video_...` task ID. \
+            Never call a *_gen tool again merely to check status; duplicate submission may create \
+            a second billable task.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "job_id": {"type": "string", "description": "Existing internal job UUID, native rsclaw job_... ID, or legacy video_... ID."}
+                "job_id": {"type": "string", "description": "Existing internal job UUID returned by a *_gen tool, native rsclaw job_... ID, or legacy video_... ID."}
             },
             "required": ["job_id"]
         }),

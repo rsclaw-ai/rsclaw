@@ -9,13 +9,13 @@ fn gateway_url(port: u16) -> String {
 
 pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
     let cfg = config::load().ok();
-    let port = cfg.as_ref().map_or(18888, |c| c.gateway.port);
+    let port = cfg.as_ref().map_or(rsclaw_brand::DEFAULT_PORT, |c| c.gateway.port);
     let auth_token = cfg
         .as_ref()
         .and_then(|c| c.gateway.auth_token.as_deref())
         .unwrap_or("");
     let base = gateway_url(port);
-    let client = reqwest::Client::new();
+    let client = crate::cmd::gateway_http::local_client();
 
     match sub {
         DirectoryCommand::Self_ { channel } => {
@@ -37,7 +37,7 @@ pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
                     println!("handle: {handle}");
                 }
                 _ => {
-                    anyhow::bail!(
+                    brand_bail!(
                         "gateway not reachable at port {port}; start it with: rsclaw gateway start"
                     );
                 }
@@ -83,7 +83,7 @@ pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
                         }
                     }
                     _ => {
-                        anyhow::bail!(
+                        brand_bail!(
                             "gateway not reachable at port {port}; start it with: rsclaw gateway start"
                         );
                     }
@@ -119,7 +119,7 @@ pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
                         }
                     }
                     _ => {
-                        anyhow::bail!(
+                        brand_bail!(
                             "gateway not reachable at port {port}; start it with: rsclaw gateway start"
                         );
                     }
@@ -150,7 +150,7 @@ pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
                         }
                     }
                     _ => {
-                        anyhow::bail!(
+                        brand_bail!(
                             "gateway not reachable at port {port}; start it with: rsclaw gateway start"
                         );
                     }

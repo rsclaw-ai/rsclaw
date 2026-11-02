@@ -7,7 +7,14 @@ rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+rsclaw-brand = { path = "../rsclaw-brand", version = "0.1.0" }
 anyhow = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 dirs-next = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider", "socks"], default-features = false }
+tokio = { version = "1", features = ["net", "time"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
