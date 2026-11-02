@@ -242,6 +242,7 @@ pub const ASSET_FILES: &[(&str, &str, &str)] = &[
     ("PROMPT_POLICY", "prompts/policy.md", "distributor policy prompt (any language)"),
     ("PROMPT_POLICY_ZH", "prompts/policy.zh.md", "distributor policy prompt for Chinese sessions"),
     ("PROMPT_POLICY_EN", "prompts/policy.en.md", "distributor policy prompt for other sessions"),
+    ("EXTENSIONS", "extensions.toml", "settings read by extension crates linked into a custom build"),
 ];
 
 /// Languages with bootstrap templates.

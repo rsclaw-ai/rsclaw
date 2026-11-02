@@ -162,6 +162,7 @@ Markdown must be non-empty UTF-8. The default brand directory
 | `prompts/policy.md` | Distributor policy prompt |
 | `prompts/policy.zh.md`, `prompts/policy.en.md` | Language-specific policy prompt (optional) |
 | `prompts/<zh\|en>/<SOUL\|IDENTITY\|AGENTS\|USER\|HEARTBEAT>.md` | Bootstrap workspace templates |
+| `extensions.toml` | Settings for extension crates linked into a custom build (`rsclaw_brand::EXTENSIONS`). The engine itself never reads it; each extension owns a top-level table and ignores the others. |
 | `plugins/<name>/` | Plugin bundled with the brand (see "Bundled plugins") |
 
 ### Config layers
