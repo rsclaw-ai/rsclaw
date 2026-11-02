@@ -1567,6 +1567,30 @@ impl rsclaw::plugin::host_device::Host for HostState {
     }
 }
 
+impl rsclaw::plugin::host_ext::Host for HostState {
+    async fn ext_call(
+        &mut self,
+        name: String,
+        args_json: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let Some((namespace, method)) = name.split_once('.') else {
+            return Ok(Err(format!(
+                "host_ext.ext_call: `{name}` must be <namespace>.<method>"
+            )));
+        };
+        let cap = crate::host_ext::capability(namespace);
+        if let Err(e) = self.require_capability(&cap, "host_ext.ext_call") {
+            return Ok(Err(e));
+        }
+        let Some(extension) = crate::host_ext::lookup(namespace) else {
+            return Ok(Err(format!(
+                "host_ext.ext_call: this engine has no extension `{namespace}`"
+            )));
+        };
+        Ok(extension.call(&self.plugin_name, method, &args_json).await)
+    }
+}
+
 impl rsclaw::plugin::host_background::Host for HostState {
     async fn cron_register(
         &mut self,
@@ -1728,7 +1752,10 @@ fn device_key_path() -> PathBuf {
         .join("host-ed25519.key")
 }
 
-async fn load_device_signing_key() -> Result<SigningKey, String> {
+/// The host's device identity key (`<data dir>/device/host-ed25519.key`),
+/// created with owner-only permissions on first use. Plugins never see it:
+/// `host-device` hands each plugin a key derived from it.
+pub async fn load_device_signing_key() -> Result<SigningKey, String> {
     tokio::task::spawn_blocking(|| {
         let path = device_key_path();
         if let Some(parent) = path.parent() {
@@ -4231,6 +4258,11 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
         |state: &mut HostState| state,
     )
     .map_err(|e| anyhow::anyhow!("failed to add host-ios linker interfaces: {e}"))?;
+    rsclaw::plugin::host_ext::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state: &mut HostState| state,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to add host-ext linker interfaces: {e}"))?;
     Ok(linker)
 }
 

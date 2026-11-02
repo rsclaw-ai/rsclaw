@@ -375,6 +375,14 @@ interface host-ocr {
         -> result<string, string>;
 }
 
+interface host-ext {
+    /// Call a host extension added by this engine build. `name` is
+    /// `<namespace>.<method>`; the plugin must declare the capability
+    /// `ext:<namespace>`. `args-json` and the result are JSON. An engine
+    /// without that extension returns an error.
+    ext-call: func(name: string, args-json: string) -> result<string, string>;
+}
+
 interface plugin-api {
     handle-tool: func(tool-name: string, args-json: string) -> result<string, string>;
 }
@@ -395,5 +403,6 @@ world jimeng-plugin {
     import host-desktop;
     import host-vlm;
     import host-ocr;
+    import host-ext;
     export plugin-api;
 }
