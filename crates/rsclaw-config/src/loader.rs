@@ -626,6 +626,9 @@ fn backup_defaults_before_upgrade(path: &Path) -> Result<()> {
 struct DefaultsMeta {
     #[serde(default)]
     defaults_version: Option<String>,
+    /// Stamped by build.rs on a brand-shaped catalog (see `stamp_fingerprint`).
+    #[serde(default)]
+    defaults_fingerprint: Option<String>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -649,7 +652,10 @@ fn merge_defaults_toml(user_raw: &str, builtin_raw: &str) -> Option<String> {
     let user: DefaultsIndex = toml::from_str(user_raw).ok()?;
     let builtin: DefaultsIndex = toml::from_str(builtin_raw).ok()?;
     let builtin_version = builtin.meta.as_ref()?.defaults_version.as_deref()?.trim();
-    if builtin_version.is_empty() || !defaults_version_is_legacy(&user, builtin_version) {
+    if builtin_version.is_empty()
+        || !(defaults_version_is_legacy(&user, builtin_version)
+            || shaped_catalog_changed(&user, &builtin, builtin_version))
+    {
         return None;
     }
 
@@ -807,6 +813,33 @@ fn defaults_version_is_legacy(user: &DefaultsIndex, builtin_version: &str) -> bo
     version_parts(user_version)
         .zip(version_parts(builtin_version))
         .is_none_or(|(user, builtin)| compare_version_parts(&user, &builtin).is_lt())
+}
+
+/// A brand build ships a reshaped catalog under the upstream
+/// `defaults_version` (a new API host, say). The file is refreshed when it is
+/// at that same version but carries another build's fingerprint, or none (it
+/// came from a build before the stamp). A newer user version, or a builtin
+/// without a stamp (stock builds, remote payloads), never triggers this.
+fn shaped_catalog_changed(user: &DefaultsIndex, builtin: &DefaultsIndex, builtin_version: &str) -> bool {
+    let Some(stamp) = builtin
+        .meta
+        .as_ref()
+        .and_then(|m| m.defaults_fingerprint.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let user_meta = user.meta.as_ref();
+    let same_version = user_meta
+        .and_then(|m| m.defaults_version.as_deref())
+        .and_then(version_parts)
+        .zip(version_parts(builtin_version))
+        .is_some_and(|(u, b)| compare_version_parts(&u, &b).is_eq());
+    let user_stamp = user_meta
+        .and_then(|m| m.defaults_fingerprint.as_deref())
+        .map(str::trim);
+    same_version && user_stamp != Some(stamp)
 }
 
 fn version_parts(raw: &str) -> Option<Vec<u64>> {
@@ -1353,6 +1386,25 @@ label = "OpenAI"
 "#;
         // Same version → not legacy → no rewrite.
         assert!(merge_defaults_toml(builtin, builtin).is_none());
+    }
+
+    #[test]
+    fn brand_catalog_refreshes_at_the_same_version_when_its_stamp_moves() {
+        let old_build = "[meta]\ndefaults_version = \"2026.10.24\"\n\n[[providers]]\nname = \"rsclaw\"\nbase_url = \"https://api.rsclaw.ai/v1\"\n";
+        let new_build = "[meta]\ndefaults_fingerprint = \"00000000000000aa\"\ndefaults_version = \"2026.10.24\"\n\n[[providers]]\nname = \"rsclaw\"\nbase_url = \"https://api.qishu.example/v1\"\n";
+        // A file from a build before the stamp, same version: refreshed.
+        let merged = merge_defaults_toml(old_build, new_build).expect("refresh");
+        assert!(merged.contains("api.qishu.example"));
+        // Refreshed once: the stamp now matches, so no loop.
+        assert!(merge_defaults_toml(&merged, new_build).is_none());
+        // Another build's stamp at the same version: refreshed.
+        let other = new_build.replace("00000000000000aa", "00000000000000bb");
+        assert!(merge_defaults_toml(&other, new_build).is_some());
+        // A newer version on disk (e.g. a remote payload) is never replaced.
+        let newer = old_build.replace("2026.10.24", "2026.11.01");
+        assert!(merge_defaults_toml(&newer, new_build).is_none());
+        // A builtin without a stamp (stock build) keeps the version-only rule.
+        assert!(merge_defaults_toml(old_build, old_build).is_none());
     }
 
     #[test]
