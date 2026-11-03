@@ -693,6 +693,9 @@ fn pick_consistent(
     if a > b { (whole_90.text, 90) } else { (whole_270.text, 270) }
 }
 
+/// Shortest read time that comes from the model rather than the OCR cache.
+const MIN_TIMED_READ_SECS: f64 = 0.5;
+
 /// Of the readings of a page turned 90° and 270°, the one read upright:
 /// the one that loops less, else the clearly faster one, else the shorter.
 /// The wrong way up the model generates far more (a loop the endpoint
@@ -700,9 +703,11 @@ fn pick_consistent(
 fn pick_upright(turned_90: OcrRead, turned_270: OcrRead) -> (String, u16) {
     let (a, b) = (repeated_phrase_share(&turned_90.text), repeated_phrase_share(&turned_270.text));
     let (fast, slow) = (turned_90.secs.min(turned_270.secs), turned_90.secs.max(turned_270.secs));
+    // A reading served from the OCR cache takes no time, so timing only
+    // says something when both readings were really generated.
     let first = if (a - b).abs() > 0.05 {
         a < b
-    } else if slow > fast * 1.5 {
+    } else if fast >= MIN_TIMED_READ_SECS && slow > fast * 1.5 {
         turned_90.secs < turned_270.secs
     } else {
         turned_90.text.chars().count() <= turned_270.text.chars().count()
@@ -811,6 +816,12 @@ mod tests {
         // A trimmed loop leaves no repeats but took far longer.
         let invented = "名称 武汉市硚口区汉正街1号\n法定代表人 李明远";
         assert_eq!(pick_upright(read(invented, 29.5), read(upright, 8.4)), (upright.to_string(), 270));
+        // Both served from the OCR cache: the instant timings are noise and
+        // must decide nothing, so the pick is the one equal timings give.
+        for (a, b) in [(invented, upright), (upright, invented)] {
+            assert_eq!(pick_upright(read(a, 0.003), read(b, 0.001)), pick_upright(read(a, 9.0), read(b, 9.0)));
+            assert_eq!(pick_upright(read(a, 0.001), read(b, 0.003)), pick_upright(read(a, 9.0), read(b, 9.0)));
+        }
     }
 
     #[test]

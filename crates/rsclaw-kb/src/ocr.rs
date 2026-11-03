@@ -14,6 +14,8 @@
 
 use anyhow::{Context, Result};
 
+use crate::ocr_cache::OcrCache;
+
 /// OCR request deadline. A full page of dense CJK can take a while on an
 /// autoregressive model; past this the endpoint is wedged.
 const OCR_TIMEOUT_SECS: u64 = 120;
@@ -111,13 +113,16 @@ impl OcrClient {
         model: Option<&str>,
         lang: Option<&str>,
     ) -> Result<String> {
-        let body = ocr_request_body(
-            image,
-            prompt.or(self.prompt.as_deref()),
-            max_tokens,
-            model.or(self.model.as_deref()),
-            lang.or(self.lang.as_deref()),
-        );
+        let prompt = prompt.or(self.prompt.as_deref());
+        let model = model.or(self.model.as_deref());
+        let lang = lang.or(self.lang.as_deref());
+        // Same image, model and instruction: the reading from last time.
+        let cache_key = OcrCache::key(image, model, prompt, lang, max_tokens);
+        if let Some(text) = cache_key.as_deref().and_then(|k| OcrCache::global().get(k)) {
+            tracing::debug!(chars = text.len(), "ocr: cache hit");
+            return Ok(text);
+        }
+        let body = ocr_request_body(image, prompt, max_tokens, model, lang);
 
         let send = || async {
             let resp = self
@@ -154,6 +159,11 @@ impl OcrClient {
                     .and_then(|v| v.as_str())
             })
             .context("ocr response missing `content`")?;
+        // An empty reading may be a hiccup rather than a blank page; let the
+        // next request ask again.
+        if let Some(key) = cache_key.as_deref().filter(|_| !content.trim().is_empty()) {
+            OcrCache::global().put(key, content);
+        }
         Ok(content.to_owned())
     }
 }
