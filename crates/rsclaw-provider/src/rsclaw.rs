@@ -96,7 +96,13 @@ pub const RSCLAW_DEFAULT_VISION: &str = "rsclaw/rsclaw-vision-v1";
 /// (TCP connect + TLS + send body + receive headers + first byte).
 /// Once the body stream begins this deadline no longer applies — the
 /// SSE body is allowed to take as long as the model needs.
-const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// The server holds a turn's response headers for up to 90 s while it
+/// waits for the worker's first frame (so a "session lost" answer can still
+/// come back as a status the client replays on). Giving up at 60 s, as this
+/// used to, abandoned turns the server was still about to start and paid
+/// for a full session replay instead; stay just past the server's wait.
+const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// Read-idle bound applied per chunk once the SSE body is streaming. The
 /// headers deadline above no longer applies after the body begins, so this
