@@ -1601,6 +1601,7 @@ impl rsclaw::plugin::host_ext::Host for HostState {
         let caller = crate::host_ext::Caller {
             name: &self.plugin_name,
             digest: self.plugin_digest.as_deref(),
+            session_key: self.notify_ctx.as_ref().map(|c| c.session_key.as_str()),
         };
         Ok(extension.call_from(&caller, method, &args_json).await)
     }
@@ -3560,8 +3561,15 @@ impl rsclaw::plugin::host_ocr::Host for HostState {
                 ),
             ));
         };
+        let session = self
+            .notify_ctx
+            .as_ref()
+            .map(|c| Arc::<str>::from(c.session_key.as_str()))
+            .or_else(rsclaw_embed::fleet_scope::current);
         let result = tokio::task::spawn_blocking(move || {
-            client.ocr(&image_data_uri, Some(&prompt), Some(max_tokens))
+            rsclaw_embed::fleet_scope::sync_within(session, || {
+                client.ocr(&image_data_uri, Some(&prompt), Some(max_tokens))
+            })
         })
         .await
         .map_err(|e| anyhow::anyhow!("ocr_image: task join failed: {e}"))?;
@@ -4458,6 +4466,13 @@ impl WasmPlugin {
             *last = Some(Instant::now());
         }
 
+        // The conversation the call is made for: its model and OCR calls
+        // carry that conversation's fleet headers (`fleet_scope`) on the
+        // task below too.
+        let fleet_session = notify_ctx
+            .as_ref()
+            .map(|c| Arc::<str>::from(c.session_key.as_str()))
+            .or_else(rsclaw_embed::fleet_scope::current);
         // Fresh store per call for isolation, with memory cap and epoch deadline.
         let mut store = new_sandboxed_store(
             &self.engine,
@@ -4483,7 +4498,7 @@ impl WasmPlugin {
         let linker = self.linker.clone();
         let component = self.component.clone();
         let tool = tool_name.to_string();
-        let call = tokio::spawn(async move {
+        let work = async move {
             let instance = linker
                 .instantiate_async(&mut store, &component)
                 .await
@@ -4512,7 +4527,8 @@ impl WasmPlugin {
                 .await
                 .map_err(|e| anyhow::anyhow!("handle-tool call failed for '{tool}': {e}"))?;
             anyhow::Ok(result)
-        });
+        };
+        let call = tokio::spawn(rsclaw_embed::fleet_scope::within(fleet_session, work));
         let result = call
             .await
             .map_err(|e| anyhow::anyhow!("WASM tool task for '{tool_name}' failed: {e}"))??;

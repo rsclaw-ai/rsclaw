@@ -25,6 +25,10 @@ pub struct Caller<'a> {
     /// ([`rsclaw_brand::plugin_digest::tree_digest`]), computed for the
     /// brand's bundled plugins only; None otherwise.
     pub digest: Option<&'a str>,
+    /// The conversation the call is made in (the tool call's session key),
+    /// when the plugin was invoked from one; None for cron, the tools API
+    /// and other calls outside a conversation.
+    pub session_key: Option<&'a str>,
 }
 
 /// One host extension.

@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use tracing::warn;
 
 pub mod fleet;
+pub mod fleet_scope;
 pub use fleet::FleetHttp;
 
 /// Shared HTTP client for remote embedding/rerank endpoints.

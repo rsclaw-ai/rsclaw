@@ -53,6 +53,7 @@ rsclaw-channel = { path = "../rsclaw-channel", version = "0.1.1" }
 rsclaw-skill = { path = "../rsclaw-skill", version = "0.1.0" }
 rsclaw-browser = { path = "../rsclaw-browser", version = "0.1.0" }
 rsclaw-kb = { path = "../rsclaw-kb", version = "0.1.0" }
+rsclaw-embed = { path = "../rsclaw-embed", version = "0.1.0" }
 rsclaw-plugin = { path = "../rsclaw-plugin", version = "0.1.0" }
 rsclaw-artifact = { path = "../rsclaw-artifact", version = "0.1.0" }
 rsclaw-computer = { path = "../rsclaw-computer", version = "0.1.0" }

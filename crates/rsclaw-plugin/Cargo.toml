@@ -23,6 +23,7 @@ rsclaw-provider = { path = "../rsclaw-provider", version = "0.1.0" }
 rsclaw-store = { path = "../rsclaw-store", version = "0.1.0" }
 rsclaw-channel = { path = "../rsclaw-channel", version = "0.1.0" }
 rsclaw-kb = { path = "../rsclaw-kb", version = "0.1.0" }
+rsclaw-embed = { path = "../rsclaw-embed", version = "0.1.0" }
 rsclaw-browser = { path = "../rsclaw-browser", version = "0.1.0" }
 rsclaw-memory = { path = "../rsclaw-memory", version = "0.1.0" }
 rsclaw-desktop = { path = "../rsclaw-desktop", version = "0.1.0" }

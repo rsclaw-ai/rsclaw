@@ -589,9 +589,11 @@ impl OcrRequest {
             .map_err(|e| format!("ocr: slot closed: {e}"))?;
         let client = self.client.clone();
         let (prompt, max_tokens, lang) = (self.prompt.clone(), self.max_tokens, self.lang.clone());
+        // The conversation's fleet headers go along to the blocking thread.
+        let session = rsclaw_embed::fleet_scope::current();
         // OCR transport is sync (block_in_place); run it off the async
         // worker so we don't stall the runtime thread on a slow page.
-        tokio::task::spawn_blocking(move || {
+        let read = move || {
             let mut attempt = 0;
             loop {
                 let started = std::time::Instant::now();
@@ -619,9 +621,10 @@ impl OcrRequest {
                     }
                 }
             }
-        })
-        .await
-        .map_err(|e| format!("ocr: task join failed: {e}"))?
+        };
+        tokio::task::spawn_blocking(move || rsclaw_embed::fleet_scope::sync_within(session, read))
+            .await
+            .map_err(|e| format!("ocr: task join failed: {e}"))?
     }
 }
 
