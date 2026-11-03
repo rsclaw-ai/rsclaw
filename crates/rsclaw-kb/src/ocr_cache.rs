@@ -6,10 +6,10 @@
 //! [`crate::OcrClient`], so the cache sits there and covers the `ocr` and
 //! `pdf` tools, `read_file` on PDFs, KB image ingest, the CLI and plugins.
 //!
-//! The key is a SHA-256 over the exact image bytes sent (after rendering,
-//! cropping, strip cutting and JPEG encoding, so any change to that
-//! preprocessing changes the key), the model, the prompt, the language and
-//! the output cap. Only inline `data:` images are cached: a URL can change
+//! The key is a SHA-256 over the endpoint, the exact image bytes sent (after
+//! rendering, cropping, strip cutting and JPEG encoding, so any change to
+//! that preprocessing changes the key), the model, the prompt, the language
+//! and the output cap. Only inline `data:` images are cached: a URL can change
 //! behind the same string. Entries are plain text files under
 //! `var/cache/ocr/`, kept to a total size cap by evicting the least
 //! recently used.
@@ -61,9 +61,12 @@ impl OcrCache {
         })
     }
 
-    /// The cache key for one OCR request, or `None` when the image is not
-    /// an inline `data:` URI.
+    /// The cache key for one OCR request to `endpoint`, or `None` when the
+    /// image is not an inline `data:` URI. The endpoint is part of the key:
+    /// with no model named, the server picks one, and another server may
+    /// pick another.
     pub fn key(
+        endpoint: &str,
         image: &str,
         model: Option<&str>,
         prompt: Option<&str>,
@@ -77,6 +80,7 @@ impl OcrCache {
         let mut h = Sha256::new();
         for part in [
             Some(KEY_VERSION),
+            Some(endpoint),
             model,
             prompt,
             lang,
@@ -174,7 +178,10 @@ impl OcrCache {
 }
 
 fn remove(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path) {
+    // Another process or thread trimming at the same time may have taken it.
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
         tracing::warn!(error = %e, "ocr cache: cannot remove an old entry");
     }
 }
@@ -184,55 +191,98 @@ mod tests {
     use super::*;
 
     const IMG: &str = "data:image/jpeg;base64,AAAA";
+    const EP: &str = "https://api.example/v1/agent/ocr";
 
     #[test]
     fn ocr_cache_key_covers_every_input() {
-        let base = OcrCache::key(IMG, Some("rsclaw-ocr-v1"), Some("OCR:"), None, Some(2048));
+        let base = OcrCache::key(
+            EP,
+            IMG,
+            Some("rsclaw-ocr-v1"),
+            Some("OCR:"),
+            None,
+            Some(2048),
+        );
         assert!(base.is_some());
         let variants = [
             OcrCache::key(
+                EP,
                 "data:image/jpeg;base64,AAAB",
                 Some("rsclaw-ocr-v1"),
                 Some("OCR:"),
                 None,
                 Some(2048),
             ),
-            OcrCache::key(IMG, Some("rsclaw-ocr-v2"), Some("OCR:"), None, Some(2048)),
-            OcrCache::key(IMG, Some("rsclaw-ocr-v1"), Some("Table:"), None, Some(2048)),
-            OcrCache::key(IMG, Some("rsclaw-ocr-v1"), None, None, Some(2048)),
             OcrCache::key(
+                EP,
+                IMG,
+                Some("rsclaw-ocr-v2"),
+                Some("OCR:"),
+                None,
+                Some(2048),
+            ),
+            OcrCache::key(
+                EP,
+                IMG,
+                Some("rsclaw-ocr-v1"),
+                Some("Table:"),
+                None,
+                Some(2048),
+            ),
+            OcrCache::key(EP, IMG, Some("rsclaw-ocr-v1"), None, None, Some(2048)),
+            OcrCache::key(
+                EP,
                 IMG,
                 Some("rsclaw-ocr-v1"),
                 Some("OCR:"),
                 Some("zh"),
                 Some(2048),
             ),
-            OcrCache::key(IMG, Some("rsclaw-ocr-v1"), Some("OCR:"), None, None),
+            OcrCache::key(EP, IMG, Some("rsclaw-ocr-v1"), Some("OCR:"), None, None),
         ];
         for v in variants {
             assert_ne!(v, base);
         }
+        // The same request to another endpoint is another reading.
+        assert_ne!(
+            OcrCache::key(
+                "https://other.example/v1/agent/ocr",
+                IMG,
+                Some("rsclaw-ocr-v1"),
+                Some("OCR:"),
+                None,
+                Some(2048)
+            ),
+            base
+        );
         assert_eq!(
             base,
-            OcrCache::key(IMG, Some("rsclaw-ocr-v1"), Some("OCR:"), None, Some(2048))
+            OcrCache::key(
+                EP,
+                IMG,
+                Some("rsclaw-ocr-v1"),
+                Some("OCR:"),
+                None,
+                Some(2048)
+            )
         );
         // Absent and empty are different requests.
         assert_ne!(
-            OcrCache::key(IMG, None, None, None, None),
-            OcrCache::key(IMG, None, Some(""), None, None)
+            OcrCache::key(EP, IMG, None, None, None, None),
+            OcrCache::key(EP, IMG, None, Some(""), None, None)
         );
     }
 
     #[test]
     fn ocr_cache_skips_urls() {
-        assert!(OcrCache::key("https://example.com/a.png", None, None, None, None).is_none());
+        assert!(OcrCache::key(EP, "https://example.com/a.png", None, None, None, None).is_none());
     }
 
     #[test]
     fn ocr_cache_stores_and_reads_back() {
         let dir = tempfile::tempdir().unwrap();
         let cache = OcrCache::new(dir.path().join("ocr"), 1024 * 1024);
-        let key = OcrCache::key(IMG, Some("m"), None, None, None).unwrap();
+        let key = OcrCache::key(EP, IMG, Some("m"), None, None, None).unwrap();
         assert!(cache.get(&key).is_none());
         cache.put(&key, "第一页 合同金额 120000 元");
         assert_eq!(
@@ -249,7 +299,7 @@ mod tests {
         let cache = OcrCache::new(dir.path().to_path_buf(), 400);
         let text = "x".repeat(40);
         let keys: Vec<String> = (0..10)
-            .map(|i| OcrCache::key(&format!("data:,{i}"), None, None, None, None).unwrap())
+            .map(|i| OcrCache::key(EP, &format!("data:,{i}"), None, None, None, None).unwrap())
             .collect();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         for (i, key) in keys.iter().enumerate() {

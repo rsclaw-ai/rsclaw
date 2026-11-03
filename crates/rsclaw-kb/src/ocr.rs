@@ -116,8 +116,8 @@ impl OcrClient {
         let prompt = prompt.or(self.prompt.as_deref());
         let model = model.or(self.model.as_deref());
         let lang = lang.or(self.lang.as_deref());
-        // Same image, model and instruction: the reading from last time.
-        let cache_key = OcrCache::key(image, model, prompt, lang, max_tokens);
+        // Same endpoint, image, model and instruction: the reading from last time.
+        let cache_key = OcrCache::key(&self.url, image, model, prompt, lang, max_tokens);
         if let Some(text) = cache_key.as_deref().and_then(|k| OcrCache::global().get(k)) {
             tracing::debug!(chars = text.len(), "ocr: cache hit");
             return Ok(text);
