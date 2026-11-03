@@ -3144,8 +3144,9 @@ enum BlockKind {
 /// arriving, is reported alive to the caller.
 const TOOL_INPUT_KEEPALIVE: Duration = Duration::from_secs(20);
 
-/// Longest gap between frames tolerated inside an open tool call before
-/// the keepalive stops and the caller's own idle watchdog takes over.
+/// Longest gap between frames tolerated inside an open tool call. Past it
+/// the turn ends with an error naming the tool, so a worker that died
+/// mid-argument still fails, and says why.
 ///
 /// The worker holds back each tool argument until it is complete (values
 /// under 64 KiB go out in one piece when the parameter closes), so a model
@@ -3156,43 +3157,50 @@ const TOOL_INPUT_KEEPALIVE: Duration = Duration::from_secs(20);
 const TOOL_INPUT_MAX_SILENCE: Duration = Duration::from_secs(480);
 
 /// Wraps a turn's event stream so that, while a `tool_call` block is open
-/// and the stream is silent, an empty text delta is emitted every `tick`
-/// (for at most `max_silence` since the last real event). Outside a tool
-/// call nothing is added, so a stream that stalls anywhere else still trips
-/// the caller's idle watchdog as before.
+/// and the stream is silent, an empty text delta is emitted every `tick`.
+/// After `max_silence` without a real event inside the tool call, the stream
+/// ends with an error naming the tool. Outside a tool call nothing is added,
+/// so a stream that stalls anywhere else still trips the caller's idle
+/// watchdog as before.
 fn keep_alive_in_tool_input(
     inner: LlmStream,
     state: Arc<tokio::sync::Mutex<SseState>>,
     tick: Duration,
     max_silence: Duration,
 ) -> LlmStream {
-    let start = (inner, state, std::time::Instant::now());
-    Box::pin(futures::stream::unfold(
-        start,
-        move |(mut inner, state, mut last)| async move {
-            loop {
-                tokio::select! {
-                    // `next()` is cancel-safe: the stream keeps any half-read
-                    // chunk when the timer wins the race.
-                    event = inner.next() => {
-                        last = std::time::Instant::now();
-                        return event.map(|e| (e, (inner, state, last)));
+    // `None` once the stream has been ended by the silence error.
+    let start = Some((inner, state, std::time::Instant::now()));
+    Box::pin(futures::stream::unfold(start, move |running| async move {
+        let (mut inner, state, mut last) = running?;
+        loop {
+            tokio::select! {
+                // `next()` is cancel-safe: the stream keeps any half-read
+                // chunk when the timer wins the race.
+                event = inner.next() => {
+                    last = std::time::Instant::now();
+                    return event.map(|e| (e, Some((inner, state, last))));
+                }
+                () = tokio::time::sleep(tick) => {
+                    let open_tool = state
+                        .lock()
+                        .await
+                        .blocks
+                        .values()
+                        .find(|b| b.kind == BlockKind::ToolCall)
+                        .map(|b| b.tool_name.clone());
+                    let Some(tool) = open_tool else { continue };
+                    if last.elapsed() < max_silence {
+                        return Some((Ok(StreamEvent::TextDelta(String::new())), Some((inner, state, last))));
                     }
-                    () = tokio::time::sleep(tick) => {
-                        let in_tool_call = state
-                            .lock()
-                            .await
-                            .blocks
-                            .values()
-                            .any(|b| b.kind == BlockKind::ToolCall);
-                        if in_tool_call && last.elapsed() < max_silence {
-                            return Some((Ok(StreamEvent::TextDelta(String::new())), (inner, state, last)));
-                        }
-                    }
+                    let error = anyhow::anyhow!(
+                        "rsclaw turn: no data for {}s while the model was writing the arguments of `{tool}` (the worker stopped mid tool call)",
+                        last.elapsed().as_secs()
+                    );
+                    return Some((Err(error), None));
                 }
             }
-        },
-    ))
+        }
+    }))
 }
 
 async fn parse_sse_chunk(
@@ -3646,16 +3654,28 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(80),
         );
-        let events = events_until_quiet(&mut s, Duration::from_millis(300)).await;
+        let mut keepalives = 0;
+        let error = loop {
+            match tokio::time::timeout(Duration::from_millis(300), s.next()).await {
+                Ok(Some(Ok(StreamEvent::TextDelta(t)))) if t.is_empty() => keepalives += 1,
+                Ok(Some(Err(e))) => break e.to_string(),
+                other => panic!("expected a keepalive or the silence error, got {other:?}"),
+            }
+        };
         assert!(
-            !events.is_empty() && events.len() <= 9,
-            "keepalives while inside the tool call, then they stop: got {}",
-            events.len()
+            (1..=9).contains(&keepalives),
+            "keepalives while inside the tool call: got {keepalives}"
         );
         assert!(
-            events
-                .iter()
-                .all(|e| matches!(e, StreamEvent::TextDelta(t) if t.is_empty()))
+            error.contains("create_docx"),
+            "a dead stream inside a tool call fails naming the tool: {error}"
+        );
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_millis(100), s.next()).await,
+                Ok(None)
+            ),
+            "the stream ends after the silence error"
         );
     }
 
