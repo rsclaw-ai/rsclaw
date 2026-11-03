@@ -135,6 +135,10 @@ pub struct WasmPlugin {
     pub capabilities: Vec<String>,
     /// Shared copy of `capabilities` handed to every per-call `HostState`.
     capabilities_arc: Arc<Vec<String>>,
+    /// Content digest of the plugin directory at load time, for a plugin
+    /// whose name is one of the brand's bundled plugins (host extensions
+    /// such as billing trust only the bundled build); None for others.
+    content_digest: Option<Arc<str>>,
     /// Slash command metadata from the manifest.
     pub slash_commands: Vec<crate::manifest::PluginSlashCommand>,
     /// Trusted tool aliases from plugin tool name to first-class host tool
@@ -244,6 +248,9 @@ struct HostState {
     /// Capability names declared in the plugin manifest. Sensitive host
     /// functions check this at entry (see `require_capability`).
     capabilities: Arc<Vec<String>>,
+    /// Content digest of the plugin as loaded, for host extensions that
+    /// trust only the brand's bundled build (see [`WasmPlugin`]).
+    plugin_digest: Option<Arc<str>>,
 }
 
 fn new_host_state(
@@ -255,6 +262,7 @@ fn new_host_state(
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
     capabilities: Arc<Vec<String>>,
+    plugin_digest: Option<Arc<str>>,
 ) -> HostState {
     HostState {
         browser,
@@ -272,6 +280,7 @@ fn new_host_state(
         vision_model,
         wda_url: None,
         capabilities,
+        plugin_digest,
     }
 }
 
@@ -287,6 +296,7 @@ fn new_sandboxed_store(
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
     capabilities: Arc<Vec<String>>,
+    plugin_digest: Option<Arc<str>>,
 ) -> Store<HostState> {
     let mut store = Store::new(
         engine,
@@ -299,6 +309,7 @@ fn new_sandboxed_store(
             providers,
             vision_model,
             capabilities,
+            plugin_digest,
         ),
     );
     store.limiter(|s| &mut s.limits);
@@ -1587,7 +1598,11 @@ impl rsclaw::plugin::host_ext::Host for HostState {
                 "host_ext.ext_call: this engine has no extension `{namespace}`"
             )));
         };
-        Ok(extension.call(&self.plugin_name, method, &args_json).await)
+        let caller = crate::host_ext::Caller {
+            name: &self.plugin_name,
+            digest: self.plugin_digest.as_deref(),
+        };
+        Ok(extension.call_from(&caller, method, &args_json).await)
     }
 }
 
@@ -4288,6 +4303,19 @@ pub async fn load_wasm_plugin(
     let component = Component::new(engine, &wasm_bytes).map_err(|e| {
         anyhow::anyhow!("failed to compile WASM component: {}: {e}", path.display())
     })?;
+    // What the brand records for its bundled plugins, over the files loaded
+    // now, so a host extension can tell the bundled build from a plugin
+    // installed under the same name.
+    let content_digest = if rsclaw_brand::BUNDLED_PLUGINS
+        .iter()
+        .any(|p| p.name == manifest.name)
+    {
+        path.parent()
+            .and_then(|dir| rsclaw_brand::plugin_digest::tree_digest(dir).ok())
+            .map(Arc::from)
+    } else {
+        None
+    };
 
     let linker = build_linker(engine)?;
 
@@ -4320,6 +4348,7 @@ pub async fn load_wasm_plugin(
         plugin_config: resolve_plugin_config(&manifest.config, &manifest.name),
         capabilities: manifest.capabilities.clone(),
         capabilities_arc: Arc::new(manifest.capabilities.clone()),
+        content_digest,
         slash_commands: manifest.slash_commands.clone(),
         tool_aliases: manifest.tool_aliases.clone(),
         min_call_interval: Duration::from_millis(u64::from(manifest.min_call_interval_ms)),
@@ -4440,6 +4469,7 @@ impl WasmPlugin {
             self.providers.clone(),
             self.vision_model.clone(),
             Arc::clone(&self.capabilities_arc),
+            self.content_digest.clone(),
         );
 
         let args_json =

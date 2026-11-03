@@ -16,10 +16,28 @@ use std::{
 /// The future an extension call returns: JSON text, or an error message.
 pub type HostExtFuture = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
 
+/// The plugin making a call.
+#[derive(Debug, Clone, Copy)]
+pub struct Caller<'a> {
+    /// Plugin name (from its manifest).
+    pub name: &'a str,
+    /// `sha256:<hex>` content digest of the plugin's directory as loaded
+    /// ([`rsclaw_brand::plugin_digest::tree_digest`]), computed for the
+    /// brand's bundled plugins only; None otherwise.
+    pub digest: Option<&'a str>,
+}
+
 /// One host extension.
 pub trait HostExtension: Send + Sync {
     /// Handle `method` for the plugin named `plugin`, with JSON `args_json`.
     fn call(&self, plugin: &str, method: &str, args_json: &str) -> HostExtFuture;
+
+    /// Handle `method` for `caller`. The plugin runtime calls this; an
+    /// extension that trusts only particular builds of a plugin checks
+    /// `caller.digest` here. By default the same as [`Self::call`].
+    fn call_from(&self, caller: &Caller<'_>, method: &str, args_json: &str) -> HostExtFuture {
+        self.call(caller.name, method, args_json)
+    }
 }
 
 static REGISTRY: RwLock<Vec<(String, Arc<dyn HostExtension>)>> = RwLock::new(Vec::new());
