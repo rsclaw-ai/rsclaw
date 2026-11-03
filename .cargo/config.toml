@@ -16,11 +16,13 @@ rrd = "run --profile release-dev --"
 # CI-grade release — catches release-only issues without fat LTO.
 brc = "build --profile ci"
 
+# The engine's main thread needs more than Windows' default 1 MB stack; reserve
+# 16 MB at link time so no installer has to patch the PE header afterwards.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:16777216"]
 
 [target.x86_64-pc-windows-gnu]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-Wl,--stack,16777216"]
 
 [target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:16777216"]

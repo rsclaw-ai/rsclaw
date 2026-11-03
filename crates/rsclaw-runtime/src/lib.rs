@@ -469,16 +469,14 @@ fn init_tracing(cli: &Cli) {
             .with_timer(timer.clone())
             .with_env_filter(filter)
             .init();
-    } else if cli.no_color {
-        tracing_subscriber::fmt()
-            .with_timer(timer)
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .init();
     } else {
+        // Colors only on a terminal: a gateway started in the background writes
+        // its stdout to gateway.log, where escape codes are noise.
+        use std::io::IsTerminal;
         tracing_subscriber::fmt()
             .with_timer(timer)
             .with_env_filter(filter)
+            .with_ansi(!cli.no_color && std::io::stdout().is_terminal())
             .init();
     }
 }
