@@ -33,8 +33,9 @@ impl super::runtime::AgentRuntime {
             .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
             .ok_or_else(|| {
                 anyhow!(
-                    "{kind}_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in {cfg} or export RSCLAW_API_KEY, then retry.",
-                    cfg = rsclaw_brand::CONFIG_FILE
+                    "{kind}_gen: no API key for {cloud}. Set `model.models.providers.rsclaw.apiKey` in {cfg} or export RSCLAW_API_KEY, then retry.",
+                    cfg = rsclaw_brand::CONFIG_FILE,
+                    cloud = rsclaw_brand::cloud_name()
                 )
             })?;
         let host = rsclaw_provider::rsclaw_http::gen_host_base(None);
@@ -81,7 +82,7 @@ impl super::runtime::AgentRuntime {
                 .and_then(|x| x.as_str())
                 .or_else(|| v.get("message").and_then(|x| x.as_str()))
                 .unwrap_or_else(|| rsclaw_util::truncate_str(&raw, 200));
-            return Err(anyhow!("{kind}_gen: rsclaw API {status}: {msg}"));
+            return Err(anyhow!("{kind}_gen: {} API {status}: {msg}", rsclaw_brand::cloud_name()));
         }
 
         // Success. The body is normally raw audio bytes, but tolerate a JSON

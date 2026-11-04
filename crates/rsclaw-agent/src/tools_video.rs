@@ -332,8 +332,9 @@ impl super::runtime::AgentRuntime {
                     .await
                     .map(|id| ("rsclaw_native", id)),
                     None => Err(anyhow!(
-                        "video_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in {cfg} or export RSCLAW_API_KEY, then retry — or tell the user the rsclaw key is missing.",
-                        cfg = rsclaw_brand::CONFIG_FILE
+                        "video_gen: no API key for {cloud}. Set `model.models.providers.rsclaw.apiKey` in {cfg} or export RSCLAW_API_KEY, then retry — or tell the user the {cloud} key is missing.",
+                        cfg = rsclaw_brand::CONFIG_FILE,
+                        cloud = rsclaw_brand::cloud_name()
                     )),
                 },
                 other => Err(anyhow!("video_gen: unsupported provider {other}")),
@@ -463,7 +464,8 @@ impl super::runtime::AgentRuntime {
                 .or_else(|| std::env::var("RSCLAW_API_KEY").ok())
                 .ok_or_else(|| {
                     anyhow!(
-                        "gen_status: no rsclaw API key configured; query with the internal `job_id` instead"
+                        "gen_status: no {} API key configured; query with the internal `job_id` instead",
+                        rsclaw_brand::cloud_name()
                     )
                 })
         };
@@ -625,7 +627,7 @@ impl super::runtime::AgentRuntime {
             "kind": endpoint,
             "task_id": task_id,
             "job_id": job_id,
-            "message": "Generation submitted to the rsclaw gen service. The finished video will be delivered automatically when ready. The user has been informed; do not poll or wait — your turn is complete. If the user later asks about progress, call gen_status with this job_id."
+            "message": format!("Generation submitted to the {} gen service. The finished video will be delivered automatically when ready. The user has been informed; do not poll or wait — your turn is complete. If the user later asks about progress, call gen_status with this job_id.", rsclaw_brand::cloud_name())
         }))
     }
 }
@@ -722,7 +724,7 @@ async fn post_rsclaw_gen(endpoint: &str, api_key: &str, body: &Value) -> Result<
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| anyhow!("{endpoint}_gen: rsclaw read body: {e}"))?;
+        .map_err(|e| anyhow!("{endpoint}_gen: {} read body: {e}", rsclaw_brand::cloud_name()))?;
     if !status.is_success() {
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         let raw = String::from_utf8_lossy(&bytes);
@@ -731,14 +733,14 @@ async fn post_rsclaw_gen(endpoint: &str, api_key: &str, body: &Value) -> Result<
             .and_then(|v| v.as_str())
             .or_else(|| v.get("message").and_then(|v| v.as_str()))
             .unwrap_or_else(|| rsclaw_util::truncate_str(&raw, 200));
-        return Err(anyhow!("{endpoint}_gen: rsclaw API {status}: {msg}"));
+        return Err(anyhow!("{endpoint}_gen: {} API {status}: {msg}", rsclaw_brand::cloud_name()));
     }
     let v: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow!("{endpoint}_gen: rsclaw parse response: {e}"))?;
+        .map_err(|e| anyhow!("{endpoint}_gen: {} parse response: {e}", rsclaw_brand::cloud_name()))?;
     let id = v
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("{endpoint}_gen: rsclaw no `id` in response: {v}"))?
+        .ok_or_else(|| anyhow!("{endpoint}_gen: {} no `id` in response: {v}", rsclaw_brand::cloud_name()))?
         .to_owned();
     Ok(id)
 }
@@ -805,7 +807,8 @@ fn validate_native_rsclaw_model(model: Option<&str>) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!(
-            "video_gen: rsclaw native jobs only support `rsclaw-video-v3`; unsupported model `{model}`"
+            "video_gen: {} native jobs only support `rsclaw-video-v3`; unsupported model `{model}`",
+            rsclaw_brand::cloud_name()
         ))
     }
 }
@@ -938,7 +941,7 @@ async fn submit_rsclaw_video(
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| anyhow!("video_gen: rsclaw read body: {e}"))?;
+        .map_err(|e| anyhow!("video_gen: {} read body: {e}", rsclaw_brand::cloud_name()))?;
 
     if !status.is_success() {
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -951,14 +954,14 @@ async fn submit_rsclaw_video(
             .and_then(|v| v.as_str())
             .or_else(|| v.get("message").and_then(|v| v.as_str()))
             .unwrap_or_else(|| rsclaw_util::truncate_str(&raw, 200));
-        return Err(anyhow!("video_gen: rsclaw API {status}: {msg}"));
+        return Err(anyhow!("video_gen: {} API {status}: {msg}", rsclaw_brand::cloud_name()));
     }
     let v: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow!("video_gen: rsclaw parse response: {e}"))?;
+        .map_err(|e| anyhow!("video_gen: {} parse response: {e}", rsclaw_brand::cloud_name()))?;
     let id = v
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("video_gen: rsclaw no `id` in response: {v}"))?
+        .ok_or_else(|| anyhow!("video_gen: {} no `id` in response: {v}", rsclaw_brand::cloud_name()))?
         .to_owned();
     Ok(id)
 }

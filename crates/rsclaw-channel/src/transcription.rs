@@ -422,7 +422,7 @@ async fn transcribe_rsclaw(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("rsclaw ASR error {status}: {body}");
+        anyhow::bail!("{} ASR error {status}: {body}", rsclaw_brand::cloud_name());
     }
 
     let result: serde_json::Value = resp.json().await?;

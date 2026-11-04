@@ -298,17 +298,33 @@ fn markdown_to_feishu_post(text: &str) -> serde_json::Value {
     })
 }
 
+/// Card header: `<emoji><website> | <engine name>`. Another brand's product
+/// name already says what it is ("Qishu Agent", 「栖枢智能体」), so it stands
+/// alone instead of filling the stock "RsClaw AI Agent Engine" template.
+fn card_title(lark: bool) -> String {
+    if rsclaw_brand::is_stock() {
+        return if lark {
+            "\u{1F980}rsclaw.ai | RsClaw AI Agent Engine"
+        } else {
+            "\u{1F980}rsclaw.ai | \u{8783}\u{87F9}AI\u{667A}\u{80FD}\u{4F53}\u{5F15}\u{64CE}"
+        }
+        .to_owned();
+    }
+    let name = if lark {
+        rsclaw_brand::PRODUCT_NAME
+    } else {
+        rsclaw_brand::PRODUCT_NAME_ZH
+    };
+    format!("{}{} | {name}", rsclaw_brand::EMOJI, rsclaw_brand::WEBSITE)
+}
+
 /// Build feishu message payload. Returns (msg_type, content_or_card_json).
 /// For interactive cards, the second value is the raw card JSON (not
 /// stringified).
 fn build_feishu_card(text: &str, brand: &str) -> serde_json::Value {
     let cleaned = text;
 
-    let title = rsclaw_brand::rebrand(if brand == "lark" {
-        "\u{1F980}rsclaw.ai | RsClaw AI Agent Engine"
-    } else {
-        "\u{1F980}rsclaw.ai | \u{8783}\u{87F9}AI\u{667A}\u{80FD}\u{4F53}\u{5F15}\u{64CE}"
-    });
+    let title = card_title(brand == "lark");
     json!({
         "msg_type": "interactive",
         "card": {
@@ -2743,6 +2759,20 @@ mod tests {
 
     fn init_crypto() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    #[test]
+    fn card_title_follows_the_brand() {
+        if rsclaw_brand::is_stock() {
+            assert_eq!(card_title(true), "\u{1F980}rsclaw.ai | RsClaw AI Agent Engine");
+            assert_eq!(card_title(false), "\u{1F980}rsclaw.ai | 螃蟹AI智能体引擎");
+        } else {
+            for lark in [true, false] {
+                let title = card_title(lark);
+                assert!(!title.to_lowercase().contains("rsclaw"), "{title}");
+                assert!(!title.contains("Agent Agent") && !title.contains("智能体智能体"), "{title}");
+            }
+        }
     }
 
     #[test]

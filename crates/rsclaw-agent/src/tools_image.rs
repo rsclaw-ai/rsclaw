@@ -411,7 +411,8 @@ impl super::runtime::AgentRuntime {
     ) -> Result<Value> {
         if poll_url.is_empty() {
             return Err(anyhow!(
-                "image_gen: rsclaw returned status=processing without a poll URL"
+                "image_gen: {} returned status=processing without a poll URL",
+                rsclaw_brand::cloud_name()
             ));
         }
         let job = rsclaw_types::ExternalJob::new_submitted(
@@ -443,7 +444,7 @@ impl super::runtime::AgentRuntime {
             "provider": "rsclaw",
             "kind": "image",
             "job_id": job_id,
-            "message": "Image edit submitted to the rsclaw gen service (async, ~1–5min). The finished image will be delivered automatically when ready. The user has been informed; do not poll or wait — your turn is complete. If the user later asks about progress, call gen_status with this job_id."
+            "message": format!("Image edit submitted to the {} gen service (async, ~1–5min). The finished image will be delivered automatically when ready. The user has been informed; do not poll or wait — your turn is complete. If the user later asks about progress, call gen_status with this job_id.", rsclaw_brand::cloud_name())
         }))
     }
 
@@ -851,7 +852,7 @@ impl super::runtime::AgentRuntime {
                 // and re-attaches Bearer on each hop. Mirrors the LLM
                 // side's `send_following_redirects`.
                 let redirect_client = rsclaw_provider::rsclaw_http::build_client(img_ua, 120)
-                    .map_err(|e| anyhow!("image: rsclaw client: {e}"))?;
+                    .map_err(|e| anyhow!("image: {} client: {e}", rsclaw_brand::cloud_name()))?;
                 let resp = rsclaw_provider::rsclaw_http::post_json(
                     &redirect_client,
                     &url,
@@ -863,7 +864,7 @@ impl super::runtime::AgentRuntime {
                 let body_bytes = resp
                     .bytes()
                     .await
-                    .map_err(|e| anyhow!("image: rsclaw read body: {e}"))?;
+                    .map_err(|e| anyhow!("image: {} read body: {e}", rsclaw_brand::cloud_name()))?;
                 let body = parse_response_body(st, &body_bytes)?;
                 (st, body)
             } else {

@@ -205,7 +205,7 @@ fn sensitive_write_reason(full: &Path) -> Option<&'static str> {
         if parent_canon == base_canon
             && (filename.ends_with(".json5") || filename.ends_with(".json"))
         {
-            return Some("rsclaw config file");
+            return Some(concat!(rsclaw_brand::brand_cli_name!(), " config file"));
         }
     }
     None
@@ -268,7 +268,7 @@ pub(crate) fn check_read_safety(path: &str, full: &std::path::Path) -> anyhow::R
         && (parent == base_canon.as_path() || parent == base.as_path())
         && (filename.ends_with(".json5") || filename.ends_with(".json") || filename == ".env")
     {
-        anyhow::bail!("[blocked] access to rsclaw config file: {path}");
+        anyhow::bail!("[blocked] access to {} config file: {path}", rsclaw_brand::CLI_NAME);
     }
 
     const SENSITIVE_FILES: &[&str] = &[

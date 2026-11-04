@@ -547,7 +547,7 @@ impl ExternalJobsWorker {
 
     async fn deliver_failure(&self, job: &ExternalJob) -> bool {
         let lang = job_lang();
-        let reason = job.error.as_deref().unwrap_or("unknown error");
+        let reason = failure_reason(job, lang);
         let prompt_preview: String = job.prompt.chars().take(80).collect();
         let text = rsclaw_i18n::t_fmt(
             "job_delivery_failed",
@@ -555,7 +555,7 @@ impl ExternalJobsWorker {
             &[
                 ("kind", &kind_name(job, lang)),
                 ("prompt", &prompt_preview),
-                ("reason", reason),
+                ("reason", &reason),
             ],
         );
         let out = OutboundMessage {
@@ -587,6 +587,13 @@ fn job_lang() -> &'static str {
     }
 }
 
+/// Why a job failed, as people read it: the poller's error with the
+/// service's ids named the way the brand names them (`rsclaw_brand::scrub`).
+fn failure_reason(job: &ExternalJob, lang: &str) -> String {
+    let reason = job.error.as_deref().unwrap_or("unknown error");
+    rsclaw_brand::scrub(reason, lang == "zh").into_owned()
+}
+
 /// "image" / "video" in `lang`.
 fn kind_name(job: &ExternalJob, lang: &str) -> String {
     let key = match job.kind {
@@ -607,8 +614,8 @@ fn writeback_text(job: &ExternalJob, lang: &str) -> String {
             ExternalJobStatus::TimedOut => "job_timed_out",
             _ => "job_failed",
         };
-        let reason = job.error.as_deref().unwrap_or("unknown error");
-        return rsclaw_i18n::t_fmt(key, lang, &[("kind", &kind), ("reason", reason)]);
+        let reason = failure_reason(job, lang);
+        return rsclaw_i18n::t_fmt(key, lang, &[("kind", &kind), ("reason", &reason)]);
     }
     let path = job.result_path.as_deref().unwrap_or("");
     match rsclaw_events::media::token_for_path(path) {

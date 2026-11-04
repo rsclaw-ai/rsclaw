@@ -14,6 +14,9 @@ include!(concat!(env!("OUT_DIR"), "/brand.rs"));
 
 pub mod plugin_digest;
 
+mod display;
+pub use display::{cloud_name, cloud_name_zh, display_model, display_provider, is_stock, scrub};
+
 /// A plugin shipped with this brand. The install package carries its files;
 /// [`BUNDLED_PLUGINS`] records what they must hash to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +220,34 @@ mod tests {
         assert!(prompt_template("zh", "IDENTITY.md").is_none());
         assert!(!has_config_layers());
         assert!(BUNDLED_PLUGINS.is_empty());
+        assert!(CLOUD_NAME_EN.is_none() && CLOUD_NAME_ZH.is_none());
+        assert!(is_stock());
+        assert_eq!(cloud_name(), "rsclaw");
+        assert_eq!(display_model("rsclaw/rsclaw-agent-v2", true), "rsclaw/rsclaw-agent-v2");
+    }
+
+    #[test]
+    fn cloud_names_come_from_the_rsclaw_provider_override() {
+        let src = r#"
+[[providers]]
+name    = "doubao"
+name_en = "Doubao"
+
+[[providers]]
+name    = "rsclaw"
+label   = "Qishu Cloud (recommended)"
+name_zh = "栖枢云端模型"
+name_en = "Qishu Cloud"
+"#;
+        assert_eq!(
+            spec::cloud_names(src),
+            (Some("Qishu Cloud".to_owned()), Some("栖枢云端模型".to_owned()))
+        );
+        assert_eq!(spec::cloud_names("[video_providers.rsclaw]\nlabel = \"x\"\n"), (None, None));
+        assert_eq!(spec::cloud_names("not toml ["), (None, None));
+        let code = spec::generate_cloud_names(Some("Qishu Cloud"), None);
+        assert!(code.contains("pub const CLOUD_NAME_EN: Option<&str> = Some(\"Qishu Cloud\");"));
+        assert!(code.contains("pub const CLOUD_NAME_ZH: Option<&str> = None;"));
     }
 
     #[test]

@@ -146,6 +146,17 @@ _remove = true
 Bump `meta.defaults_version` whenever an override changes shipped entries;
 installed copies only refresh on a version change.
 
+The brand directory's override also names the managed cloud in engine
+text: `name_en` / `name_zh` of its `rsclaw` provider entry become
+`rsclaw_brand::cloud_name()` / `cloud_name_zh()` ("Cloud" / 「云端模型」 when
+unset). A brand other than the default never shows the RsClaw name in what
+people read: `/status`, `/models` and `/model` show model refs through
+`rsclaw_brand::display_model` (`rsclaw/rsclaw-agent-v2` reads 「智能体模型 v2」
+/ "Agent model v2"), gen-tool errors name the cloud, and tool cards and job
+failure reasons go through `rsclaw_brand::scrub`. Ids, config keys, headers
+and protocol strings keep their values; the default brand prints them as
+before.
+
 ## Brand directory
 
 The directory that holds the brand file may also ship optional assets. The

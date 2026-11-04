@@ -33,7 +33,11 @@ pub async fn exec_approval_set(_ctx: MethodCtx) -> MethodResult {
 /// `exec.approval.resolve` — not implemented (no pending approvals exist).
 pub async fn exec_approval_resolve(_ctx: MethodCtx) -> MethodResult {
     Err(ErrorShape::not_implemented(
-        "exec.approval.resolve is not implemented; rsclaw has no pending exec approvals",
+        concat!(
+            "exec.approval.resolve is not implemented; ",
+            rsclaw_brand::brand_cli_name!(),
+            " has no pending exec approvals"
+        ),
     ))
 }
 

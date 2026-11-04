@@ -308,3 +308,38 @@ pub fn generate_bundled_plugins(plugins: &[BundledPluginSpec]) -> String {
     )
 }
 
+
+/// The brand's own names for the managed cloud: `name_en` / `name_zh` of the
+/// `rsclaw` provider in its `defaults.override.toml` (the names its provider
+/// picker shows). `None` for a field the override does not set.
+pub fn cloud_names(override_src: &str) -> (Option<String>, Option<String>) {
+    let Ok(table) = override_src.parse::<toml::Table>() else {
+        return (None, None);
+    };
+    let entry = table
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_table())
+        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("rsclaw"));
+    let field = |key: &str| {
+        entry
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    (field("name_en"), field("name_zh"))
+}
+
+/// Rust source for `CLOUD_NAME_EN` / `CLOUD_NAME_ZH`.
+pub fn generate_cloud_names(en: Option<&str>, zh: Option<&str>) -> String {
+    format!(
+        "/// `name_en` of the `rsclaw` provider in the brand's defaults override.\n\
+         pub const CLOUD_NAME_EN: Option<&str> = {en:?};\n\
+         /// `name_zh` of the `rsclaw` provider in the brand's defaults override.\n\
+         pub const CLOUD_NAME_ZH: Option<&str> = {zh:?};\n"
+    )
+}

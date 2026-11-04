@@ -583,8 +583,12 @@ fn control_request_allowed(
             .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/json"));
     if has_marker {
         Ok(())
-    } else {
+    } else if rsclaw_brand::is_stock() {
         Err("browser requests must carry the X-RsClaw-Request header")
+    } else {
+        // The header keeps its name; the message doesn't spell the RsClaw
+        // name out to an OEM brand's users.
+        Err("browser requests must carry the local-request marker header")
     }
 }
 

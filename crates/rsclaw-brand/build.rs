@@ -61,6 +61,11 @@ fn main() {
     let plugins = bundled_plugins(&brand_dir.join("plugins"))
         .unwrap_or_else(|e| panic!("invalid bundled plugin under {}: {e}", brand_dir.join("plugins").display()));
     code.push_str(&spec::generate_bundled_plugins(&plugins));
+    let (cloud_en, cloud_zh) = found("defaults.override.toml")
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|src| spec::cloud_names(&src))
+        .unwrap_or_default();
+    code.push_str(&spec::generate_cloud_names(cloud_en.as_deref(), cloud_zh.as_deref()));
 
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("brand.rs");
     fs::write(&out, code).unwrap_or_else(|e| panic!("cannot write {}: {e}", out.display()));

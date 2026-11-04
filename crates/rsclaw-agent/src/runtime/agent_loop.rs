@@ -2913,6 +2913,10 @@ impl AgentRuntime {
                                     None => preview,
                                 }
                             };
+                            // The card is for people: ids read as the brand
+                            // names them (the model keeps the raw result).
+                            let display_out =
+                                rsclaw_brand::scrub(&display_out, rsclaw_i18n::default_lang() == "zh");
                             let marker =
                                 format!("<rstool name=\"{tool_name}\">{display_out}</rstool>");
                             let _ = bus.send(AgentEvent {
@@ -3325,6 +3329,10 @@ impl AgentRuntime {
                     } else {
                         result_text.clone()
                     };
+                    // Shown to people: ids read as the brand names them.
+                    let zh = rsclaw_i18n::default_lang() == "zh";
+                    let args_str = rsclaw_brand::scrub(&args_str, zh).into_owned();
+                    let out_str = rsclaw_brand::scrub(&out_str, zh).into_owned();
                     tool_log.push((tool_name.clone(), args_str, out_str));
                 }
 
