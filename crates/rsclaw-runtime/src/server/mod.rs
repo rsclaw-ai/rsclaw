@@ -7159,6 +7159,11 @@ async fn run_doctor_cmd(fix: bool) -> Response {
         cmd.env("RSCLAW_BASE_DIR", v);
     }
     cmd.env("NO_COLOR", "1"); // Strip ANSI for clean parsing.
+    // The app shows `raw`: log lines there carry crate paths (`rsclaw_*`),
+    // which another brand's users never see. Doctor reports its own checks.
+    if !rsclaw_brand::is_stock() {
+        cmd.env("RUST_LOG", "off");
+    }
     #[cfg(windows)]
     {
         cmd.creation_flags(0x08000000);
