@@ -3386,7 +3386,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="rsclaw/2026.10.1"
+                              placeholder="rsclaw/2026.11.1"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -3461,7 +3461,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="e.g. rsclaw/2026.10.1"
+                              placeholder="e.g. rsclaw/2026.11.1"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -3516,7 +3516,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="e.g. rsclaw/2026.10.1"
+                              placeholder="e.g. rsclaw/2026.11.1"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
