@@ -1182,7 +1182,9 @@ fn extract_pptx_text(bytes: &[u8]) -> Option<String> {
 
     for i in 0..archive.len() {
         if let Ok(mut file) = archive.by_index(i) {
-            let name = file.name().to_owned();
+            let Ok(name) = file.name().map(|n| n.into_owned()) else {
+                continue;
+            };
             if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
                 let mut xml = String::new();
                 let _ = std::io::Read::read_to_string(&mut file, &mut xml);

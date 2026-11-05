@@ -551,8 +551,8 @@ fn extract_binary(data: &[u8], filename: &str, url: &str) -> Result<Vec<u8>> {
         let mut archive = zip::ZipArchive::new(reader)?;
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
-            let name = file.name();
-            if std::path::Path::new(name)
+            let name = file.name()?.into_owned();
+            if std::path::Path::new(&name)
                 .file_name()
                 .map(|n| n == filename)
                 .unwrap_or(false)

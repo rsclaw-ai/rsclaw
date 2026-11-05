@@ -1132,7 +1132,7 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
     let mut total: u64 = 0;
     for i in 0..archive.len() {
         let entry = archive.by_index(i)?;
-        let name = entry.name().to_owned();
+        let name = entry.name()?.into_owned();
         let buf = read_zip_entry_capped(entry, &name)?;
         total += buf.len() as u64;
         if total > MAX_ZIP_TOTAL_BYTES {
