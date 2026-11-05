@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use rsclaw_channel::OutboundMessage;
-use rsclaw_config::runtime::RuntimeConfig;
+use rsclaw_config::live_config::LiveConfig;
 use rsclaw_store::RedbStore;
 use serde_json::json;
 use tokio::sync::{Semaphore, broadcast};
@@ -76,7 +76,9 @@ pub struct ExternalJobsWorker {
     /// where the notification router drops deliveries, still receive it.
     event_tx: Option<broadcast::Sender<rsclaw_events::AgentEvent>>,
     shutdown: ShutdownCoordinator,
-    config: Arc<RuntimeConfig>,
+    /// Read on every poll, not cached: a job outlives config hot-reloads, and
+    /// a provider key added after startup must reach jobs already queued.
+    live: Arc<LiveConfig>,
     client: reqwest::Client,
     /// Cap on concurrent per-job operations — see MAX_CONCURRENT_OPS.
     op_semaphore: Arc<Semaphore>,
@@ -106,7 +108,7 @@ impl ExternalJobsWorker {
         store: Arc<RedbStore>,
         notification_tx: broadcast::Sender<OutboundMessage>,
         shutdown: ShutdownCoordinator,
-        config: Arc<RuntimeConfig>,
+        live: Arc<LiveConfig>,
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -117,7 +119,7 @@ impl ExternalJobsWorker {
             notification_tx,
             event_tx: None,
             shutdown,
-            config,
+            live,
             client,
             op_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OPS)),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -288,6 +290,7 @@ impl ExternalJobsWorker {
                 let dl = if job.provider == "rsclaw_legacy" && !signed {
                     let key = self
                         .resolve_provider_key("rsclaw", "RSCLAW_API_KEY")
+                        .await
                         .unwrap_or_default();
                     rsclaw_jobs::download_artifact_authed(&url, &key, job.kind).await
                 } else {
@@ -432,17 +435,19 @@ impl ExternalJobsWorker {
             "seedance" => {
                 let key = self
                     .resolve_provider_key("doubao", "ARK_API_KEY")
+                    .await
                     .ok_or_else(|| anyhow!("seedance: no API key configured"))?;
                 rsclaw_jobs::poll_seedance(&self.client, &key, &job.external_task_id).await
             }
             "minimax" => {
                 let key = self
                     .resolve_provider_key("minimax", "MINIMAX_API_KEY")
+                    .await
                     .ok_or_else(|| anyhow!("minimax: no API key configured"))?;
                 rsclaw_jobs::poll_minimax(&self.client, &key, &job.external_task_id).await
             }
             "kling" => {
-                let (ak, sk) = self.resolve_kling_keys().ok_or_else(|| {
+                let (ak, sk) = self.resolve_kling_keys().await.ok_or_else(|| {
                     anyhow!("kling: KLING_ACCESS_KEY / KLING_SECRET_KEY not configured")
                 })?;
                 rsclaw_jobs::poll_kling(&self.client, &ak, &sk, &job.external_task_id).await
@@ -450,26 +455,30 @@ impl ExternalJobsWorker {
             "rsclaw_native" => {
                 let key = self
                     .resolve_provider_key("rsclaw", "RSCLAW_API_KEY")
+                    .await
                     .ok_or_else(|| anyhow!("rsclaw: no API key configured"))?;
                 rsclaw_jobs::poll_rsclaw_native(&key, &job.external_task_id).await
             }
             "rsclaw_legacy" => {
                 let key = self
                     .resolve_provider_key("rsclaw", "RSCLAW_API_KEY")
+                    .await
                     .ok_or_else(|| anyhow!("rsclaw: no API key configured"))?;
                 rsclaw_jobs::poll_rsclaw_legacy(&key, &job.external_task_id).await
             }
             "agnes" => {
                 let key = self
                     .resolve_provider_key("agnes", "AGNES_API_KEY")
+                    .await
                     .ok_or_else(|| anyhow!("agnes: no API key configured"))?;
                 rsclaw_jobs::poll_agnes(&self.client, &key, &job.external_task_id).await
             }
             "openai" => {
                 let key = self
                     .resolve_provider_key("openai", "OPENAI_API_KEY")
+                    .await
                     .ok_or_else(|| anyhow!("openai: no API key configured"))?;
-                let base = self.resolve_provider_base_url("openai");
+                let base = self.resolve_provider_base_url("openai").await;
                 rsclaw_jobs::poll_openai_video(&self.client, &base, &key, &job.external_task_id)
                     .await
             }
@@ -484,9 +493,11 @@ impl ExternalJobsWorker {
 
     /// Resolve a provider's configured `base_url`, falling back to the builtin
     /// default for that provider (e.g. openai → https://api.openai.com/v1).
-    fn resolve_provider_base_url(&self, provider: &str) -> String {
-        self.config
+    async fn resolve_provider_base_url(&self, provider: &str) -> String {
+        self.live
             .model
+            .read()
+            .await
             .models
             .as_ref()
             .and_then(|m| m.providers.get(provider))
@@ -496,21 +507,14 @@ impl ExternalJobsWorker {
 
     /// Resolve a single-bearer-token provider key from rsclaw.json5
     /// (`models.providers.<name>.api_key`) with env-var fallback.
-    fn resolve_provider_key(&self, provider: &str, env_var: &str) -> Option<String> {
-        self.config
-            .model
-            .models
-            .as_ref()
-            .and_then(|m| m.providers.get(provider))
-            .and_then(|p| p.api_key.as_ref())
-            .and_then(|k| k.resolve_full(self.config.ops.secrets.as_ref()))
-            .or_else(|| std::env::var(env_var).ok())
+    async fn resolve_provider_key(&self, provider: &str, env_var: &str) -> Option<String> {
+        provider_key(&self.live, provider, env_var).await
     }
 
     /// Resolve the Kling access/secret pair. Both must be present, otherwise
     /// `None` so the caller can fail loudly rather than build a bad JWT.
-    fn resolve_kling_keys(&self) -> Option<(String, String)> {
-        let ak = self.resolve_provider_key("kling", "KLING_ACCESS_KEY")?;
+    async fn resolve_kling_keys(&self) -> Option<(String, String)> {
+        let ak = self.resolve_provider_key("kling", "KLING_ACCESS_KEY").await?;
         let sk = std::env::var("KLING_SECRET_KEY").ok()?;
         Some((ak, sk))
     }
@@ -626,6 +630,19 @@ fn writeback_text(job: &ExternalJob, lang: &str) -> String {
         ),
         None => rsclaw_i18n::t_fmt("job_ready_plain", lang, &[("kind", &kind), ("path", path)]),
     }
+}
+
+/// A provider key from the live config, falling back to `env_var`.
+async fn provider_key(live: &LiveConfig, provider: &str, env_var: &str) -> Option<String> {
+    let model = live.model.read().await;
+    let ops = live.ops.read().await;
+    model
+        .models
+        .as_ref()
+        .and_then(|m| m.providers.get(provider))
+        .and_then(|p| p.api_key.as_ref())
+        .and_then(|k| k.resolve_full(ops.secrets.as_ref()))
+        .or_else(|| std::env::var(env_var).ok())
 }
 
 /// Channels whose sessions get no follow-up turn when a job ends: a
@@ -843,6 +860,30 @@ mod tests {
             ExternalJobKind::ImageGen,
             "a cat",
         )
+    }
+
+    #[tokio::test]
+    async fn provider_key_follows_a_hot_reload() {
+        // A job submitted after the key was hot-reloaded in must be polled
+        // with that key, not with the config the gateway started on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cfg.json5");
+        std::fs::write(&path, "{}").expect("write initial");
+        let live = LiveConfig::new(rsclaw_config::load_from(path.clone()).expect("load initial"));
+        let env = "RSCLAW_TEST_JOBS_WORKER_UNSET_KEY";
+        assert_eq!(provider_key(&live, "rsclaw", env).await, None);
+
+        std::fs::write(
+            &path,
+            r#"{ models: { providers: { rsclaw: { api: "rsclaw", apiKey: "k-reloaded" } } } }"#,
+        )
+        .expect("write reloaded");
+        let reloaded = rsclaw_config::load_from(path).expect("load reloaded");
+        *live.model.write().await = reloaded.model;
+        assert_eq!(
+            provider_key(&live, "rsclaw", env).await.as_deref(),
+            Some("k-reloaded")
+        );
     }
 
     #[test]

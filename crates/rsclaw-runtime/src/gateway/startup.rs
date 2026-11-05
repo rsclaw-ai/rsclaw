@@ -705,7 +705,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             Arc::clone(&store.db),
             notification_tx.clone(),
             shutdown.clone(),
-            Arc::clone(&config),
+            Arc::clone(&live),
         )
         .with_event_bus(event_tx.clone()));
         tokio::spawn(async move { worker.run().await });
