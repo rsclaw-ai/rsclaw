@@ -1320,6 +1320,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_message_edit_reaches_the_payload_the_job_runs() {
+        let new = serde_json::json!("new prompt");
+        let mut job = serde_json::json!({
+            "message": "new prompt",
+            "payload": {"kind": "agentTurn", "text": "old", "timeoutSeconds": 600}
+        });
+        sync_payload_message(job.as_object_mut().unwrap(), &new);
+        assert_eq!(
+            job["payload"],
+            serde_json::json!({"kind": "agentTurn", "message": "new prompt", "timeoutSeconds": 600})
+        );
+        let mut job = serde_json::json!({"payload": "old"});
+        sync_payload_message(job.as_object_mut().unwrap(), &new);
+        assert_eq!(job["payload"], new);
+        let mut job = serde_json::json!({"message": "new prompt"});
+        sync_payload_message(job.as_object_mut().unwrap(), &new);
+        assert!(job.get("payload").is_none());
+    }
+
+    #[test]
     fn cors_allows_only_local_and_desktop_origins() {
         for allowed in [
             "http://localhost:3000",
@@ -4528,6 +4548,11 @@ async fn cron_update(
                 }
                 existing.insert(k.clone(), v.clone());
             }
+            // A job with a payload runs the payload's message, so a bare
+            // `message` patch must reach it or the edit never takes effect.
+            if let Some(message) = patch.get("message").filter(|_| !patch.contains_key("payload")) {
+                sync_payload_message(existing, message);
+            }
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -4547,6 +4572,23 @@ async fn cron_update(
             Json(serde_json::json!({"error": e})),
         )
             .into_response(),
+    }
+}
+
+/// Point the job's payload (if it has one) at `message`: the text inside a
+/// structured payload (either spelling), or the whole payload when it is
+/// plain text.
+fn sync_payload_message(
+    job: &mut serde_json::Map<String, serde_json::Value>,
+    message: &serde_json::Value,
+) {
+    match job.get_mut("payload") {
+        Some(serde_json::Value::Object(payload)) => {
+            payload.remove("text");
+            payload.insert("message".to_owned(), message.clone());
+        }
+        Some(payload @ serde_json::Value::String(_)) => *payload = message.clone(),
+        _ => {}
     }
 }
 
