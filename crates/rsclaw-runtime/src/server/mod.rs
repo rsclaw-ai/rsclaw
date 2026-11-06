@@ -3299,6 +3299,29 @@ pub(crate) async fn apply_reload_scopes(
 
     // --- Providers: rebuild registry from config and swap into all handles ---
     if reload_providers {
+        // A provider whose block changed (a key added after a 401, a new base
+        // URL) starts healthy again: its old failures were against the old
+        // settings, and a cooled-down model would refuse the new key until
+        // the backoff ran out.
+        let provider_json = |m: &Option<rsclaw_config::schema::ModelsConfig>| {
+            m.as_ref()
+                .map(|m| {
+                    m.providers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or_default()))
+                        .collect::<std::collections::HashMap<_, _>>()
+                })
+                .unwrap_or_default()
+        };
+        let old_providers = provider_json(&state.live.model.read().await.models);
+        for (name, cfg) in provider_json(&fresh_config.model.models) {
+            if old_providers.get(&name) != Some(&cfg) {
+                let cleared = state.model_health.reset_provider(&name);
+                if cleared > 0 {
+                    tracing::info!(provider = %name, cleared, "hot-reload: provider changed; model health reset");
+                }
+            }
+        }
         let new_registry = Arc::new(rsclaw_provider::build::build_providers(&fresh_config));
         let provider_count = new_registry.names().len();
         {

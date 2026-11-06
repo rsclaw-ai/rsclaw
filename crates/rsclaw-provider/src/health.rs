@@ -303,6 +303,27 @@ impl ProviderHealthRegistry {
         }
     }
 
+    /// Clear every model of `provider` (ids `"{provider}/…"`), e.g. after its
+    /// key changed: a 401 recorded before the key was set says nothing about
+    /// the new one. Returns how many entries were cleared.
+    pub fn reset_provider(&self, provider: &str) -> usize {
+        let mut g = match self.inner.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let prefix = format!("{provider}/");
+        let mut cleared = 0;
+        for h in g
+            .entries
+            .iter_mut()
+            .filter(|e| e.model.starts_with(&prefix))
+        {
+            h.reset();
+            cleared += 1;
+        }
+        cleared
+    }
+
     /// Read-only snapshot for /api/v1/models/health.
     pub fn snapshot(&self) -> Vec<HealthEntrySnapshot> {
         let g = match self.inner.read() {
@@ -818,5 +839,28 @@ mod tests {
             cooling_backoff(1, ErrorKind::Transient),
             Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn reset_provider_clears_only_that_providers_models() {
+        let reg = ProviderHealthRegistry::new();
+        reg.ensure(&[
+            "rsclaw/rsclaw-flash-v2".to_owned(),
+            "rsclaw/rsclaw-agent-v2".to_owned(),
+            "rsclawx/m".to_owned(),
+        ]);
+        for m in [
+            "rsclaw/rsclaw-flash-v2",
+            "rsclaw/rsclaw-agent-v2",
+            "rsclawx/m",
+        ] {
+            reg.record_failure(m, ErrorKind::Auth, "401".into());
+        }
+        assert!(!reg.is_callable("rsclaw/rsclaw-flash-v2"));
+
+        assert_eq!(reg.reset_provider("rsclaw"), 2);
+        assert!(reg.is_callable("rsclaw/rsclaw-flash-v2"));
+        assert!(reg.is_callable("rsclaw/rsclaw-agent-v2"));
+        assert!(!reg.is_callable("rsclawx/m"));
     }
 }
