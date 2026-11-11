@@ -245,6 +245,10 @@ pub struct AppState {
     >,
     /// Device token store for WebSocket gateway auth.
     pub devices: Arc<crate::ws::DeviceStore>,
+    /// Scoped access tokens (see [`crate::access`]).
+    pub access_tokens: Arc<crate::access::AccessTokens>,
+    /// End-to-end encrypted sessions (see [`crate::e2e`]).
+    pub e2e: Arc<crate::e2e::E2e>,
     /// Active WebSocket connections registry.
     pub ws_conns: Arc<crate::ws::ConnRegistry>,
     /// Feishu channel handle for webhook events (set after startup).
@@ -536,6 +540,13 @@ fn origin_allowed(origin: &HeaderValue, host: Option<&str>) -> bool {
 }
 
 /// True when the request carries a valid gateway Bearer token.
+fn query_param(uri: &axum::http::Uri, name: &str) -> Option<String> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then(|| v.to_owned())
+    })
+}
+
 fn bearer_matches(headers: &HeaderMap, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return false;
@@ -816,7 +827,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/pairing/{channel}/reject", post(pairing_reject))
         .route("/brand", get(brand_info))
         .route("/owners", get(owners_get).put(owners_put).post(owners_add))
-        .route("/owners/{channel}/{*peer}", delete(owners_remove));
+        .route("/owners/{channel}/{*peer}", delete(owners_remove))
+        .route(
+            "/tokens",
+            get(crate::access::list_tokens).post(crate::access::mint_token),
+        )
+        .route("/tokens/{id}", delete(crate::access::revoke_token))
+        .route("/e2e/key", get(crate::e2e::public_key))
+        .route("/e2e/handshake", post(crate::e2e::handshake))
+        .route(
+            "/e2e/call",
+            post(crate::e2e::call).layer(axum::extract::DefaultBodyLimit::max(
+                crate::e2e::MAX_ENVELOPE_BODY,
+            )),
+        )
+        .route("/e2e/events", get(crate::e2e::events));
 
     // Mount the knowledge base routes only when the store opened. A KB
     // open failure leaves `knowledge` None; the rest of the API still serves.
@@ -830,7 +855,8 @@ pub fn build_router(state: AppState) -> Router {
         api = api.merge(routes.with_state::<AppState>(()));
     }
 
-    Router::new()
+    let e2e = Arc::clone(&state.e2e);
+    let router = Router::new()
         .nest("/api/v1", api)
         // Convenience alias: bare `/health` resolves to the same handler
         // as `/api/v1/health`. Container orchestrators (Docker, k8s,
@@ -891,7 +917,10 @@ pub fn build_router(state: AppState) -> Router {
         // proxy rather than granting arbitrary websites ambient gateway access.
         .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(state);
+    // Requests inside an encrypted session run through this same router.
+    e2e.set_router(router.clone());
+    router
 }
 
 /// Start the HTTP server. Blocks until shutdown.
@@ -936,9 +965,19 @@ pub async fn serve(state: AppState, bind: std::net::SocketAddr) -> Result<()> {
 async fn auth_middleware(
     State(state): State<AppState>,
     headers: HeaderMap,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    // A request carried inside an encrypted session: the session's
+    // principal stands in for the bearer token. Only `crate::e2e` inserts
+    // this extension, never the network.
+    if let Some(admitted) = crate::e2e::admit(&mut request) {
+        return match admitted {
+            Ok(()) => next.run(request).await,
+            Err(refused) => refused,
+        };
+    }
+
     // Health, agent card discovery, WS, and internal reload endpoints are always
     // open (WS performs its own handshake-level auth).
     //
@@ -1008,14 +1047,32 @@ async fn auth_middleware(
         // auth and any A2A v1.0 client following the spec would 401.
         || path == "/api/v1/a2a"
         || path == "/api/v1/a2a/relay/ws"
+        // Encrypted sessions authenticate inside the handshake and the
+        // envelopes; see `crate::e2e`.
+        || path == "/api/v1/e2e/handshake"
+        || path == "/api/v1/e2e/call"
+        || path == "/api/v1/e2e/events"
     {
         return next.run(request).await;
+    }
+
+    // Areas that accept only encrypted requests refuse plaintext from
+    // anyone, the gateway token included: a relay must never see them.
+    if crate::ext::e2e_only(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "e2e_required"})),
+        )
+            .into_response();
     }
 
     // If no token is configured, gateway runs open (loopback-only recommended).
     // Read from live config so auth_token rotation takes effect without restart.
     let expected = state.live.gateway.read().await.auth_token.clone();
     let Some(expected) = expected else {
+        request
+            .extensions_mut()
+            .insert(crate::access::Principal::Admin);
         return next.run(request).await;
     };
 
@@ -1025,7 +1082,12 @@ async fn auth_middleware(
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match provided {
-        Some(token) if constant_time_eq(token, &expected) => next.run(request).await,
+        Some(token) if constant_time_eq(token, &expected) => {
+            request
+                .extensions_mut()
+                .insert(crate::access::Principal::Admin);
+            next.run(request).await
+        }
         _ => {
             warn!(path = %path, "auth rejected: missing or invalid Bearer token");
             (
@@ -1055,6 +1117,17 @@ async fn rate_limit_middleware(
     }
     let token = state.live.gateway.read().await.auth_token.clone();
     if bearer_matches(request.headers(), token.as_deref()) {
+        return next.run(request).await;
+    }
+    // Encrypted sessions are authenticated: their inner requests, and outer
+    // calls naming a live session.
+    if request.extensions().get::<crate::e2e::E2eRequest>().is_some() {
+        return next.run(request).await;
+    }
+    if matches!(request.uri().path(), "/api/v1/e2e/call" | "/api/v1/e2e/events")
+        && let Some(sid) = query_param(request.uri(), "sid")
+        && state.e2e.has_session(&sid).await
+    {
         return next.run(request).await;
     }
     if state

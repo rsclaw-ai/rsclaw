@@ -1055,6 +1055,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // 13. Start HTTP server.
     let devices_path = rsclaw_config::loader::base_dir().join("var/data/devices.json");
     let devices = Arc::new(crate::ws::DeviceStore::new(devices_path));
+    let access_tokens = Arc::new(crate::access::AccessTokens::load(
+        rsclaw_config::loader::base_dir().join("var/data/access_tokens.json"),
+    ));
+    let e2e = Arc::new(crate::e2e::E2e::load(
+        rsclaw_config::loader::base_dir().join("var/data/e2e_key.json"),
+    ));
     let ws_conns = Arc::new(crate::ws::ConnRegistry::new());
 
     // Start custom channels (webhook + websocket).
@@ -1289,6 +1295,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         computer_status_tx: computer_status_tx.clone(),
         computer_runs: Arc::clone(&computer_runs),
         devices,
+        access_tokens,
+        e2e,
         ws_conns,
         feishu: Arc::clone(&feishu_slot),
         wecom: Arc::clone(&wecom_slot),
