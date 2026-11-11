@@ -41,71 +41,22 @@ use crate::e2e::Gate;
 /// gateway token without a lookup.
 pub const TOKEN_PREFIX: &str = "rsat_";
 
-/// Who a request acts for. Inserted into every authenticated request's
-/// extensions, so extension routes can read it with
-/// `Option<axum::Extension<Principal>>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Principal {
-    /// The gateway token, or a gateway that runs without one.
-    Admin,
-    /// A scoped token.
-    Scoped(ScopedPrincipal),
-}
+pub use rsclaw_types::access::{Principal, ScopedPrincipal};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ScopedPrincipal {
-    pub token_id: String,
-    pub label: String,
-    pub scopes: Vec<String>,
-    /// Accounts this token may see; `None` means all of them.
-    pub accounts: Option<Vec<String>>,
-}
-
-impl Principal {
-    /// True when the principal holds `scope` (the admin holds every scope).
-    pub fn has_scope(&self, scope: &str) -> bool {
-        match self {
-            Self::Admin => true,
-            Self::Scoped(p) => p.scopes.iter().any(|s| s == scope),
-        }
+/// True when `principal` may call `path`. A scoped principal reaches the
+/// health check and the areas its scopes name, nothing else.
+pub(crate) fn may_reach(principal: &Principal, path: &str) -> bool {
+    let Principal::Scoped(p) = principal else {
+        return true;
+    };
+    if path == "/api/v1/health" {
+        return true;
     }
-
-    /// True when the principal may see the account keyed `account`.
-    pub fn allows_account(&self, account: &str) -> bool {
-        match self {
-            Self::Admin => true,
-            Self::Scoped(p) => p
-                .accounts
-                .as_ref()
-                .is_none_or(|keys| keys.iter().any(|k| k == account)),
-        }
-    }
-
-    /// The token's label; `None` for the admin.
-    pub fn label(&self) -> Option<&str> {
-        match self {
-            Self::Admin => None,
-            Self::Scoped(p) => Some(&p.label),
-        }
-    }
-
-    /// True when the principal may call `path`. A scoped principal reaches
-    /// the health check and the areas its scopes name, nothing else.
-    pub(crate) fn may_reach(&self, path: &str) -> bool {
-        let Self::Scoped(p) = self else {
-            return true;
-        };
-        if path == "/api/v1/health" {
-            return true;
-        }
-        let Some(rest) = path.strip_prefix("/api/v1/") else {
-            return false;
-        };
-        let area = rest.split('/').next().unwrap_or_default();
-        crate::ext::scoped_area(area).is_some()
-            && p.scopes.iter().any(|s| scope_area(s) == Some(area))
-    }
+    let Some(rest) = path.strip_prefix("/api/v1/") else {
+        return false;
+    };
+    let area = rest.split('/').next().unwrap_or_default();
+    crate::ext::scoped_area(area).is_some() && p.scopes.iter().any(|s| scope_area(s) == Some(area))
 }
 
 fn scope_area(scope: &str) -> Option<&str> {
@@ -573,17 +524,17 @@ mod tests {
             scopes: vec!["testarea:read".into()],
             accounts: Some(vec!["acct-a".into()]),
         });
-        assert!(p.may_reach("/api/v1/testarea/things"));
-        assert!(p.may_reach("/api/v1/testarea"));
-        assert!(p.may_reach("/api/v1/health"));
-        assert!(!p.may_reach("/api/v1/testareax/things"));
-        assert!(!p.may_reach("/api/v1/config"));
-        assert!(!p.may_reach("/api/v1/tokens"));
-        assert!(!p.may_reach("/v1/chat/completions"));
+        assert!(may_reach(&p, "/api/v1/testarea/things"));
+        assert!(may_reach(&p, "/api/v1/testarea"));
+        assert!(may_reach(&p, "/api/v1/health"));
+        assert!(!may_reach(&p, "/api/v1/testareax/things"));
+        assert!(!may_reach(&p, "/api/v1/config"));
+        assert!(!may_reach(&p, "/api/v1/tokens"));
+        assert!(!may_reach(&p, "/v1/chat/completions"));
         assert!(p.has_scope("testarea:read"));
         assert!(!p.has_scope("testarea:write"));
         assert!(p.allows_account("acct-a"));
         assert!(!p.allows_account("acct-b"));
-        assert!(Principal::Admin.may_reach("/api/v1/config"));
+        assert!(may_reach(&Principal::Admin, "/api/v1/config"));
     }
 }

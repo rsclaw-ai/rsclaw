@@ -101,7 +101,7 @@ impl axum::extract::FromRef<AppState> for Gate {
 /// before looking at any bearer token.
 pub(crate) fn admit(request: &mut axum::extract::Request) -> Option<Result<(), Response>> {
     let inner = request.extensions().get::<E2eRequest>().cloned()?;
-    if !inner.principal.may_reach(request.uri().path()) {
+    if !crate::access::may_reach(&inner.principal, request.uri().path()) {
         return Some(Err(error(StatusCode::FORBIDDEN, "out_of_scope")));
     }
     request.extensions_mut().insert(inner.principal);
