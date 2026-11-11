@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(data) = line.strip_prefix("data: ") {
                         let plain = session.open(&serde_json::from_str(data)?)?;
                         print!("{}", String::from_utf8_lossy(&plain));
+                        std::io::Write::flush(&mut std::io::stdout())?;
                     }
                 }
             }
