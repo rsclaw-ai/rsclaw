@@ -198,7 +198,7 @@ async fn start_server(addr: SocketAddr) {
             Arc::new(
                 rsclaw_store::redb_store::RedbStore::open(
                     &std::env::temp_dir()
-                        .join(format!("rsclaw-test-tq-{}.redb", std::process::id())),
+                        .join(format!("rsclaw-test-tq-{}.redb", uuid::Uuid::new_v4())),
                     MemoryTier::Low,
                 )
                 .expect("task queue store"),
@@ -210,6 +210,10 @@ async fn start_server(addr: SocketAddr) {
         wasm_browser: Arc::new(tokio::sync::Mutex::new(None)),
         rate_limiter: Arc::new(rsclaw::server::RateLimiter::new()),
         reload_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        access_tokens: Arc::new(rsclaw::access::AccessTokens::load(
+            std::env::temp_dir().join(format!("rsclaw-test-tokens-{}.json", uuid::Uuid::new_v4())),
+        )),
+        e2e: Arc::new(rsclaw::e2e::E2e::ephemeral()),
     };
 
     // Leak the tempdir so the store stays valid for the lifetime of the server.
@@ -363,7 +367,7 @@ async fn bare_health_alias_returns_200_without_auth() {
             Arc::new(
                 rsclaw_store::redb_store::RedbStore::open(
                     &std::env::temp_dir()
-                        .join(format!("rsclaw-test-tq-{}.redb", std::process::id())),
+                        .join(format!("rsclaw-test-tq-{}.redb", uuid::Uuid::new_v4())),
                     MemoryTier::Low,
                 )
                 .expect("task queue store"),
@@ -375,6 +379,10 @@ async fn bare_health_alias_returns_200_without_auth() {
         wasm_browser: Arc::new(tokio::sync::Mutex::new(None)),
         rate_limiter: Arc::new(rsclaw::server::RateLimiter::new()),
         reload_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        access_tokens: Arc::new(rsclaw::access::AccessTokens::load(
+            std::env::temp_dir().join(format!("rsclaw-test-tokens-{}.json", uuid::Uuid::new_v4())),
+        )),
+        e2e: Arc::new(rsclaw::e2e::E2e::ephemeral()),
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });
@@ -545,7 +553,7 @@ async fn auth_token_gates_non_health_endpoints() {
             Arc::new(
                 rsclaw_store::redb_store::RedbStore::open(
                     &std::env::temp_dir()
-                        .join(format!("rsclaw-test-tq-{}.redb", std::process::id())),
+                        .join(format!("rsclaw-test-tq-{}.redb", uuid::Uuid::new_v4())),
                     MemoryTier::Low,
                 )
                 .expect("task queue store"),
@@ -557,6 +565,10 @@ async fn auth_token_gates_non_health_endpoints() {
         wasm_browser: Arc::new(tokio::sync::Mutex::new(None)),
         rate_limiter: Arc::new(rsclaw::server::RateLimiter::new()),
         reload_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        access_tokens: Arc::new(rsclaw::access::AccessTokens::load(
+            std::env::temp_dir().join(format!("rsclaw-test-tokens-{}.json", uuid::Uuid::new_v4())),
+        )),
+        e2e: Arc::new(rsclaw::e2e::E2e::ephemeral()),
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });

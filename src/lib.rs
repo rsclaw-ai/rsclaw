@@ -39,7 +39,7 @@ pub use rsclaw_runtime::*;
 // Re-export the 7 root-knot modules explicitly so `rsclaw::a2a::`,
 // `rsclaw::ws::`, etc. resolve as module paths (glob import alone does not
 // re-export child modules as paths).
-pub use rsclaw_runtime::{a2a, cmd, cron, gateway, hooks, server, ws};
+pub use rsclaw_runtime::{a2a, access, cmd, cron, e2e, gateway, hooks, server, ws};
 pub use rsclaw_skill as skill;
 pub use rsclaw_store as store;
 pub use rsclaw_util as util;
