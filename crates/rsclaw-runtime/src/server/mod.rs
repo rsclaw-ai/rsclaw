@@ -917,6 +917,9 @@ pub fn build_router(state: AppState) -> Router {
         // proxy rather than granting arbitrary websites ambient gateway access.
         .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
+        // Outermost: a request a proxy or tunnel forwarded is not local, so
+        // every loopback check below sees it as remote.
+        .layer(middleware::from_fn(forwarded_peer_middleware))
         .with_state(state);
     // Requests inside an encrypted session run through this same router.
     e2e.set_router(router.clone());
@@ -956,6 +959,53 @@ pub async fn serve(state: AppState, bind: std::net::SocketAddr) -> Result<()> {
     .with_graceful_shutdown(async move { shutdown.notified().await })
     .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Forwarded requests
+// ---------------------------------------------------------------------------
+
+/// Headers a reverse proxy or tunnel adds to the requests it forwards.
+const FORWARDING_HEADERS: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-real-ip",
+    "cf-connecting-ip",
+];
+
+/// The peer a forwarded request is given: neither loopback nor anyone's
+/// real address.
+const FORWARDED_PEER: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+fn is_forwarded(headers: &HeaderMap) -> bool {
+    FORWARDING_HEADERS.iter().any(|h| headers.contains_key(*h))
+}
+
+/// A tunnel client or reverse proxy on this machine connects from loopback,
+/// so everything it relays would pass the loopback checks: shutdown and
+/// restart without a token, open-gateway trust, local file imports, the
+/// rate-limit exemption. Proxies mark what they forward with a forwarding
+/// header, and a remote caller cannot remove one the proxy adds, so a
+/// loopback request that carries one gets [`FORWARDED_PEER`] as its peer.
+/// A local caller sending such a header only gives up its own local trust.
+async fn forwarded_peer_middleware(mut request: axum::extract::Request, next: Next) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    if let Some(peer) = peer
+        && is_loopback(peer)
+        && is_forwarded(request.headers())
+    {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::new(
+                FORWARDED_PEER,
+                peer.port(),
+            )));
+    }
+    next.run(request).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1608,6 +1658,53 @@ mod tests {
         assert_eq!(agent["name"], "New");
         set_or_clear_agent_text(&mut agent, "name", " ");
         assert!(agent.get("name").is_none());
+    }
+
+    async fn peer_seen_by_handlers(peer: SocketAddr, header: Option<(&str, &str)>) -> String {
+        use tower::ServiceExt as _;
+        let app = Router::new()
+            .route(
+                "/",
+                get(
+                    |axum::extract::ConnectInfo(p): axum::extract::ConnectInfo<SocketAddr>| async move {
+                        p.ip().to_string()
+                    },
+                ),
+            )
+            .layer(middleware::from_fn(forwarded_peer_middleware));
+        let mut request = axum::http::Request::builder().uri("/");
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
+        }
+        let mut request = request.body(axum::body::Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn forwarded_requests_from_loopback_are_not_local() {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 50000));
+        assert_eq!(peer_seen_by_handlers(loopback, None).await, "127.0.0.1");
+        for header in FORWARDING_HEADERS {
+            let seen = peer_seen_by_handlers(loopback, Some((header, "203.0.113.7"))).await;
+            assert_eq!(seen, "0.0.0.0", "{header}");
+            assert!(!is_loopback(SocketAddr::new(seen.parse().unwrap(), 1)));
+        }
+        // A forwarded header naming loopback is still a forwarded request.
+        assert_eq!(
+            peer_seen_by_handlers(loopback, Some(("x-forwarded-for", "127.0.0.1"))).await,
+            "0.0.0.0"
+        );
+        // Remote peers keep their address.
+        let remote = SocketAddr::from(([203, 0, 113, 7], 50000));
+        assert_eq!(
+            peer_seen_by_handlers(remote, Some(("x-forwarded-for", "198.51.100.1"))).await,
+            "203.0.113.7"
+        );
     }
 
     #[test]
@@ -4144,12 +4241,11 @@ async fn respawn_mcp_servers(
 /// Reject the request if the caller isn't a loopback peer.
 /// Shutdown / restart are only exposed to local processes — never over LAN.
 ///
-/// Caveat: this checks the direct **TCP peer** address, NOT `X-Forwarded-For`.
-/// If you run rsclaw behind a reverse proxy (nginx/caddy/traefik), the proxy
-/// itself may be loopback even when the original client is on the WAN, which
-/// would incorrectly authorize remote shutdowns. In that deployment, bind the
-/// gateway to 127.0.0.1 so only the proxy can reach it, OR put `/shutdown` and
-/// `/restart` behind an explicit proxy ACL.
+/// This checks the direct TCP peer. A reverse proxy or tunnel on this machine
+/// is a loopback peer too; `forwarded_peer_middleware` gives the requests it
+/// forwards a non-loopback peer when they carry a forwarding header (nginx
+/// needs `proxy_set_header X-Forwarded-For`, caddy, cloudflared, ngrok and
+/// rsclaw-tunnel add one themselves).
 pub(crate) fn is_loopback(addr: std::net::SocketAddr) -> bool {
     match addr.ip() {
         std::net::IpAddr::V4(v4) => v4.is_loopback(),
@@ -4246,7 +4342,18 @@ async fn http_restart_dismiss(
     Json(serde_json::json!({ "dismissed": true })).into_response()
 }
 
-async fn cron_reload(State(state): State<AppState>) -> impl IntoResponse {
+/// POST /api/v1/cron/reload — loopback-only, like shutdown and restart.
+async fn cron_reload(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> impl IntoResponse {
+    if !is_loopback(peer) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "cron reload is loopback-only"})),
+        )
+            .into_response();
+    }
     match state.cron_reload.send(()) {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({"reloaded": true}))).into_response(),
         Err(e) => (
