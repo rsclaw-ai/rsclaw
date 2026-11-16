@@ -1,20 +1,22 @@
 //! astock-core capability adapters for rsclaw.
 //!
-//! Bridges rsclaw's built-in implementations (BrowserPool, config, LLM providers)
-//! to astock-core's trait interfaces, enabling the stock tools to work.
+//! Bridges rsclaw's built-in implementations (BrowserPool, config, LLM
+//! providers) to astock-core's trait interfaces, enabling the stock tools to
+//! work.
 
 use std::sync::Arc;
-use anyhow::Result;
-use async_trait::async_trait;
-use serde_json::Value;
-use futures::StreamExt;
 
-use astock_core::capability::{CdpCapability, TabHandle, ConfigProvider, LlmCapability, LlmMessage, LlmRole};
-use rsclaw_provider::{
-    LlmRequest, Message, MessageContent, Role, StreamEvent,
-    registry::ProviderRegistry,
-    failover::FailoverManager,
+use anyhow::Result;
+use astock_core::capability::{
+    CdpCapability, ConfigProvider, LlmCapability, LlmMessage, LlmRole, TabHandle,
 };
+use async_trait::async_trait;
+use futures::StreamExt;
+use rsclaw_provider::{
+    LlmRequest, Message, MessageContent, Role, StreamEvent, failover::FailoverManager,
+    registry::ProviderRegistry,
+};
+use serde_json::Value;
 
 // ============================================================================
 // CDP Adapter - bridges rsclaw-browser::BrowserPool to CdpCapability
@@ -75,10 +77,12 @@ impl TabHandle for RsclawTab {
 // Config Adapter - reads from rsclaw.json5
 // ============================================================================
 
-/// Load rsclaw.json5 as raw JSON value (for extracting custom fields like astock).
+/// Load rsclaw.json5 as raw JSON value (for extracting custom fields like
+/// astock).
 fn load_raw_config() -> Option<Value> {
-    use rsclaw_config::loader::base_dir;
     use std::fs;
+
+    use rsclaw_config::loader::base_dir;
 
     let config_path = base_dir().join("rsclaw.json5");
     let raw = fs::read_to_string(&config_path).ok()?;
@@ -134,7 +138,10 @@ impl RsclawConfig {
                     .map(String::from)
             });
 
-        Self { tushare_token, llm_model }
+        Self {
+            tushare_token,
+            llm_model,
+        }
     }
 }
 
@@ -196,7 +203,11 @@ impl StockLlmContext {
         failover: FailoverManager,
         default_model: String,
     ) -> Self {
-        Self { providers, failover, default_model }
+        Self {
+            providers,
+            failover,
+            default_model,
+        }
     }
 
     /// Create a boxed LlmCapability adapter.
@@ -245,8 +256,8 @@ impl LlmCapability for RsclawLlm {
         let request = LlmRequest {
             model: self.0.default_model.clone(),
             messages: rsclaw_messages,
-            tools: vec![],  // No tools for simple chat
-            max_tokens: Some(500),  // Debate responses are short
+            tools: vec![],         // No tools for simple chat
+            max_tokens: Some(500), // Debate responses are short
             temperature: Some(0.7),
             ..Default::default()
         };
@@ -272,6 +283,10 @@ impl LlmCapability for RsclawLlm {
                     if output.is_empty() {
                         output.push_str(&delta);
                     }
+                }
+                Ok(StreamEvent::ReasoningBlock { .. }) => {
+                    // Replay metadata only; reasoning text already arrived as
+                    // deltas.
                 }
                 Ok(StreamEvent::ToolCall { .. }) => {
                     // Not expected for simple chat, ignore
