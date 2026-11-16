@@ -135,6 +135,10 @@ pub struct WasmPlugin {
     pub capabilities: Vec<String>,
     /// Shared copy of `capabilities` handed to every per-call `HostState`.
     capabilities_arc: Arc<Vec<String>>,
+    /// Content digest of the plugin directory at load time, for a plugin
+    /// whose name is one of the brand's bundled plugins (host extensions
+    /// such as billing trust only the bundled build); None for others.
+    content_digest: Option<Arc<str>>,
     /// Slash command metadata from the manifest.
     pub slash_commands: Vec<crate::manifest::PluginSlashCommand>,
     /// Trusted tool aliases from plugin tool name to first-class host tool
@@ -244,6 +248,9 @@ struct HostState {
     /// Capability names declared in the plugin manifest. Sensitive host
     /// functions check this at entry (see `require_capability`).
     capabilities: Arc<Vec<String>>,
+    /// Content digest of the plugin as loaded, for host extensions that
+    /// trust only the brand's bundled build (see [`WasmPlugin`]).
+    plugin_digest: Option<Arc<str>>,
 }
 
 fn new_host_state(
@@ -255,6 +262,7 @@ fn new_host_state(
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
     capabilities: Arc<Vec<String>>,
+    plugin_digest: Option<Arc<str>>,
 ) -> HostState {
     HostState {
         browser,
@@ -272,6 +280,7 @@ fn new_host_state(
         vision_model,
         wda_url: None,
         capabilities,
+        plugin_digest,
     }
 }
 
@@ -287,6 +296,7 @@ fn new_sandboxed_store(
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
     capabilities: Arc<Vec<String>>,
+    plugin_digest: Option<Arc<str>>,
 ) -> Store<HostState> {
     let mut store = Store::new(
         engine,
@@ -299,6 +309,7 @@ fn new_sandboxed_store(
             providers,
             vision_model,
             capabilities,
+            plugin_digest,
         ),
     );
     store.limiter(|s| &mut s.limits);
@@ -1567,6 +1578,35 @@ impl rsclaw::plugin::host_device::Host for HostState {
     }
 }
 
+impl rsclaw::plugin::host_ext::Host for HostState {
+    async fn ext_call(
+        &mut self,
+        name: String,
+        args_json: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let Some((namespace, method)) = name.split_once('.') else {
+            return Ok(Err(format!(
+                "host_ext.ext_call: `{name}` must be <namespace>.<method>"
+            )));
+        };
+        let cap = crate::host_ext::capability(namespace);
+        if let Err(e) = self.require_capability(&cap, "host_ext.ext_call") {
+            return Ok(Err(e));
+        }
+        let Some(extension) = crate::host_ext::lookup(namespace) else {
+            return Ok(Err(format!(
+                "host_ext.ext_call: this engine has no extension `{namespace}`"
+            )));
+        };
+        let caller = crate::host_ext::Caller {
+            name: &self.plugin_name,
+            digest: self.plugin_digest.as_deref(),
+            session_key: self.notify_ctx.as_ref().map(|c| c.session_key.as_str()),
+        };
+        Ok(extension.call_from(&caller, method, &args_json).await)
+    }
+}
+
 impl rsclaw::plugin::host_background::Host for HostState {
     async fn cron_register(
         &mut self,
@@ -1728,7 +1768,10 @@ fn device_key_path() -> PathBuf {
         .join("host-ed25519.key")
 }
 
-async fn load_device_signing_key() -> Result<SigningKey, String> {
+/// The host's device identity key (`<data dir>/device/host-ed25519.key`),
+/// created with owner-only permissions on first use. Plugins never see it:
+/// `host-device` hands each plugin a key derived from it.
+pub async fn load_device_signing_key() -> Result<SigningKey, String> {
     tokio::task::spawn_blocking(|| {
         let path = device_key_path();
         if let Some(parent) = path.parent() {
@@ -3518,8 +3561,15 @@ impl rsclaw::plugin::host_ocr::Host for HostState {
                 ),
             ));
         };
+        let session = self
+            .notify_ctx
+            .as_ref()
+            .map(|c| Arc::<str>::from(c.session_key.as_str()))
+            .or_else(rsclaw_embed::fleet_scope::current);
         let result = tokio::task::spawn_blocking(move || {
-            client.ocr(&image_data_uri, Some(&prompt), Some(max_tokens))
+            rsclaw_embed::fleet_scope::sync_within(session, || {
+                client.ocr(&image_data_uri, Some(&prompt), Some(max_tokens))
+            })
         })
         .await
         .map_err(|e| anyhow::anyhow!("ocr_image: task join failed: {e}"))?;
@@ -4231,6 +4281,11 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
         |state: &mut HostState| state,
     )
     .map_err(|e| anyhow::anyhow!("failed to add host-ios linker interfaces: {e}"))?;
+    rsclaw::plugin::host_ext::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state: &mut HostState| state,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to add host-ext linker interfaces: {e}"))?;
     Ok(linker)
 }
 
@@ -4256,6 +4311,19 @@ pub async fn load_wasm_plugin(
     let component = Component::new(engine, &wasm_bytes).map_err(|e| {
         anyhow::anyhow!("failed to compile WASM component: {}: {e}", path.display())
     })?;
+    // What the brand records for its bundled plugins, over the files loaded
+    // now, so a host extension can tell the bundled build from a plugin
+    // installed under the same name.
+    let content_digest = if rsclaw_brand::BUNDLED_PLUGINS
+        .iter()
+        .any(|p| p.name == manifest.name)
+    {
+        path.parent()
+            .and_then(|dir| rsclaw_brand::plugin_digest::tree_digest(dir).ok())
+            .map(Arc::from)
+    } else {
+        None
+    };
 
     let linker = build_linker(engine)?;
 
@@ -4288,6 +4356,7 @@ pub async fn load_wasm_plugin(
         plugin_config: resolve_plugin_config(&manifest.config, &manifest.name),
         capabilities: manifest.capabilities.clone(),
         capabilities_arc: Arc::new(manifest.capabilities.clone()),
+        content_digest,
         slash_commands: manifest.slash_commands.clone(),
         tool_aliases: manifest.tool_aliases.clone(),
         min_call_interval: Duration::from_millis(u64::from(manifest.min_call_interval_ms)),
@@ -4397,6 +4466,13 @@ impl WasmPlugin {
             *last = Some(Instant::now());
         }
 
+        // The conversation the call is made for: its model and OCR calls
+        // carry that conversation's fleet headers (`fleet_scope`) on the
+        // task below too.
+        let fleet_session = notify_ctx
+            .as_ref()
+            .map(|c| Arc::<str>::from(c.session_key.as_str()))
+            .or_else(rsclaw_embed::fleet_scope::current);
         // Fresh store per call for isolation, with memory cap and epoch deadline.
         let mut store = new_sandboxed_store(
             &self.engine,
@@ -4408,6 +4484,7 @@ impl WasmPlugin {
             self.providers.clone(),
             self.vision_model.clone(),
             Arc::clone(&self.capabilities_arc),
+            self.content_digest.clone(),
         );
 
         let args_json =
@@ -4421,7 +4498,7 @@ impl WasmPlugin {
         let linker = self.linker.clone();
         let component = self.component.clone();
         let tool = tool_name.to_string();
-        let call = tokio::spawn(async move {
+        let work = async move {
             let instance = linker
                 .instantiate_async(&mut store, &component)
                 .await
@@ -4450,7 +4527,8 @@ impl WasmPlugin {
                 .await
                 .map_err(|e| anyhow::anyhow!("handle-tool call failed for '{tool}': {e}"))?;
             anyhow::Ok(result)
-        });
+        };
+        let call = tokio::spawn(rsclaw_embed::fleet_scope::within(fleet_session, work));
         let result = call
             .await
             .map_err(|e| anyhow::anyhow!("WASM tool task for '{tool_name}' failed: {e}"))??;

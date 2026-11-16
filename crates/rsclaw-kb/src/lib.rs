@@ -38,6 +38,7 @@ pub mod jobs;
 pub mod ledger;
 pub mod model;
 pub mod ocr;
+pub mod ocr_cache;
 pub mod paths;
 pub mod pipeline;
 pub mod rerank;

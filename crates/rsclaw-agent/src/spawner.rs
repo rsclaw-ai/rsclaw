@@ -107,17 +107,22 @@ pub async fn process_queued_message(
             hard_cancelled = true;
             Err(anyhow!("turn aborted"))
         }
-        r = runtime.run_turn(
-            &session_key,
-            &text,
-            &channel,
-            &peer_id,
-            &chat_id,
-            account.as_deref(),
-            extra_tools,
-            images,
-            files,
-            turn_ctx,
+        // The turn's fleet requests carry its conversation's headers
+        // (`rsclaw_embed::fleet_scope`).
+        r = rsclaw_embed::fleet_scope::scope(
+            std::sync::Arc::from(session_key.as_str()),
+            runtime.run_turn(
+                &session_key,
+                &text,
+                &channel,
+                &peer_id,
+                &chat_id,
+                account.as_deref(),
+                extra_tools,
+                images,
+                files,
+                turn_ctx,
+            ),
         ) => r,
     };
     watchdog.abort();

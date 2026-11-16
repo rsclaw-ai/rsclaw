@@ -245,6 +245,10 @@ pub struct AppState {
     >,
     /// Device token store for WebSocket gateway auth.
     pub devices: Arc<crate::ws::DeviceStore>,
+    /// Scoped access tokens (see [`crate::access`]).
+    pub access_tokens: Arc<crate::access::AccessTokens>,
+    /// End-to-end encrypted sessions (see [`crate::e2e`]).
+    pub e2e: Arc<crate::e2e::E2e>,
     /// Active WebSocket connections registry.
     pub ws_conns: Arc<crate::ws::ConnRegistry>,
     /// Feishu channel handle for webhook events (set after startup).
@@ -536,6 +540,13 @@ fn origin_allowed(origin: &HeaderValue, host: Option<&str>) -> bool {
 }
 
 /// True when the request carries a valid gateway Bearer token.
+fn query_param(uri: &axum::http::Uri, name: &str) -> Option<String> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then(|| v.to_owned())
+    })
+}
+
 fn bearer_matches(headers: &HeaderMap, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return false;
@@ -583,8 +594,12 @@ fn control_request_allowed(
             .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/json"));
     if has_marker {
         Ok(())
-    } else {
+    } else if rsclaw_brand::is_stock() {
         Err("browser requests must carry the X-RsClaw-Request header")
+    } else {
+        // The header keeps its name; the message doesn't spell the RsClaw
+        // name out to an OEM brand's users.
+        Err("browser requests must carry the local-request marker header")
     }
 }
 
@@ -812,7 +827,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/pairing/{channel}/reject", post(pairing_reject))
         .route("/brand", get(brand_info))
         .route("/owners", get(owners_get).put(owners_put).post(owners_add))
-        .route("/owners/{channel}/{*peer}", delete(owners_remove));
+        .route("/owners/{channel}/{*peer}", delete(owners_remove))
+        .route(
+            "/tokens",
+            get(crate::access::list_tokens).post(crate::access::mint_token),
+        )
+        .route("/tokens/{id}", delete(crate::access::revoke_token))
+        .route("/e2e/key", get(crate::e2e::public_key))
+        .route("/e2e/handshake", post(crate::e2e::handshake))
+        .route(
+            "/e2e/call",
+            post(crate::e2e::call).layer(axum::extract::DefaultBodyLimit::max(
+                crate::e2e::MAX_ENVELOPE_BODY,
+            )),
+        )
+        .route("/e2e/events", get(crate::e2e::events));
 
     // Mount the knowledge base routes only when the store opened. A KB
     // open failure leaves `knowledge` None; the rest of the API still serves.
@@ -820,8 +849,14 @@ pub fn build_router(state: AppState) -> Router {
         let max_doc_bytes = k.max_doc_bytes();
         api = api.nest("/knowledge", knowledge::routes(max_doc_bytes).with_state(k));
     }
+    // Routes added by extension crates of a custom build (none in the stock
+    // binary). They are complete routers, so give them this router's state type.
+    for routes in crate::ext::api_routes() {
+        api = api.merge(routes.with_state::<AppState>(()));
+    }
 
-    Router::new()
+    let e2e = Arc::clone(&state.e2e);
+    let router = Router::new()
         .nest("/api/v1", api)
         // Convenience alias: bare `/health` resolves to the same handler
         // as `/api/v1/health`. Container orchestrators (Docker, k8s,
@@ -882,7 +917,13 @@ pub fn build_router(state: AppState) -> Router {
         // proxy rather than granting arbitrary websites ambient gateway access.
         .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        // Outermost: a request a proxy or tunnel forwarded is not local, so
+        // every loopback check below sees it as remote.
+        .layer(middleware::from_fn(forwarded_peer_middleware))
+        .with_state(state);
+    // Requests inside an encrypted session run through this same router.
+    e2e.set_router(router.clone());
+    router
 }
 
 /// Start the HTTP server. Blocks until shutdown.
@@ -921,15 +962,72 @@ pub async fn serve(state: AppState, bind: std::net::SocketAddr) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Forwarded requests
+// ---------------------------------------------------------------------------
+
+/// Headers a reverse proxy or tunnel adds to the requests it forwards.
+const FORWARDING_HEADERS: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-real-ip",
+    "cf-connecting-ip",
+];
+
+/// The peer a forwarded request is given: neither loopback nor anyone's
+/// real address.
+const FORWARDED_PEER: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+fn is_forwarded(headers: &HeaderMap) -> bool {
+    FORWARDING_HEADERS.iter().any(|h| headers.contains_key(*h))
+}
+
+/// A tunnel client or reverse proxy on this machine connects from loopback,
+/// so everything it relays would pass the loopback checks: shutdown and
+/// restart without a token, open-gateway trust, local file imports, the
+/// rate-limit exemption. Proxies mark what they forward with a forwarding
+/// header, and a remote caller cannot remove one the proxy adds, so a
+/// loopback request that carries one gets [`FORWARDED_PEER`] as its peer.
+/// A local caller sending such a header only gives up its own local trust.
+async fn forwarded_peer_middleware(mut request: axum::extract::Request, next: Next) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    if let Some(peer) = peer
+        && is_loopback(peer)
+        && is_forwarded(request.headers())
+    {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::new(
+                FORWARDED_PEER,
+                peer.port(),
+            )));
+    }
+    next.run(request).await
+}
+
+// ---------------------------------------------------------------------------
 // Auth middleware
 // ---------------------------------------------------------------------------
 
 async fn auth_middleware(
     State(state): State<AppState>,
     headers: HeaderMap,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    // A request carried inside an encrypted session: the session's
+    // principal stands in for the bearer token. Only `crate::e2e` inserts
+    // this extension, never the network.
+    if let Some(admitted) = crate::e2e::admit(&mut request) {
+        return match admitted {
+            Ok(()) => next.run(request).await,
+            Err(refused) => refused,
+        };
+    }
+
     // Health, agent card discovery, WS, and internal reload endpoints are always
     // open (WS performs its own handshake-level auth).
     //
@@ -999,14 +1097,32 @@ async fn auth_middleware(
         // auth and any A2A v1.0 client following the spec would 401.
         || path == "/api/v1/a2a"
         || path == "/api/v1/a2a/relay/ws"
+        // Encrypted sessions authenticate inside the handshake and the
+        // envelopes; see `crate::e2e`.
+        || path == "/api/v1/e2e/handshake"
+        || path == "/api/v1/e2e/call"
+        || path == "/api/v1/e2e/events"
     {
         return next.run(request).await;
+    }
+
+    // Areas that accept only encrypted requests refuse plaintext from
+    // anyone, the gateway token included: a relay must never see them.
+    if crate::ext::e2e_only(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "e2e_required"})),
+        )
+            .into_response();
     }
 
     // If no token is configured, gateway runs open (loopback-only recommended).
     // Read from live config so auth_token rotation takes effect without restart.
     let expected = state.live.gateway.read().await.auth_token.clone();
     let Some(expected) = expected else {
+        request
+            .extensions_mut()
+            .insert(crate::access::Principal::Admin);
         return next.run(request).await;
     };
 
@@ -1016,7 +1132,12 @@ async fn auth_middleware(
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match provided {
-        Some(token) if constant_time_eq(token, &expected) => next.run(request).await,
+        Some(token) if constant_time_eq(token, &expected) => {
+            request
+                .extensions_mut()
+                .insert(crate::access::Principal::Admin);
+            next.run(request).await
+        }
         _ => {
             warn!(path = %path, "auth rejected: missing or invalid Bearer token");
             (
@@ -1046,6 +1167,17 @@ async fn rate_limit_middleware(
     }
     let token = state.live.gateway.read().await.auth_token.clone();
     if bearer_matches(request.headers(), token.as_deref()) {
+        return next.run(request).await;
+    }
+    // Encrypted sessions are authenticated: their inner requests, and outer
+    // calls naming a live session.
+    if request.extensions().get::<crate::e2e::E2eRequest>().is_some() {
+        return next.run(request).await;
+    }
+    if matches!(request.uri().path(), "/api/v1/e2e/call" | "/api/v1/e2e/events")
+        && let Some(sid) = query_param(request.uri(), "sid")
+        && state.e2e.has_session(&sid).await
+    {
         return next.run(request).await;
     }
     if state
@@ -1311,6 +1443,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_message_edit_reaches_the_payload_the_job_runs() {
+        let new = serde_json::json!("new prompt");
+        let mut job = serde_json::json!({
+            "message": "new prompt",
+            "payload": {"kind": "agentTurn", "text": "old", "timeoutSeconds": 600}
+        });
+        sync_payload_message(job.as_object_mut().unwrap(), &new);
+        assert_eq!(
+            job["payload"],
+            serde_json::json!({"kind": "agentTurn", "message": "new prompt", "timeoutSeconds": 600})
+        );
+        let mut job = serde_json::json!({"payload": "old"});
+        sync_payload_message(job.as_object_mut().unwrap(), &new);
+        assert_eq!(job["payload"], new);
+        let mut job = serde_json::json!({"message": "new prompt"});
+        sync_payload_message(job.as_object_mut().unwrap(), &new);
+        assert!(job.get("payload").is_none());
+    }
+
+    #[test]
     fn cors_allows_only_local_and_desktop_origins() {
         for allowed in [
             "http://localhost:3000",
@@ -1506,6 +1658,53 @@ mod tests {
         assert_eq!(agent["name"], "New");
         set_or_clear_agent_text(&mut agent, "name", " ");
         assert!(agent.get("name").is_none());
+    }
+
+    async fn peer_seen_by_handlers(peer: SocketAddr, header: Option<(&str, &str)>) -> String {
+        use tower::ServiceExt as _;
+        let app = Router::new()
+            .route(
+                "/",
+                get(
+                    |axum::extract::ConnectInfo(p): axum::extract::ConnectInfo<SocketAddr>| async move {
+                        p.ip().to_string()
+                    },
+                ),
+            )
+            .layer(middleware::from_fn(forwarded_peer_middleware));
+        let mut request = axum::http::Request::builder().uri("/");
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
+        }
+        let mut request = request.body(axum::body::Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn forwarded_requests_from_loopback_are_not_local() {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 50000));
+        assert_eq!(peer_seen_by_handlers(loopback, None).await, "127.0.0.1");
+        for header in FORWARDING_HEADERS {
+            let seen = peer_seen_by_handlers(loopback, Some((header, "203.0.113.7"))).await;
+            assert_eq!(seen, "0.0.0.0", "{header}");
+            assert!(!is_loopback(SocketAddr::new(seen.parse().unwrap(), 1)));
+        }
+        // A forwarded header naming loopback is still a forwarded request.
+        assert_eq!(
+            peer_seen_by_handlers(loopback, Some(("x-forwarded-for", "127.0.0.1"))).await,
+            "0.0.0.0"
+        );
+        // Remote peers keep their address.
+        let remote = SocketAddr::from(([203, 0, 113, 7], 50000));
+        assert_eq!(
+            peer_seen_by_handlers(remote, Some(("x-forwarded-for", "198.51.100.1"))).await,
+            "203.0.113.7"
+        );
     }
 
     #[test]
@@ -3290,6 +3489,29 @@ pub(crate) async fn apply_reload_scopes(
 
     // --- Providers: rebuild registry from config and swap into all handles ---
     if reload_providers {
+        // A provider whose block changed (a key added after a 401, a new base
+        // URL) starts healthy again: its old failures were against the old
+        // settings, and a cooled-down model would refuse the new key until
+        // the backoff ran out.
+        let provider_json = |m: &Option<rsclaw_config::schema::ModelsConfig>| {
+            m.as_ref()
+                .map(|m| {
+                    m.providers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or_default()))
+                        .collect::<std::collections::HashMap<_, _>>()
+                })
+                .unwrap_or_default()
+        };
+        let old_providers = provider_json(&state.live.model.read().await.models);
+        for (name, cfg) in provider_json(&fresh_config.model.models) {
+            if old_providers.get(&name) != Some(&cfg) {
+                let cleared = state.model_health.reset_provider(&name);
+                if cleared > 0 {
+                    tracing::info!(provider = %name, cleared, "hot-reload: provider changed; model health reset");
+                }
+            }
+        }
         let new_registry = Arc::new(rsclaw_provider::build::build_providers(&fresh_config));
         let provider_count = new_registry.names().len();
         {
@@ -4019,12 +4241,11 @@ async fn respawn_mcp_servers(
 /// Reject the request if the caller isn't a loopback peer.
 /// Shutdown / restart are only exposed to local processes — never over LAN.
 ///
-/// Caveat: this checks the direct **TCP peer** address, NOT `X-Forwarded-For`.
-/// If you run rsclaw behind a reverse proxy (nginx/caddy/traefik), the proxy
-/// itself may be loopback even when the original client is on the WAN, which
-/// would incorrectly authorize remote shutdowns. In that deployment, bind the
-/// gateway to 127.0.0.1 so only the proxy can reach it, OR put `/shutdown` and
-/// `/restart` behind an explicit proxy ACL.
+/// This checks the direct TCP peer. A reverse proxy or tunnel on this machine
+/// is a loopback peer too; `forwarded_peer_middleware` gives the requests it
+/// forwards a non-loopback peer when they carry a forwarding header (nginx
+/// needs `proxy_set_header X-Forwarded-For`, caddy, cloudflared, ngrok and
+/// rsclaw-tunnel add one themselves).
 pub(crate) fn is_loopback(addr: std::net::SocketAddr) -> bool {
     match addr.ip() {
         std::net::IpAddr::V4(v4) => v4.is_loopback(),
@@ -4121,7 +4342,18 @@ async fn http_restart_dismiss(
     Json(serde_json::json!({ "dismissed": true })).into_response()
 }
 
-async fn cron_reload(State(state): State<AppState>) -> impl IntoResponse {
+/// POST /api/v1/cron/reload — loopback-only, like shutdown and restart.
+async fn cron_reload(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> impl IntoResponse {
+    if !is_loopback(peer) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "cron reload is loopback-only"})),
+        )
+            .into_response();
+    }
     match state.cron_reload.send(()) {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({"reloaded": true}))).into_response(),
         Err(e) => (
@@ -4496,6 +4728,11 @@ async fn cron_update(
                 }
                 existing.insert(k.clone(), v.clone());
             }
+            // A job with a payload runs the payload's message, so a bare
+            // `message` patch must reach it or the edit never takes effect.
+            if let Some(message) = patch.get("message").filter(|_| !patch.contains_key("payload")) {
+                sync_payload_message(existing, message);
+            }
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -4515,6 +4752,23 @@ async fn cron_update(
             Json(serde_json::json!({"error": e})),
         )
             .into_response(),
+    }
+}
+
+/// Point the job's payload (if it has one) at `message`: the text inside a
+/// structured payload (either spelling), or the whole payload when it is
+/// plain text.
+fn sync_payload_message(
+    job: &mut serde_json::Map<String, serde_json::Value>,
+    message: &serde_json::Value,
+) {
+    match job.get_mut("payload") {
+        Some(serde_json::Value::Object(payload)) => {
+            payload.remove("text");
+            payload.insert("message".to_owned(), message.clone());
+        }
+        Some(payload @ serde_json::Value::String(_)) => *payload = message.clone(),
+        _ => {}
     }
 }
 
@@ -7150,6 +7404,11 @@ async fn run_doctor_cmd(fix: bool) -> Response {
         cmd.env("RSCLAW_BASE_DIR", v);
     }
     cmd.env("NO_COLOR", "1"); // Strip ANSI for clean parsing.
+    // The app shows `raw`: log lines there carry crate paths (`rsclaw_*`),
+    // which another brand's users never see. Doctor reports its own checks.
+    if !rsclaw_brand::is_stock() {
+        cmd.env("RUST_LOG", "off");
+    }
     #[cfg(windows)]
     {
         cmd.creation_flags(0x08000000);

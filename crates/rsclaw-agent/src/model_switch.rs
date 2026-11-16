@@ -74,6 +74,7 @@ pub fn switch_session_model(handle: &AgentHandle, session_key: &str, input: &str
     match resolve_model_choice(input, aliases, &handle.providers_snapshot()) {
         Ok(ModelChoice::Set(model)) => {
             handle.set_session_model(session_key, Some(model.clone()));
+            let model = rsclaw_brand::display_model(&model, zh);
             if zh {
                 format!("本会话已切换到 {model}（只影响当前会话，重启后恢复；/model default 切回默认）")
             } else {
@@ -84,7 +85,7 @@ pub fn switch_session_model(handle: &AgentHandle, session_key: &str, input: &str
         }
         Ok(ModelChoice::Reset) => {
             handle.set_session_model(session_key, None);
-            let model = &handle.effective_model;
+            let model = rsclaw_brand::display_model(&handle.effective_model, zh);
             if zh {
                 format!("本会话已恢复默认模型 {model}")
             } else {
@@ -92,6 +93,7 @@ pub fn switch_session_model(handle: &AgentHandle, session_key: &str, input: &str
             }
         }
         Err(e) => {
+            let e = rsclaw_brand::scrub(&e, zh);
             if zh {
                 format!("未切换：{e}")
             } else {

@@ -355,7 +355,8 @@ impl AgentHandle {
     pub fn format_status(&self) -> String {
         use crate::prompt_builder::format_duration;
 
-        let model = self.effective_model.as_str();
+        let zh = rsclaw_i18n::default_lang() == "zh";
+        let model = rsclaw_brand::display_model(&self.effective_model, zh);
         let sessions = self
             .session_count
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -503,7 +504,8 @@ impl AgentHandle {
              {ctx_lines}\
              {sticky_lines}\
              {in_flight_lines}\
-             Uptime: {uptime}\nVersion: rsclaw {}",
+             Uptime: {uptime}\nVersion: {} {}",
+            rsclaw_brand::CLI_NAME,
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         )
     }
@@ -532,19 +534,26 @@ impl AgentHandle {
     pub fn format_models_for(&self, session_key: &str) -> String {
         match self.session_model(session_key) {
             Some(m) => format!(
-                "This chat: {m} (/model default to switch back)\n{}",
+                "This chat: {} (/model default to switch back)\n{}",
+                rsclaw_brand::display_model(&m, rsclaw_i18n::default_lang() == "zh"),
                 self.format_models().replacen("Current model:", "Default model:", 1)
             ),
             None => self.format_models(),
         }
     }
 
+    /// Model and provider ids read as the brand names them
+    /// (`rsclaw_brand::display_model`); the stock brand shows the ids.
     pub fn format_models(&self) -> String {
-        let mut lines = vec![format!("Current model: {}", self.effective_model)];
+        let zh = rsclaw_i18n::default_lang() == "zh";
+        let mut lines = vec![format!(
+            "Current model: {}",
+            rsclaw_brand::display_model(&self.effective_model, zh)
+        )];
         lines.push(String::new());
         lines.push("Registered providers:".to_owned());
         for name in self.providers_snapshot().names() {
-            lines.push(format!("  {name}"));
+            lines.push(format!("  {}", rsclaw_brand::display_provider(name, zh)));
         }
         lines.join("\n")
     }

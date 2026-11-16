@@ -184,7 +184,8 @@ impl PreParseEngine {
         add_direct(&mut commands, r"(?i)^/health$", |_| "__HEALTH__".into());
         add_direct(&mut commands, r"(?i)^/version$", |_| {
             format!(
-                "rsclaw v{}",
+                "{} v{}",
+                rsclaw_brand::CLI_NAME,
                 option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
             )
         });

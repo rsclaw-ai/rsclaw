@@ -153,7 +153,10 @@ pub fn process_terminate(pid: u32) -> Result<()> {
             pid,
             "refusing to terminate process: not a running rsclaw process (stale pid?)"
         );
-        anyhow::bail!("process {pid} is not a running rsclaw process; refusing to terminate");
+        anyhow::bail!(
+            "process {pid} is not a running {} process; refusing to terminate",
+            rsclaw_brand::CLI_NAME
+        );
     }
     #[cfg(unix)]
     {

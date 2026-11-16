@@ -565,6 +565,7 @@ pub trait NotificationSink: Send + Sync {
     fn send(&self, notification: &Notification) -> _NotifBoxFuture<'_, anyhow::Result<()>>;
 }
 
+pub mod access;
 pub mod turn_metrics;
 
 // ============================================================================

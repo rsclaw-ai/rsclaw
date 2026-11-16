@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-calamine = "0.36"
+calamine = "0.38"
 # OLE compound files: the container of legacy Word (.doc) documents.
 cfb = "0.15"
 docx-rs = "0.4.22"
@@ -20,6 +20,6 @@ lopdf = "0.42"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 hayro = { version = "0.8", default-features = false, features = ["simd"] }
 rust_xlsxwriter = "0.83"
-zip = "2"
+zip = "9"
 pdf-extract = "0.12"
 tracing = "0.1"

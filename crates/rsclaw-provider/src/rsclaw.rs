@@ -96,7 +96,13 @@ pub const RSCLAW_DEFAULT_VISION: &str = "rsclaw/rsclaw-vision-v1";
 /// (TCP connect + TLS + send body + receive headers + first byte).
 /// Once the body stream begins this deadline no longer applies — the
 /// SSE body is allowed to take as long as the model needs.
-const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// The server holds a turn's response headers for up to 90 s while it
+/// waits for the worker's first frame (so a "session lost" answer can still
+/// come back as a status the client replays on). Giving up at 60 s, as this
+/// used to, abandoned turns the server was still about to start and paid
+/// for a full session replay instead; stay just past the server's wait.
+const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// Read-idle bound applied per chunk once the SSE body is streaming. The
 /// headers deadline above no longer applies after the body begins, so this
@@ -1700,20 +1706,26 @@ impl RsclawProvider {
         let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
         let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let block_state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
+        let parse_state = block_state.clone();
         let event_stream =
             byte_stream
                 .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
                 .then(move |chunk| {
                     let line_buffer = line_buffer.clone();
                     let utf8_remainder = utf8_remainder.clone();
-                    let block_state = block_state.clone();
+                    let block_state = parse_state.clone();
                     async move {
                         parse_sse_chunk(chunk, &line_buffer, &utf8_remainder, &block_state).await
                     }
                 })
                 .flat_map(futures::stream::iter);
 
-        Ok(TurnOutcome::Stream(Box::pin(event_stream)))
+        Ok(TurnOutcome::Stream(keep_alive_in_tool_input(
+            Box::pin(event_stream),
+            block_state,
+            TOOL_INPUT_KEEPALIVE,
+            TOOL_INPUT_MAX_SILENCE,
+        )))
     }
 }
 
@@ -3128,6 +3140,69 @@ enum BlockKind {
     ToolCall,
 }
 
+/// How often a turn that is inside an open tool call, with no frames
+/// arriving, is reported alive to the caller.
+const TOOL_INPUT_KEEPALIVE: Duration = Duration::from_secs(20);
+
+/// Longest gap between frames tolerated inside an open tool call. Past it
+/// the turn ends with an error naming the tool, so a worker that died
+/// mid-argument still fails, and says why.
+///
+/// The worker holds back each tool argument until it is complete (values
+/// under 64 KiB go out in one piece when the parameter closes), so a model
+/// writing a whole document into `create_docx.content` sends `block_start`
+/// and then nothing for as long as the document takes to generate: at about
+/// 40 tokens/s, 8k tokens is over three minutes. The agent loop's 120 s idle
+/// watchdog used to kill exactly those turns.
+const TOOL_INPUT_MAX_SILENCE: Duration = Duration::from_secs(480);
+
+/// Wraps a turn's event stream so that, while a `tool_call` block is open
+/// and the stream is silent, an empty text delta is emitted every `tick`.
+/// After `max_silence` without a real event inside the tool call, the stream
+/// ends with an error naming the tool. Outside a tool call nothing is added,
+/// so a stream that stalls anywhere else still trips the caller's idle
+/// watchdog as before.
+fn keep_alive_in_tool_input(
+    inner: LlmStream,
+    state: Arc<tokio::sync::Mutex<SseState>>,
+    tick: Duration,
+    max_silence: Duration,
+) -> LlmStream {
+    // `None` once the stream has been ended by the silence error.
+    let start = Some((inner, state, std::time::Instant::now()));
+    Box::pin(futures::stream::unfold(start, move |running| async move {
+        let (mut inner, state, mut last) = running?;
+        loop {
+            tokio::select! {
+                // `next()` is cancel-safe: the stream keeps any half-read
+                // chunk when the timer wins the race.
+                event = inner.next() => {
+                    last = std::time::Instant::now();
+                    return event.map(|e| (e, Some((inner, state, last))));
+                }
+                () = tokio::time::sleep(tick) => {
+                    let open_tool = state
+                        .lock()
+                        .await
+                        .blocks
+                        .values()
+                        .find(|b| b.kind == BlockKind::ToolCall)
+                        .map(|b| b.tool_name.clone());
+                    let Some(tool) = open_tool else { continue };
+                    if last.elapsed() < max_silence {
+                        return Some((Ok(StreamEvent::TextDelta(String::new())), Some((inner, state, last))));
+                    }
+                    let error = anyhow::anyhow!(
+                        "rsclaw turn: no data for {}s while the model was writing the arguments of `{tool}` (the worker stopped mid tool call)",
+                        last.elapsed().as_secs()
+                    );
+                    return Some((Err(error), None));
+                }
+            }
+        }
+    }))
+}
+
 async fn parse_sse_chunk(
     chunk: Result<bytes::Bytes>,
     line_buffer: &Arc<tokio::sync::Mutex<String>>,
@@ -3546,6 +3621,97 @@ mod tests {
     /// Convenience: create a fresh block state for a single-call test.
     fn new_state() -> Arc<tokio::sync::Mutex<SseState>> {
         Arc::new(tokio::sync::Mutex::new(SseState::default()))
+    }
+
+    /// Events the wrapped stream yields before going quiet for `quiet`.
+    async fn events_until_quiet(stream: &mut LlmStream, quiet: Duration) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        while let Ok(Some(ev)) = tokio::time::timeout(quiet, stream.next()).await {
+            out.push(ev.expect("no stream error"));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn tool_input_keepalive_while_a_tool_call_is_open() {
+        let state = new_state();
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        parse_sse_test(
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"tool_call\",\"id\":\"c1\",\"name\":\"create_docx\"}}\n",
+            )),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
+        // The worker is generating the argument: no frames at all.
+        let silent: LlmStream = Box::pin(futures::stream::pending());
+        let mut s = keep_alive_in_tool_input(
+            silent,
+            state,
+            Duration::from_millis(10),
+            Duration::from_millis(80),
+        );
+        let mut keepalives = 0;
+        let error = loop {
+            match tokio::time::timeout(Duration::from_millis(300), s.next()).await {
+                Ok(Some(Ok(StreamEvent::TextDelta(t)))) if t.is_empty() => keepalives += 1,
+                Ok(Some(Err(e))) => break e.to_string(),
+                other => panic!("expected a keepalive or the silence error, got {other:?}"),
+            }
+        };
+        assert!(
+            (1..=9).contains(&keepalives),
+            "keepalives while inside the tool call: got {keepalives}"
+        );
+        assert!(
+            error.contains("create_docx"),
+            "a dead stream inside a tool call fails naming the tool: {error}"
+        );
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_millis(100), s.next()).await,
+                Ok(None)
+            ),
+            "the stream ends after the silence error"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_keepalive_outside_a_tool_call() {
+        let silent: LlmStream = Box::pin(futures::stream::pending());
+        let mut s = keep_alive_in_tool_input(
+            silent,
+            new_state(),
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        );
+        assert!(
+            events_until_quiet(&mut s, Duration::from_millis(100))
+                .await
+                .is_empty(),
+            "a silent stream with no open tool call must still look stalled"
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_wrapper_passes_events_through() {
+        let inner: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::TextDelta("hi".into())),
+            Ok(StreamEvent::Done { usage: None }),
+        ]));
+        let mut s = keep_alive_in_tool_input(
+            inner,
+            new_state(),
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        );
+        let events = events_until_quiet(&mut s, Duration::from_millis(100)).await;
+        assert!(
+            matches!(&events[..], [StreamEvent::TextDelta(t), StreamEvent::Done { .. }] if t == "hi")
+        );
     }
 
     #[tokio::test]

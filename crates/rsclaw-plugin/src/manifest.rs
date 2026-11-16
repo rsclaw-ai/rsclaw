@@ -128,8 +128,9 @@ pub struct PluginManifest {
     /// honored only for trusted plugins. WASM host functions gated here:
     /// `http`, `device`, `cron`, `sse`, `pushOutbound`, `submitAgentTurn`,
     /// `desktop` (all `host-desktop` calls), `vlmDrive` (desktop/android
-    /// VLM loops, limited to the named app) and `vlmDriveBypass` (lets a
-    /// VLM loop act on any app).
+    /// VLM loops, limited to the named app), `vlmDriveBypass` (lets a
+    /// VLM loop act on any app) and `ext:<namespace>` (`host-ext` calls into
+    /// that extension).
     #[serde(default)]
     pub capabilities: Vec<String>,
     /// Slash command prefixes this plugin wants to handle locally.

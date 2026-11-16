@@ -613,7 +613,8 @@ impl AgentRuntime {
                         build_help_text_filtered(allowed, lang)
                     }
                     "__VERSION__" => format!(
-                        "rsclaw {}",
+                        "{} {}",
+                        rsclaw_brand::CLI_NAME,
                         option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
                     ),
                     "__STATUS__" => self.handle.format_status(),
@@ -623,10 +624,14 @@ impl AgentRuntime {
                             rsclaw_provider::registry::ProviderRegistry::parse_model(&model);
                         let provider_ok = self.providers.get(prov_name).is_ok();
                         format!(
-                            "Health check:\n  Provider ({}): {}\n  Store: ok\n  Agent: {}\n  Version: rsclaw {}",
-                            model,
+                            "Health check:\n  Provider ({}): {}\n  Store: ok\n  Agent: {}\n  Version: {} {}",
+                            rsclaw_brand::display_model(
+                                &model,
+                                rsclaw_i18n::default_lang() == "zh"
+                            ),
                             if provider_ok { "ok" } else { "unavailable" },
                             self.handle.id,
+                            rsclaw_brand::CLI_NAME,
                             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
                         )
                     }

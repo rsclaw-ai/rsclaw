@@ -279,18 +279,12 @@ impl CronRunner {
                             if !mem_job.enabled {
                                 redb_job.enabled = false;
                             }
-                            // If the user edited the schedule in cron.json5,
-                            // adopt it and force a next-run recompute — otherwise
-                            // the stale `next_run_at_ms` carried in state keeps
-                            // firing on the OLD time (or never, if it's past).
-                            let sched_changed = serde_json::to_string(&redb_job.schedule).ok()
-                                != serde_json::to_string(&mem_job.schedule).ok();
-                            if sched_changed {
-                                redb_job.schedule = mem_job.schedule.clone();
-                                if let Some(st) = redb_job.state.as_mut() {
-                                    st.next_run_at_ms = None;
-                                }
-                            }
+                            // Every other field (schedule, message, payload, …)
+                            // stays as redb has it. Memory picks up config only
+                            // on reload, so a save landing between an edit and
+                            // the reload it triggers holds the OLD config; the
+                            // reload that follows recomputes the next run for
+                            // an edited schedule.
                             redb_job
                         }
                         Err(e) => {
@@ -720,32 +714,31 @@ impl CronRunner {
                     .collect();
                 info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, modified=?modified_ids, "cron: merge complete");
 
-                // Cancel running tasks that were removed, disabled, OR whose
-                // user-facing config changed.  The "modified" case matters
-                // because a user editing a long-running job (e.g. switching a
-                // 5-minute schedule to 30 minutes) expects the old in-flight
-                // run on the OLD config to stop — otherwise it keeps using the
-                // old message/payload/cadence side-by-side with the new one.
-                let active_unchanged: HashSet<&str> = jobs
+                // Cancel running tasks that were removed or disabled. A run
+                // whose config was only edited finishes on the config it
+                // started with and the next run uses the new one: cutting it
+                // off mid-turn can leave a reply half sent (part one of a
+                // two-part message out, part two never). The next run time
+                // already follows an edited schedule (merge_jobs recomputes
+                // it, and a finished run computes from the job as it is now).
+                let still_enabled: HashSet<&str> = jobs
                     .iter()
-                    .filter(|j| j.enabled && !modified_ids.contains(&j.id))
+                    .filter(|j| j.enabled)
                     .map(|j| j.id.as_str())
                     .collect();
                 let to_cancel: Vec<String> = cancel_flags
                     .keys()
-                    .filter(|id| !active_unchanged.contains(id.as_str()))
+                    .filter(|id| !still_enabled.contains(id.as_str()))
                     .cloned()
                     .collect();
                 for id in &to_cancel {
                     if let Some(flag) = cancel_flags.remove(id) {
                         flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        let reason = if modified_ids.contains(id) {
-                            "modified"
-                        } else {
-                            "deleted/disabled"
-                        };
-                        info!(job_id = id, reason, "cron: cancelled running job");
+                        info!(job_id = id, reason = "deleted/disabled", "cron: cancelled running job");
                     }
+                }
+                for id in cancel_flags.keys().filter(|id| modified_ids.contains(*id)) {
+                    info!(job_id = %id, "cron: job edited while running; the new config applies from its next run");
                 }
 
                 if let Err(e) = self.save_store(&jobs).await {

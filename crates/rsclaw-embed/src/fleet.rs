@@ -308,8 +308,13 @@ impl FleetHttp {
     ) -> Result<reqwest::Response> {
         let mut current_url = self.resolve_url(url);
         let mut hops = 0;
+        // The conversation's own headers (`fleet_scope`), on every hop.
+        let scoped = crate::fleet_scope::current_headers();
         loop {
             let mut builder = self.client.post(&current_url).json(body);
+            for (name, value) in &scoped {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
             if let Some(t) = builder_timeout {
                 builder = builder.timeout(t);
             }

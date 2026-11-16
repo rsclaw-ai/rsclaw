@@ -255,6 +255,10 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
         wasm_browser: Arc::new(tokio::sync::Mutex::new(None)),
         rate_limiter: Arc::new(rsclaw::server::RateLimiter::new()),
         reload_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        access_tokens: Arc::new(rsclaw::access::AccessTokens::load(
+            std::env::temp_dir().join(format!("rsclaw-test-tokens-{}.json", uuid::Uuid::new_v4())),
+        )),
+        e2e: Arc::new(rsclaw::e2e::E2e::ephemeral()),
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.

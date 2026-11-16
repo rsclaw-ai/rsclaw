@@ -19,6 +19,7 @@ mod android_vlm;
 pub mod codex;
 mod desktop_focus;
 mod desktop_vlm;
+pub mod host_ext;
 pub mod host_methods;
 pub mod js_runtime;
 pub mod manifest;

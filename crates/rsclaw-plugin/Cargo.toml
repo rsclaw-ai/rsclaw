@@ -23,6 +23,7 @@ rsclaw-provider = { path = "../rsclaw-provider", version = "0.1.0" }
 rsclaw-store = { path = "../rsclaw-store", version = "0.1.0" }
 rsclaw-channel = { path = "../rsclaw-channel", version = "0.1.0" }
 rsclaw-kb = { path = "../rsclaw-kb", version = "0.1.0" }
+rsclaw-embed = { path = "../rsclaw-embed", version = "0.1.0" }
 rsclaw-browser = { path = "../rsclaw-browser", version = "0.1.0" }
 rsclaw-memory = { path = "../rsclaw-memory", version = "0.1.0" }
 rsclaw-desktop = { path = "../rsclaw-desktop", version = "0.1.0" }
@@ -36,8 +37,8 @@ reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocki
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 dirs-next = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
-wasmtime = { version = "36.0.17", features = ["async"] }
-wasmtime-wasi = "36.0.17"
+wasmtime = { version = "36.0.20", features = ["async"] }
+wasmtime-wasi = "36.0.20"
 chrono = { version = "0.4", features = ["serde"] }
 which = "7"
 rand = "0.9"

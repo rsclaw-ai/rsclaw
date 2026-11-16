@@ -388,7 +388,10 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
                 Err(anyhow!("message: gateway returned {status}: {body}"))
             }
             Err(e) => Err(anyhow!(
-                "message: cannot reach local gateway at 127.0.0.1:{port}: {e}. The gateway HTTP listener appears down — restart it with `rsclaw gateway restart` or verify the configured port"
+                "{}",
+                rsclaw_brand::rebrand(&format!(
+                    "message: cannot reach local gateway at 127.0.0.1:{port}: {e}. The gateway HTTP listener appears down — restart it with `rsclaw gateway restart` or verify the configured port"
+                ))
             )),
         }
     }
@@ -505,7 +508,7 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
                     .ok_or_else(|| anyhow!("anycli install: `name` required"))?;
                 let hub = anycli::Hub::new()?;
                 let dir = anycli::hub::default_adapters_dir()
-                    .ok_or_else(|| anyhow!("anycli install: cannot determine adapters directory (home dir unresolved — is $HOME/%USERPROFILE% unset?). Set HOME or install manually with `rsclaw anycli install <name>`"))?;
+                    .ok_or_else(|| anyhow!("{}", rsclaw_brand::rebrand("anycli install: cannot determine adapters directory (home dir unresolved — is $HOME/%USERPROFILE% unset?). Set HOME or install manually with `rsclaw anycli install <name>`")))?;
                 let path = hub.install(name, &dir).await?;
                 Ok(json!({"installed": name, "path": path.display().to_string()}))
             }
@@ -540,7 +543,7 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
             })),
             "version" => Ok(json!({
                 "version": version,
-                "name": "rsclaw",
+                "name": rsclaw_brand::CLI_NAME,
             })),
             other => Err(anyhow!(
                 "gateway: unsupported action `{other}` (status, health, version)"
@@ -864,7 +867,7 @@ $synth.Speak($env:RSCLAW_TTS_TEXT)
 
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "rsclaw".to_owned());
+            .unwrap_or_else(|_| rsclaw_brand::CLI_NAME.to_owned());
 
         let name = name.trim();
         if name.is_empty() || name.starts_with('-') {

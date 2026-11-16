@@ -982,15 +982,21 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(cursor).context("not a valid ZIP archive")?;
 
     // Strip the top-level directory only if all entries share one.
+    let names: Vec<String> = archive
+        .file_names()
+        .map(|n| n.map(|n| n.into_owned()))
+        .collect::<Result<_, _>>()
+        .context("ZIP entry name is not valid")?;
     let top = common_top_dir(
-        archive
-            .file_names()
+        names
+            .iter()
+            .map(String::as_str)
             .filter(|n| !n.starts_with("__MACOSX")),
     );
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let name = file.name().to_owned();
+        let name = file.name()?.into_owned();
 
         // Skip directories and __MACOSX metadata.
         if name.ends_with('/') || name.starts_with("__MACOSX") {

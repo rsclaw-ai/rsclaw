@@ -31,4 +31,13 @@ jobs:
           # not compile or ship matrix-sdk. matrix-sdk >=0.19 requires Rust 1.96,
           # above the project's Rust 1.91 MSRV; remove these ignores when Matrix
           # is upgraded or enabled in release builds.
-          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2026-0292,RUSTSEC-2026-0318
+          #
+          # RUSTSEC-2026-0367/0368/0369/0429 are flaws in zip's `extract`. Our own
+          # code is on zip 9, where they are fixed; the older copies come in
+          # through rust_xlsxwriter (writes only), docx-rs and candle-core (read
+          # entries by name), none of which call `extract`.
+          #
+          # RUSTSEC-2026-0387 (crypto-bigint timing) reaches us only through
+          # webrtc's DTLS (p256/p384 ephemeral keys); remove it once webrtc moves
+          # to elliptic-curve 0.14.
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2026-0292,RUSTSEC-2026-0318,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369,RUSTSEC-2026-0429,RUSTSEC-2026-0387

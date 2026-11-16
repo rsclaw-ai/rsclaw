@@ -161,8 +161,9 @@ impl Canonicalizer for PptxCanonicalizer {
         // the mutable `by_name` reads below), then read in slide order.
         let mut slides: Vec<String> = archive
             .file_names()
+            .filter_map(|n| n.ok())
             .filter(|n| n.starts_with("ppt/slides/slide") && n.ends_with(".xml"))
-            .map(|s| s.to_string())
+            .map(|s| s.into_owned())
             .collect();
         slides.sort_by_key(|n| slide_number(n));
         let mut sections = Vec::new();
