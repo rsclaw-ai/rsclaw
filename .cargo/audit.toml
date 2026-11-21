@@ -3,13 +3,8 @@
 
 [advisories]
 ignore = [
-    "RUSTSEC-2020-0020",   # stb_truetype — indirect via genpdf
-    "RUSTSEC-2020-0056",   # instant — unmaintained, indirect via gtk
-    "RUSTSEC-2020-0144",   # atty — unmaintained, indirect via clap v3
     "RUSTSEC-2021-0139",   # ansi_term — unmaintained
-    "RUSTSEC-2021-0140",   # atk/atk-sys — unmaintained, indirect via gtk
     "RUSTSEC-2021-0145",   # atk — unmaintained
-    "RUSTSEC-2021-0153",   # number_prefix — unmaintained
     "RUSTSEC-2024-0370",   # glib — unmaintained
     "RUSTSEC-2024-0375",   # paste — soundness issue
     "RUSTSEC-2024-0384",   # backoff — unmaintained
@@ -29,10 +24,7 @@ ignore = [
     "RUSTSEC-2025-0135",   # indirect dep
     "RUSTSEC-2025-0141",   # indirect dep
     "RUSTSEC-2026-0002",   # indirect dep
-    "RUSTSEC-2026-0009",   # indirect dep
     "RUSTSEC-2026-0097",   # indirect dep
-    "RUSTSEC-2026-0098",   # indirect dep
-    "RUSTSEC-2026-0099",   # indirect dep
     # `quick-xml` 0.30/0.39 are compile-only through xcb's build script and
     # wayland-scanner's proc macro. They parse checked-in protocol files from
     # checksummed crates, never user input in the shipped gateway. Runtime XML
