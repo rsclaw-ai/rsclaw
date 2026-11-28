@@ -17,6 +17,7 @@ pub mod direct_apis;
 pub use rsclaw_doc as doc;
 pub use rsclaw_evolution as evolution;
 pub mod exec_pool;
+pub mod ext;
 pub mod goal;
 pub mod key_data;
 pub use rsclaw_platform::install_hints;

@@ -87,7 +87,13 @@ pub fn needs_approval(
 /// `blockInWake` is on (the default).
 pub fn blocked_without_person(cfg: Option<&ToolApprovalConfig>, channel: &str, user_text: &str) -> bool {
     let on = cfg.and_then(|c| c.block_in_wake).unwrap_or(true);
-    on && (matches!(channel, "heartbeat" | "system")
+    on && !started_by_person(channel, user_text)
+}
+
+/// Whether a person started the turn: not a heartbeat / system tick and
+/// not a turn whose only input is a job's completion notice.
+pub fn started_by_person(channel: &str, user_text: &str) -> bool {
+    !(matches!(channel, "heartbeat" | "system")
         || rsclaw_events::notice::is_auto_notice_only(user_text))
 }
 

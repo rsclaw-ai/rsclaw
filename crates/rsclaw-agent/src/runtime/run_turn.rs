@@ -2023,6 +2023,25 @@ impl AgentRuntime {
             }
             // else: "full" or unknown -> keep all
 
+            // Extension tools (crate::ext): offered only when the toolset is
+            // `full` with no `tools` list, or `tools` names them exactly or as
+            // `<ns>_*`. Grouped ones ride behind the request_tool stub until
+            // `ext:<ns>:<group>` is enabled for this session. Not builtins,
+            // so they land in the per-session user_tools segment.
+            if crate::ext::any_registered() {
+                let enabled = self
+                    .handle
+                    .cold_enabled
+                    .read()
+                    .ok()
+                    .and_then(|g| g.get(session_key).cloned())
+                    .unwrap_or_default();
+                let ext = crate::ext::tool_list(&self.handle.id, allowed.as_ref(), &enabled);
+                all.extend(ext.live);
+                deferred_tool_defs.extend(ext.deferred);
+                stub_entries.extend(ext.stub_entries);
+            }
+
             // cap-followup sessions: agent is meant to briefly summarise one
             // or more cap completions whose results were already pushed to
             // the user via push_notif. Strip research/exec/chain tools so it

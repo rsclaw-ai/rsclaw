@@ -107,6 +107,25 @@ impl AgentRuntime {
         )
     }
 
+    /// The allowlist this agent's turns build their tool list with (`None` =
+    /// unrestricted). Mirrors the resolution in run_turn: the default agent
+    /// defaults to `full`, others to `standard`. Extension tools are
+    /// admitted against it at dispatch, so an agent never runs one it was
+    /// not offered.
+    pub(super) fn ext_tool_allowlist(&self) -> Option<std::collections::HashSet<String>> {
+        let model_cfg = self
+            .handle
+            .config
+            .model
+            .as_ref()
+            .or(self.config.agents.defaults.model.as_ref());
+        let is_default = self.handle.config.default.unwrap_or(false) || self.handle.id == "main";
+        let toolset = model_cfg
+            .and_then(|m| m.toolset.as_deref())
+            .unwrap_or(if is_default { "full" } else { "standard" });
+        crate::tools_builder::toolset_allowed_names(toolset, model_cfg.and_then(|m| m.tools.as_ref()))
+    }
+
     pub(super) fn has_stock_tool_provider(&self) -> bool {
         self.wasm_plugins.iter().any(|wp| {
             wp.capabilities.iter().any(|c| c == "trustedToolAlias")
@@ -152,7 +171,7 @@ impl AgentRuntime {
         // instead of routing to the spoke. Enforce here whenever the agent
         // config explicitly limits its toolset.
         if let Some(allowed) = self.allowed_tools_for_dispatch() {
-            if !allowed.contains(name) {
+            if !allowed.contains(name) && !crate::ext::pattern_admits(&allowed, name) {
                 return Err(anyhow!(
                     "tool '{name}' is not in this agent's whitelist — \
                      hallucinated tool names are blocked. Available: {}",
@@ -165,13 +184,21 @@ impl AgentRuntime {
             }
         }
 
+        // Extension tool (crate::ext), resolved up front so the owner-only
+        // gate sees its flag. A name under a registered namespace that the
+        // provider does not offer this agent is an unknown tool.
+        let ext_tool = crate::ext::resolve(&self.handle.id, name)?;
+
         // Sender-trust gate: non-owner senders (paired users, group members,
         // A2A peers, webhooks) cannot reach host-level tools unless this
         // agent lists them in `nonOwnerTools`. Enforced here, not only in the
         // tool list, because models call tools they were never shown.
-        if !crate::trust::tool_allowed(
+        let owner_only = crate::trust::is_owner_only_tool(name)
+            || ext_tool.as_ref().is_some_and(|t| t.tool.owner_only);
+        if !crate::trust::owner_only_tool_allowed(
             ctx.turn_ctx.trust,
             name,
+            owner_only,
             self.handle.config.non_owner_tools.as_deref(),
         ) {
             tracing::warn!(
@@ -561,6 +588,21 @@ impl AgentRuntime {
             "request_tool" => {
                 // v1 leaks trailing whitespace into string args — trim before lookup.
                 let name = args["name"].as_str().unwrap_or("").trim().to_owned();
+                // Extension tool group: "ext:<namespace>:<group>" (crate::ext).
+                // The key itself is the cold_enabled marker run_turn reads.
+                if name.starts_with("ext:")
+                    && crate::ext::is_group(&self.handle.id, self.ext_tool_allowlist().as_ref(), &name)
+                {
+                    if let Ok(mut g) = self.handle.cold_enabled.write() {
+                        g.entry(ctx.session_key.clone())
+                            .or_default()
+                            .insert(name.clone());
+                    }
+                    return Ok(json!({
+                        "enabled": name,
+                        "note": "Group tools are now available for this session — call them directly."
+                    }));
+                }
                 // Plugin tool group: "<plugin>:<group>" (v2 toolGroups).
                 if name.contains(':') {
                     let valid = name.split_once(':').is_some_and(|(pl, gr)| {
@@ -642,6 +684,20 @@ impl AgentRuntime {
             "cap_bind_sticky" => return self.tool_cap_bind_sticky(ctx, args).await,
             "cap_unbind_sticky" => return self.tool_cap_unbind_sticky(ctx, args).await,
             _ => {}
+        }
+
+        // Extension tool: after built-ins (a namespace never prefixes a
+        // built-in name), before A2A / MCP / plugin / skill routing.
+        if let Some(resolved) = ext_tool {
+            let ext_ctx = crate::ext::ExtToolCtx {
+                agent_id: ctx.agent_id.clone(),
+                session_key: ctx.session_key.clone(),
+                channel: ctx.channel.clone(),
+                peer_id: ctx.peer_id.clone(),
+                person_started: crate::tool_approval::started_by_person(&ctx.channel, &ctx.user_text),
+            };
+            let allowed = self.ext_tool_allowlist();
+            return crate::ext::call(resolved, allowed.as_ref(), ext_ctx, name, args).await;
         }
 
         // 1. A2A: `agent_<id>` prefix → invoke another agent via registry.

@@ -100,7 +100,18 @@ pub fn is_owner_only_tool(tool: &str) -> bool {
 /// Decide whether `trust` may call `tool` on an agent whose
 /// `nonOwnerTools` config is `non_owner_tools`.
 pub fn tool_allowed(trust: SenderTrust, tool: &str, non_owner_tools: Option<&[String]>) -> bool {
-    if trust.is_owner() || !is_owner_only_tool(tool) {
+    owner_only_tool_allowed(trust, tool, is_owner_only_tool(tool), non_owner_tools)
+}
+
+/// [`tool_allowed`] for a tool whose owner-only flag the caller already
+/// knows (an extension tool declares its own).
+pub fn owner_only_tool_allowed(
+    trust: SenderTrust,
+    tool: &str,
+    owner_only: bool,
+    non_owner_tools: Option<&[String]>,
+) -> bool {
+    if trust.is_owner() || !owner_only {
         return true;
     }
     non_owner_tools.is_some_and(|list| list.iter().any(|t| t == "*" || t == tool))
