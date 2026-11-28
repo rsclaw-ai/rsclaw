@@ -3,8 +3,15 @@
 //! A custom binary is a thin `main` that registers its extensions and then
 //! calls [`crate::run`], like the stock `src/main.rs`. The stock binary
 //! registers nothing, so the gateway behaves exactly as before.
+//!
+//! Native agent tools are registered with [`register_tool_provider`]
+//! (re-exported from `rsclaw_agent::ext`, which documents the rules).
 
 use std::sync::{Arc, RwLock};
+
+pub use rsclaw_agent::ext::{
+    BoxFuture, ExtTool, ExtToolCtx, ToolDef, ToolProvider, register_tool_provider,
+};
 
 use axum::Router;
 
